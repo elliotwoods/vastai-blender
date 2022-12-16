@@ -1,8 +1,12 @@
 # Introduction
 
+https://vast.ai allows you to rent time on very powerful computers (e.g. for machine learning or crypto mining purposes). In general the cost of renting time on a vast.ai machine is significantly lower than other cloud computing services (e.g. cloud renderers for Blender) because these are machines under people's desks, in people's garages, etc. Often they are out-of-use crypto mining rigs.
+
 A set of scripts for easy handling Blender renders on vast.ai instances. We use https://medium.com/@yani/blender-rendering-on-vast-ai-b77a20d1847d as a starting reference.
 
-This script uses https://github.com/andreafabrizi/Dropbox-Uploader (included here under GPL v3.0). We could instead use rclone which works better for synchronising files (detecting changes), but rclone requires access to the entire of your dropbox account, which isn't recommended when working on a vast.ai instance when you can't 100% trust the operator of the machine that you're giving access to.
+## Notes on Dropbox-Uploader
+
+This script uses https://github.com/andreafabrizi/Dropbox-Uploader (included here under GPL v3.0). We could instead use rclone which works somewhat better for comparing files when synchronising, but rclone requires access to the entire of your dropbox account, which isn't recommended when working on a vast.ai instance when you can't 100% trust the operator of the machine that you're giving access to.
 
 # Usage
 
