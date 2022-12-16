@@ -71,9 +71,13 @@ Note : `-s` excludes pre-existing files on server and must come before the `uplo
 ## View network traffic
 
 ```
-sudp apt-get install -y slurm bmon
-#slurm -i eth0
+sudo apt-get install -y bmon
 bmon
+```
+
+```
+sudo apt-get install -y slurm
+slurm -i eth0
 ```
 
 ## View NVidia GPU usage
