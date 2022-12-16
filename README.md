@@ -67,3 +67,17 @@ Run the script in the SSH session:
 ```
 
 Note : `-s` excludes pre-existing files on server and must come before the `upload` argument
+
+## View network traffic
+
+```
+sudp apt-get install -y slurm bmon
+#slurm -i eth0
+bmon
+```
+
+## View NVidia GPU usage
+
+```
+nvidia-smi
+```
