@@ -1,8 +1,10 @@
 # Introduction
 
+A set of scripts for easy handling Blender renders on vast.ai instances. We use https://medium.com/@yani/blender-rendering-on-vast-ai-b77a20d1847d as a starting reference.
+
 https://vast.ai allows you to rent time on very powerful computers (e.g. for machine learning or crypto mining purposes). In general the cost of renting time on a vast.ai machine is significantly lower than other cloud computing services (e.g. cloud renderers for Blender) because these are machines under people's desks, in people's garages, etc. Often they are out-of-use crypto mining rigs.
 
-A set of scripts for easy handling Blender renders on vast.ai instances. We use https://medium.com/@yani/blender-rendering-on-vast-ai-b77a20d1847d as a starting reference.
+Warning : Uploads from vast.ai instances to Dropbox can be very slow (on machines with very low upload speeds, this might end up being longer than your render times). Currently this script will only start uploading the results of each render after each `.blend` file is finished. One workaround is to split your render into seperate `.blend` files as the script will upload previous results at the same time as rendering the next `.blend` file.
 
 ## Notes on Dropbox-Uploader
 
