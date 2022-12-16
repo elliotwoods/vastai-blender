@@ -63,7 +63,7 @@ Run the script in the SSH session:
 ## Upload all renders to dropbox
 
 ```
-./dropbox_uploader.sh upload ~/output/* ~/output -s
+./dropbox_uploader.sh -s upload ~/output/* ~/output
 ```
 
-Note : `-s` excludes pre-existing files on server
+Note : `-s` excludes pre-existing files on server and must come before the `upload` argument
