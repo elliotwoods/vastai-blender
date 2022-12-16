@@ -8,7 +8,7 @@ A set of scripts for easy handling Blender renders on vast.ai instances. We use 
 
 Go to Vast.ai and create an instance with image `nvidia/cuda:11.4.1-cudnn8-devel-ubuntu20.04`. You will need some credit in your account in order to create the instance. Generally I've just been keeping the default 10GB of storage but of course extend that if you need to. Remember to delete the instance after you've used it, as you'll have to pay for this storage every day that it's kept on the server. Wait for the instance to be created.
 
-## 2. Login the instance
+## 2. Login to and setup the instance
 
 You'll find the instance in https://console.vast.ai/instances/ . Connect using SSH.
 
