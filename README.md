@@ -10,6 +10,10 @@ Now perform the Dropbox config, check here for keys: https://www.dropbox.com/dev
 
 # Usage
 
+This will perform renders in todo folder and upload results back to dropbox:
+
 ```
-./dropbox_uploader.sh download scenes ~/scenes
+cd vastai-scripts
+./dropbox_uploader.sh download scenes/todo ~/scenes
+./do_renders.sh
 ```
