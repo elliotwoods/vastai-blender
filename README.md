@@ -8,3 +8,8 @@ cd vastai-scripts
 
 Now perform the Dropbox config, check here for keys: https://www.dropbox.com/developers/apps/info/xlianiquhxnhdg6#settings
 
+# Usage
+
+```
+./dropbox_uploader.sh download scenes ~/scenes
+```
