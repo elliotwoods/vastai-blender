@@ -45,13 +45,22 @@ This will perform renders in todo folder and upload results back to dropbox in t
 In the SSH session..
 
 ```
-# Go into the scripts folder
-cd ~/vastai-scripts
-
-# Download all scenes from dropbox folder
-./dropbox_uploader.sh download scenes/todo ~/scenes -s
-
-# Perform renders and do uploads. Note that uploads will be performed in background whilst next renders are performed
-# The script presumes that it is running insde a tmux session (standard for this vastai config)
-./do_renders_and_uploads.sh
+# This script:
+# 1. Downloads contents of todo folder
+# 2. Renders file
+# 3. Uploads results in background (requires to be run in tmux session - which is vastai default)
+# 4. Moves file from todo to done folder both locally and on server
+# 5. Repeat from step 2 with next file
+~/vastai-scripts/download_render_upload.sh
 ```
+
+
+# Other commands
+
+## Upload all renders to dropbox
+
+```
+./dropbox_uploader.sh upload ~/output/* ~/output -s
+```
+
+Note : `-s` excludes pre-existing files on server
