@@ -40,17 +40,18 @@ Copy any `.blend` files you want to render into the `scenes/todo` folder.
 
 Now we're ready to render
 
-This will perform renders in todo folder and upload results back to dropbox in the `output/` folder
+This script will
 
-In the SSH session..
+1. Downloads contents of `scenes/todo` folder
+2. Iterate through `.blend` files in this folder
+3. Render the file with all GPU's in CUDA mode 
+4. After render completes, uploads results in background (requires to be run in tmux session - which is vastai default)
+5. Moves `.blend` file from `scenes/todo` to `scenes/done` folder both locally and on dropbox
+6. Repeat from step 2 with next file
+
+Run the script in the SSH session:
 
 ```
-# This script:
-# 1. Downloads contents of todo folder
-# 2. Renders file
-# 3. Uploads results in background (requires to be run in tmux session - which is vastai default)
-# 4. Moves file from todo to done folder both locally and on server
-# 5. Repeat from step 2 with next file
 ~/vastai-scripts/download_render_upload.sh
 ```
 
