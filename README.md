@@ -6,6 +6,10 @@ https://vast.ai allows you to rent time on very powerful computers (e.g. for mac
 
 Warning : Uploads from vast.ai instances to Dropbox can be very slow (on machines with very low upload speeds, this might end up being longer than your render times). Currently this script will only start uploading the results of each render after each `.blend` file is finished. One workaround is to split your render into seperate `.blend` files as the script will upload previous results at the same time as rendering the next `.blend` file.
 
+Also *please avoid spaces in your filenames!*.
+
+Annoyingly we fully implemented a file watching version with python `watchdog` and handled paths with spaces, but then lost it on a VastAI instance that died. 
+
 ## Notes on Dropbox-Uploader
 
 This script uses https://github.com/andreafabrizi/Dropbox-Uploader (included here under GPL v3.0). We could instead use rclone which works somewhat better for comparing files when synchronising, but rclone requires access to the entire of your dropbox account, which isn't recommended when working on a vast.ai instance when you can't 100% trust the operator of the machine that you're giving access to.
