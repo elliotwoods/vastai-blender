@@ -4,11 +4,7 @@ A set of scripts for easy handling Blender renders on vast.ai instances. We use 
 
 https://vast.ai allows you to rent time on very powerful computers (e.g. for machine learning or crypto mining purposes). In general the cost of renting time on a vast.ai machine is significantly lower than other cloud computing services (e.g. cloud renderers for Blender) because these are machines under people's desks, in people's garages, etc. Often they are out-of-use crypto mining rigs.
 
-Warning : Uploads from vast.ai instances to Dropbox can be very slow (on machines with very low upload speeds, this might end up being longer than your render times). Currently this script will only start uploading the results of each render after each `.blend` file is finished. One workaround is to split your render into seperate `.blend` files as the script will upload previous results at the same time as rendering the next `.blend` file.
-
-Also *please avoid spaces in your filenames!*.
-
-Annoyingly we fully implemented a file watching version with python `watchdog` and handled paths with spaces, but then lost it on a VastAI instance that died. 
+Also *please avoid spaces in your filenames!*. It should work now, but this was a cause of many errors before.
 
 ## Notes on Dropbox-Uploader
 
@@ -74,7 +70,7 @@ This script will
 1. Downloads contents of `scenes/todo` folder
 2. Iterate through `.blend` files in this folder
 3. Render the file with all GPU's in CUDA mode 
-4. After render completes, uploads results in background (requires to be run in tmux session - which is vastai default)
+4. Upload images as they are completed (note that if the files already exist - this will not be detected. delete old files first)
 5. Moves `.blend` file from `scenes/todo` to `scenes/done` folder both locally and on dropbox
 6. Repeat from step 2 with next file
 
@@ -111,6 +107,12 @@ slurm -i eth0
 
 ```
 nvidia-smi
+```
+
+## Setup GitHub (if elliot)
+
+```
+~/vastai-scripts/setup_github_elliot.sh
 ```
 
 # Todo / Future
