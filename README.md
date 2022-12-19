@@ -32,6 +32,7 @@ Perform setup using:
 ```
 git clone https://github.com/elliotwoods/vastai-scripts
 cd vastai-scripts
+chmod 777 ./setup.sh
 ./setup.sh
 ```
 
@@ -42,7 +43,7 @@ Otherwise : you'll need to craete your own app (dropbox_uploader.sh will guide y
 You can also add this as a step for the vast.ai 'On-start script:' when configuring your instance as
 
 ```
-git clone https://github.com/elliotwoods/vastai-scripts & cd vastai-scripts & ./setup_non_interactive.sh
+git clone https://github.com/elliotwoods/vastai-scripts; cd vastai-scripts; chmod 777 ./setup_non_interactive.sh; ./setup_non_interactive.sh
 ```
 
 Then you will only need to perform the `dropbox_uploader` script later in order to configure dropbox (which requires user interaction).
@@ -110,4 +111,6 @@ nvidia-smi
 
 # Todo / Future
 
-1. Make this into a Docker image
+1. Make this into a Docker image that is good to go
+2. Background uploading (detect on new file)
+3. Web interface?
