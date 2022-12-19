@@ -16,6 +16,13 @@ This script uses https://github.com/andreafabrizi/Dropbox-Uploader (included her
 
 Go to Vast.ai and create an instance with image `nvidia/cuda:11.4.1-cudnn8-devel-ubuntu20.04`. You will need some credit in your account in order to create the instance. Generally I've just been keeping the default 10GB of storage but of course extend that if you need to. Remember to delete the instance after you've used it, as you'll have to pay for this storage every day that it's kept on the server. Wait for the instance to be created.
 
+I generally use the following priorities when selecting an instace:
+
+* Sort by `TFlops/$/Hr`
+* At least 100Mbps upload speeds
+
+Generally in 2022-12 I'll pick an instance with a couple of GeForce 3080's
+
 ## 2. Login to and setup the instance
 
 You'll find the instance in https://console.vast.ai/instances/ . Connect using SSH.
@@ -31,6 +38,15 @@ cd vastai-scripts
 Now perform the Dropbox config. If you're Elliot then use the keys from this app: https://www.dropbox.com/developers/apps/info/xlianiquhxnhdg6#settings
 
 Otherwise : you'll need to craete your own app (dropbox_uploader.sh will guide you). Ideally setup an app that only has access to one folder (not the entire of your Dropbox : especially with vastai you never know who might access your files).
+
+You can also add this as a step for the vast.ai 'On-start script:' when configuring your instance as
+
+```
+git clone https://github.com/elliotwoods/vastai-scripts & cd vastai-scripts & ./setup_non_interactive.sh
+```
+
+Then you will only need to perform the `dropbox_uploader` script later in order to configure dropbox (which requires user interaction).
+
 
 ## 4. Setup your dropbox folders
 
@@ -91,3 +107,7 @@ slurm -i eth0
 ```
 nvidia-smi
 ```
+
+# Todo / Future
+
+1. Make this into a Docker image
