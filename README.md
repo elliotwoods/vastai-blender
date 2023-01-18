@@ -148,6 +148,8 @@ nvidia-smi
 
 # Todo / Future
 
-1. Make this into a Docker image that is good to go
-2. Background uploading (detect on new file)
-3. Web interface?
+* Make this into a Docker image that is good to go
+* Web interface?
+* Better handling of multiple render servers e.g.
+  * They work on seperate folders?
+  * They can render different parts of the animation? (e.g. frames 1-100, 101-200, etc)
