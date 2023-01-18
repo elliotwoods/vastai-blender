@@ -12,16 +12,31 @@ This script uses https://github.com/andreafabrizi/Dropbox-Uploader (included her
 
 # Usage
 
-## 1. Create the instance
+## 1. Setup a computer on Vast AI
 
-Go to Vast.ai and create an instance with image `nvidia/cuda:11.4.1-cudnn8-devel-ubuntu20.04`. You will need some credit in your account in order to create the instance. Generally I've just been keeping the default 10GB of storage but of course extend that if you need to. Remember to delete the instance after you've used it, as you'll have to pay for this storage every day that it's kept on the server. Wait for the instance to be created.
+## Configure the image
 
-I generally use the following priorities when selecting an instace:
+1. Go to Vast.ai console in the Client>Create section. You should see a list of available instances. Generally I use `On-Demand` not `Interruptable`
+2. Choose 'EDIT IMAGE & CONFIG...'
+3. Select an empty template slot
+4. Set the field `Enter full docker image/...` to `nvidia/cuda:11.4.1-cudnn8-devel-ubuntu20.04`
+5. Leave the other settings as default (e.g. run interactive shell server)
+6. Choose disk space to allocate (often I choose around 10GB, but use your own judgement here)
+7. Hit the `SELECT & SAVE` button
+
+## Select a computer to use
+
+Lok through the list of available machines and select one you like. I generally use the following priorities when selecting an instace:
 
 * Sort by `TFlops/$/Hr`
 * At least 100Mbps upload speeds
 
-Generally in 2022-12 I'll pick an instance with a couple of GeForce 3080's
+As of 2022-12 I'll pick an instance with a couple of GeForce 3080's
+
+Presuming that you have the right `Instance Configuration` appearing in the top left corner from the last step, you can now select `RENT` button on the computer that you like to use.
+
+You will need some credit in your account in order to create the instance. Remember to delete the instance after you've used it, as you'll have to pay for the storage every day that it's kept on the server. Wait for the instance to be created.
+
 
 ## 2. Login to and setup the instance
 
