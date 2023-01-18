@@ -100,8 +100,12 @@ This script will
 Run the script in the SSH session:
 
 ```
-~/vastai-scripts/download_render_upload.py
+~/vastai-scripts/render_watchdog_upload.py
+
+# Or use the old script if you prefer
+# ~/vastai-scripts/download_render_upload.py
 ```
+
 
 Notes:
 
