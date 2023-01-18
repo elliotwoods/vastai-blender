@@ -3,4 +3,4 @@
 
 #Setup dropbox script
 chmod 777 ./dropbox_uploader.sh
-./dropbox_uploader
+./dropbox_uploader.sh
