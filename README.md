@@ -40,9 +40,11 @@ You will need some credit in your account in order to create the instance. Remem
 
 ## 2. Login to and setup the instance
 
-You'll find the instance in https://console.vast.ai/instances/ . Connect using SSH.
+You'll find the instance in https://console.vast.ai/instances/ . It might take a listtle while to get running the first time. The `Status` line will show you the output coming out from docker. Note that if the docker image is already available on this machine then it will start up much faster as it won't need to download everything from the internet.
 
-Perform setup using:
+When it's ready, you should see a blue button sayind `>_CONNECT`. Select that to connect (note you'll need to share your public SSH keys with Vast AI for this to work). I presume that you've used SSH before so I won't go into how to connect here.
+
+Once you're logged in and at the bash prompt on the remote machine. Perform setup using:
 
 ```
 git clone https://github.com/elliotwoods/vastai-scripts
@@ -51,9 +53,15 @@ chmod 777 ./setup.sh
 ./setup.sh
 ```
 
+This will download some utils, python bits and pieces and a copy of blender 3.4.0.
+
+Note : the remote will likely be running tmux, so you can multi-task by adding new windows. Check out a tmux tutorial if you're interested in that.
+
 Now perform the Dropbox config. If you're Elliot then use the keys from this app: https://www.dropbox.com/developers/apps/info/xlianiquhxnhdg6#settings
 
 Otherwise : you'll need to craete your own app (dropbox_uploader.sh will guide you). Ideally setup an app that only has access to one folder (not the entire of your Dropbox : especially with vastai you never know who might access your files).
+
+## Side note for more automation
 
 You can also add this as a step for the vast.ai 'On-start script:' when configuring your instance as
 
@@ -92,7 +100,7 @@ This script will
 Run the script in the SSH session:
 
 ```
-~/vastai-scripts/download_render_upload.sh
+~/vastai-scripts/download_render_upload.py
 ```
 
 
