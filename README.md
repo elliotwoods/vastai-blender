@@ -103,6 +103,10 @@ Run the script in the SSH session:
 ~/vastai-scripts/download_render_upload.py
 ```
 
+Notes:
+
+1. Make sure your file name doesn't have any spaces in it
+2. Use the feature `File>External Resources>Automatically Pack Data` in Blender to ensure all your textures, etc are stored in the blend file
 
 # Other commands
 
