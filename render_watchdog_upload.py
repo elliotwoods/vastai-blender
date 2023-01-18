@@ -1,11 +1,12 @@
 #!/usr/bin/python3
-from os import listdir, system
+from os import listdir, system, mkdir
 import queue
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent
 import threading
 import time
 import sys
+from datetime import datetime
 
 in_folder = '/root/scenes/todo'
 done_folder = '/root/scenes/done'
@@ -13,8 +14,11 @@ done_folder = '/root/scenes/done'
 in_folder_remote = 'scenes/todo/'
 done_folder_remote = 'scenes/done/'
 
-out_folder = '/root/output'
-out_folder_remote = 'output'
+date_time_string = datetime.now().strftime("%Y-%m-%d_%H.%M.%S")
+out_folder = '/root/output/' + date_time_string
+mkdir(out_folder)
+out_folder_remote = 'output/' + date_time_string
+
 blender = '/root/blender-3.4.0-linux-x64/blender'
 dropbox_uploader = '/root/vastai-scripts/dropbox_uploader.sh'
 
