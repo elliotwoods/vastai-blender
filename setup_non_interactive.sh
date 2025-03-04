@@ -1,7 +1,8 @@
 #Install system packages
 apt-get install -y \
     vim netcat curl htop python3-pip\
-    libglu1-mesa-dev libxi6 libxrender1 libfontconfig1 libxxf86vm-dev libxfixes-dev libgl1-mesa-glx libxkbcommon-dev
+    libglu1-mesa-dev libxi6 libxrender1 libfontconfig1 libxxf86vm-dev libxfixes-dev libgl1-mesa-glx libxkbcommon-dev\
+    libsm6
 pip3 install watchdog
 
 #Install Blender

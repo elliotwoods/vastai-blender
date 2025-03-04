@@ -19,7 +19,7 @@ This script uses https://github.com/andreafabrizi/Dropbox-Uploader (included her
 1. Go to Vast.ai console in the Client>Create section. You should see a list of available instances. Generally I use `On-Demand` not `Interruptable`
 2. Choose 'EDIT IMAGE & CONFIG...'
 3. Select an empty template slot
-4. Set the field `Enter full docker image/...` to `nvidia/cuda:11.4.1-cudnn8-devel-ubuntu20.04`
+4. Set the field `Enter full docker image/...` to `vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04` (as of March 2025 this is the 'CUDA' docker image)
 5. Leave the other settings as default (e.g. run interactive shell server)
 6. Choose disk space to allocate (often I choose around 10GB, but use your own judgement here)
 7. Hit the `SELECT & SAVE` button
@@ -47,6 +47,7 @@ When it's ready, you should see a blue button sayind `>_CONNECT`. Select that to
 Once you're logged in and at the bash prompt on the remote machine. Perform setup using:
 
 ```
+cd /root
 git clone https://github.com/elliotwoods/vastai-scripts
 cd vastai-scripts
 chmod 777 ./setup.sh
@@ -82,7 +83,7 @@ scenes/todo/
 scenes/done/
 ```
 
-Copy any `.blend` files you want to render into the `scenes/todo` folder.
+Copy any `.blend` files you want to render into the `scenes/todo` folder. **Note that you should pack all your resources into the blend file e.g. textures**
 
 ## 4. Perform renders
 
@@ -100,10 +101,10 @@ This script will
 Run the script in the SSH session:
 
 ```
-~/vastai-scripts/render_watchdog_upload.py
+python ~/vastai-scripts/render_watchdog_upload.py
 
 # Or use the old script if you prefer
-# ~/vastai-scripts/download_render_upload.py
+#python ~/vastai-scripts/download_render_upload.py
 ```
 
 
