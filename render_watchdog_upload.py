@@ -19,7 +19,7 @@ out_folder = '/root/output/' + date_time_string
 mkdir(out_folder)
 out_folder_remote = 'output/' + date_time_string
 
-blender = '/root/blender-3.4.0-linux-x64/blender'
+blender = '/root/blender-4.2.7-linux-x64/blender'
 dropbox_uploader = '/root/vastai-scripts/dropbox_uploader.sh'
 
 def is_dry_run():
