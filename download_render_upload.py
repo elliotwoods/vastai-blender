@@ -8,7 +8,7 @@ in_folder_remote = 'scenes/todo/'
 done_folder_remote = 'scenes/done/'
 
 out_folder = '~/output'
-blender = '/root/blender-4.2.7-linux-x64/blender'
+blender = '/root/blender-4.3.2-linux-x64/blender'
 dropbox_uploader = '/root/vastai-scripts/dropbox_uploader.sh'
 
 # Download the blender scenes
