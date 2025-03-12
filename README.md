@@ -51,7 +51,9 @@ cd /root
 git clone https://github.com/elliotwoods/vastai-scripts
 cd vastai-scripts
 chmod 777 ./setup.sh
+chmod 777 ./start.sh
 ./setup.sh
+
 ```
 
 This will download some utils, python bits and pieces and a copy of blender 3.4.0.
