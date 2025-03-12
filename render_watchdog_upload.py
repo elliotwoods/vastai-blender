@@ -27,7 +27,9 @@ def is_dry_run():
 def run(command):
 	print(command)
 	if not is_dry_run():
-		system(command)
+		exit_code = system(command)
+		if exit_code != 0:
+			print(f"Command {command} failed with exit code {exit_code}")
 
 # Setup upload queue
 upload_queue = queue.Queue()
@@ -58,8 +60,12 @@ observer = Observer()
 observer.schedule(event_handler, out_folder, recursive=True)
 observer.start()
 
+# Clear out local and done folders
+run("rm -rf {0}/*".format(in_folder))
+run("rm -rf {0}/*".format(done_folder))
+
 # Download the blender scenes
-system("{0} download scenes/todo ~/scenes -s".format(dropbox_uploader))
+run(f"{dropbox_uploader} download {in_folder_remote} ~/scenes -s".format(dropbox_uploader))
 
 for filename in listdir(in_folder):
 	if not filename.endswith('.blend'):
