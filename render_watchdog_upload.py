@@ -65,7 +65,7 @@ run("rm -rf {0}/*".format(in_folder))
 run("rm -rf {0}/*".format(done_folder))
 
 # Download the blender scenes
-run(f"{dropbox_uploader} download {in_folder_remote} ~/scenes -s".format(dropbox_uploader))
+run(f"{dropbox_uploader} download {in_folder_remote[:-1]} ~/scenes -s".format(dropbox_uploader))
 
 for filename in listdir(in_folder):
 	if not filename.endswith('.blend'):
