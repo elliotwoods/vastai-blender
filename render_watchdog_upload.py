@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-from os import listdir, system, mkdir
+from os import listdir, system, mkdir, popen
 import queue
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent
@@ -24,12 +24,32 @@ dropbox_uploader = '/root/vastai-scripts/dropbox_uploader.sh'
 
 def is_dry_run():
 	return '-d' in sys.argv or '--dry-run' in sys.argv
+
 def run(command):
 	print(command)
 	if not is_dry_run():
-		exit_code = system(command)
-		if exit_code != 0:
-			print(f"Command {command} failed with exit code {exit_code}")
+		return system(command) == 0
+	return True
+
+def run_blender(command):
+	print(command)
+	if not is_dry_run():
+		process = popen(command)
+		previous_was_Fra = False
+		while True:
+			starts_with_Fra = False
+			output = process.readline()
+			if output == "" and process.poll() is not None:
+				break
+			if output.startswith("Fra:"):
+				starts_with_Fra = True
+			if starts_with_Fra and previous_was_Fra:
+				print(output.strip() + " ", end="\r", flush=True)
+			else:
+				print(output.strip())
+			previous_was_Fra = starts_with_Fra
+		return process.returncode == 0
+	return True
 
 # Setup upload queue
 upload_queue = queue.Queue()
@@ -67,23 +87,32 @@ run("rm -rf {0}/*".format(done_folder))
 # Download the blender scenes
 run(f"{dropbox_uploader} download {in_folder_remote[:-1]} ~/scenes -s".format(dropbox_uploader))
 
-for filename in listdir(in_folder):
+files_todo = listdir(in_folder)
+
+# if there are no files to do then exit early
+if len(files_todo) == 0:
+	exit()
+
+for filename in files_todo:
 	if not filename.endswith('.blend'):
 		continue
 
 	# perform the render
-	command = "{3} -b \"{0}/{1}\" -P ~/vastai-scripts/enable_gpu.py -o \"{2}/{1}/\" -a".format(in_folder, filename, out_folder, blender)
-	run(command)
+	command = "{3} -b \"{0}/{1}\" -P ~/vastai-scripts/run_startup_scripts.py -P ~/vastai-scripts/enable_gpu.py -o \"{2}/{1}/\" -a".format(in_folder, filename, out_folder, blender)
+	render_success = run_blender(command)
 
-	# move the file from todo to done locally
-	command = "mv \"{1}/{0}\" \"{2}/{0}\"".format(filename, in_folder, done_folder)
-	run(command)
+	if render_success:	
+		# move the file from todo to done locally
+		command = "mv \"{1}/{0}\" \"{2}/{0}\"".format(filename, in_folder, done_folder)
+		run(command)
 
-	# move the file in drobox also 
-	command = "{0} move \"{2}{1}\" \"{3}{1}\" -d".format(dropbox_uploader, filename, in_folder_remote, done_folder_remote)
-	run(command)
+		# move the file in drobox also 
+		command = "{0} move \"{2}{1}\" \"{3}{1}\" -d".format(dropbox_uploader, filename, in_folder_remote, done_folder_remote)
+		run(command)
 
-	print("Finished {0}".format(filename))
+		print("Finished {0}".format(filename))
+	else:
+		print("Failed {0}".format(filename))
 
 upload_queue.task_done()
 upload_thread_running = False
