@@ -7,7 +7,7 @@ pip3 install watchdog
 
 #Install Blender
 pushd ~
-wget https://mirrors.aliyun.com/blender/release/Blender4.3/blender-4.3.2-linux-x64.tar.xz
+wget https://download.blender.org/release/Blender4.3/blender-4.3.2-linux-x64.tar.xz
 unxz blender-4.3.2-linux-x64.tar.xz
 tar -xvf blender-4.3.2-linux-x64.tar
 popd
