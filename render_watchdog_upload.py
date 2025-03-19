@@ -80,12 +80,16 @@ observer = Observer()
 observer.schedule(event_handler, out_folder, recursive=True)
 observer.start()
 
-# Clear out local and done folders
-run("rm -rf {0}/*".format(in_folder))
-run("rm -rf {0}/*".format(done_folder))
+# hack - can disable this flag if you want to use the already downloaded scenes instead
+do_download = True
 
-# Download the blender scenes
-run(f"{dropbox_uploader} download {in_folder_remote[:-1]} ~/scenes -s".format(dropbox_uploader))
+if do_download:
+	# Clear out local and done folders
+	run("rm -rf {0}/*".format(in_folder))
+	run("rm -rf {0}/*".format(done_folder))
+
+	# Download the blender scenes
+	run(f"{dropbox_uploader} download {in_folder_remote[:-1]} ~/scenes -s".format(dropbox_uploader))
 
 files_todo = listdir(in_folder)
 
