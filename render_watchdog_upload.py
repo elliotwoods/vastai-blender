@@ -7,6 +7,7 @@ import threading
 import time
 import sys
 from datetime import datetime
+import subprocess
 
 in_folder = '/root/scenes/todo'
 done_folder = '/root/scenes/done'
@@ -32,24 +33,22 @@ def run(command):
 	return True
 
 def run_blender(command):
-	print(command)
-	if not is_dry_run():
-		process = popen(command)
-		previous_was_Fra = False
-		while True:
-			starts_with_Fra = False
-			output = process.readline()
-			if output == "" and process.poll() is not None:
-				break
-			if output.startswith("Fra:"):
-				starts_with_Fra = True
-			if starts_with_Fra and previous_was_Fra:
-				print(output.strip() + " ", end="\r", flush=True)
-			else:
-				print(output.strip())
-			previous_was_Fra = starts_with_Fra
-		return process.returncode == 0
-	return True
+    print(command)
+    if not is_dry_run():
+        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        previous_was_Fra = False
+        while True:
+            output = process.stdout.readline()
+            if output == "" and process.poll() is not None:
+                break
+            starts_with_Fra = output.startswith("Fra:")
+            if starts_with_Fra and previous_was_Fra:
+                print(output.strip() + " ", end="\r", flush=True)
+            else:
+                print(output.strip())
+            previous_was_Fra = starts_with_Fra
+        return process.returncode == 0
+    return True
 
 # Setup upload queue
 upload_queue = queue.Queue()
