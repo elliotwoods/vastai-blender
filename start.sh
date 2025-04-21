@@ -1,1 +1,1 @@
-python ./render_watchdog_upload.py
+python3 ./render_watchdog_upload.py

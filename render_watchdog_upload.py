@@ -20,7 +20,17 @@ out_folder = '/root/output/' + date_time_string
 mkdir(out_folder)
 out_folder_remote = 'output/' + date_time_string
 
-blender = '/root/blender-4.3.2-linux-x64/blender'
+# Check if Octane version is installed at `/usr/local/OctaneBlender/blender` and use that if it is otherwise use default
+octane_blender = '/usr/local/OctaneBlender/blender'
+default_blender = '/root/blender-4.3.2-linux-x64/blender'
+octane_available = system(f"test -f {octane_blender}") == 0
+if octane_available:
+    print("Using Octane Blender")
+else:
+    print("Using default Blender")
+    
+blender = octane_blender if octane_available else default_blender
+
 dropbox_uploader = '/root/vastai-scripts/dropbox_uploader.sh'
 
 def is_dry_run():
