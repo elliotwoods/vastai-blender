@@ -21,8 +21,14 @@ done_folder_remote = 'scenes/done/'
 
 date_time_string = datetime.now().strftime("%Y-%m-%d_%H.%M.%S")
 out_folder = f"{user_base_folder}/output/{date_time_string}"
-mkdir(out_folder)
 out_folder_remote = 'output/' + date_time_string
+
+# make folders if they don't exist including the outer folders
+mkdir(f"{user_base_folder}/scenes")
+mkdir(f"{user_base_folder}/output")
+mkdir(in_folder)
+mkdir(done_folder)
+mkdir(out_folder)
 
 # Check if Octane version is installed at `/usr/local/OctaneBlender/blender` and use that if it is otherwise use default
 octane_blender = '/usr/local/OctaneBlender/blender'
