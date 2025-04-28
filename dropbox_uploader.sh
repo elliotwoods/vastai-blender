@@ -847,6 +847,13 @@ function db_download_file
     local FILE_SRC=$(normalize_path "$1")
     local FILE_DST=$(normalize_path "$2")
 
+    # Skip *.blend* files except *.blend exactly
+    local basefile_dst=$(basename "$FILE_DST")
+    if [[ "$basefile_dst" == *.blend* && "$basefile_dst" != *.blend ]]; then
+        print " > Skipping undesired file \"$basefile_dst\"\n"
+        return
+    fi
+
     if [[ $SHOW_PROGRESSBAR == 1 && $QUIET == 0 ]]; then
         CURL_PARAMETERS="-L --progress-bar"
         LINE_CR="\n"
@@ -855,14 +862,25 @@ function db_download_file
         LINE_CR=""
     fi
 
-    #Checking if the file already exists
-    if [[ -e $FILE_DST && $SKIP_EXISTING_FILES == 1 ]]; then
-        print " > Skipping already existing file \"$FILE_DST\"\n"
-        return
-    fi
+    # Check if file already exists locally
+    if [[ -e "$FILE_DST" ]]; then
+        local local_size=$(file_size "$FILE_DST")
 
-    # Checking if the file has the correct check sum
-    if [[ $TYPE != "ERR" ]]; then
+        ensure_accesstoken
+        $CURL_BIN $CURL_ACCEPT_CERTIFICATES -X POST -L -s --show-error --globoff -i -o "$RESPONSE_FILE" \
+            --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "{\"path\": \"$FILE_SRC\"}" "$API_METADATA_URL" 2> /dev/null
+        check_http_response
+
+        local remote_size=$(sed -n 's/.*"size": \([0-9]*\).*/\1/p' "$RESPONSE_FILE")
+
+        if [[ "$local_size" == "$remote_size" ]]; then
+            print " > Skipping already downloaded file \"$FILE_DST\" (size match)\n"
+            return
+        fi
+
+        # Checking SHA256 only if size mismatches
         sha_src=$(db_sha "$FILE_SRC")
         sha_dst=$(db_sha_local "$FILE_DST")
         if [[ $sha_src == $sha_dst && $sha_src != "ERR" ]]; then
@@ -871,9 +889,7 @@ function db_download_file
         fi
     fi
 
-    #Creating the empty file, that for two reasons:
-    #1) In this way I can check if the destination file is writable or not
-    #2) Curl doesn't automatically creates files with 0 bytes size
+    # Creating the empty file for permission checking
     dd if=/dev/zero of="$FILE_DST" count=0 2> /dev/null
     if [[ $? != 0 ]]; then
         print " > Error writing file $FILE_DST: permission denied\n"
@@ -883,10 +899,11 @@ function db_download_file
 
     print " > Downloading \"$FILE_SRC\" to \"$FILE_DST\"... $LINE_CR"
     ensure_accesstoken
-    $CURL_BIN $CURL_ACCEPT_CERTIFICATES $CURL_PARAMETERS -X POST --globoff -D "$RESPONSE_FILE" -o "$FILE_DST" --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" --header "Dropbox-API-Arg: {\"path\": \"$FILE_SRC\"}" "$API_DOWNLOAD_URL"
+    $CURL_BIN $CURL_ACCEPT_CERTIFICATES $CURL_PARAMETERS -X POST --globoff -D "$RESPONSE_FILE" -o "$FILE_DST" \
+        --header "Authorization: Bearer $OAUTH_ACCESS_TOKEN" \
+        --header "Dropbox-API-Arg: {\"path\": \"$FILE_SRC\"}" "$API_DOWNLOAD_URL"
     check_http_response
 
-    #Check
     if grep -q "^HTTP/[12].* 200" "$RESPONSE_FILE"; then
         print "DONE\n"
     else
