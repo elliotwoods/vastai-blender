@@ -52,7 +52,7 @@ git clone https://github.com/elliotwoods/vastai-scripts
 cd vastai-scripts
 chmod 777 ./setup.sh
 chmod 777 ./start.sh
-./setup.sh
+sudo ./setup.sh
 
 ```
 

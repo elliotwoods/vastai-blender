@@ -13,20 +13,20 @@ user_base_folder = popen("echo $HOME").read().strip()
 if user_base_folder == '':
 	user_base_folder = '/root'
 
-in_folder = f"${user_base_folder}/scenes/todo"
-done_folder = f"${user_base_folder}/scenes/done"
+in_folder = f"{user_base_folder}/scenes/todo"
+done_folder = f"{user_base_folder}/scenes/done"
 
 in_folder_remote = 'scenes/todo/'
 done_folder_remote = 'scenes/done/'
 
 date_time_string = datetime.now().strftime("%Y-%m-%d_%H.%M.%S")
-out_folder = f"${user_base_folder}/output/$(date_time_string)"
+out_folder = f"{user_base_folder}/output/$(date_time_string)"
 mkdir(out_folder)
 out_folder_remote = 'output/' + date_time_string
 
 # Check if Octane version is installed at `/usr/local/OctaneBlender/blender` and use that if it is otherwise use default
 octane_blender = '/usr/local/OctaneBlender/blender'
-default_blender = f"${user_base_folder}/blender-4.3.2-linux-x64/blender"
+default_blender = f"{user_base_folder}/blender-4.3.2-linux-x64/blender"
 octane_available = system(f"test -f {octane_blender}") == 0
 if octane_available:
     print("Using Octane Blender")
@@ -35,7 +35,7 @@ else:
     
 blender = octane_blender if octane_available else default_blender
 
-dropbox_uploader = f"${user_base_folder}/vastai-scripts/dropbox_uploader.sh"
+dropbox_uploader = f"{user_base_folder}/vastai-scripts/dropbox_uploader.sh"
 
 def is_dry_run():
 	return '-d' in sys.argv or '--dry-run' in sys.argv
