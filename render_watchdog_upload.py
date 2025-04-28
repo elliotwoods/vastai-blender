@@ -20,7 +20,7 @@ in_folder_remote = 'scenes/todo/'
 done_folder_remote = 'scenes/done/'
 
 date_time_string = datetime.now().strftime("%Y-%m-%d_%H.%M.%S")
-out_folder = f"{user_base_folder}/output/$(date_time_string)"
+out_folder = f"{user_base_folder}/output/{date_time_string}"
 mkdir(out_folder)
 out_folder_remote = 'output/' + date_time_string
 
