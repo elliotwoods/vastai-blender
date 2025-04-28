@@ -24,21 +24,28 @@ out_folder = f"{user_base_folder}/output/{date_time_string}"
 out_folder_remote = 'output/' + date_time_string
 
 # make folders if they don't exist including the outer folders
-mkdir(f"{user_base_folder}/scenes")
-mkdir(f"{user_base_folder}/output")
-mkdir(in_folder)
-mkdir(done_folder)
-mkdir(out_folder)
+folders_to_create = [
+	f"{user_base_folder}/scenes",
+	f"{user_base_folder}/output",
+	in_folder,
+	done_folder,
+	out_folder
+]
+for folder in folders_to_create:
+	try:
+		mkdir(folder)
+	except FileExistsError:
+		pass
 
 # Check if Octane version is installed at `/usr/local/OctaneBlender/blender` and use that if it is otherwise use default
 octane_blender = '/usr/local/OctaneBlender/blender'
 default_blender = f"{user_base_folder}/blender-4.3.2-linux-x64/blender"
 octane_available = system(f"test -f {octane_blender}") == 0
 if octane_available:
-    print("Using Octane Blender")
+	print("Using Octane Blender")
 else:
-    print("Using default Blender")
-    
+	print("Using default Blender")
+	
 blender = octane_blender if octane_available else default_blender
 
 dropbox_uploader = f"{user_base_folder}/vastai-scripts/dropbox_uploader.sh"
@@ -53,22 +60,22 @@ def run(command):
 	return True
 
 def run_blender(command):
-    print(command)
-    if not is_dry_run():
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        previous_was_Fra = False
-        while True:
-            output = process.stdout.readline()
-            if output == "" and process.poll() is not None:
-                break
-            starts_with_Fra = output.startswith("Fra:")
-            if starts_with_Fra and previous_was_Fra:
-                print(output.strip() + " ", end="\r", flush=True)
-            else:
-                print(output.strip())
-            previous_was_Fra = starts_with_Fra
-        return process.returncode == 0
-    return True
+	print(command)
+	if not is_dry_run():
+		process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+		previous_was_Fra = False
+		while True:
+			output = process.stdout.readline()
+			if output == "" and process.poll() is not None:
+				break
+			starts_with_Fra = output.startswith("Fra:")
+			if starts_with_Fra and previous_was_Fra:
+				print(output.strip() + " ", end="\r", flush=True)
+			else:
+				print(output.strip())
+			previous_was_Fra = starts_with_Fra
+		return process.returncode == 0
+	return True
 
 # Setup upload queue
 upload_queue = queue.Queue()
@@ -106,7 +113,7 @@ do_download = True
 do_delete = False
 
 if do_delete:
-    # Clear out local and done folders
+	# Clear out local and done folders
 	run("rm -rf {0}/*".format(in_folder))
 	run("rm -rf {0}/*".format(done_folder))
  
