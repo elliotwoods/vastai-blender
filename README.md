@@ -100,7 +100,15 @@ This script will
 5. Moves `.blend` file from `scenes/todo` to `scenes/done` folder both locally and on dropbox
 6. Repeat from step 2 with next file
 
+**Make sure you're in a tmux session as we use the tmux windowing features. Note that many docker images have this as the default**
+
 Run the script in the SSH session:
+
+```
+./start.sh
+```
+
+This internally runs
 
 ```
 python ~/vastai-scripts/render_watchdog_upload.py
