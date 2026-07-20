@@ -1,0 +1,110 @@
+/* ============================================================================
+   Design tokens — "Graphite + lime", DARK ONLY.
+   Shared studio design system ("graphite + lime"). Components reference these
+   semantic tokens via `var(--token)` in inline styles (colors → lib/theme.ts
+   TOKENS; type/spacing/radius → SCALE).
+
+   NOTE (inherited gotcha): if Tailwind v4 / Lightning CSS ever enters this
+   build, this :root block MUST be wrapped in `@layer base` — otherwise the
+   optimiser statically inlines and then DELETES the custom-property
+   declarations, and every inline-style `var(--token)` renders invisible.
+   Plain Vite CSS (current setup) does not do this.
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* ---- Type -------------------------------------------------------------- */
+  --font-sans:
+    'InterVariable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica,
+    Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --text-2xs: 10px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-lg: 14px;
+  --text-xl: 17px;
+  --leading-tight: 1.2;
+  --leading-normal: 1.5;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* ---- Spacing / radius --------------------------------------------------- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-pill: 999px;
+
+  /* ---- Surfaces / structure (graphite) ------------------------------------ */
+  --surface: #131417;
+  --surface-raised: #1b1d21;
+  --surface-overlay: rgba(27, 29, 33, 0.92);
+  --surface-disabled: #232529;
+  --border: #2a2d33;
+  --border-strong: #3a3e46;
+
+  /* ---- Text ---------------------------------------------------------------- */
+  --text: #e8eaed;
+  --text-secondary: #c5c8cd;
+  --text-muted: #9aa0a8;
+  --text-faint: #6f757e;
+  --text-disabled: #565b63;
+  --text-on-accent: #131417;
+
+  /* ---- Accent (lime) ------------------------------------------------------- */
+  --accent: #a3e635;
+  --accent-hover: #b6f15a;
+  --accent-fg: #131417;
+  --accent-soft-bg: rgba(163, 230, 53, 0.14);
+  --accent-soft-border: rgba(163, 230, 53, 0.4);
+  --accent-ring: #a3e635;
+
+  /* ---- Feedback ------------------------------------------------------------ */
+  --danger: #f87171;
+  --danger-bg: #7f1d1d;
+  --danger-border: rgba(248, 113, 113, 0.4);
+  --danger-strong: #ef4444;
+  --warn: #f59e0b;
+  --warn-soft-bg: rgba(245, 158, 11, 0.12);
+  --warn-soft-border: rgba(245, 158, 11, 0.35);
+  --warn-soft-text: #fcd34d;
+  --highlight-bg: rgba(163, 230, 53, 0.32);
+
+  /* ---- App-specific: node/job/chunk status --------------------------------- */
+  --status-queued-fill: #232529;
+  --status-queued-border: #3a3e46;
+  --status-queued-text: #c5c8cd;
+  --status-running-fill: #2563eb;
+  --status-running-border: #3b82f6;
+  --status-running-text: #ffffff;
+  --status-done-fill: #16a34a;
+  --status-done-border: #22c55e;
+  --status-done-text: #ffffff;
+  --status-error-fill: #dc2626;
+  --status-error-border: #ef4444;
+  --status-error-text: #ffffff;
+  --status-dead-fill: #1b1d21;
+  --status-dead-border: #2a2d33;
+  --status-dead-text: #6f757e;
+
+  /* ---- Media / transport ---------------------------------------------------- */
+  --playhead: var(--accent);
+  --ruler-tick: #3a3e46;
+  --ruler-label: #6f757e;
+
+  /* ---- Shadows / elevation -------------------------------------------------- */
+  --shadow-panel: 0 -8px 28px rgba(0, 0, 0, 0.55), -8px 0 28px rgba(0, 0, 0, 0.45);
+  --shadow-popover: 0 8px 28px rgba(0, 0, 0, 0.55);
+  --shadow-fab: 0 4px 14px rgba(0, 0, 0, 0.6);
+  --elevation-1: var(--shadow-popover);
+  --elevation-2: var(--shadow-panel);
+}

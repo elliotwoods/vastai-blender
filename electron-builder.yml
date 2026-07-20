@@ -1,0 +1,41 @@
+appId: com.kimchiandchips.vastai-blender
+productName: Vast Render
+directories:
+  buildResources: build
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!remote/*'
+  - '!fixtures/*'
+  - '!docs/*'
+  - '!scripts/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+# remote/ ships beside the app (read at runtime by the provisioner and
+# SFTP-uploaded verbatim to nodes) — see localRemoteDir() in provisioner.ts.
+extraResources:
+  - from: remote
+    to: remote
+asarUnpack:
+  - resources/**
+win:
+  executableName: vast-render
+nsis:
+  artifactName: ${name}-${version}-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  createDesktopShortcut: always
+mac:
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: false
+dmg:
+  artifactName: ${name}-${version}.${ext}
+linux:
+  target:
+    - AppImage
+  category: Graphics
+appImage:
+  artifactName: ${name}-${version}.${ext}
+npmRebuild: false

@@ -1,1 +1,0 @@
-python3 ./render_watchdog_upload.py
