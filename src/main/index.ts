@@ -107,6 +107,81 @@ app.whenReady().then(() => {
   scheduler.start()
   createWindow()
 
+  // Headless batch driver: VR_JOB_SPEC=<path to .json> submits a whole campaign at boot.
+  // Generalises VR_E2E_BLEND (pinned to one blend, Cycles, frames 1-20, no addons) so a
+  // scripted run can set engine, frame range, addon zips and fleet size. Spec shape:
+  //   {
+  //     "blends": ["C:/.../suzanne.blend", ...]  // or "blendDir": "C:/.../blends/<cfg>"
+  //     "engine": "eevee", "frameStart": 1, "frameEnd": 200, "frameStep": 1,
+  //     "addonZips": ["C:/.../auroravision-0.2.0.zip"],
+  //     "chunkSize": null, "maxActiveNodes": 4, "spendCapPerHour": 2
+  //   }
+  const jobSpecPath = process.env.VR_JOB_SPEC
+  if (jobSpecPath) {
+    setTimeout(() => {
+      void (async () => {
+        const { readFileSync, readdirSync } = await import('fs')
+        const { createJob, listJobs } = await import('./jobs/jobs')
+        const { registerAddon } = await import('./addons/addons')
+        const { updateSettings } = await import('./settings')
+
+        const spec = JSON.parse(readFileSync(jobSpecPath, 'utf-8'))
+
+        const patch: Record<string, number> = {}
+        if (spec.maxActiveNodes) patch.maxActiveNodes = spec.maxActiveNodes
+        if (spec.spendCapPerHour) patch.spendCapPerHour = spec.spendCapPerHour
+        if (Object.keys(patch).length) {
+          updateSettings(patch)
+          console.log(`[spec] settings ${JSON.stringify(patch)}`)
+        }
+
+        // Register each zip fresh: the registry keys on the manifest id and re-hashes the
+        // file, so re-running after an extension rebuild replaces the stale entry even
+        // when the version string is unchanged.
+        const addonIds: string[] = []
+        for (const zip of spec.addonZips ?? []) {
+          const info = registerAddon(zip)
+          addonIds.push(info.id)
+          console.log(`[spec] addon ${info.id} v${info.version} ${info.zipHash.slice(0, 12)}`)
+        }
+
+        let blends: string[] = spec.blends ?? []
+        if (!blends.length && spec.blendDir) {
+          blends = readdirSync(spec.blendDir)
+            .filter((f: string) => f.toLowerCase().endsWith('.blend'))
+            .sort()
+            .map((f: string) => join(spec.blendDir, f))
+        }
+        if (!blends.length) {
+          console.error('[spec] no blends resolved — nothing submitted')
+          return
+        }
+
+        const active = listJobs().filter((j) => ['queued', 'running'].includes(j.state))
+        let created = 0
+        for (const blendPath of blends) {
+          if (active.some((j) => j.blendPath === blendPath)) {
+            console.log(`[spec] skip (already active): ${blendPath}`)
+            continue
+          }
+          const jobId = await createJob({
+            blendPath,
+            engine: spec.engine ?? 'eevee',
+            frameStart: spec.frameStart ?? 1,
+            frameEnd: spec.frameEnd ?? 200,
+            frameStep: spec.frameStep ?? 1,
+            addonIds,
+            chunkSize: spec.chunkSize ?? null
+          })
+          created++
+          console.log(`[spec] job ${created}/${blends.length} ${jobId} ${blendPath}`)
+        }
+        console.log(`[spec] submitted ${created} job(s)`)
+        scheduler.kick()
+      })().catch((e) => console.error('[spec] submission failed:', e))
+    }, 3000)
+  }
+
   // Headless E2E driver: VR_E2E_BLEND=<path> submits a small Cycles job at
   // boot; the scheduler then scales up, renders, downloads, and idles down.
   const e2eBlend = process.env.VR_E2E_BLEND

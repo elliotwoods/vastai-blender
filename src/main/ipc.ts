@@ -29,11 +29,14 @@ function handle<C extends InvokeChannel>(channel: C, handler: Handler<C>): void 
 
 /** Push an event to every window. */
 export function emit<C extends EventChannel>(channel: C, payload: IpcEventMap[C]): void {
-  // E2E observability: mirror events to stdout when driving headless tests.
-  if (process.env.VR_E2E_BLEND && channel !== 'render:logLine') {
+  // E2E observability: mirror events to stdout when driving headless tests. Both headless
+  // drivers need this — without it a scripted run has no way to see why a chunk failed,
+  // because the node's render log otherwise only ever reaches the renderer window.
+  const headless = process.env.VR_E2E_BLEND || process.env.VR_JOB_SPEC
+  if (headless && channel !== 'render:logLine') {
     console.log(`[event] ${channel} ${JSON.stringify(payload).slice(0, 240)}`)
   }
-  if (process.env.VR_E2E_BLEND && channel === 'render:logLine') {
+  if (headless && channel === 'render:logLine') {
     const l = payload as IpcEventMap['render:logLine']
     console.log(`[log:${l.nodeId.slice(0, 8)}] ${l.line}`)
   }
