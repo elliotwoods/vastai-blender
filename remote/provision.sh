@@ -84,9 +84,14 @@ cmd_probe_eevee() {
   local version="$1"
   local blender="$BLENDER_ROOT/$version/blender"
   [ -x "$blender" ] || { echo "PROBE_FAIL no blender $version"; exit 1; }
-  # Render one frame of the default cube with EEVEE Next. Success → GPU/EGL OK.
+  # Render one frame of the default cube with EEVEE. Success → GPU/EGL OK.
+  # The identifier moved between releases: EEVEE Next is BLENDER_EEVEE_NEXT in 4.2-4.5
+  # but plain BLENDER_EEVEE from 5.0 on (legacy EEVEE was removed, so the enum is just
+  # BLENDER_EEVEE/BLENDER_WORKBENCH/CYCLES). Hardcoding either raises TypeError on the
+  # other and reports a perfectly GPU-capable node as EEVEE-incapable, so pick whichever
+  # identifier this build actually exposes.
   if "$blender" -b -noaudio --factory-startup \
-      --python-expr "import bpy; bpy.context.scene.render.engine='BLENDER_EEVEE_NEXT'" \
+      --python-expr "import bpy; ids=[i.identifier for i in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items]; bpy.context.scene.render.engine=('BLENDER_EEVEE_NEXT' if 'BLENDER_EEVEE_NEXT' in ids else 'BLENDER_EEVEE')" \
       -o /tmp/eevee_probe_#### -f 1 > /tmp/eevee_probe.log 2>&1; then
     echo "PROBE_OK"
   else
