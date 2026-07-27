@@ -49,6 +49,12 @@ gauges, ssh access, what it's rendering, and its console.*
 
 ## Install and run
 
+Prebuilt Windows installer:
+[latest release](https://github.com/elliotwoods/vastai-blender/releases/latest).
+It is unsigned, so SmartScreen will ask for a confirmation on first run.
+
+From source:
+
 ```bash
 npm install
 npm run dev          # development (Vite + Electron, hot reload)
