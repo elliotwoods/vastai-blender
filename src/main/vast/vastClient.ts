@@ -27,7 +27,8 @@ function apiKey(): string {
 async function request<T>(
   method: 'GET' | 'POST' | 'PUT' | 'DELETE',
   path: string,
-  body?: unknown
+  body?: unknown,
+  attempt = 0
 ): Promise<T> {
   const key = apiKey()
   const sep = path.includes('?') ? '&' : '?'
@@ -48,6 +49,14 @@ async function request<T>(
   }
   const text = await res.text()
   if (!res.ok) {
+    // 429 is routine once several node lifecycles poll concurrently; vast
+    // rejects the request before acting, so retrying (with backoff) is safe
+    // for mutations too. Without this, a transient 429 inside driveToReady
+    // destroys a perfectly healthy node mid-boot.
+    if (res.status === 429 && attempt < 4) {
+      await new Promise((r) => setTimeout(r, 3_000 * (attempt + 1)))
+      return request<T>(method, path, body, attempt + 1)
+    }
     throw new VastError(
       `vast.ai ${method} ${path} → ${res.status}: ${text.slice(0, 300)}`,
       res.status
