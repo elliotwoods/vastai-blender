@@ -80,15 +80,20 @@ function createWindow(): void {
       console.log(`[renderer] load failed ${code} ${desc}`)
     })
     mainWindow.webContents.once('did-finish-load', () => {
-      setTimeout(async () => {
-        // capturePage on a hidden/occluded window yields the background colour.
-        mainWindow.show()
-        mainWindow.focus()
-        const image = await mainWindow.webContents.capturePage()
-        const { writeFileSync } = await import('fs')
-        writeFileSync(shotPath, image.toPNG())
-        console.log(`[shot] saved ${shotPath} (${image.getSize().width}x${image.getSize().height})`)
-      }, Number(process.env.VR_SHOT_DELAY ?? 6000))
+      setTimeout(
+        async () => {
+          // capturePage on a hidden/occluded window yields the background colour.
+          mainWindow.show()
+          mainWindow.focus()
+          const image = await mainWindow.webContents.capturePage()
+          const { writeFileSync } = await import('fs')
+          writeFileSync(shotPath, image.toPNG())
+          console.log(
+            `[shot] saved ${shotPath} (${image.getSize().width}x${image.getSize().height})`
+          )
+        },
+        Number(process.env.VR_SHOT_DELAY ?? 6000)
+      )
     })
   }
 

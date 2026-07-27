@@ -128,6 +128,23 @@ function GeneralSection(): React.JSX.Element {
         />
       </div>
       <div style={formRow}>
+        <span style={label}>Render slots per node</span>
+        <input
+          type="number"
+          min={1}
+          max={8}
+          value={settings.nodeSlots}
+          onChange={(e) =>
+            update.mutate({ nodeSlots: Math.max(1, Math.min(8, Number(e.target.value))) })
+          }
+          style={{ ...input({ size: 'sm' }), ...mono, width: 80 }}
+        />
+        <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
+          concurrent Blender processes per machine — raise for scenes that don&apos;t saturate a GPU
+          on their own
+        </span>
+      </div>
+      <div style={formRow}>
         <span style={label}>Idle timeout (minutes)</span>
         <input
           type="number"
