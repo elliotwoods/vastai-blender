@@ -19,12 +19,20 @@ export const TONE_COLOR: Record<Tone, string> = {
 /**
  * Colour by headroom: amber when a resource is nearly full, red when it is
  * effectively out (a VRAM/RAM wall is what kills a render), grey when idle.
+ *
+ * `compute: true` inverts the intent for utilisation meters — a GPU pinned at
+ * 99% is exactly what you're paying for, so it stays accent-coloured and only
+ * an idle machine is dimmed.
  */
-export function usageTone(pct: number | null, opts: { idleBelow?: number } = {}): Tone {
+export function usageTone(
+  pct: number | null,
+  opts: { idleBelow?: number; compute?: boolean } = {}
+): Tone {
   if (pct == null) return 'idle'
+  if (opts.idleBelow != null && pct < opts.idleBelow) return 'idle'
+  if (opts.compute) return 'normal'
   if (pct >= 95) return 'danger'
   if (pct >= 85) return 'warn'
-  if (opts.idleBelow != null && pct < opts.idleBelow) return 'idle'
   return 'normal'
 }
 

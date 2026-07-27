@@ -41,9 +41,20 @@ const PATHS = {
       <path d="M12 7v5l3.5 2" />
     </>
   ),
-  rate: (
+  power: (
     <>
       <path d="M13 2 3 14h9l-1 8 10-12h-9z" />
+    </>
+  ),
+  dollar: (
+    <>
+      <path d="M12 1.5v21M17 5.5H9.7a3.3 3.3 0 0 0 0 6.5h4.6a3.3 3.3 0 0 1 0 6.5H6" />
+    </>
+  ),
+  battery: (
+    <>
+      <rect x="1.5" y="7" width="17" height="10" rx="2" />
+      <path d="M22 10.5v3M6 10v4M10 10v4" />
     </>
   ),
   cost: (

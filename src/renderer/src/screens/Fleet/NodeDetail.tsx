@@ -10,9 +10,9 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { Icon, type IconName } from '../../components/Icon'
 import { btn, logLine, mono, sectionLabel } from '../../lib/controls'
-import { fmtDuration, fmtMoney, fmtRate, fmtTimeAgo } from '../../lib/format'
+import { fmtDuration, fmtEnergy, fmtMoney, fmtRate, fmtTimeAgo, fmtWatts } from '../../lib/format'
 import { ipc } from '../../lib/ipc'
-import { useLogStore } from '../../lib/logStore'
+import { NO_LINES, useLogStore } from '../../lib/logStore'
 import { useNav } from '../../lib/nav'
 import { useJobs } from '../../lib/queries'
 import { SCALE, TOKENS } from '../../lib/theme'
@@ -176,7 +176,7 @@ function resolveChunk(
 }
 
 export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element {
-  const lines = useLogStore((s) => s.byNode[node.id] ?? [])
+  const lines = useLogStore((s) => s.byNode[node.id] ?? NO_LINES)
   const { data: jobs } = useJobs()
   const { navigate } = useNav()
   const now = useNow(10_000)
@@ -211,6 +211,7 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
   const m = node.metrics
   const vramPct = m ? pctOf(m.vramUsedGb, m.vramTotalGb) : null
   const ramPct = m ? pctOf(m.ramUsedGb, m.ramTotalGb) : null
+  const powerPct = m ? pctOf(m.powerW, m.powerLimitW) : null
   // Temperature reads on a 30–95 °C scale — the range that matters for a GPU.
   const tempPct = m ? ((m.gpuTemp - 30) / 65) * 100 : 0
   const tempTone: Tone = !m
@@ -307,7 +308,7 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
           value={pct(m ? m.gpuUtil : null)}
           sub={m && m.gpuUtil < 5 ? 'idle' : 'compute'}
           pct={m ? m.gpuUtil : null}
-          tone={usageTone(m ? m.gpuUtil : null, { idleBelow: 5 })}
+          tone={usageTone(m ? m.gpuUtil : null, { idleBelow: 5, compute: true })}
         />
         <Gauge
           icon="memory"
@@ -323,7 +324,7 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
           value={pct(m ? m.cpuUtil : null)}
           sub={m ? `load ${m.cpuLoad1.toFixed(1)} / ${m.cpuCores}` : undefined}
           pct={m ? m.cpuUtil : null}
-          tone={usageTone(m ? m.cpuUtil : null, { idleBelow: 5 })}
+          tone={usageTone(m ? m.cpuUtil : null, { idleBelow: 5, compute: true })}
         />
         <Gauge
           icon="memory"
@@ -336,6 +337,14 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
           }
           pct={ramPct}
           tone={usageTone(ramPct)}
+        />
+        <Gauge
+          icon="power"
+          label="gpu power"
+          value={m && m.powerW > 0 ? fmtWatts(m.powerW) : '—'}
+          sub={m && m.powerLimitW > 0 ? `/ ${fmtWatts(m.powerLimitW)} cap` : undefined}
+          pct={powerPct}
+          tone={usageTone(powerPct)}
         />
         <Gauge
           icon="temp"
@@ -356,11 +365,14 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
           gap: `6px ${SCALE.space4}`
         }}
       >
-        <Fact icon="rate" label="rate">
+        <Fact icon="dollar" label="rate">
           {node.dphTotal != null ? fmtRate(node.dphTotal) : '—'}
         </Fact>
         <Fact icon="cost" label="spent" color={TOKENS.text}>
           {fmtMoney(node.accumulatedCost)}
+        </Fact>
+        <Fact icon="battery" label="energy" color={node.energyWh > 0 ? TOKENS.text : undefined}>
+          {fmtEnergy(node.energyWh)}
         </Fact>
         {burn != null ? (
           <Fact icon="activity" label="actual">

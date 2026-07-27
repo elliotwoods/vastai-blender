@@ -75,6 +75,10 @@ export interface NodeMetrics {
   vramTotalGb: number
   /** max GPU temperature °C */
   gpuTemp: number
+  /** GPU package power draw, summed across GPUs (W); 0 = not reported */
+  powerW: number
+  /** summed GPU power limit (W); 0 = not reported */
+  powerLimitW: number
   /** busy CPU % from /proc/stat deltas (not load average) */
   cpuUtil: number
   /** 1-min load average — queue depth, kept alongside cpuUtil */
@@ -100,6 +104,11 @@ export interface NodeSnapshot {
   startedAt: number | null
   /** accumulated $ cost for this node's lifetime */
   accumulatedCost: number
+  /**
+   * GPU energy used since the app started watching this node (Wh), integrated
+   * from power samples. In-memory only — resets when the app restarts.
+   */
+  energyWh: number
   currentChunkId: string | null
   /** null = probe not yet run */
   eeveeCapable: boolean | null
@@ -125,6 +134,8 @@ export interface SshCommandInfo {
 export interface FleetCost {
   perHour: number
   sessionTotal: number
+  /** GPU energy across every node this session (Wh) */
+  sessionWh: number
   /** vast account credit balance, null until first fetched */
   balance: number | null
 }

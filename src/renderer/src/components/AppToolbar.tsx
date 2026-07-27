@@ -1,7 +1,7 @@
 import type { CSSProperties, ReactNode } from 'react'
 import { SCALE, TOKENS } from '../lib/theme'
 import { mono, readout } from '../lib/controls'
-import { fmtRate } from '../lib/format'
+import { fmtEnergy, fmtRate } from '../lib/format'
 import { ipc } from '../lib/ipc'
 import { useFleetCost, useNodes, useSettings } from '../lib/queries'
 
@@ -71,9 +71,11 @@ function FleetReadouts(): React.JSX.Element {
         <span style={{ color: TOKENS.textFaint }}>rate</span>
         <span style={mono}>{cost ? fmtRate(cost.perHour) : '$0.000/hr'}</span>
       </span>
-      <span style={readout()}>
+      <span style={readout()} title="Spend and GPU energy since the app started">
         <span style={{ color: TOKENS.textFaint }}>session</span>
         <span style={mono}>${(cost?.sessionTotal ?? 0).toFixed(2)}</span>
+        <span style={{ color: TOKENS.border }}>|</span>
+        <span style={{ ...mono, color: TOKENS.textMuted }}>{fmtEnergy(cost?.sessionWh ?? 0)}</span>
       </span>
       <button
         title="Vast.ai balance — click to add funds"

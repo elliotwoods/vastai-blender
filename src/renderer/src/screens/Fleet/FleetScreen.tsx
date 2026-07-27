@@ -2,7 +2,7 @@ import { useState, type CSSProperties } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
 import { Icon } from '../../components/Icon'
 import { btn, mono, panel, sectionLabel, statusDot, tableRow } from '../../lib/controls'
-import { fmtDuration, fmtMoney, fmtRate } from '../../lib/format'
+import { fmtDuration, fmtEnergy, fmtMoney, fmtRate, fmtWatts } from '../../lib/format'
 import { ipc } from '../../lib/ipc'
 import { useNav } from '../../lib/nav'
 import { NodeDetail } from './NodeDetail'
@@ -49,6 +49,7 @@ const COLS = {
   cpuUse: 132,
   rate: 82,
   cost: 70,
+  power: 76,
   uptime: 72
 } as const
 
@@ -95,6 +96,7 @@ function HeaderRow(): React.JSX.Element {
       <span style={{ ...h, width: COLS.cpuUse }}>cpu % · ram %</span>
       <span style={{ ...h, width: COLS.rate }}>rate</span>
       <span style={{ ...h, width: COLS.cost }}>cost</span>
+      <span style={{ ...h, width: COLS.power }}>power</span>
       <span style={{ ...h, width: COLS.uptime }}>uptime</span>
       <span style={{ ...h, flex: 1 }}>activity</span>
       <span style={{ width: 70 }} />
@@ -145,7 +147,7 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
             <MiniMeter
               icon="gpu"
               pct={m ? m.gpuUtil : null}
-              tone={usageTone(m ? m.gpuUtil : null, { idleBelow: 5 })}
+              tone={usageTone(m ? m.gpuUtil : null, { idleBelow: 5, compute: true })}
               title={m ? `GPU compute ${m.gpuUtil.toFixed(0)}%` : 'no metrics yet'}
             />
           }
@@ -166,7 +168,7 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
             <MiniMeter
               icon="cpu"
               pct={m ? m.cpuUtil : null}
-              tone={usageTone(m ? m.cpuUtil : null, { idleBelow: 5 })}
+              tone={usageTone(m ? m.cpuUtil : null, { idleBelow: 5, compute: true })}
               title={
                 m
                   ? `CPU ${m.cpuUtil.toFixed(0)}% · load ${m.cpuLoad1.toFixed(1)} / ${m.cpuCores} cores`
@@ -192,6 +194,32 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
         </span>
         <span style={{ ...mono, ...cellSm, width: COLS.cost }}>
           {fmtMoney(node.accumulatedCost)}
+        </span>
+        <span
+          style={{
+            ...cellSm,
+            width: COLS.power,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 5
+          }}
+          title={
+            m && m.powerW > 0
+              ? `GPU draw ${fmtWatts(m.powerW)}${m.powerLimitW > 0 ? ` of ${fmtWatts(m.powerLimitW)} limit` : ''} · ${fmtEnergy(node.energyWh)} this session`
+              : undefined
+          }
+        >
+          <span
+            style={{
+              display: 'flex',
+              color: m && m.powerW > 0 ? TOKENS.warn : TOKENS.textDisabled
+            }}
+          >
+            <Icon name="power" size={11} />
+          </span>
+          <span style={{ ...mono, color: m && m.powerW > 0 ? TOKENS.text : TOKENS.textDisabled }}>
+            {m && m.powerW > 0 ? fmtWatts(m.powerW) : '—'}
+          </span>
         </span>
         <span style={{ ...mono, ...cellSm, width: COLS.uptime }}>{uptime}</span>
         <span

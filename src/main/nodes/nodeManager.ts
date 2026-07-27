@@ -62,6 +62,19 @@ const metricsByNode = new Map<string, NodeMetrics>()
 const cpuStatByNode = new Map<string, { total: number; idle: number }>()
 
 /**
+ * GPU energy per node (Wh), integrated from power samples. Kept for destroyed
+ * nodes too so the session total doesn't drop when a node goes away — and, as
+ * a session figure, deliberately not persisted.
+ */
+const energyByNode = new Map<string, number>()
+
+export function sessionEnergyWh(): number {
+  let total = 0
+  for (const wh of energyByNode.values()) total += wh
+  return total
+}
+
+/**
  * True CPU utilisation from consecutive `/proc/stat` samples. Load average is
  * NOT a percentage — on Linux it counts uninterruptible-I/O tasks too, so a
  * node stuck on disk reads as "busy" while its cores idle. Until a second
@@ -96,6 +109,7 @@ function rowToSnapshot(r: NodeRow): NodeSnapshot {
     sshPort: r.ssh_port,
     startedAt: r.started_at,
     accumulatedCost: r.accumulated_cost,
+    energyWh: energyByNode.get(r.id) ?? 0,
     currentChunkId: currentChunkProvider?.(r.id) ?? null,
     eeveeCapable: r.eevee_capable === null ? null : r.eevee_capable === 1,
     octaneReady: r.octane_ready === 1,
@@ -241,17 +255,22 @@ export class NodeManager {
         continue
       try {
         const r = await node.ssh.exec(
-          `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits; echo ----; cat /proc/loadavg; nproc; echo ----; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; head -1 /proc/stat`,
+          `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits; echo ----; cat /proc/loadavg; nproc; echo ----; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; head -1 /proc/stat`,
           { timeoutMs: 10_000 }
         )
         const [gpuPart, cpuPart, memPart] = r.stdout.split('----')
         if (!gpuPart || !cpuPart) continue
+        // Only the first four columns must parse: cards that don't report
+        // power give "[N/A]" and would otherwise drop the whole sample.
         const gpuRows = gpuPart
           .trim()
           .split('\n')
           .map((line) => line.split(',').map((x) => parseFloat(x)))
-          .filter((xs) => xs.length >= 4 && xs.every((x) => Number.isFinite(x)))
+          .filter((xs) => xs.length >= 4 && xs.slice(0, 4).every((x) => Number.isFinite(x)))
         if (gpuRows.length === 0) continue
+        const sumCol = (i: number): number =>
+          gpuRows.reduce((a, xs) => a + (Number.isFinite(xs[i]) ? xs[i] : 0), 0)
+        const powerW = sumCol(4)
         const cpuLines = cpuPart.trim().split('\n')
         const load1 = parseFloat(cpuLines[0]?.split(' ')[0] ?? '0')
         const cores = parseInt(cpuLines[1] ?? '0', 10)
@@ -263,17 +282,27 @@ export class NodeManager {
         }
         const ramTotalGb = meminfo('MemTotal')
         const ramAvailGb = meminfo('MemAvailable')
+        // Energy: rectangle-integrate this power reading over the gap since
+        // the previous sample (skipping absurd gaps after a sleep/disconnect).
+        const now = Date.now()
+        const prevAt = metricsByNode.get(node.id)?.updatedAt
+        const gapMs = prevAt ? now - prevAt : 0
+        if (powerW > 0 && gapMs > 0 && gapMs < 10 * 60_000) {
+          energyByNode.set(node.id, (energyByNode.get(node.id) ?? 0) + (powerW * gapMs) / 3_600_000)
+        }
         metricsByNode.set(node.id, {
           cpuUtil: cpuUtilFromStat(node.id, memPart ?? '', load1, cores),
           gpuUtil: gpuRows.reduce((a, xs) => a + xs[0], 0) / gpuRows.length,
           vramUsedGb: gpuRows.reduce((a, xs) => a + xs[1], 0) / 1024,
           vramTotalGb: gpuRows.reduce((a, xs) => a + xs[2], 0) / 1024,
           gpuTemp: Math.max(...gpuRows.map((xs) => xs[3])),
+          powerW,
+          powerLimitW: sumCol(5),
           cpuLoad1: Number.isFinite(load1) ? load1 : 0,
           cpuCores: Number.isFinite(cores) ? cores : 0,
           ramUsedGb: Math.max(0, ramTotalGb - ramAvailGb),
           ramTotalGb,
-          updatedAt: Date.now()
+          updatedAt: now
         })
         emit('node:changed', node.snapshot)
       } catch {
@@ -508,7 +537,12 @@ export class NodeManager {
     } catch {
       // keep last known balance (no key / offline)
     }
-    emit('fleet:cost', { perHour, sessionTotal, balance: this.balance })
+    emit('fleet:cost', {
+      perHour,
+      sessionTotal,
+      sessionWh: sessionEnergyWh(),
+      balance: this.balance
+    })
   }
 }
 

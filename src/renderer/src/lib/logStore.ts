@@ -14,6 +14,14 @@ interface LogState {
   clear: (nodeId?: string) => void
 }
 
+/**
+ * Stable empty result for nodes with no lines yet. A selector returning a
+ * fresh `[]` each call makes useSyncExternalStore see a changed snapshot every
+ * render — "Maximum update depth exceeded" the moment such a node's panel
+ * opens. Always select `s.byNode[id] ?? NO_LINES`.
+ */
+export const NO_LINES: LogLineEvent[] = []
+
 export const useLogStore = create<LogState>((set) => ({
   byNode: {},
   append: (e) =>

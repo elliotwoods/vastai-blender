@@ -8,6 +8,16 @@ export function fmtRate(perHour: number): string {
   return `$${perHour.toFixed(3)}/hr`
 }
 
+/** Instantaneous power draw. */
+export function fmtWatts(w: number): string {
+  return w >= 1000 ? `${(w / 1000).toFixed(2)} kW` : `${w.toFixed(0)} W`
+}
+
+/** Accumulated energy — Wh below a kilowatt-hour, kWh above. */
+export function fmtEnergy(wh: number): string {
+  return wh >= 1000 ? `${(wh / 1000).toFixed(2)} kWh` : `${wh.toFixed(0)} Wh`
+}
+
 export function fmtFrames(done: number, total: number): string {
   return `${done.toLocaleString()} / ${total.toLocaleString()}`
 }
