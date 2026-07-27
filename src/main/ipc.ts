@@ -5,7 +5,7 @@
  * VR_MOCK=1 for UI development).
  */
 
-import { BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import { relative, sep } from 'path'
 import type { EventChannel, IpcEventMap, InvokeChannel, IpcInvokeMap } from '../shared/ipc'
 import type { JobSummary, NodeSnapshot } from '../shared/models'
@@ -18,6 +18,7 @@ import { createJob, getJob, listJobs } from './jobs/jobs'
 import { scheduler } from './scheduler/scheduler'
 import { getDb } from './db/db'
 import { REMOTE_ROOT } from './nodes/provisioner'
+import { openSshTerminal, sshTargetFor } from './ssh/sshTerminal'
 
 type Handler<C extends InvokeChannel> = (
   ...args: IpcInvokeMap[C]['args']
@@ -70,8 +71,11 @@ const mockNodes = (): NodeSnapshot[] => [
       vramUsedGb: 14.2,
       vramTotalGb: 24,
       gpuTemp: 71,
+      cpuUtil: 43,
       cpuLoad1: 6.3,
       cpuCores: 16,
+      ramUsedGb: 21.7,
+      ramTotalGb: 64,
       updatedAt: Date.now()
     }
   },
@@ -138,6 +142,9 @@ export function registerIpc(): void {
   handle('settings:setSecret', (key, value) => setSecret(key, value))
 
   // -- shell / dialogs (real) ----------------------------------------------
+  handle('clipboard:write', (text) => {
+    clipboard.writeText(text)
+  })
   handle('shell:openExternal', async (url) => {
     // http(s) links only (billing page etc.) — never arbitrary protocols.
     if (/^https?:\/\//.test(url)) await shell.openExternal(url)
@@ -202,6 +209,20 @@ export function registerIpc(): void {
     if (!node?.ssh) throw new Error('node not connected')
     const { openVncTunnel } = await import('./octane/octaneLicense')
     return openVncTunnel(node.ssh, nodeId)
+  })
+  handle('node:sshCommand', (nodeId) => {
+    const snap = MOCK
+      ? (mockNodes().find((n) => n.id === nodeId) ?? null)
+      : (nodeManager.get(nodeId)?.snapshot ?? null)
+    return snap ? sshTargetFor(snap) : null
+  })
+  handle('node:openSshTerminal', (nodeId) => {
+    const snap = MOCK
+      ? (mockNodes().find((n) => n.id === nodeId) ?? null)
+      : (nodeManager.get(nodeId)?.snapshot ?? null)
+    const target = snap ? sshTargetFor(snap) : null
+    if (!target) return { ok: false, message: 'node has no ssh endpoint yet' }
+    return openSshTerminal(target)
   })
 
   // -- jobs -----------------------------------------------------------------

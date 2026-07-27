@@ -151,11 +151,32 @@ export class SshConnection extends EventEmitter {
     }
   }
 
+  /**
+   * Open an exec channel, retrying on "Channel open failure" — the server
+   * caps concurrent channels (OpenSSH MaxSessions ≈ 10) and with many
+   * concurrent chunk runs the cap is hit transiently; a short backoff and
+   * retry rides out the burst instead of failing the operation.
+   */
+  private execChannel(
+    c: Client,
+    command: string,
+    cb: (err: Error | undefined, stream: import('ssh2').ClientChannel) => void,
+    attempt = 0
+  ): void {
+    c.exec(command, (err, stream) => {
+      if (err && /channel open failure/i.test(err.message) && attempt < 4) {
+        setTimeout(() => this.execChannel(c, command, cb, attempt + 1), 1500 * (attempt + 1))
+        return
+      }
+      cb(err ?? undefined, stream)
+    })
+  }
+
   /** Run a command to completion, capturing output. */
   async exec(command: string, opts: { timeoutMs?: number } = {}): Promise<ExecResult> {
     const c = await this.acquire()
     return new Promise<ExecResult>((resolve, reject) => {
-      c.exec(command, (err, stream) => {
+      this.execChannel(c, command, (err, stream) => {
         if (err) return reject(err)
         let stdout = ''
         let stderr = ''
@@ -197,7 +218,7 @@ export class SshConnection extends EventEmitter {
   ): Promise<{ stop: () => void; done: Promise<number | null> }> {
     const c = await this.acquire()
     return new Promise((resolve, reject) => {
-      c.exec(command, (err, stream) => {
+      this.execChannel(c, command, (err, stream) => {
         if (err) return reject(err)
         let buf = ''
         stream.on('data', (d: Buffer) => {

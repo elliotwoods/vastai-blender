@@ -26,7 +26,43 @@ import type { ChunkState, EngineId } from '../../shared/models'
 
 const TICK_MS = 15_000
 const STATE_POLL_MS = 5_000
-const MAX_RETRIES = 2
+// 4: with many concurrent runs per node, transient SSH channel contention can
+// fail a dispatch attempt — the retry budget must absorb a few of those on
+// top of genuine render failures.
+const MAX_RETRIES = 4
+
+/**
+ * Per-node preparation mutex. With nodeSlots > 1 several ChunkRuns dispatch
+ * to one node concurrently; the prep steps (Blender install, extension
+ * install/enable + save_userpref, scene upload) are idempotent but NOT
+ * concurrency-safe — two blender processes writing userpref/extension repo at
+ * once fail with exit 1. Serialize prep per node; the renders themselves
+ * still run in parallel.
+ */
+const nodePrepLocks = new Map<string, Promise<void>>()
+
+/**
+ * Extensions already installed per node this session (nodeId:version:id:hash
+ * → bootstrap expr or null). Installing is idempotent but costs two blender
+ * launches; with many chunks per node it must happen once, not per chunk —
+ * repeat runs also proved fragile under SSH channel pressure.
+ */
+const installedExtensions = new Map<string, string | null>()
+async function withNodePrep<T>(nodeId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = nodePrepLocks.get(nodeId) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>((r) => (release = r))
+  nodePrepLocks.set(
+    nodeId,
+    prev.then(() => gate)
+  )
+  await prev
+  try {
+    return await fn()
+  } finally {
+    release()
+  }
+}
 
 interface ChunkRow {
   id: string
@@ -56,7 +92,18 @@ interface AgentState {
   framesTotal?: number
   error?: string
   exitCode: number | null
+  /** epoch seconds of the agent's last state write */
+  updatedAt?: number
 }
+
+/**
+ * Stall watchdog: the agent rewrites the chunk state at least every ~2s while
+ * its blender is producing output. A state file frozen for this long means
+ * the render process died or hung without the agent noticing (observed in
+ * the wild: zombie blender after an agent restart) — fail the chunk so the
+ * requeue path re-renders only what's missing instead of polling forever.
+ */
+const STATE_STALL_MS = 15 * 60_000
 
 class ChunkRun {
   private stopped = false
@@ -97,48 +144,60 @@ class ChunkRun {
     node.setState('rendering')
     refreshJobState(this.jobId)
 
-    // 1. Blender version (idempotent, cheap when already installed).
-    if (job.blender_version && !node.snapshot.blenderVersions.includes(job.blender_version)) {
-      await installBlender(this.ssh, this.nodeId, job.blender_version)
-    }
-
-    // 1b. Octane jobs need the X11/VNC + OctaneServer environment (and an
-    // OctaneBlender build on the node — see docs/OCTANE.md).
-    if (job.engine === 'octane' && !node.snapshot.octaneReady) {
-      const { setupOctane } = await import('../octane/octaneLicense')
-      await setupOctane(this.ssh, this.nodeId)
-    }
-
-    // 2. Extensions for this job (idempotent; bootstrap zips contribute a
-    //    register() expression to the job spec instead of installing).
-    const bootstrapExprs: string[] = []
-    for (const addonId of JSON.parse(job.addon_ids) as string[]) {
-      const addon = getAddon(addonId)
-      if (!addon) {
-        emit('alert', {
-          level: 'warn',
-          message: `addon ${addonId} missing from registry — skipped`
-        })
-        continue
-      }
-      if (job.blender_version) {
-        const expr = await installExtension(this.ssh, this.nodeId, job.blender_version, addon)
-        if (expr) bootstrapExprs.push(expr)
-      }
-    }
-
-    // 3. Scene upload (hash-skipped when the node already has this version).
+    // Steps 1-3 are serialized per node (see withNodePrep) — with multiple
+    // slots two dispatches would otherwise race on userpref/extension state.
     const remoteBlend = `${this.jobId}.blend`
-    const result = await uploadFileVerified(
-      this.ssh,
-      job.blend_path,
-      posix.join(REMOTE_ROOT, 'work', 'scenes', remoteBlend)
-    )
-    emit('render:logLine', {
-      nodeId: this.nodeId,
-      chunkId: this.chunkId,
-      line: `scene upload: ${result}`,
-      ts: Date.now()
+    const bootstrapExprs: string[] = await withNodePrep(this.nodeId, async () => {
+      // 1. Blender version (idempotent, cheap when already installed).
+      if (job.blender_version && !node.snapshot.blenderVersions.includes(job.blender_version)) {
+        await installBlender(this.ssh, this.nodeId, job.blender_version)
+      }
+
+      // 1b. Octane jobs need the X11/VNC + OctaneServer environment (and an
+      // OctaneBlender build on the node — see docs/OCTANE.md).
+      if (job.engine === 'octane' && !node.snapshot.octaneReady) {
+        const { setupOctane } = await import('../octane/octaneLicense')
+        await setupOctane(this.ssh, this.nodeId)
+      }
+
+      // 2. Extensions for this job (once per node+version+zip — cached; the
+      //    bootstrap mechanism contributes a register() expression instead).
+      const exprs: string[] = []
+      for (const addonId of JSON.parse(job.addon_ids) as string[]) {
+        const addon = getAddon(addonId)
+        if (!addon) {
+          emit('alert', {
+            level: 'warn',
+            message: `addon ${addonId} missing from registry — skipped`
+          })
+          continue
+        }
+        if (job.blender_version) {
+          const key = `${this.nodeId}:${job.blender_version}:${addon.id}:${addon.zipHash}`
+          let expr: string | null
+          if (installedExtensions.has(key)) {
+            expr = installedExtensions.get(key) ?? null
+          } else {
+            expr = await installExtension(this.ssh, this.nodeId, job.blender_version, addon)
+            installedExtensions.set(key, expr)
+          }
+          if (expr) exprs.push(expr)
+        }
+      }
+
+      // 3. Scene upload (hash-skipped when the node already has this version).
+      const result = await uploadFileVerified(
+        this.ssh,
+        job.blend_path,
+        posix.join(REMOTE_ROOT, 'work', 'scenes', remoteBlend)
+      )
+      emit('render:logLine', {
+        nodeId: this.nodeId,
+        chunkId: this.chunkId,
+        line: `scene upload: ${result}`,
+        ts: Date.now()
+      })
+      return exprs
     })
 
     // 4. Job spec — written atomically (agent ignores *.tmp.json).
@@ -150,6 +209,8 @@ class ChunkRun {
       frameStart: chunk.frame_start,
       frameEnd: chunk.frame_end,
       frameStep: job.frame_step,
+      // Concurrent render slots on the node (1 = historical single-slot).
+      nodeSlots: settings.nodeSlots ?? 1,
       extraArgs: [],
       pythonExprs: bootstrapExprs,
       encode: {
@@ -177,7 +238,11 @@ class ChunkRun {
       remoteChunkDir: posix.join(REMOTE_ROOT, 'renders', this.chunkId)
     })
     this.downloader.start()
-    void this.tailLog()
+    // Per-chunk log tails hold one SSH channel each for the chunk's whole
+    // lifetime; with many slots per node they alone exhaust the server's
+    // channel cap (OpenSSH MaxSessions ~10). State polling remains the
+    // durable progress source — only tail on low-concurrency nodes.
+    if ((settings.nodeSlots ?? 1) <= 2) void this.tailLog()
     await this.pollUntilDone()
   }
 
@@ -238,6 +303,18 @@ class ChunkRun {
           this.finish('failed', state.error ?? `exit ${state.exitCode}`)
           return
         }
+        if (
+          state.updatedAt != null &&
+          Date.now() - state.updatedAt * 1000 > STATE_STALL_MS &&
+          ['rendering', 'encoding'].includes(state.status)
+        ) {
+          await this.downloader?.drain()
+          this.finish(
+            'failed',
+            `render stalled — no agent state update for ${Math.round(STATE_STALL_MS / 60000)} min`
+          )
+          return
+        }
       }
       await new Promise((r) => setTimeout(r, STATE_POLL_MS))
     }
@@ -277,9 +354,27 @@ class ChunkRun {
 
 class Scheduler {
   private runs = new Map<string, ChunkRun>() // chunkId → run
-  private byNode = new Map<string, ChunkRun>() // nodeId → run
+  private byNode = new Map<string, Set<ChunkRun>>() // nodeId → in-flight runs
   private timer: NodeJS.Timeout | null = null
   private requestingNode = false
+
+  private nodeRuns(nodeId: string): Set<ChunkRun> {
+    let s = this.byNode.get(nodeId)
+    if (!s) {
+      s = new Set()
+      this.byNode.set(nodeId, s)
+    }
+    return s
+  }
+
+  private dropRun(run: ChunkRun): void {
+    this.runs.delete(run.chunkId)
+    const s = this.byNode.get(run.nodeId)
+    if (s) {
+      s.delete(run)
+      if (s.size === 0) this.byNode.delete(run.nodeId)
+    }
+  }
 
   start(): void {
     // Restart recovery: chunks stranded in transient states (their ChunkRun
@@ -304,7 +399,9 @@ class Scheduler {
   }
 
   currentChunkForNode(nodeId: string): string | null {
-    return this.byNode.get(nodeId)?.chunkId ?? null
+    const s = this.byNode.get(nodeId)
+    if (!s || s.size === 0) return null
+    return [...s].map((r) => r.chunkId).join(', ')
   }
 
   private pendingChunks(): ChunkRow[] {
@@ -319,36 +416,44 @@ class Scheduler {
 
   async tick(): Promise<void> {
     const pending = this.pendingChunks()
+    const slots = Math.max(1, getSettings().nodeSlots ?? 1)
+    // Prefetch: keep the node's inbox slightly over-full (slots + 2) so a
+    // finishing slot always has a queued spec to pick up without waiting a
+    // scheduler round-trip. Single-slot behaviour unchanged.
+    const perNodeLimit = slots > 1 ? slots + 2 : 1
 
-    // Assign to idle nodes.
+    // Assign to nodes with free slots ('rendering' nodes included — a node
+    // running fewer chunks than its slot count can take more).
     for (const node of nodeManager.list()) {
       if (pending.length === 0) break
-      if (!['ready', 'idle'].includes(node.state) || this.byNode.has(node.id)) continue
+      if (!['ready', 'idle', 'rendering'].includes(node.state)) continue
       const managed = nodeManager.get(node.id)
       if (!managed?.ssh) continue
 
-      // Affinity: prefer a chunk whose job's blender version is installed.
-      const idx = pending.findIndex((c) => {
-        const job = getDb()
-          .prepare('SELECT blender_version FROM jobs WHERE id = ?')
-          .get(c.job_id) as { blender_version: string | null } | undefined
-        return !job?.blender_version || node.blenderVersions.includes(job.blender_version)
-      })
-      const chunk = idx >= 0 ? pending.splice(idx, 1)[0] : pending.shift()!
-
-      const run = new ChunkRun(chunk.id, chunk.job_id, node.id, managed.ssh)
-      this.runs.set(chunk.id, run)
-      this.byNode.set(node.id, run)
-      void run.dispatch().catch((e) => {
-        emit('alert', {
-          level: 'error',
-          message: `dispatch ${chunk.id} failed: ${(e as Error).message}`
+      while (pending.length > 0 && this.nodeRuns(node.id).size < perNodeLimit) {
+        // Affinity: prefer a chunk whose job's blender version is installed.
+        const idx = pending.findIndex((c) => {
+          const job = getDb()
+            .prepare('SELECT blender_version FROM jobs WHERE id = ?')
+            .get(c.job_id) as { blender_version: string | null } | undefined
+          return !job?.blender_version || node.blenderVersions.includes(job.blender_version)
         })
-        this.requeue(chunk.id)
-        this.runs.delete(chunk.id)
-        this.byNode.delete(node.id)
-        nodeManager.get(node.id)?.setState('idle')
-      })
+        const chunk = idx >= 0 ? pending.splice(idx, 1)[0] : pending.shift()!
+
+        const run = new ChunkRun(chunk.id, chunk.job_id, node.id, managed.ssh)
+        this.runs.set(chunk.id, run)
+        this.nodeRuns(node.id).add(run)
+        void run.dispatch().catch((e) => {
+          emit('alert', {
+            level: 'error',
+            message: `dispatch ${chunk.id} failed: ${(e as Error).message}`
+          })
+          this.requeue(chunk.id)
+          this.dropRun(run)
+          const n = nodeManager.get(node.id)
+          if (n && !this.byNode.has(node.id) && n.state === 'rendering') n.setState('idle')
+        })
+      }
     }
 
     this.scalePolicy(pending.length)
@@ -356,13 +461,13 @@ class Scheduler {
 
   /** Called by a run when its chunk reaches complete/failed. */
   onChunkFinished(run: ChunkRun): void {
-    this.runs.delete(run.chunkId)
-    this.byNode.delete(run.nodeId)
+    this.dropRun(run)
     const chunk = getDb().prepare('SELECT * FROM chunks WHERE id = ?').get(run.chunkId) as ChunkRow
     if (chunk.state === 'failed') this.requeue(run.chunkId)
     refreshJobState(run.jobId)
     const node = nodeManager.get(run.nodeId)
-    if (node && node.state === 'rendering') node.setState('idle')
+    // Only fall back to idle when the node has no other in-flight chunks.
+    if (node && node.state === 'rendering' && !this.byNode.has(run.nodeId)) node.setState('idle')
     this.kick()
   }
 
@@ -426,7 +531,11 @@ class Scheduler {
     const perHour = active.reduce((a, n) => a + (n.dphTotal ?? 0), 0)
 
     // Scale up: queued work beyond in-flight capacity, below limits.
-    const capacityFree = active.filter((n) => ['ready', 'idle'].includes(n.state)).length
+    // Capacity is counted in SLOTS (free concurrent-render slots), not nodes.
+    const slots = Math.max(1, settings.nodeSlots ?? 1)
+    const capacityFree = active
+      .filter((n) => ['ready', 'idle', 'rendering'].includes(n.state))
+      .reduce((a, n) => a + Math.max(0, slots - (this.byNode.get(n.id)?.size ?? 0)), 0)
     if (
       pendingCount > capacityFree &&
       active.length < settings.maxActiveNodes &&
@@ -473,8 +582,7 @@ class Scheduler {
       const run = this.runs.get(chunk.id)
       if (run) {
         run.abort()
-        this.runs.delete(chunk.id)
-        this.byNode.delete(run.nodeId)
+        this.dropRun(run)
         const node = nodeManager.get(run.nodeId)
         if (node?.ssh) {
           // Remove queued spec + kill any in-flight blender for this chunk.
@@ -484,7 +592,9 @@ class Scheduler {
             )
             .catch(() => {})
         }
-        if (node && node.state === 'rendering') node.setState('idle')
+        if (node && node.state === 'rendering' && !this.byNode.has(run.nodeId)) {
+          node.setState('idle')
+        }
       }
       if (!['complete', 'failed'].includes(chunk.state)) {
         db.prepare("UPDATE chunks SET state = 'failed' WHERE id = ?").run(chunk.id)

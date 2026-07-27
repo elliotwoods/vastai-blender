@@ -58,6 +58,32 @@ export function setCurrentChunkProvider(fn: (nodeId: string) => string | null): 
 /** Latest usage sample per node (in-memory — no need to persist). */
 const metricsByNode = new Map<string, NodeMetrics>()
 
+/** Previous `/proc/stat` jiffie totals per node, for the CPU% delta. */
+const cpuStatByNode = new Map<string, { total: number; idle: number }>()
+
+/**
+ * True CPU utilisation from consecutive `/proc/stat` samples. Load average is
+ * NOT a percentage — on Linux it counts uninterruptible-I/O tasks too, so a
+ * node stuck on disk reads as "busy" while its cores idle. Until a second
+ * sample exists (first poll after connect), fall back to load/cores.
+ */
+function cpuUtilFromStat(nodeId: string, memPart: string, load1: number, cores: number): number {
+  const fallback = cores > 0 ? Math.min(100, (load1 / cores) * 100) : 0
+  const line = /^cpu\s+(.+)$/m.exec(memPart)
+  if (!line) return fallback
+  const f = line[1].trim().split(/\s+/).map(Number)
+  if (f.length < 5 || f.some((x) => !Number.isFinite(x))) return fallback
+  // user nice system idle iowait irq softirq steal … — idle time is idle+iowait.
+  const total = f.reduce((a, x) => a + x, 0)
+  const idle = f[3] + f[4]
+  const prev = cpuStatByNode.get(nodeId)
+  cpuStatByNode.set(nodeId, { total, idle })
+  if (!prev || total <= prev.total) return fallback
+  const dTotal = total - prev.total
+  const dIdle = Math.max(0, idle - prev.idle)
+  return Math.max(0, Math.min(100, ((dTotal - dIdle) / dTotal) * 100))
+}
+
 function rowToSnapshot(r: NodeRow): NodeSnapshot {
   return {
     id: r.id,
@@ -205,7 +231,7 @@ export class NodeManager {
     for (const n of this.nodes.values()) n.closeSsh()
   }
 
-  /** Sample GPU/CPU usage on every SSH-connected node. */
+  /** Sample GPU/CPU/RAM usage on every SSH-connected node. */
   private async pollMetrics(): Promise<void> {
     for (const node of this.nodes.values()) {
       if (
@@ -215,10 +241,10 @@ export class NodeManager {
         continue
       try {
         const r = await node.ssh.exec(
-          `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits; echo ----; cat /proc/loadavg; nproc`,
+          `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits; echo ----; cat /proc/loadavg; nproc; echo ----; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; head -1 /proc/stat`,
           { timeoutMs: 10_000 }
         )
-        const [gpuPart, cpuPart] = r.stdout.split('----')
+        const [gpuPart, cpuPart, memPart] = r.stdout.split('----')
         if (!gpuPart || !cpuPart) continue
         const gpuRows = gpuPart
           .trim()
@@ -229,13 +255,24 @@ export class NodeManager {
         const cpuLines = cpuPart.trim().split('\n')
         const load1 = parseFloat(cpuLines[0]?.split(' ')[0] ?? '0')
         const cores = parseInt(cpuLines[1] ?? '0', 10)
+        // /proc/meminfo is in kB; "used" = total - available (the number that
+        // actually predicts an OOM, unlike total - free).
+        const meminfo = (key: string): number => {
+          const m = new RegExp(`^${key}:\\s+(\\d+)`, 'm').exec(memPart ?? '')
+          return m ? parseInt(m[1], 10) / (1024 * 1024) : 0
+        }
+        const ramTotalGb = meminfo('MemTotal')
+        const ramAvailGb = meminfo('MemAvailable')
         metricsByNode.set(node.id, {
+          cpuUtil: cpuUtilFromStat(node.id, memPart ?? '', load1, cores),
           gpuUtil: gpuRows.reduce((a, xs) => a + xs[0], 0) / gpuRows.length,
           vramUsedGb: gpuRows.reduce((a, xs) => a + xs[1], 0) / 1024,
           vramTotalGb: gpuRows.reduce((a, xs) => a + xs[2], 0) / 1024,
           gpuTemp: Math.max(...gpuRows.map((xs) => xs[3])),
           cpuLoad1: Number.isFinite(load1) ? load1 : 0,
           cpuCores: Number.isFinite(cores) ? cores : 0,
+          ramUsedGb: Math.max(0, ramTotalGb - ramAvailGb),
+          ramTotalGb,
           updatedAt: Date.now()
         })
         emit('node:changed', node.snapshot)

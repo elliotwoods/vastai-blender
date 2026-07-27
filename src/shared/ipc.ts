@@ -20,7 +20,8 @@ import type {
   Offer,
   OfferFilters,
   SecretKey,
-  SettingsPublic
+  SettingsPublic,
+  SshCommandInfo
 } from './models'
 
 /** Request/response channels (`ipcRenderer.invoke` ↔ `ipcMain.handle`). */
@@ -40,6 +41,10 @@ export interface IpcInvokeMap {
   'node:destroy': { args: [string]; result: void }
   'node:reprovision': { args: [string]; result: void }
   'node:openVncTunnel': { args: [string]; result: { localPort: number; password: string } }
+  /** Command line for an interactive shell on the node (null = no ssh endpoint yet). */
+  'node:sshCommand': { args: [string]; result: SshCommandInfo | null }
+  /** Spawn a terminal running that command; `ok: false` → caller copies instead. */
+  'node:openSshTerminal': { args: [string]; result: { ok: boolean; message: string } }
   'nodes:list': { args: []; result: NodeSnapshot[] }
 
   // jobs
@@ -61,6 +66,7 @@ export interface IpcInvokeMap {
   'logs:getTail': { args: [{ nodeId?: string; chunkId?: string; lines: number }]; result: string[] }
 
   // shell / dialogs
+  'clipboard:write': { args: [string]; result: void }
   'shell:openExternal': { args: [string]; result: void }
   'shell:openPath': { args: [string]; result: void }
   'shell:showItemInFolder': { args: [string]; result: void }

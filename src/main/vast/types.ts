@@ -17,6 +17,13 @@ export interface RawOffer {
   geolocation?: string
   disk_space: number
   rentable?: boolean
+  cpu_name?: string
+  cpu_cores?: number
+  /** cores actually allocated to this offer (fraction of the machine) */
+  cpu_cores_effective?: number
+  cpu_ghz?: number
+  /** MB */
+  cpu_ram?: number
 }
 
 export interface RawInstance {

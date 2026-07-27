@@ -38,7 +38,8 @@ function defaults(): SettingsFile {
       blenderVersionOverride: null,
       offerFilters: DEFAULT_FILTERS,
       sshKeyPath: '',
-      concurrentTransfersPerNode: 3
+      concurrentTransfersPerNode: 3,
+      nodeSlots: 1
     },
     secrets: {}
   }

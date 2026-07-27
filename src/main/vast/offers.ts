@@ -59,7 +59,10 @@ function toOffer(r: RawOffer): Offer {
     reliability: r.reliability2 ?? r.reliability ?? 0,
     cudaMaxGood: r.cuda_max_good ?? null,
     geolocation: r.geolocation ?? null,
-    diskSpaceGb: r.disk_space
+    diskSpaceGb: r.disk_space,
+    cpuName: r.cpu_name ?? null,
+    cpuCoresEffective: r.cpu_cores_effective ?? r.cpu_cores ?? null,
+    cpuGhz: r.cpu_ghz ?? null
   }
 }
 
@@ -97,13 +100,34 @@ export function recordThroughput(gpuName: string, framesPerHour: number): void {
   }
 }
 
-export function scoreOffer(o: Offer): number {
+/**
+ * CPU proxy for cpuBound workloads: single-core clock dominates (the render
+ * loop is a mostly single-threaded numpy trace per Blender instance), with a
+ * mild √cores bonus for encode/transfer overlap. Scaled so typical consumer
+ * machines (~4.5 GHz × 16 eff. cores ≈ 18) land in the same magnitude as
+ * dlperf_per_dphtotal once divided by price.
+ */
+function cpuProxy(o: Offer): number {
+  const ghz = o.cpuGhz ?? 3.0 // unknown clock — assume a mediocre one
+  const cores = Math.min(o.cpuCoresEffective ?? 8, 32)
+  return ghz * Math.sqrt(cores)
+}
+
+/** In cpuBound mode, cap how much vast's GPU DL benchmark can matter. */
+const CPU_BOUND_DLPERF_CAP = 250
+
+export function scoreOffer(o: Offer, cpuBound = false): number {
   const measured = measuredFramesPerHour(o.gpuName)
   let perfPerDollar: number
   if (measured != null) {
     // frames/hour per dollar/hour = frames per dollar. Scale to roughly the
     // magnitude of dlperf_per_dphtotal so mixed fleets rank sanely.
     perfPerDollar = (measured / o.dphTotal) * 0.5
+  } else if (cpuBound) {
+    // CPU-bound: rank unmeasured machines by CPU per dollar; the DL benchmark
+    // only tie-breaks (capped) so premium datacenter GPUs stop auto-winning.
+    const dl = Math.min(o.dlperfPerDph ?? 0, CPU_BOUND_DLPERF_CAP)
+    perfPerDollar = (cpuProxy(o) / o.dphTotal) * 10 + dl * 0.1
   } else if (o.dlperfPerDph != null) {
     perfPerDollar = o.dlperfPerDph
   } else {
@@ -123,5 +147,6 @@ export async function findOffers(
 ): Promise<Offer[]> {
   const raw = await searchOffers(buildQuery(filters))
   const offers = raw.map(toOffer).filter((o) => !exclude.has(o.machineId))
-  return offers.sort((a, b) => scoreOffer(b) - scoreOffer(a))
+  const cpuBound = filters.cpuBound === true
+  return offers.sort((a, b) => scoreOffer(b, cpuBound) - scoreOffer(a, cpuBound))
 }

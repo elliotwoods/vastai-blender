@@ -51,6 +51,10 @@ ENCODE_SCRIPT = os.path.join(ROOT, "encode", "encode_preview.py")
 FRA_RE = re.compile(r"^Fra:(\d+)")
 SAVED_RE = re.compile(r"Saved: '(.+?)'")
 
+# Exit code Blender returns when any Python script raises (--python-exit-code).
+# Distinguishes "a scene/startup guard aborted the render" from render crashes.
+GUARD_EXIT = 32
+
 
 def ensure_dirs():
     for d in (INBOX, DONE, FAILED, LOGS, STATE, RENDERS):
@@ -192,23 +196,34 @@ def run_render(spec, log_path, tracker):
     if not os.path.exists(blend):
         raise RuntimeError(f"blend file missing: {blend}")
 
-    cmd = [
-        blender, "-b", blend, "-noaudio",
-        "-P", os.path.join(ROOT, "blender", "run_startup_scripts.py"),
-        "-P", os.path.join(ROOT, "blender", "enable_gpu.py"),
-    ]
-    for expr in spec.get("pythonExprs") or []:
-        cmd += ["--python-expr", expr]
-    cmd += [
-        "-o", os.path.join(frames_dir, "####"),
-        "-s", str(spec["frameStart"]),
-        "-e", str(spec["frameEnd"]),
-    ]
+    def build_cmd(gpu_backend=None):
+        # --python-exit-code makes script exceptions FATAL. Without it Blender
+        # renders on after a failed -P script (verified on 5.1: exit 0, frame
+        # saved), which silently defeats scene guard scripts — e.g. a packed
+        # startup block that raises when a required extension is missing would
+        # otherwise let black frames encode and download as "complete".
+        cmd = [blender, "-b", blend, "-noaudio", "--python-exit-code", str(GUARD_EXIT)]
+        if gpu_backend:
+            cmd += ["--gpu-backend", gpu_backend]
+        cmd += [
+            "-P", os.path.join(ROOT, "blender", "run_startup_scripts.py"),
+            "-P", os.path.join(ROOT, "blender", "enable_gpu.py"),
+        ]
+        for expr in spec.get("pythonExprs") or []:
+            cmd += ["--python-expr", expr]
+        cmd += [
+            "-o", os.path.join(frames_dir, "####"),
+            "-s", str(spec["frameStart"]),
+            "-e", str(spec["frameEnd"]),
+        ]
+        if step > 1:
+            cmd += ["-j", str(step)]
+        cmd += list(spec.get("extraArgs") or [])
+        cmd += ["-a"]
+        return cmd
+
     step = int(spec.get("frameStep") or 1)
-    if step > 1:
-        cmd += ["-j", str(step)]
-    cmd += list(spec.get("extraArgs") or [])
-    cmd += ["-a"]
+    cmd = build_cmd()
 
     frames_total = (spec["frameEnd"] - spec["frameStart"]) // step + 1
     state = {
@@ -222,32 +237,62 @@ def run_render(spec, log_path, tracker):
     }
     write_state(chunk_id, state)
 
-    with open(log_path, "a") as log:
-        log.write(f"=== {time.strftime('%F %T')} render start: {' '.join(cmd)}\n")
-        log.flush()
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-        )
-        last_state_write = 0.0
-        for line in proc.stdout:
-            log.write(line)
-            m = FRA_RE.match(line)
-            if m:
-                state["currentFrame"] = int(m.group(1))
-            m = SAVED_RE.search(line)
-            if m:
-                tracker.saw_saved(m.group(1))
-                state["framesDone"] = len(tracker.recorded) + len(tracker.pending)
-            state["lastLine"] = line.strip()[:300]
-            now = time.time()
-            if now - last_state_write > 2:
-                tracker.flush()
-                state["framesDone"] = len(tracker.recorded)
-                write_state(chunk_id, state)
-                log.flush()
-                last_state_write = now
-        code = proc.wait()
-        log.write(f"=== render exit code {code}\n")
+    # With many concurrent blender processes, each spawning a full BLAS/OpenMP
+    # thread pool thrashes the CPU — pin numeric libraries to one thread per
+    # process. Single-slot jobs keep the historical (unpinned) environment.
+    env = os.environ.copy()
+    if slot_limit(spec) > 2:
+        env.update({
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+        })
+
+    def run_once(cmd):
+        with open(log_path, "a") as log:
+            log.write(f"=== {time.strftime('%F %T')} render start: {' '.join(cmd)}\n")
+            log.flush()
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                env=env
+            )
+            last_state_write = 0.0
+            for line in proc.stdout:
+                log.write(line)
+                m = FRA_RE.match(line)
+                if m:
+                    state["currentFrame"] = int(m.group(1))
+                m = SAVED_RE.search(line)
+                if m:
+                    tracker.saw_saved(m.group(1))
+                    state["framesDone"] = len(tracker.recorded) + len(tracker.pending)
+                state["lastLine"] = line.strip()[:300]
+                now = time.time()
+                if now - last_state_write > 2:
+                    tracker.flush()
+                    state["framesDone"] = len(tracker.recorded)
+                    write_state(chunk_id, state)
+                    log.flush()
+                    last_state_write = now
+            code = proc.wait()
+            log.write(f"=== render exit code {code}\n")
+            return code
+
+    code = run_once(cmd)
+
+    # EEVEE needs a windowing GPU context even in background. Blender >= 5.0
+    # defaults to the Vulkan backend, which container nodes often cannot
+    # initialise (no ICD for the driver) even when EGL/OpenGL works fine — the
+    # process dies before frame 1. If the first attempt produced nothing and
+    # didn't fail via the script guard, retry once on the OpenGL backend.
+    if (
+        code not in (0, GUARD_EXIT)
+        and spec.get("engine") == "eevee"
+        and len(tracker.recorded) == 0
+    ):
+        with open(log_path, "a") as log:
+            log.write(f"=== retrying with --gpu-backend opengl (first attempt exit {code})\n")
+        code = run_once(build_cmd(gpu_backend="opengl"))
 
     # Catch any frames the log parser missed (or that settled late).
     for _ in range(5):
@@ -265,6 +310,10 @@ def run_render(spec, log_path, tracker):
     if code != 0:
         state["status"] = "failed"
         write_state(chunk_id, state)
+        if code == GUARD_EXIT:
+            raise RuntimeError(
+                f"python script raised (exit {code}) — scene guard or startup script failed; see log"
+            )
         raise RuntimeError(f"blender exited {code}")
     return state
 
@@ -350,17 +399,91 @@ def process(spec_path):
         shutil.move(spec_path, os.path.join(FAILED, os.path.basename(spec_path)))
 
 
+def gpu_vram_mb():
+    """Total VRAM of GPU 0 in MB, or None when nvidia-smi is unavailable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip().splitlines()
+        return int(float(out[0])) if out else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def node_ceiling():
+    """Hardware slot ceiling: min(cores-2, vram_gb/1.5, ram_gb/3, 16).
+
+    The render trace is mostly single-threaded CPU per blender process;
+    EEVEE at ~1Kpx needs ~1-1.5 GB VRAM and ~3 GB RAM per process.
+    """
+    cores = os.cpu_count() or 4
+    cap = max(1, cores - 2)
+    vram = gpu_vram_mb()
+    if vram is not None:
+        cap = min(cap, max(1, int(vram // 1536)))
+    try:
+        with open("/proc/meminfo") as f:
+            mem_gb = int(f.readline().split()[1]) / 1048576.0
+        cap = min(cap, max(1, int(mem_gb // 3)))
+    except (OSError, ValueError, IndexError):
+        pass
+    return min(cap, 16)
+
+
+def slot_limit(spec):
+    """Concurrent render slots this spec asks for.
+
+    Absent / 1 → 1 (the historical behaviour, unchanged for anyone whose app
+    doesn't send nodeSlots). "auto"/0 → the hardware ceiling. Explicit N →
+    min(N, ceiling).
+    """
+    raw = spec.get("nodeSlots")
+    if raw in (None, "", 1):
+        return 1
+    if raw in (0, "auto"):
+        return node_ceiling()
+    return max(1, min(int(raw), node_ceiling()))
+
+
 def main():
     ensure_dirs()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     print(f"noderunner up, watching {INBOX}", flush=True)
+    # Multi-slot: up to `slots` chunks render concurrently, each in its own
+    # blender subprocess + thread. All chunk state is per-chunkId (log, state
+    # json, renders/<chunkId>/ dir, manifest) so workers never share files;
+    # the in_progress set stops double-claims within this process.
+    in_progress = {}  # spec filename -> Thread
     while True:
+        for name, t in list(in_progress.items()):
+            if not t.is_alive():
+                del in_progress[name]
         specs = sorted(
             p for p in os.listdir(INBOX) if p.endswith(".json") and not p.endswith(".tmp.json")
         )
-        if specs:
-            process(os.path.join(INBOX, specs[0]))
-        else:
+        slots = 1
+        parsed = []
+        for name in specs:
+            if name in in_progress:
+                continue
+            try:
+                with open(os.path.join(INBOX, name)) as f:
+                    spec = json.load(f)
+            except (OSError, ValueError):
+                continue  # mid-write or corrupt — retry next scan
+            parsed.append(name)
+            slots = max(slots, slot_limit(spec))
+        launched = False
+        for name in parsed:
+            if len(in_progress) >= slots:
+                break
+            t = threading.Thread(target=process, args=(os.path.join(INBOX, name),), daemon=True)
+            in_progress[name] = t
+            t.start()
+            launched = True
+            print(f"slot start {name} ({len(in_progress)}/{slots})", flush=True)
+        if not launched:
             time.sleep(2)
 
 

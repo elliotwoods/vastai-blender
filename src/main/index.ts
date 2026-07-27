@@ -96,9 +96,12 @@ app.whenReady().then(() => {
   registerIpc()
   // Provisioning pipeline: base setup, default Blender release, EEVEE probe.
   // Job-specific Blender versions are installed on demand at dispatch time.
+  // 5.1 (not 4.5): campaign blends are saved by Blender 5.1, so probing EEVEE
+  // on 4.5 verified nothing — 5.x changed the default GPU backend to Vulkan
+  // and a node can pass on 4.5 yet fail every real render on 5.1.
   nodeManager.onReady = async ({ id, ssh }) => {
     await provisionBase(ssh, id)
-    const version = await resolveBlenderRelease('4.5')
+    const version = await resolveBlenderRelease('5.1')
     await installBlender(ssh, id, version)
     await probeEevee(ssh, id, version)
   }
@@ -121,15 +124,21 @@ app.whenReady().then(() => {
     setTimeout(() => {
       void (async () => {
         const { readFileSync, readdirSync } = await import('fs')
-        const { createJob, listJobs } = await import('./jobs/jobs')
+        const { createJob, listJobs, refreshJobState } = await import('./jobs/jobs')
         const { registerAddon } = await import('./addons/addons')
         const { updateSettings } = await import('./settings')
+        const { getDb } = await import('./db/db')
 
         const spec = JSON.parse(readFileSync(jobSpecPath, 'utf-8'))
 
-        const patch: Record<string, number> = {}
+        const patch: Record<string, unknown> = {}
         if (spec.maxActiveNodes) patch.maxActiveNodes = spec.maxActiveNodes
         if (spec.spendCapPerHour) patch.spendCapPerHour = spec.spendCapPerHour
+        // Concurrent render slots per node (agent runs N blender processes).
+        if (spec.nodeSlots) patch.nodeSlots = spec.nodeSlots
+        // Partial offer-filter overrides (e.g. {"cpuBound": true}) merge over
+        // the stored filters via updateSettings' offerFilters merge.
+        if (spec.offerFilters) patch.offerFilters = spec.offerFilters
         if (Object.keys(patch).length) {
           updateSettings(patch)
           console.log(`[spec] settings ${JSON.stringify(patch)}`)
@@ -145,36 +154,65 @@ app.whenReady().then(() => {
           console.log(`[spec] addon ${info.id} v${info.version} ${info.zipHash.slice(0, 12)}`)
         }
 
-        let blends: string[] = spec.blends ?? []
+        // Blend list entries are either plain paths or objects with per-blend
+        // frame overrides: {"path": "...", "frameStart": 1, "frameEnd": 120}.
+        // Needed for mixed-length submissions (e.g. experiment scenes with
+        // different animation lengths in one campaign spec).
+        interface BlendEntry {
+          path: string
+          frameStart?: number
+          frameEnd?: number
+          frameStep?: number
+        }
+        let blends: BlendEntry[] = (spec.blends ?? []).map((b: string | BlendEntry): BlendEntry =>
+          typeof b === 'string' ? { path: b } : b
+        )
         if (!blends.length && spec.blendDir) {
           blends = readdirSync(spec.blendDir)
             .filter((f: string) => f.toLowerCase().endsWith('.blend'))
             .sort()
-            .map((f: string) => join(spec.blendDir, f))
+            .map((f: string): BlendEntry => ({ path: join(spec.blendDir, f) }))
         }
         if (!blends.length) {
           console.error('[spec] no blends resolved — nothing submitted')
           return
         }
 
-        const active = listJobs().filter((j) => ['queued', 'running'].includes(j.state))
+        // 'partial' included: resubmitting a spec HEALS a half-done job
+        // (failed chunks revived below) instead of duplicating it.
+        const active = listJobs().filter((j) => ['queued', 'running', 'partial'].includes(j.state))
         let created = 0
-        for (const blendPath of blends) {
-          if (active.some((j) => j.blendPath === blendPath)) {
-            console.log(`[spec] skip (already active): ${blendPath}`)
+        for (const blend of blends) {
+          const existing = active.find((j) => j.blendPath === blend.path)
+          if (existing) {
+            // Revive permanently-failed chunks (retry budget exhausted, e.g.
+            // by a since-fixed dispatch bug) so the scheduler re-runs only
+            // the missing work — downloaded frames are never re-rendered
+            // because requeue narrowed the chunk ranges already.
+            const revived = getDb()
+              .prepare(
+                `UPDATE chunks SET state='pending', node_id=NULL, retries=0
+                 WHERE job_id = ? AND state='failed'`
+              )
+              .run(existing.id).changes
+            if (revived > 0) refreshJobState(existing.id)
+            console.log(
+              `[spec] skip (already active): ${blend.path}` +
+                (revived ? ` — revived ${revived} failed chunk(s)` : '')
+            )
             continue
           }
           const jobId = await createJob({
-            blendPath,
+            blendPath: blend.path,
             engine: spec.engine ?? 'eevee',
-            frameStart: spec.frameStart ?? 1,
-            frameEnd: spec.frameEnd ?? 200,
-            frameStep: spec.frameStep ?? 1,
+            frameStart: blend.frameStart ?? spec.frameStart ?? 1,
+            frameEnd: blend.frameEnd ?? spec.frameEnd ?? 200,
+            frameStep: blend.frameStep ?? spec.frameStep ?? 1,
             addonIds,
             chunkSize: spec.chunkSize ?? null
           })
           created++
-          console.log(`[spec] job ${created}/${blends.length} ${jobId} ${blendPath}`)
+          console.log(`[spec] job ${created}/${blends.length} ${jobId} ${blend.path}`)
         }
         console.log(`[spec] submitted ${created} job(s)`)
         scheduler.kick()

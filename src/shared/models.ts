@@ -21,6 +21,14 @@ export interface OfferFilters {
   /** vast `reliability2`, 0..1 */
   minReliability: number
   minDiskGb: number
+  /**
+   * CPU-bound workload mode (optional; default off = GPU-benchmark ranking,
+   * unchanged behaviour). When true, offers with no measured throughput are
+   * ranked by a CPU proxy (clock × √effective-cores per dollar) instead of
+   * vast's DL benchmark, so premium datacenter GPUs stop winning offers for
+   * renders whose frame cost is mostly CPU.
+   */
+  cpuBound?: boolean
 }
 
 export interface Offer {
@@ -38,6 +46,9 @@ export interface Offer {
   cudaMaxGood: number | null
   geolocation: string | null
   diskSpaceGb: number
+  cpuName: string | null
+  cpuCoresEffective: number | null
+  cpuGhz: number | null
 }
 
 // ---------------------------------------------------------------------------
@@ -64,9 +75,14 @@ export interface NodeMetrics {
   vramTotalGb: number
   /** max GPU temperature °C */
   gpuTemp: number
-  /** 1-min load average */
+  /** busy CPU % from /proc/stat deltas (not load average) */
+  cpuUtil: number
+  /** 1-min load average — queue depth, kept alongside cpuUtil */
   cpuLoad1: number
   cpuCores: number
+  /** system RAM; 0 total = not sampled */
+  ramUsedGb: number
+  ramTotalGb: number
   /** epoch ms of the sample */
   updatedAt: number
 }
@@ -94,6 +110,16 @@ export interface NodeSnapshot {
   lastError: string | null
   /** live usage sample; null until the first metrics poll */
   metrics: NodeMetrics | null
+}
+
+/** Everything the UI needs to open (or hand the user) a shell on a node. */
+export interface SshCommandInfo {
+  host: string
+  port: number
+  user: string
+  keyPath: string
+  /** Ready-to-paste `ssh -i … -p … root@host`. */
+  command: string
 }
 
 export interface FleetCost {
@@ -233,6 +259,13 @@ export interface SettingsPublic {
   offerFilters: OfferFilters
   sshKeyPath: string
   concurrentTransfersPerNode: number
+  /**
+   * Concurrent render slots per node (blender subprocesses running different
+   * chunks at once). 1 = historical behaviour. "auto"-style heuristics live
+   * node-side; this is passed through in every chunk's job spec and also
+   * raises the scheduler's per-node in-flight chunk limit.
+   */
+  nodeSlots: number
 }
 
 export type SecretKey = 'vastApiKey' | 'otoyUsername' | 'otoyPassword'

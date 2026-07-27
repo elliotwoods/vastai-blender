@@ -18,10 +18,14 @@ cmd_base() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   # EGL/X libs so EEVEE (and Blender's GPU module) can run headless; tmux to
-  # keep the agent alive across SSH drops.
+  # keep the agent alive across SSH drops. libvulkan1 is the Vulkan LOADER —
+  # Blender >= 5.0 defaults to the Vulkan backend and the nvidia container
+  # runtime only supplies the driver ICD, not the loader. (Deliberately NOT
+  # mesa-vulkan-drivers: a software lavapipe device would be silently picked
+  # over the OpenGL fallback and render EEVEE on CPU.)
   apt-get install -y -qq \
     tmux curl xz-utils \
-    libegl1 libgl1 libgles2 libglu1-mesa \
+    libegl1 libgl1 libgles2 libglu1-mesa libvulkan1 \
     libxi6 libxrender1 libxkbcommon0 libsm6 libxfixes3 libxxf86vm1 \
     > /dev/null
 
@@ -49,6 +53,12 @@ cmd_base() {
   log "ffmpeg: $("$VASTAI_HOME/bin/ffmpeg" -version | head -1)"
   log "starting agent…"
   tmux kill-session -t vr-agent 2>/dev/null || true
+  # Kill stray render processes from a previous agent (SIGHUP from the tmux
+  # kill does not reliably reach detached blender children) — a zombie
+  # blender writing into a chunk dir alongside the fresh agent's own render
+  # corrupts progress accounting. Manifested frames survive; the fresh agent
+  # re-renders only what is missing from the manifest… of unfinished chunks.
+  pkill -f "$VASTAI_HOME/blender/" 2>/dev/null || true
   tmux new-session -d -s vr-agent "python3 '$VASTAI_HOME/agent/noderunner.py' >> '$VASTAI_HOME/logs/agent.log' 2>&1"
   log "base provisioning complete"
 }
@@ -90,12 +100,22 @@ cmd_probe_eevee() {
   # BLENDER_EEVEE/BLENDER_WORKBENCH/CYCLES). Hardcoding either raises TypeError on the
   # other and reports a perfectly GPU-capable node as EEVEE-incapable, so pick whichever
   # identifier this build actually exposes.
-  if "$blender" -b -noaudio --factory-startup \
-      --python-expr "import bpy; ids=[i.identifier for i in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items]; bpy.context.scene.render.engine=('BLENDER_EEVEE_NEXT' if 'BLENDER_EEVEE_NEXT' in ids else 'BLENDER_EEVEE')" \
+  # --python-exit-code: without it a failed engine-switch expr is swallowed and
+  # the probe "passes" by rendering with whatever the default engine is.
+  local expr="import bpy; ids=[i.identifier for i in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items]; bpy.context.scene.render.engine=('BLENDER_EEVEE_NEXT' if 'BLENDER_EEVEE_NEXT' in ids else 'BLENDER_EEVEE')"
+  if "$blender" -b -noaudio --factory-startup --python-exit-code 32 \
+      --python-expr "$expr" \
       -o /tmp/eevee_probe_#### -f 1 > /tmp/eevee_probe.log 2>&1; then
     echo "PROBE_OK"
+  # Blender >= 5.0 defaults to the Vulkan backend, which may be unavailable in
+  # the container while EGL/OpenGL works — mirror the render-time fallback.
+  elif "$blender" -b -noaudio --factory-startup --python-exit-code 32 --gpu-backend opengl \
+      --python-expr "$expr" \
+      -o /tmp/eevee_probe_#### -f 1 > /tmp/eevee_probe_gl.log 2>&1; then
+    echo "PROBE_OK (opengl fallback)"
   else
     tail -5 /tmp/eevee_probe.log
+    tail -5 /tmp/eevee_probe_gl.log 2>/dev/null
     echo "PROBE_FAIL"
   fi
 }

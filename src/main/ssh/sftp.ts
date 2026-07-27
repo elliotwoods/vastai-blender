@@ -44,9 +44,18 @@ export function sftpReadFile(sftp: SFTPWrapper, remote: string): Promise<Buffer>
   )
 }
 
+/**
+ * POSIX-overwrite rename. SFTP v3 RENAME fails with a bare "Failure" when the
+ * target exists — which happens routinely on restart recovery (e.g. a chunk's
+ * inbox spec re-written while the previous spec file is still there). Unlink
+ * the target first (ignoring "no such file") to get mv -f semantics.
+ */
 export function sftpRename(sftp: SFTPWrapper, from: string, to: string): Promise<void> {
   return new Promise((resolve, reject) =>
-    sftp.rename(from, to, (err) => (err ? reject(err) : resolve()))
+    sftp.unlink(to, () =>
+      // unlink error (target absent) is expected — rename decides the outcome
+      sftp.rename(from, to, (err) => (err ? reject(err) : resolve()))
+    )
   )
 }
 

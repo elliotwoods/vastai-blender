@@ -115,8 +115,10 @@ export async function installExtension(
     await runLogged(
       ssh,
       nodeId,
+      // --python-exit-code: a failed addon_enable must fail the dispatch here,
+      // not surface later as a scene-guard abort on every render attempt.
       `${blender} --command extension install-file -r user_default --enable '${remoteZip}' && ` +
-        `${blender} -b -noaudio --python-expr "import bpy; bpy.ops.preferences.addon_enable(module='bl_ext.user_default.${addon.id}'); bpy.ops.wm.save_userpref()"`,
+        `${blender} -b -noaudio --python-exit-code 1 --python-expr "import bpy; bpy.ops.preferences.addon_enable(module='bl_ext.user_default.${addon.id}'); bpy.ops.wm.save_userpref()"`,
       `install extension ${addon.id}`
     )
     return null
