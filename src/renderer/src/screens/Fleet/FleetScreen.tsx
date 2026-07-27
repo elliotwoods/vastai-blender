@@ -1,11 +1,15 @@
-import { useEffect, useState, type CSSProperties } from 'react'
+import { useState, type CSSProperties } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
-import { btn, logLine, mono, panel, sectionLabel, statusDot, tableRow } from '../../lib/controls'
-import { fmtDuration, fmtMoney, fmtRate, fmtTimeAgo } from '../../lib/format'
+import { Icon } from '../../components/Icon'
+import { btn, mono, panel, sectionLabel, statusDot, tableRow } from '../../lib/controls'
+import { fmtDuration, fmtMoney, fmtRate } from '../../lib/format'
 import { ipc } from '../../lib/ipc'
-import { useLogStore } from '../../lib/logStore'
 import { useNav } from '../../lib/nav'
+import { NodeDetail } from './NodeDetail'
+import { MeterPair, MiniMeter } from './meters'
+import { pctOf, usageTone } from '../../lib/usage'
 import { useNodes, useSettings, useUpdateSettings } from '../../lib/queries'
+import { useNow } from '../../lib/useNow'
 import { SCALE, TOKENS, type StatusTone } from '../../lib/theme'
 import type { NodeSnapshot, NodeState } from '../../../../shared/models'
 
@@ -23,41 +27,32 @@ const STATE_TONE: Record<NodeState, StatusTone> = {
   destroyed: 'dead'
 }
 
+/**
+ * Dev aid (mirrors `?screen=` in nav.ts): `?expand=1` on the dev-server URL
+ * opens every node's detail panel on load, so VR_SHOT screenshots capture it.
+ */
+const EXPAND_ALL = ((): boolean => {
+  try {
+    return new URLSearchParams(window.location.search).get('expand') === '1'
+  } catch {
+    return false
+  }
+})()
+
 // Column widths shared by the header and rows.
 const COLS = {
+  caret: 12,
   dot: 18,
   state: 92,
   gpu: 150,
-  util: 120,
-  cpu: 86,
+  gpuUse: 132,
+  cpuUse: 132,
   rate: 82,
   cost: 70,
   uptime: 72
 } as const
 
 const cellSm: CSSProperties = { fontSize: SCALE.textSm }
-
-function UtilBar({ pct, label }: { pct: number; label: string }): React.JSX.Element {
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, width: '100%' }}>
-      <span style={{ flex: 1, height: 4, background: TOKENS.border, borderRadius: 2 }}>
-        <span
-          style={{
-            display: 'block',
-            height: '100%',
-            width: `${Math.min(100, pct)}%`,
-            background: pct > 90 ? TOKENS.warn : TOKENS.accent,
-            borderRadius: 2,
-            transition: 'width 400ms'
-          }}
-        />
-      </span>
-      <span style={{ ...mono, fontSize: 'var(--text-2xs)', color: TOKENS.textMuted, minWidth: 52 }}>
-        {label}
-      </span>
-    </span>
-  )
-}
 
 function MaxNodesStepper(): React.JSX.Element {
   const { data: settings } = useSettings()
@@ -92,11 +87,12 @@ function HeaderRow(): React.JSX.Element {
         padding: '6px 12px'
       }}
     >
+      <span style={{ width: COLS.caret }} />
       <span style={{ width: COLS.dot }} />
       <span style={{ ...h, width: COLS.state }}>state</span>
       <span style={{ ...h, width: COLS.gpu }}>gpu</span>
-      <span style={{ ...h, width: COLS.util }}>gpu util · vram</span>
-      <span style={{ ...h, width: COLS.cpu }}>cpu load</span>
+      <span style={{ ...h, width: COLS.gpuUse }}>gpu % · vram %</span>
+      <span style={{ ...h, width: COLS.cpuUse }}>cpu % · ram %</span>
       <span style={{ ...h, width: COLS.rate }}>rate</span>
       <span style={{ ...h, width: COLS.cost }}>cost</span>
       <span style={{ ...h, width: COLS.uptime }}>uptime</span>
@@ -106,99 +102,33 @@ function HeaderRow(): React.JSX.Element {
   )
 }
 
-function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element {
-  const lines = useLogStore((s) => s.byNode[node.id] ?? [])
-  const kv: Array<[string, string]> = [
-    ['instance', node.instanceId != null ? String(node.instanceId) : '—'],
-    ['ssh', node.sshHost ? `${node.sshHost}:${node.sshPort}` : '—'],
-    ['blender', node.blenderVersions.join(', ') || '—'],
-    [
-      'eevee',
-      node.eeveeCapable == null ? 'unprobed' : node.eeveeCapable ? 'capable' : 'not capable'
-    ],
-    ['octane', node.octaneReady ? 'ready' : '—'],
-    [
-      'vram',
-      node.metrics
-        ? `${node.metrics.vramUsedGb.toFixed(1)} / ${node.metrics.vramTotalGb.toFixed(0)} GB`
-        : '—'
-    ],
-    ['gpu temp', node.metrics ? `${node.metrics.gpuTemp.toFixed(0)}°C` : '—'],
-    [
-      'cpu',
-      node.metrics
-        ? `load ${node.metrics.cpuLoad1.toFixed(1)} / ${node.metrics.cpuCores} cores`
-        : '—'
-    ],
-    ['metrics age', node.metrics ? fmtTimeAgo(node.metrics.updatedAt) : '—'],
-    ['last error', node.lastError ?? '—']
-  ]
-  return (
-    <div
-      style={{
-        padding: `${SCALE.space2} ${SCALE.space4} ${SCALE.space3}`,
-        borderBottom: `1px solid ${TOKENS.border}`
-      }}
-    >
-      <div
-        style={{
-          display: 'flex',
-          flexWrap: 'wrap',
-          gap: `${SCALE.space1} ${SCALE.space5}`,
-          marginBottom: SCALE.space2
-        }}
-      >
-        {kv.map(([k, v]) => (
-          <span key={k} style={{ fontSize: SCALE.textXs }}>
-            <span style={{ color: TOKENS.textFaint }}>{k} </span>
-            <span style={{ ...mono, color: TOKENS.textSecondary }}>{v}</span>
-          </span>
-        ))}
-      </div>
-      <div
-        style={{
-          background: TOKENS.surface,
-          border: `1px solid ${TOKENS.border}`,
-          borderRadius: SCALE.radiusSm,
-          padding: SCALE.space2,
-          maxHeight: 180,
-          overflow: 'auto'
-        }}
-      >
-        {lines.length === 0 ? (
-          <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
-            No console output captured yet.
-          </span>
-        ) : (
-          lines.slice(-200).map((l, i) => (
-            <div key={i} style={logLine()}>
-              {l.line}
-            </div>
-          ))
-        )}
-      </div>
-    </div>
-  )
-}
-
-/** Ticking clock so uptime/age readouts stay fresh (and render stays pure). */
-function useNow(intervalMs = 30_000): number {
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), intervalMs)
-    return () => clearInterval(t)
-  }, [intervalMs])
-  return now
-}
-
 function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(EXPAND_ALL)
   const now = useNow()
   const uptime = node.startedAt ? fmtDuration(now - node.startedAt) : '—'
   const m = node.metrics
+  const vramPct = m ? pctOf(m.vramUsedGb, m.vramTotalGb) : null
+  const ramPct = m ? pctOf(m.ramUsedGb, m.ramTotalGb) : null
   return (
     <>
-      <div style={tableRow({ clickable: true })} onClick={() => setExpanded(!expanded)}>
+      <div
+        style={{
+          ...tableRow({ clickable: true }),
+          ...(expanded ? { background: TOKENS.surface, borderBottomColor: 'transparent' } : {})
+        }}
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span
+          style={{
+            width: COLS.caret,
+            display: 'inline-flex',
+            color: expanded ? TOKENS.accent : TOKENS.textFaint,
+            transform: expanded ? 'rotate(90deg)' : 'none',
+            transition: 'transform 140ms'
+          }}
+        >
+          <Icon name="chevron" size={12} />
+        </span>
         <span style={{ width: COLS.dot, display: 'inline-flex' }}>
           <span style={statusDot(STATE_TONE[node.state])} />
         </span>
@@ -209,23 +139,54 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
           {node.gpuName ?? '…'}
           {node.numGpus > 1 ? ` ×${node.numGpus}` : ''}
         </span>
-        <span style={{ width: COLS.util, display: 'inline-flex' }}>
-          {m ? (
-            <UtilBar
-              pct={m.gpuUtil}
-              label={`${m.gpuUtil.toFixed(0)}% ${m.vramUsedGb.toFixed(0)}G`}
+        <MeterPair
+          width={COLS.gpuUse}
+          top={
+            <MiniMeter
+              icon="gpu"
+              pct={m ? m.gpuUtil : null}
+              tone={usageTone(m ? m.gpuUtil : null, { idleBelow: 5 })}
+              title={m ? `GPU compute ${m.gpuUtil.toFixed(0)}%` : 'no metrics yet'}
             />
-          ) : (
-            <span style={{ color: TOKENS.textFaint, fontSize: SCALE.textXs }}>—</span>
-          )}
-        </span>
-        <span style={{ width: COLS.cpu, display: 'inline-flex' }}>
-          {m && m.cpuCores > 0 ? (
-            <UtilBar pct={(m.cpuLoad1 / m.cpuCores) * 100} label={m.cpuLoad1.toFixed(1)} />
-          ) : (
-            <span style={{ color: TOKENS.textFaint, fontSize: SCALE.textXs }}>—</span>
-          )}
-        </span>
+          }
+          bottom={
+            <MiniMeter
+              icon="memory"
+              pct={vramPct}
+              tone={usageTone(vramPct)}
+              title={
+                m ? `VRAM ${m.vramUsedGb.toFixed(1)} / ${m.vramTotalGb.toFixed(0)} GB` : undefined
+              }
+            />
+          }
+        />
+        <MeterPair
+          width={COLS.cpuUse}
+          top={
+            <MiniMeter
+              icon="cpu"
+              pct={m ? m.cpuUtil : null}
+              tone={usageTone(m ? m.cpuUtil : null, { idleBelow: 5 })}
+              title={
+                m
+                  ? `CPU ${m.cpuUtil.toFixed(0)}% · load ${m.cpuLoad1.toFixed(1)} / ${m.cpuCores} cores`
+                  : undefined
+              }
+            />
+          }
+          bottom={
+            <MiniMeter
+              icon="memory"
+              pct={ramPct}
+              tone={usageTone(ramPct)}
+              title={
+                m && m.ramTotalGb > 0
+                  ? `RAM ${m.ramUsedGb.toFixed(1)} / ${m.ramTotalGb.toFixed(0)} GB`
+                  : undefined
+              }
+            />
+          }
+        />
         <span style={{ ...mono, ...cellSm, width: COLS.rate }}>
           {node.dphTotal != null ? fmtRate(node.dphTotal) : '—'}
         </span>
