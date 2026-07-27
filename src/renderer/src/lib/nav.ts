@@ -23,12 +23,19 @@ interface NavState {
   back: () => void
 }
 
-/** Dev aid: `?screen=jobs` etc. in the dev-server URL picks the initial screen. */
+/**
+ * Dev aid: `?screen=jobs` etc. in the dev-server URL picks the initial screen;
+ * `?screen=settings&section=general` also picks the settings section.
+ */
 function initialRoute(): Route {
   try {
-    const s = new URLSearchParams(window.location.search).get('screen')
+    const params = new URLSearchParams(window.location.search)
+    const s = params.get('screen')
     if (s === 'jobs' || s === 'fleet' || s === 'gallery') return { screen: s }
-    if (s === 'settings') return { screen: 'settings' }
+    if (s === 'settings') {
+      const section = params.get('section')
+      return { screen: 'settings', section: (section as SettingsSection | null) ?? undefined }
+    }
   } catch {
     // fall through
   }

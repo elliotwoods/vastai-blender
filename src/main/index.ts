@@ -10,6 +10,13 @@ import { installBlender, probeEevee, provisionBase } from './nodes/provisioner'
 import { scheduler } from './scheduler/scheduler'
 import { getSettings } from './settings'
 
+// Dev aid: VR_USERDATA=<dir> runs against a throwaway profile (own settings,
+// own SQLite state, no API key) — used with VR_MOCK=1 to drive the UI for
+// screenshots without touching the real fleet. Must be set before app ready.
+if (process.env.VR_USERDATA) {
+  app.setPath('userData', process.env.VR_USERDATA)
+}
+
 // media:// serves local media (proxy clips, fixtures) to the renderer with
 // Range-request support for <video> seeking. Registered before app ready.
 protocol.registerSchemesAsPrivileged([
@@ -59,16 +66,29 @@ function createWindow(): void {
   })
 
   // Dev aid: VR_SHOT=<path.png> captures the window shortly after load —
-  // used for automated visual verification during development.
+  // used for automated visual verification during development. The delay
+  // (VR_SHOT_DELAY ms) has to outlast the dev server's first paint, web font
+  // load and the first IPC round trip, or the capture is an empty window.
   const shotPath = process.env.VR_SHOT
   if (shotPath) {
+    // Renderer console + failures go to stdout: a blank capture is otherwise
+    // indistinguishable from a renderer that threw before its first paint.
+    mainWindow.webContents.on('console-message', (_e, level, message) => {
+      console.log(`[renderer:${level}] ${message}`)
+    })
+    mainWindow.webContents.on('did-fail-load', (_e, code, desc) => {
+      console.log(`[renderer] load failed ${code} ${desc}`)
+    })
     mainWindow.webContents.once('did-finish-load', () => {
       setTimeout(async () => {
+        // capturePage on a hidden/occluded window yields the background colour.
+        mainWindow.show()
+        mainWindow.focus()
         const image = await mainWindow.webContents.capturePage()
         const { writeFileSync } = await import('fs')
         writeFileSync(shotPath, image.toPNG())
-        console.log(`[shot] saved ${shotPath}`)
-      }, 2500)
+        console.log(`[shot] saved ${shotPath} (${image.getSize().width}x${image.getSize().height})`)
+      }, Number(process.env.VR_SHOT_DELAY ?? 6000))
     })
   }
 
