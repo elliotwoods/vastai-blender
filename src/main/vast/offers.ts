@@ -42,6 +42,11 @@ export function buildQuery(f: OfferFilters): Record<string, unknown> {
   if (f.maxDphTotal != null) q.dph_total = { lte: f.maxDphTotal }
   if (f.gpuNames.length === 1) q.gpu_name = { eq: f.gpuNames[0] }
   else if (f.gpuNames.length > 1) q.gpu_name = { in: f.gpuNames }
+  // CPU floor for CPU-bound fleets: without it the per-dollar ranking rents
+  // cheap 8-16-thread boxes whose aggregate cores can never hit the
+  // campaign's throughput target (measured 2026-07-27: a fleet of i7/Xeon
+  // leftovers delivered ~4 frames/min across 80 slots).
+  if (f.minCpuCores != null) q.cpu_cores_effective = { gte: f.minCpuCores }
   return q
 }
 
@@ -101,16 +106,20 @@ export function recordThroughput(gpuName: string, framesPerHour: number): void {
 }
 
 /**
- * CPU proxy for cpuBound workloads: single-core clock dominates (the render
- * loop is a mostly single-threaded numpy trace per Blender instance), with a
- * mild √cores bonus for encode/transfer overlap. Scaled so typical consumer
- * machines (~4.5 GHz × 16 eff. cores ≈ 18) land in the same magnitude as
- * dlperf_per_dphtotal once divided by price.
+ * CPU proxy for cpuBound workloads: the render trace is one single-threaded
+ * process per slot and slots scale with cores, so TOTAL node throughput is
+ * ~clock × cores — cores count LINEARLY (a √cores discount let 8-16-thread
+ * bargain boxes win on price and starve the fleet; measured 2026-07-27).
+ * Clock counts QUADRATICALLY (normalized at 4 GHz): at equal cores×clock,
+ * fewer/faster cores beat many slow ones — per-frame latency is 1/clock and
+ * contention grows with slot count (measured 7.5 min/frame/slot on low-clock
+ * rental Xeons vs ~2 min on a high-clock desktop core).
+ * Cores capped at 64: beyond that VRAM/slot ceilings bind first.
  */
 function cpuProxy(o: Offer): number {
   const ghz = o.cpuGhz ?? 3.0 // unknown clock — assume a mediocre one
-  const cores = Math.min(o.cpuCoresEffective ?? 8, 32)
-  return ghz * Math.sqrt(cores)
+  const cores = Math.min(o.cpuCoresEffective ?? 8, 64)
+  return (ghz / 4.0) * ghz * cores
 }
 
 /** In cpuBound mode, cap how much vast's GPU DL benchmark can matter. */
@@ -127,7 +136,7 @@ export function scoreOffer(o: Offer, cpuBound = false): number {
     // CPU-bound: rank unmeasured machines by CPU per dollar; the DL benchmark
     // only tie-breaks (capped) so premium datacenter GPUs stop auto-winning.
     const dl = Math.min(o.dlperfPerDph ?? 0, CPU_BOUND_DLPERF_CAP)
-    perfPerDollar = (cpuProxy(o) / o.dphTotal) * 10 + dl * 0.1
+    perfPerDollar = cpuProxy(o) / o.dphTotal + dl * 0.1
   } else if (o.dlperfPerDph != null) {
     perfPerDollar = o.dlperfPerDph
   } else {
