@@ -43,3 +43,47 @@ Display capability media queries:
   binary on this machine; fixed by manual `Expand-Archive` of the cached zip + writing
   `node_modules/electron/path.txt`. If a fresh `npm install` ever reports "Electron uninstall",
   repeat that (see git history of this file for the exact commands).
+
+## WebGL grading parity (measured 2026-07-27)
+
+The Gallery wall grades with a CSS `filter`; the preview overlay grades with a
+WebGL shader (`media/GradeRenderer.ts`). Both read one shared `Grade`, so they
+have to agree or a clip changes appearance depending on where you opened it.
+
+Measured with the grade lab — `?screen=gradelab&run=1`, which sweeps 12 grades
+over `fixtures/grade_chart_sdr.mp4` and compares the shader's `readPixels`
+against `CanvasRenderingContext2D.filter` (the readable oracle: `drawImage`
+does not apply an element's CSS filter, but the 2D context's `filter` runs the
+same Skia chain).
+
+**Result: 12/12 within 3 LSB.** Every single-parameter grade is ≤1 LSB;
+combined contrast+brightness+saturate chains land at 2-3.
+
+Two hypotheses for that residual were tested and rejected:
+
+| Change | Result |
+|---|---|
+| Drop the per-stage `[0,1]` clamp | Much worse — 11, 26, 35 LSB. The clamp is right; CSS clamps between filter primitives. |
+| Round to 8-bit between primitives | No better on combined grades, *worse* on simple ones (Δ0 → Δ1). Skia keeps float precision through the chain. |
+
+So `GradeRenderer.cssClampPerStage = true` is correct, and the 2-3 LSB residual
+is Skia's chain arithmetic, unisolated and sub-perceptual.
+
+### Two prerequisites, both non-obvious
+
+1. **`media:` must be CORS-enabled** (`corsEnabled: true` in
+   `registerSchemesAsPrivileged` plus `Access-Control-Allow-Origin` on every
+   response) and every graded `<video>` needs `crossOrigin="anonymous"`.
+   Without both, `texImage2D` throws "The video element contains cross-origin
+   data" and the renderer falls back to the CSS filter — silently, because
+   falling back is the correct response to a failed upload. The shader path
+   simply never ran.
+2. **Never call `WEBGL_lose_context.loseContext()` on teardown.** It poisons
+   the *canvas element*, not just the context: a later `getContext()` returns
+   the lost context and every shader compile fails with a `null` info log.
+   StrictMode runs effects mount → cleanup → mount, so the second mount always
+   landed on a dead canvas.
+
+HLG parity is deliberately NOT asserted: graded mode replaces Chromium's
+HLG→SDR conversion with its own decode, so that comparison is a
+documented-difference check rather than a parity check.

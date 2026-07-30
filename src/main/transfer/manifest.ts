@@ -9,6 +9,20 @@ export interface ManifestFrame {
   mtime: number
 }
 
+/** Browser-decodable preview of one frame (the frame itself is often EXR). */
+export interface ManifestThumb {
+  kind: 'thumb'
+  file: string
+  size: number
+  sha256?: string
+  mtime: number
+  meta: {
+    /** null when the filename wasn't a plain frame number */
+    frame: number | null
+    width: number
+  }
+}
+
 export interface ManifestClip {
   kind: 'clip'
   file: string
@@ -16,7 +30,7 @@ export interface ManifestClip {
   sha256?: string
   mtime: number
   meta: {
-    kindKey: 'previewSdr' | 'previewHdr' | 'proxy'
+    kindKey: 'previewSdr' | 'previewHdr' | 'proxy' | 'live'
     file: string
     fps: number
     frames: number
@@ -27,7 +41,9 @@ export interface ManifestClip {
   }
 }
 
-export type ManifestEntry = ManifestFrame | ManifestClip
+export type ManifestEntry = ManifestFrame | ManifestThumb | ManifestClip
+
+const KINDS = new Set(['frame', 'thumb', 'clip'])
 
 export function parseManifest(text: string): ManifestEntry[] {
   const entries: ManifestEntry[] = []
@@ -36,7 +52,7 @@ export function parseManifest(text: string): ManifestEntry[] {
     if (!t) continue
     try {
       const e = JSON.parse(t) as ManifestEntry
-      if ((e.kind === 'frame' || e.kind === 'clip') && e.file && e.size > 0) entries.push(e)
+      if (KINDS.has(e.kind) && e.file && e.size > 0) entries.push(e)
     } catch {
       // ignore torn tail line — it will be complete on the next poll
     }

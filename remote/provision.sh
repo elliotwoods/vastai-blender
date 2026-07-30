@@ -30,7 +30,7 @@ cmd_base() {
     > /dev/null
 
   log "directories…"
-  mkdir -p "$VASTAI_HOME"/{jobs/inbox,jobs/done,jobs/failed,logs,state,renders,work/scenes,work/extensions,bin}
+  mkdir -p "$VASTAI_HOME"/{jobs/inbox,jobs/done,jobs/failed,logs,state,renders,control,work/scenes,work/extensions,bin}
 
   # Modern static ffmpeg: the apt build (4.4 on Ubuntu 22.04) cannot decode
   # DWAA-compressed EXRs and may lack zscale — both required by the encode
@@ -59,6 +59,12 @@ cmd_base() {
   # corrupts progress accounting. Manifested frames survive; the fresh agent
   # re-renders only what is missing from the manifest… of unfinished chunks.
   pkill -f "$VASTAI_HOME/blender/" 2>/dev/null || true
+  # Clear the job inbox: after an app restart every non-complete chunk is
+  # re-dispatched with a fresh spec to whichever node the scheduler picks —
+  # stale specs left here render chunks now assigned to OTHER nodes,
+  # producing frames the app never collects (observed: 44 specs queued on a
+  # 12-slot node, slots burned on invisible duplicate work).
+  rm -f "$VASTAI_HOME"/jobs/inbox/*.json
   tmux new-session -d -s vr-agent "python3 '$VASTAI_HOME/agent/noderunner.py' >> '$VASTAI_HOME/logs/agent.log' 2>&1"
   log "base provisioning complete"
 }

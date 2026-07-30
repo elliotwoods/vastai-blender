@@ -1,11 +1,17 @@
-import { app, shell, BrowserWindow, net, protocol } from 'electron'
-import { join, normalize } from 'path'
-import { pathToFileURL } from 'url'
+import { app, shell, BrowserWindow, protocol } from 'electron'
+import { createReadStream, statSync } from 'fs'
+import { extname, join, normalize, sep } from 'path'
+import { Readable } from 'stream'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { resolveBlenderRelease } from './blender/blendInfo'
 import { registerIpc } from './ipc'
-import { nodeManager, setCurrentChunkProvider } from './nodes/nodeManager'
+import {
+  nodeManager,
+  setActiveWorkProvider,
+  setForgetNodeProvider,
+  setSlotInfoProvider
+} from './nodes/nodeManager'
 import { installBlender, probeEevee, provisionBase } from './nodes/provisioner'
 import { scheduler } from './scheduler/scheduler'
 import { getSettings } from './settings'
@@ -19,10 +25,23 @@ if (process.env.VR_USERDATA) {
 
 // media:// serves local media (proxy clips, fixtures) to the renderer with
 // Range-request support for <video> seeking. Registered before app ready.
+//
+// corsEnabled + an Access-Control-Allow-Origin header on every response is
+// what lets a <video crossOrigin="anonymous"> be uploaded into WebGL. Without
+// it the element is cross-origin-tainted and `texImage2D` throws "The video
+// element contains cross-origin data" — which silently disables the whole
+// shader grading path, because the renderer's only sane response to a failed
+// upload is to fall back to the CSS filter.
 protocol.registerSchemesAsPrivileged([
   {
     scheme: 'media',
-    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true }
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      stream: true,
+      corsEnabled: true
+    }
   }
 ])
 
@@ -36,14 +55,85 @@ function mediaRoots(): Record<string, string> {
   }
 }
 
+/** Content types for what this protocol actually serves. */
+const MEDIA_TYPES: Record<string, string> = {
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.webm': 'video/webm',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp'
+}
+
+/**
+ * media:// serves local media to the renderer, WITH byte ranges.
+ *
+ * Ranges are served by hand rather than delegated to `net.fetch`, which ignores
+ * a `Range` header on a file:// URL and always answers with the whole file. A
+ * `<video>` will not seek a resource whose server shows no range support until
+ * the entire thing happens to be buffered — so scrubbing, arrow-key stepping and
+ * opening the preview at a given frame all silently did nothing while paused:
+ * `currentTime` was assigned and immediately read back as 0.
+ */
 function registerMediaProtocol(): void {
-  protocol.handle('media', (request) => {
+  protocol.handle('media', async (request) => {
     const url = new URL(request.url)
     const root = mediaRoots()[url.host]
     if (!root) return new Response('unknown media root', { status: 404 })
     const abs = normalize(join(root, decodeURIComponent(url.pathname)))
-    if (!abs.startsWith(normalize(root))) return new Response('forbidden', { status: 403 })
-    return net.fetch(pathToFileURL(abs).toString())
+    // Trailing separator: without it `C:\renders` also admits `C:\renders-old`.
+    const guard = normalize(root) + sep
+    if (abs !== normalize(root) && !abs.startsWith(guard)) {
+      return new Response('forbidden', { status: 403 })
+    }
+
+    let size: number
+    try {
+      size = statSync(abs).size
+    } catch {
+      return new Response('not found', { status: 404 })
+    }
+
+    const headers = new Headers({
+      // corsEnabled + this header is what lets a <video crossOrigin="anonymous">
+      // be uploaded into WebGL; without it texImage2D throws cross-origin and the
+      // shader grading path silently falls back to a CSS filter.
+      'Access-Control-Allow-Origin': '*',
+      'Accept-Ranges': 'bytes',
+      'Content-Type': MEDIA_TYPES[extname(abs).toLowerCase()] ?? 'application/octet-stream',
+      'Cache-Control': 'no-cache'
+    })
+
+    const body = (start?: number, end?: number): ReadableStream =>
+      Readable.toWeb(createReadStream(abs, { start, end })) as ReadableStream
+
+    const range = request.headers.get('range')
+    const match = range ? /^bytes=(\d*)-(\d*)$/.exec(range.trim()) : null
+    if (match && (match[1] || match[2])) {
+      // An open-ended `bytes=N-` is what <video> actually sends; a suffix range
+      // (`bytes=-N`) is legal too and asks for the LAST N bytes.
+      let start: number
+      let end: number
+      if (match[1]) {
+        start = Number(match[1])
+        end = match[2] ? Math.min(Number(match[2]), size - 1) : size - 1
+      } else {
+        start = Math.max(0, size - Number(match[2]))
+        end = size - 1
+      }
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) {
+        headers.set('Content-Range', `bytes */${size}`)
+        return new Response(null, { status: 416, headers })
+      }
+      headers.set('Content-Range', `bytes ${start}-${end}/${size}`)
+      headers.set('Content-Length', String(end - start + 1))
+      return new Response(body(start, end), { status: 206, headers })
+    }
+
+    headers.set('Content-Length', String(size))
+    return new Response(body(), { status: 200, headers })
   })
 }
 
@@ -130,7 +220,12 @@ app.whenReady().then(() => {
     await installBlender(ssh, id, version)
     await probeEevee(ssh, id, version)
   }
-  setCurrentChunkProvider((nodeId) => scheduler.currentChunkForNode(nodeId))
+  setActiveWorkProvider((nodeId) => scheduler.activeWorkForNode(nodeId))
+  setSlotInfoProvider((nodeId) => ({
+    inUse: scheduler.slotsInUse(nodeId),
+    target: scheduler.slotTargetFor(nodeId)
+  }))
+  setForgetNodeProvider((nodeId) => scheduler.forgetNode(nodeId))
   nodeManager.init()
   scheduler.start()
   createWindow()
@@ -142,14 +237,17 @@ app.whenReady().then(() => {
   //     "blends": ["C:/.../suzanne.blend", ...]  // or "blendDir": "C:/.../blends/<cfg>"
   //     "engine": "eevee", "frameStart": 1, "frameEnd": 200, "frameStep": 1,
   //     "addonZips": ["C:/.../auroravision-0.2.0.zip"],
-  //     "chunkSize": null, "maxActiveNodes": 4, "spendCapPerHour": 2
+  //     "chunkSize": null, "maxActiveNodes": 4, "spendCapPerHour": 2,
+  //     "shareNode": true,      // jobs may co-run on one node (per-blend override too)
+  //     "maxNodeSlots": 0       // 0 = let the app judge concurrency per node
   //   }
   const jobSpecPath = process.env.VR_JOB_SPEC
   if (jobSpecPath) {
     setTimeout(() => {
       void (async () => {
         const { readFileSync, readdirSync } = await import('fs')
-        const { createJob, listJobs, refreshJobState } = await import('./jobs/jobs')
+        const { createJob, emitChunksChanged, listJobs, refreshJobState } =
+          await import('./jobs/jobs')
         const { registerAddon } = await import('./addons/addons')
         const { updateSettings } = await import('./settings')
         const { getDb } = await import('./db/db')
@@ -159,8 +257,12 @@ app.whenReady().then(() => {
         const patch: Record<string, unknown> = {}
         if (spec.maxActiveNodes) patch.maxActiveNodes = spec.maxActiveNodes
         if (spec.spendCapPerHour) patch.spendCapPerHour = spec.spendCapPerHour
-        // Concurrent render slots per node (agent runs N blender processes).
-        if (spec.nodeSlots) patch.nodeSlots = spec.nodeSlots
+        // Cap on the auto-judged render slots per node; 0/absent = auto.
+        // `nodeSlots` is the pre-2.1 name for the same knob.
+        const slotCap = spec.maxNodeSlots ?? spec.nodeSlots
+        if (slotCap != null) patch.maxNodeSlots = slotCap
+        // Buy-ahead fleet: rent to maxActiveNodes while any chunk is open.
+        if (spec.eagerFleet != null) patch.eagerFleet = spec.eagerFleet
         // Partial offer-filter overrides (e.g. {"cpuBound": true}) merge over
         // the stored filters via updateSettings' offerFilters merge.
         if (spec.offerFilters) patch.offerFilters = spec.offerFilters
@@ -188,6 +290,8 @@ app.whenReady().then(() => {
           frameStart?: number
           frameEnd?: number
           frameStep?: number
+          /** may co-run with other chunks on one node; falls back to spec.shareNode */
+          shareNode?: boolean
         }
         let blends: BlendEntry[] = (spec.blends ?? []).map((b: string | BlendEntry): BlendEntry =>
           typeof b === 'string' ? { path: b } : b
@@ -205,22 +309,46 @@ app.whenReady().then(() => {
 
         // 'partial' included: resubmitting a spec HEALS a half-done job
         // (failed chunks revived below) instead of duplicating it.
-        const active = listJobs().filter((j) => ['queued', 'running', 'partial'].includes(j.state))
+        const allJobs = listJobs()
+        const active = allJobs.filter((j) => ['queued', 'running', 'partial'].includes(j.state))
         let created = 0
         for (const blend of blends) {
+          // Satisfied: a prior job for the same blend AND the same frame
+          // range already completed — re-running the spec must not re-render
+          // finished work. (Observed: complete jobs were re-created on every
+          // respec because dedup only looked at ACTIVE jobs.)
+          const wantStart = blend.frameStart ?? spec.frameStart ?? 1
+          const wantEnd = blend.frameEnd ?? spec.frameEnd ?? 200
+          const satisfied = allJobs.find(
+            (j) =>
+              j.state === 'complete' &&
+              j.blendPath === blend.path &&
+              j.frameStart === wantStart &&
+              j.frameEnd === wantEnd
+          )
+          if (satisfied) {
+            console.log(`[spec] skip (already complete): ${blend.path}`)
+            continue
+          }
           const existing = active.find((j) => j.blendPath === blend.path)
           if (existing) {
             // Revive permanently-failed chunks (retry budget exhausted, e.g.
             // by a since-fixed dispatch bug) so the scheduler re-runs only
             // the missing work — downloaded frames are never re-rendered
             // because requeue narrowed the chunk ranges already.
+            const failed = getDb()
+              .prepare(`SELECT id FROM chunks WHERE job_id = ? AND state = 'failed'`)
+              .all(existing.id) as Array<{ id: string }>
             const revived = getDb()
               .prepare(
                 `UPDATE chunks SET state='pending', node_id=NULL, retries=0
                  WHERE job_id = ? AND state='failed'`
               )
               .run(existing.id).changes
-            if (revived > 0) refreshJobState(existing.id)
+            if (revived > 0) {
+              emitChunksChanged(failed.map((c) => c.id))
+              refreshJobState(existing.id)
+            }
             console.log(
               `[spec] skip (already active): ${blend.path}` +
                 (revived ? ` — revived ${revived} failed chunk(s)` : '')
@@ -234,7 +362,8 @@ app.whenReady().then(() => {
             frameEnd: blend.frameEnd ?? spec.frameEnd ?? 200,
             frameStep: blend.frameStep ?? spec.frameStep ?? 1,
             addonIds,
-            chunkSize: spec.chunkSize ?? null
+            chunkSize: spec.chunkSize ?? null,
+            shareNode: blend.shareNode ?? spec.shareNode ?? false
           })
           created++
           console.log(`[spec] job ${created}/${blends.length} ${jobId} ${blend.path}`)
@@ -282,6 +411,11 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  // Headless batch runs must survive the window going away — a crashed or
+  // closed renderer window would otherwise quit the main process
+  // mid-campaign and orphan paid instances. The scheduler/nodeManager live
+  // in main and need no window.
+  if (process.env.VR_JOB_SPEC || process.env.VR_E2E_BLEND) return
   if (process.platform !== 'darwin') {
     app.quit()
   }

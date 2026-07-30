@@ -35,11 +35,51 @@ export class ClipSyncController {
 
   constructor(public meta: TransportMeta) {}
 
+  /**
+   * Frame the transport is on, independent of any element. Survives a swap of
+   * the underlying <video>, which `currentFrame` does not: that getter reads
+   * the leader's currentTime, and a freshly-mounted element is at 0.
+   */
+  get lastKnownFrame(): number {
+    return Math.max(0, this.lastFrame)
+  }
+
+  /**
+   * Place the transport at a frame WITHOUT touching any element.
+   *
+   * For opening at a requested frame: VideoTile captures `lastKnownFrame`
+   * synchronously before it registers, then applies it once the element has
+   * metadata. Seeking from the overlay instead would be overwritten by that
+   * restore (child passive effects run before the parent's), so the overlay
+   * seeds the value here from a layout effect and lets the existing restore
+   * path do the actual seek and clamping.
+   */
+  setKnownFrame(frame: number): void {
+    this.lastFrame = Math.min(this.meta.totalFrames - 1, Math.max(0, frame))
+  }
+
   // -- registration ---------------------------------------------------------
 
   register(el: HTMLVideoElement): () => void {
     this.videos.push(el)
+    /**
+     * Re-apply the transport's position once the element can actually seek.
+     *
+     * `readyState 1` (HAVE_METADATA) is enough to know the duration but NOT to
+     * seek — Chromium silently drops the assignment and `currentTime` stays 0.
+     * Since a restore is issued as soon as metadata arrives, opening the preview
+     * at a frame left the transport reading frame N while the picture sat on
+     * frame 0. This also re-syncs a paused element whose `src` was swapped for a
+     * new live-clip version.
+     */
+    const onCanPlay = (): void => {
+      if (this._playing) return
+      const t = frameToTime(this.lastKnownFrame, this.meta.fps)
+      if (Math.abs(el.currentTime - t) > 1 / (this.meta.fps * 2)) el.currentTime = t
+    }
+    el.addEventListener('canplay', onCanPlay)
     return () => {
+      el.removeEventListener('canplay', onCanPlay)
       const i = this.videos.indexOf(el)
       if (i >= 0) this.videos.splice(i, 1)
       if (this.leaderIndex >= this.videos.length) this.leaderIndex = 0
@@ -58,6 +98,20 @@ export class ClipSyncController {
   subscribe(fn: Listener): () => void {
     this.listeners.add(fn)
     return () => this.listeners.delete(fn)
+  }
+
+  /**
+   * Retarget at a new clip length. A live clip grows while it is being
+   * watched, so `meta` is not fixed for the controller's lifetime — subscribers
+   * re-read it on every notify, and forcing one here is what re-scales the
+   * ruler and the frame count.
+   */
+  setMeta(next: TransportMeta): void {
+    if (next.fps === this.meta.fps && next.totalFrames === this.meta.totalFrames) return
+    this.meta = next
+    // A shorter clip must not leave the playhead past its end.
+    if (this.lastFrame > next.totalFrames - 1) this.lastFrame = next.totalFrames - 1
+    this.notifyForce()
   }
 
   private notify(frame: number): void {
@@ -147,9 +201,20 @@ export class ClipSyncController {
 
   // -- internals ------------------------------------------------------------
 
+  /**
+   * Re-announce the CURRENT position to every subscriber.
+   *
+   * Deliberately re-notifies `lastKnownFrame`, not `currentFrame`: the latter
+   * reads the leader element's currentTime, which is 0 immediately after a
+   * `src` swap (a live clip rolling to a new version, or a finished chunk's
+   * definitive rendition replacing the live one). Deriving from the element
+   * there would announce frame 0 and throw the viewer back to the start —
+   * previously avoided only by the order the effects happened to run in.
+   */
   private notifyForce(): void {
+    const at = this.lastKnownFrame
     this.lastFrame = -1
-    this.notify(this.currentFrame)
+    this.notify(at)
   }
 
   private startLoop(): void {

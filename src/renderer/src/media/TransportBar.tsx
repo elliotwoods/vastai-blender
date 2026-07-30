@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useState, useSyncExternalStore } from 'react'
 import { iconBtn, mono, panel, quietField } from '../lib/controls'
 import { SCALE, TOKENS } from '../lib/theme'
 import type { ClipSyncController } from './ClipSyncController'
 import { formatTimecode } from './frame-math'
 import { FrameRuler } from './FrameRuler'
+import { useTransportKeys } from './useTransportKeys'
 
 /**
  * The docked transport bar:
@@ -12,53 +13,43 @@ import { FrameRuler } from './FrameRuler'
  */
 export function TransportBar({
   controller,
-  quality
+  quality,
+  keysEnabled = true,
+  extras
 }: {
   controller: ClipSyncController
   quality: string
+  /** Bind the global transport keys. Off when another surface owns them. */
+  keysEnabled?: boolean
+  /** Extra controls rendered at the right-hand end (LIVE pill, HDR toggle…). */
+  extras?: React.ReactNode
 }): React.JSX.Element {
-  const [frame, setFrame] = useState(controller.currentFrame)
-  const [playing, setPlaying] = useState(controller.playing)
   const [frameInput, setFrameInput] = useState<string | null>(null)
-  const { fps, totalFrames } = controller.meta
+  // An external store, not local state synced by an effect: notifications that
+  // fire before this component subscribes are otherwise lost, and one does —
+  // sibling effects run in tree order, so the seek that opens the overlay at a
+  // requested frame happens in VideoTile's effect, above this one. Snapshotting
+  // `lastKnownFrame` (the transport's own position, never read from an element)
+  // means the first render is already correct however the ordering falls.
+  const frame = useSyncExternalStore(
+    (cb) => controller.subscribe(cb),
+    () => controller.lastKnownFrame
+  )
+  const playing = useSyncExternalStore(
+    (cb) => controller.subscribe(cb),
+    () => controller.playing
+  )
+  // Subscribed, NOT destructured from controller.meta at mount: a live clip
+  // grows, so its fps/totalFrames change under a mounted bar, and a once-only
+  // read left the ruler scaled to whatever the first version was.
+  // `meta` is a stable reference between setMeta() calls, so this is a valid
+  // external-store snapshot.
+  const { fps, totalFrames } = useSyncExternalStore(
+    (cb) => controller.subscribe(cb),
+    () => controller.meta
+  )
 
-  useEffect(() => {
-    const off = controller.subscribe((f, p) => {
-      setFrame(f)
-      setPlaying(p)
-    })
-    return off
-  }, [controller])
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
-      switch (e.key) {
-        case ' ':
-          e.preventDefault()
-          controller.toggle()
-          break
-        case 'ArrowLeft':
-          e.preventDefault()
-          controller.step(e.shiftKey ? -10 : -1)
-          break
-        case 'ArrowRight':
-          e.preventDefault()
-          controller.step(e.shiftKey ? 10 : 1)
-          break
-        case 'Home':
-          e.preventDefault()
-          controller.first()
-          break
-        case 'End':
-          e.preventDefault()
-          controller.last()
-          break
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [controller])
+  useTransportKeys(controller, keysEnabled)
 
   const commitFrameInput = (): void => {
     if (frameInput != null) {
@@ -170,6 +161,7 @@ export function TransportBar({
       >
         {quality}
       </span>
+      {extras}
     </div>
   )
 }
