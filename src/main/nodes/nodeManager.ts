@@ -9,6 +9,7 @@
  */
 
 import { randomUUID } from 'crypto'
+import { co2Grams } from '../carbon/intensity'
 import { getDb } from '../db/db'
 import { emit } from '../ipc'
 import { getSettings } from '../settings'
@@ -23,7 +24,7 @@ import {
   sshEndpoints,
   showInstance
 } from '../vast/vastClient'
-import type { NodeMetrics, NodeSnapshot, NodeState } from '../../shared/models'
+import type { NodeMetrics, NodeSnapshot, NodeState, NodeWorkRef } from '../../shared/models'
 import type { RawInstance } from '../vast/types'
 
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
@@ -47,12 +48,34 @@ interface NodeRow {
   octane_ready: number
   blender_versions: string
   last_error: string | null
+  geolocation: string | null
 }
 
+/** What the scheduler currently has in flight on a node. */
+export type ActiveWork = NodeWorkRef
+
 /** Injected by index.ts (avoids a scheduler ↔ nodeManager import cycle). */
-let currentChunkProvider: ((nodeId: string) => string | null) | null = null
-export function setCurrentChunkProvider(fn: (nodeId: string) => string | null): void {
-  currentChunkProvider = fn
+let activeWorkProvider: ((nodeId: string) => ActiveWork[]) | null = null
+export function setActiveWorkProvider(fn: (nodeId: string) => ActiveWork[]): void {
+  activeWorkProvider = fn
+}
+
+/** The scheduler's auto-judged concurrency for a node. */
+export interface SlotInfo {
+  inUse: number
+  target: number
+}
+
+/** Injected by index.ts, same reason as activeWorkProvider. */
+let slotInfoProvider: ((nodeId: string) => SlotInfo) | null = null
+export function setSlotInfoProvider(fn: (nodeId: string) => SlotInfo): void {
+  slotInfoProvider = fn
+}
+
+/** Lets the scheduler drop a destroyed node's learned concurrency. */
+let forgetNodeProvider: ((nodeId: string) => void) | null = null
+export function setForgetNodeProvider(fn: (nodeId: string) => void): void {
+  forgetNodeProvider = fn
 }
 
 /** Latest usage sample per node (in-memory — no need to persist). */
@@ -68,10 +91,135 @@ const cpuStatByNode = new Map<string, { total: number; idle: number }>()
  */
 const energyByNode = new Map<string, number>()
 
+/**
+ * How much of `energyByNode` has already been written to usage_log. The
+ * difference is the Wh burned since the last accrual tick. Both maps are
+ * in-memory, so a restart zeroes them together and no energy is double-counted.
+ */
+const energyFlushedByNode = new Map<string, number>()
+
+/** Wh burned on this node since the previous accrual tick; advances the mark. */
+function flushEnergy(nodeId: string): number {
+  const total = energyByNode.get(nodeId) ?? 0
+  const delta = total - (energyFlushedByNode.get(nodeId) ?? 0)
+  energyFlushedByNode.set(nodeId, total)
+  return delta > 0 ? delta : 0
+}
+
 export function sessionEnergyWh(): number {
   let total = 0
   for (const wh of energyByNode.values()) total += wh
   return total
+}
+
+/**
+ * Session CO2e (grams), each node's energy costed against its own country's
+ * grid rather than one blended figure — the whole point of recording where a
+ * machine is. Destroyed nodes still count: their row survives and the carbon
+ * was still emitted.
+ */
+function sessionCo2Grams(): number {
+  if (energyByNode.size === 0) return 0
+  const overhead = getSettings().co2OverheadFactor
+  const geoById = new Map(
+    (
+      getDb().prepare('SELECT id, geolocation FROM nodes').all() as Array<{
+        id: string
+        geolocation: string | null
+      }>
+    ).map((r) => [r.id, r.geolocation])
+  )
+  let total = 0
+  for (const [nodeId, wh] of energyByNode) {
+    total += co2Grams(wh, geoById.get(nodeId) ?? null, overhead)
+  }
+  return total
+}
+
+interface UsageRow {
+  ts: number
+  nodeId: string
+  jobId: string | null
+  chunkId: string | null
+  cost: number
+  wh: number
+  powerW: number | null
+  gpuUtil: number | null
+}
+
+/**
+ * Divide one node's minute between the jobs it was actually rendering. A node
+ * running two chunks of different jobs splits 50/50; two chunks of the *same*
+ * job collapse into one row carrying the whole share, so a per-job SUM is right
+ * either way. A node rendering nothing yields a single job_id = NULL row — that
+ * is real money spent on idle or provisioning time and the History screen shows
+ * it as overhead rather than hiding it.
+ */
+function splitUsage(nodeId: string, ts: number, cost: number, wh: number): UsageRow[] {
+  const m = metricsByNode.get(nodeId)
+  // 0 W means "this card doesn't report power", not "it drew nothing" — keep it
+  // null so it doesn't drag the averages down.
+  const powerW = m && m.powerW > 0 ? m.powerW : null
+  const gpuUtil = m ? m.gpuUtil : null
+  const base = { ts, nodeId }
+
+  const work = activeWorkProvider?.(nodeId) ?? []
+  if (work.length === 0) {
+    return [{ ...base, jobId: null, chunkId: null, cost, wh, powerW, gpuUtil }]
+  }
+
+  const chunksByJob = new Map<string, string[]>()
+  for (const w of work) {
+    const ids = chunksByJob.get(w.jobId)
+    if (ids) ids.push(w.chunkId)
+    else chunksByJob.set(w.jobId, [w.chunkId])
+  }
+  return [...chunksByJob].map(([jobId, chunkIds], i) => {
+    const share = chunkIds.length / work.length
+    return {
+      ...base,
+      jobId,
+      chunkId: chunkIds.join(', '),
+      cost: cost * share,
+      wh: wh * share,
+      // Cost and energy divide between jobs, but draw does not — the node pulls
+      // those watts once. Record the sample on the first row only, so summing
+      // power_w across a tick gives true fleet draw rather than counting a
+      // two-job node twice.
+      powerW: i === 0 ? powerW : null,
+      gpuUtil: i === 0 ? gpuUtil : null
+    }
+  })
+}
+
+/**
+ * Persist a tick's usage rows and roll the attributed spend into
+ * `jobs.cost_so_far` — the column the Jobs list and job header have always
+ * displayed but which nothing used to write.
+ */
+function writeUsage(rows: UsageRow[]): void {
+  if (rows.length === 0) return
+  const db = getDb()
+  const insert = db.prepare(
+    `INSERT INTO usage_log (ts, node_id, job_id, chunk_id, delta_cost, delta_wh, power_w, gpu_util)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+  const charge = db.prepare('UPDATE jobs SET cost_so_far = cost_so_far + ? WHERE id = ?')
+  db.transaction(() => {
+    for (const r of rows) {
+      insert.run(r.ts, r.nodeId, r.jobId, r.chunkId, r.cost, r.wh, r.powerW, r.gpuUtil)
+      if (r.jobId) charge.run(r.cost, r.jobId)
+    }
+  })()
+}
+
+/** Append a balance reading, but only when it has actually moved. */
+function recordBalance(ts: number, balance: number): void {
+  const db = getDb()
+  const last = db.prepare('SELECT balance FROM balance_log ORDER BY ts DESC LIMIT 1').get() as
+    { balance: number } | undefined
+  if (last && last.balance === balance) return
+  db.prepare('INSERT OR REPLACE INTO balance_log (ts, balance) VALUES (?, ?)').run(ts, balance)
 }
 
 /**
@@ -98,6 +246,7 @@ function cpuUtilFromStat(nodeId: string, memPart: string, load1: number, cores: 
 }
 
 function rowToSnapshot(r: NodeRow): NodeSnapshot {
+  const slots = slotInfoProvider?.(r.id) ?? { inUse: 0, target: 1 }
   return {
     id: r.id,
     instanceId: r.instance_id,
@@ -110,7 +259,11 @@ function rowToSnapshot(r: NodeRow): NodeSnapshot {
     startedAt: r.started_at,
     accumulatedCost: r.accumulated_cost,
     energyWh: energyByNode.get(r.id) ?? 0,
-    currentChunkId: currentChunkProvider?.(r.id) ?? null,
+    co2g: co2Grams(energyByNode.get(r.id) ?? 0, r.geolocation, getSettings().co2OverheadFactor),
+    geolocation: r.geolocation,
+    currentWork: activeWorkProvider?.(r.id) ?? [],
+    slotsInUse: slots.inUse,
+    slotTarget: slots.target,
     eeveeCapable: r.eevee_capable === null ? null : r.eevee_capable === 1,
     octaneReady: r.octane_ready === 1,
     octaneNeedsManualLogin: false,
@@ -135,6 +288,11 @@ class ManagedNode {
 
   get state(): NodeState {
     return this.row.state
+  }
+
+  /** Push a fresh snapshot without changing any persisted field. */
+  emitChanged(): void {
+    emit('node:changed', this.snapshot)
   }
 
   update(patch: Partial<Record<keyof NodeRow, unknown>>): void {
@@ -343,10 +501,12 @@ export class NodeManager {
     const id = randomUUID()
     getDb()
       .prepare(
-        `INSERT INTO nodes (id, state, gpu_name, num_gpus, dph_total, accumulated_cost, blender_versions)
-         VALUES (?, 'requested', ?, ?, ?, 0, '[]')`
+        `INSERT INTO nodes (id, state, gpu_name, num_gpus, dph_total, accumulated_cost, blender_versions, geolocation)
+         VALUES (?, 'requested', ?, ?, ?, 0, '[]', ?)`
       )
-      .run(id, offer.gpuName, offer.numGpus, offer.dphTotal)
+      // The offer is the only place vast.ai ever tells us where the machine is
+      // — /instances/ doesn't report it — so capture it at rent time or lose it.
+      .run(id, offer.gpuName, offer.numGpus, offer.dphTotal, offer.geolocation)
     const node = new ManagedNode(id)
     this.nodes.set(id, node)
     emit('node:changed', node.snapshot)
@@ -461,14 +621,21 @@ export class NodeManager {
         void this.driveToReady(node, inst.machine_id ?? null)
         return
       }
+      // 'provisioning' BEFORE the SSH handle exists — never 'ready' early.
+      // The node row still carries its pre-restart state ('ready' or
+      // 'rendering'), and the scheduler dispatches to any such node the
+      // moment `.ssh` is set; a dispatch racing provisionBase corrupts
+      // state: the base setup clears the job inbox (deleting freshly
+      // written specs → "No such file" renames or silently stranded chunks)
+      // and restarts the agent underneath the dispatch.
+      node.setState('provisioning')
       await node.connectSsh()
       const r = await node.ssh!.exec('echo ok', { timeoutMs: 30_000 })
       if (!r.stdout.includes('ok')) throw new Error('echo failed')
-      node.setState(node.snapshot.blenderVersions.length > 0 ? 'ready' : 'provisioning')
       if (this.onReady && node.ssh) {
         await this.onReady({ id: node.id, ssh: node.ssh })
-        node.setState('ready')
       }
+      node.setState('ready')
     } catch (e) {
       node.setState('unreachable', (e as Error).message)
       void this.recoverUnreachable(node)
@@ -482,12 +649,38 @@ export class NodeManager {
       node.setState('ready')
     } catch (e) {
       node.setState('failed', (e as Error).message)
+      // A node that dies mid-render never reaches destroyNode, so the
+      // scheduler would otherwise keep polling a dead connection for chunks
+      // this node can no longer finish. Release them here too so they requeue
+      // onto a surviving node.
+      forgetNodeProvider?.(node.id)
+      // ...and then stop paying for it. Same guarantee as driveToReady's catch:
+      // nothing else ever destroys a node that fails this way — scale-down
+      // filters 'failed' out, accrueCosts stops metering it (so the leak is
+      // invisible in History), and activeCount() ignores it, so a replacement is
+      // rented immediately while this instance keeps billing until the next
+      // app start's orphan reconcile. Destroy it directly rather than via
+      // destroyNode(), whose Octane drain would await a dead SSH connection.
+      const instanceId = node.snapshot.instanceId
+      node.closeSsh()
+      if (instanceId) {
+        try {
+          await destroyInstance(instanceId)
+          node.setState('destroyed')
+        } catch {
+          emit('alert', {
+            level: 'error',
+            message: `Could not destroy unreachable instance ${instanceId} — check the Vast.ai console!`
+          })
+        }
+      }
     }
   }
 
   async destroyNode(id: string): Promise<void> {
     const node = this.nodes.get(id)
     if (!node) return
+    forgetNodeProvider?.(id)
     const instanceId = node.snapshot.instanceId
     node.setState('destroying')
     // Octane drain ordering: a clean OctaneServer exit releases the floating
@@ -516,7 +709,9 @@ export class NodeManager {
   /** Accumulate $ cost from dph × elapsed and push the fleet totals. */
   private async accrueCosts(): Promise<void> {
     const db = getDb()
+    const ts = Date.now() // one timestamp for the tick, so buckets line up
     let perHour = 0
+    const usage: UsageRow[] = []
     for (const node of this.nodes.values()) {
       const s = node.snapshot
       if (['destroyed', 'failed'].includes(s.state) || s.dphTotal == null || !s.startedAt) continue
@@ -525,15 +720,20 @@ export class NodeManager {
       node.update({ accumulated_cost: s.accumulatedCost + delta })
       db.prepare(
         'INSERT INTO cost_log (node_id, ts, dph_total, delta_cost) VALUES (?, ?, ?, ?)'
-      ).run(s.id, Date.now(), s.dphTotal, delta)
+      ).run(s.id, ts, s.dphTotal, delta)
+      usage.push(...splitUsage(s.id, ts, delta, flushEnergy(s.id)))
     }
+    writeUsage(usage)
     const sessionTotal = (
       db.prepare('SELECT COALESCE(SUM(delta_cost), 0) AS t FROM cost_log').get() as { t: number }
     ).t
     try {
       const u = await currentUser()
       const credit = u.credit ?? u.balance
-      if (credit != null) this.balance = Number(credit)
+      if (credit != null) {
+        this.balance = Number(credit)
+        recordBalance(ts, this.balance)
+      }
     } catch {
       // keep last known balance (no key / offline)
     }
@@ -541,6 +741,7 @@ export class NodeManager {
       perHour,
       sessionTotal,
       sessionWh: sessionEnergyWh(),
+      sessionCo2g: sessionCo2Grams(),
       balance: this.balance
     })
   }
