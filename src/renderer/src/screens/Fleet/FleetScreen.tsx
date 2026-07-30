@@ -1,8 +1,10 @@
 import { useState, type CSSProperties } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
 import { Icon } from '../../components/Icon'
+import { InfoHint } from '../../components/Tooltip'
 import { btn, mono, panel, sectionLabel, statusDot, tableRow } from '../../lib/controls'
 import { fmtDuration, fmtEnergy, fmtMoney, fmtRate, fmtWatts } from '../../lib/format'
+import { HINTS } from '../../lib/hints'
 import { ipc } from '../../lib/ipc'
 import { useNav } from '../../lib/nav'
 import { NodeDetail } from './NodeDetail'
@@ -78,6 +80,30 @@ function MaxNodesStepper(): React.JSX.Element {
   )
 }
 
+/**
+ * Column header that carries an explanation. The ⓘ lives on the header rather
+ * than on every row: the rows are dense and click-to-expand, so a marker in
+ * each one would be noise.
+ */
+function HeaderCell({
+  h,
+  width,
+  label,
+  hint
+}: {
+  h: CSSProperties
+  width: number
+  label: string
+  hint: string
+}): React.JSX.Element {
+  return (
+    <span style={{ ...h, width, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      {label}
+      <InfoHint text={hint} size={10} />
+    </span>
+  )
+}
+
 function HeaderRow(): React.JSX.Element {
   const h: CSSProperties = { ...sectionLabel(), fontSize: 'var(--text-2xs)' }
   return (
@@ -94,14 +120,27 @@ function HeaderRow(): React.JSX.Element {
       <span style={{ ...h, width: COLS.gpu }}>gpu</span>
       <span style={{ ...h, width: COLS.gpuUse }}>gpu % · vram %</span>
       <span style={{ ...h, width: COLS.cpuUse }}>cpu % · ram %</span>
-      <span style={{ ...h, width: COLS.rate }}>rate</span>
-      <span style={{ ...h, width: COLS.cost }}>cost</span>
-      <span style={{ ...h, width: COLS.power }}>power</span>
+      <HeaderCell h={h} width={COLS.rate} label="rate" hint={HINTS.rate} />
+      <HeaderCell h={h} width={COLS.cost} label="cost" hint={HINTS.spent} />
+      <HeaderCell h={h} width={COLS.power} label="power" hint={HINTS.power} />
       <span style={{ ...h, width: COLS.uptime }}>uptime</span>
       <span style={{ ...h, flex: 1 }}>activity</span>
       <span style={{ width: 70 }} />
     </div>
   )
+}
+
+/**
+ * Collapsed-row activity text. Built from `currentWork` rather than a
+ * pre-joined string so a multi-slot node reads as a count plus one job name
+ * instead of a wall of chunk ids; expand the row for the per-slot detail.
+ */
+function activitySummary(node: NodeSnapshot): string {
+  const work = node.currentWork
+  if (work.length === 0) return ''
+  const jobs = new Set(work.map((w) => w.jobId))
+  const slots = `${work.length}/${node.slotTarget}`
+  return jobs.size === 1 ? `${slots} · ${work[0].chunkId}` : `${slots} · ${jobs.size} jobs`
 }
 
 function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
@@ -113,13 +152,7 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
   const ramPct = m ? pctOf(m.ramUsedGb, m.ramTotalGb) : null
   return (
     <>
-      <div
-        style={{
-          ...tableRow({ clickable: true }),
-          ...(expanded ? { background: TOKENS.surface, borderBottomColor: 'transparent' } : {})
-        }}
-        onClick={() => setExpanded(!expanded)}
-      >
+      <div style={tableRow({ clickable: true, expanded })} onClick={() => setExpanded(!expanded)}>
         <span
           style={{
             width: COLS.caret,
@@ -232,7 +265,7 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
             whiteSpace: 'nowrap'
           }}
         >
-          {node.currentChunkId ?? node.lastError ?? ''}
+          {node.lastError ?? activitySummary(node)}
         </span>
         <span style={{ width: 70, display: 'inline-flex', justifyContent: 'flex-end' }}>
           <button

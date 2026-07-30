@@ -10,13 +10,18 @@ import type {
   AlertEvent,
   AssetAddedEvent,
   AssetIndex,
+  ChunkChangedEvent,
   ChunkProgressEvent,
   FleetCost,
+  HistoryRange,
+  HistorySummary,
   JobDetail,
   JobSubmission,
   JobSummary,
   LogLineEvent,
+  NodeChunkView,
   NodeSnapshot,
+  ThumbAsset,
   Offer,
   OfferFilters,
   SecretKey,
@@ -46,13 +51,36 @@ export interface IpcInvokeMap {
   /** Spawn a terminal running that command; `ok: false` → caller copies instead. */
   'node:openSshTerminal': { args: [string]; result: { ok: boolean; message: string } }
   'nodes:list': { args: []; result: NodeSnapshot[] }
+  /** Chunks on a node joined to their jobs — live work first, then most recent. */
+  'node:chunks': { args: [{ nodeId: string; limit?: number }]; result: NodeChunkView[] }
+  /** Frame thumbnails in a range, for the filmstrip's visible window. */
+  'frames:thumbs': {
+    args: [{ jobId: string; from: number; to: number }]
+    result: ThumbAsset[]
+  }
+  /** Ask the node to build (or stop building) a chunk's rolling live clip. */
+  'preview:subscribe': { args: [{ chunkId: string; on: boolean }]; result: void }
 
   // jobs
   'jobs:list': { args: []; result: JobSummary[] }
   'job:get': { args: [string]; result: JobDetail | null }
   'job:create': { args: [JobSubmission]; result: { jobId: string } }
   'job:cancel': { args: [string]; result: void }
+  /** Toggle node sharing; affects chunks not yet assigned. */
+  'job:setShareNode': { args: [string, boolean]; result: void }
   'job:retryMissing': { args: [string]; result: void }
+
+  // scheduler
+  /**
+   * Chunks recovered from a previous session whose fleet scale-up is paused
+   * pending confirmation, or null when nothing is held.
+   */
+  'scheduler:recoveryHold': { args: []; result: { chunks: number } | null }
+  /** Release that hold and let the fleet scale up for the recovered work. */
+  'scheduler:resumeRecovery': { args: []; result: void }
+
+  // history
+  'history:summary': { args: [HistoryRange]; result: HistorySummary }
 
   // addons
   'addons:list': { args: []; result: AddonInfo[] }
@@ -80,6 +108,8 @@ export interface IpcEventMap {
   'node:changed': NodeSnapshot
   'job:changed': JobSummary
   'chunk:progress': ChunkProgressEvent
+  /** Lifecycle only — the invalidation signal chunk:progress must not be. */
+  'chunk:changed': ChunkChangedEvent
   'render:logLine': LogLineEvent
   'asset:added': AssetAddedEvent
   'fleet:cost': FleetCost

@@ -72,3 +72,27 @@ button:focus-visible {
     transform: rotate(360deg);
   }
 }
+
+/* Placeholder for a frame that is being rendered right now (media/Thumb.tsx).
+   Slow and low-contrast on purpose: a filmstrip can hold dozens of these at
+   once, and anything faster reads as an error state rather than as work. */
+@keyframes vr-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.75;
+  }
+}
+
+.vr-thumb-working {
+  animation: vr-pulse 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vr-thumb-working {
+    animation: none;
+    opacity: 0.55;
+  }
+}

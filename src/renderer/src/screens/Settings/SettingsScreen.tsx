@@ -1,12 +1,15 @@
 import { useState, type CSSProperties } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
 import { OpenInExplorerButton } from '../../components/OpenInExplorerButton'
+import { InfoHint } from '../../components/Tooltip'
 import { btn, chip, input, menuItem, mono, panel, sectionLabel } from '../../lib/controls'
+import { HINTS } from '../../lib/hints'
 import { ipc } from '../../lib/ipc'
 import { useNav, type SettingsSection } from '../../lib/nav'
 import { qk, useAddons, useSettings, useUpdateSettings } from '../../lib/queries'
 import { SCALE, TOKENS } from '../../lib/theme'
 import { useQueryClient } from '@tanstack/react-query'
+import type { SettingsPublic } from '../../../../shared/models'
 
 const SECTIONS: Array<{ key: SettingsSection; label: string }> = [
   { key: 'api', label: 'Vast.ai API' },
@@ -25,6 +28,16 @@ const formRow: CSSProperties = {
 }
 
 const label: CSSProperties = { width: 170, fontSize: SCALE.textSm, color: TOKENS.textMuted }
+
+/** Form label with an ⓘ, for settings whose effect isn't obvious from the name. */
+function FieldLabel({ text, hint }: { text: string; hint: string }): React.JSX.Element {
+  return (
+    <span style={{ ...label, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      <span>{text}</span>
+      <InfoHint text={hint} size={10} />
+    </span>
+  )
+}
 
 function ApiSection(): React.JSX.Element {
   const { data: settings } = useSettings()
@@ -113,7 +126,7 @@ function GeneralSection(): React.JSX.Element {
         />
       </div>
       <div style={formRow}>
-        <span style={label}>Spend cap ($/hr, blank = off)</span>
+        <FieldLabel text="Spend cap ($/hr, blank = off)" hint={HINTS.spendCap} />
         <input
           type="number"
           min={0}
@@ -128,20 +141,102 @@ function GeneralSection(): React.JSX.Element {
         />
       </div>
       <div style={formRow}>
-        <span style={label}>Render slots per node</span>
+        <span style={label}>Max render slots per node</span>
         <input
           type="number"
-          min={1}
-          max={8}
-          value={settings.nodeSlots}
+          min={0}
+          max={24}
+          placeholder="auto"
+          value={settings.maxNodeSlots || ''}
           onChange={(e) =>
-            update.mutate({ nodeSlots: Math.max(1, Math.min(8, Number(e.target.value))) })
+            update.mutate({
+              maxNodeSlots: Math.max(0, Math.min(24, Number(e.target.value) || 0))
+            })
           }
           style={{ ...input({ size: 'sm' }), ...mono, width: 80 }}
         />
         <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
-          concurrent Blender processes per machine — raise for scenes that don&apos;t saturate a GPU
-          on their own
+          blank = auto: each node&apos;s concurrency is measured and tuned on the fly. Set a number
+          to cap it. Only jobs marked &ldquo;share node&rdquo; ever run more than one at a time.
+        </span>
+      </div>
+      <div style={formRow}>
+        <FieldLabel text="CO₂ overhead factor" hint={HINTS.co2Overhead} />
+        <input
+          type="number"
+          min={1}
+          max={3}
+          step={0.1}
+          value={settings.co2OverheadFactor}
+          onChange={(e) =>
+            update.mutate({
+              co2OverheadFactor: Math.max(1, Math.min(3, Number(e.target.value) || 1))
+            })
+          }
+          style={{ ...input({ size: 'sm' }), ...mono, width: 80 }}
+        />
+        <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
+          Scales measured GPU watts up to a whole-machine estimate for the CO₂ figures only — host
+          CPU, PSU losses and datacentre cooling. 1 = count the GPU alone. Energy readouts are never
+          scaled by this.
+        </span>
+      </div>
+      <div style={formRow}>
+        <span style={label}>Frame thumbnails</span>
+        <label
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            fontSize: SCALE.textXs,
+            color: TOKENS.textMuted
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={settings.thumbnails}
+            onChange={(e) => update.mutate({ thumbnails: e.target.checked })}
+          />
+          stream a small JPEG per frame as it renders
+        </label>
+        <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
+          Render output is usually EXR, which browsers can&apos;t display — without these the UI has
+          no image until a chunk finishes encoding. Costs one small ffmpeg run per frame on the
+          node.
+        </span>
+      </div>
+      <div style={formRow}>
+        <span style={label}>Live preview clip</span>
+        <select
+          value={settings.livePreview}
+          onChange={(e) =>
+            update.mutate({
+              livePreview: e.target.value as SettingsPublic['livePreview']
+            })
+          }
+          style={{ ...input({ size: 'sm' }), width: 130 }}
+        >
+          <option value="off">off</option>
+          <option value="onDemand">while watching</option>
+          <option value="always">always</option>
+        </select>
+        <input
+          type="number"
+          min={256}
+          max={3840}
+          step={64}
+          value={settings.livePreviewWidth}
+          onChange={(e) =>
+            update.mutate({
+              livePreviewWidth: Math.max(256, Math.min(3840, Number(e.target.value) || 960))
+            })
+          }
+          style={{ ...input({ size: 'sm' }), ...mono, width: 80 }}
+        />
+        <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
+          A video assembled on the node one frame at a time, so you can watch a chunk render.
+          &ldquo;While watching&rdquo; only encodes for a chunk whose preview is open — an always-on
+          encoder competes with the render on a many-slot node.
         </span>
       </div>
       <div style={formRow}>
@@ -333,7 +428,7 @@ function OffersSection(): React.JSX.Element {
         </div>
       </div>
       <div style={formRow}>
-        <span style={label}>Max $/hr</span>
+        <FieldLabel text="Max $/hr" hint={HINTS.maxDph} />
         <input
           type="number"
           min={0}

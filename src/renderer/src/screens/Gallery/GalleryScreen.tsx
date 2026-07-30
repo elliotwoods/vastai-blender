@@ -1,15 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
-import { btn, iconBtn, mono, panel, sectionLabel } from '../../lib/controls'
-import { fmtBytes } from '../../lib/format'
-import { ipc } from '../../lib/ipc'
+import { btn, mono, panel, sectionLabel } from '../../lib/controls'
 import { useNav } from '../../lib/nav'
+import { usePreview } from '../../lib/preview'
 import { useAssetIndex, useJobs } from '../../lib/queries'
 import { SCALE, TOKENS } from '../../lib/theme'
-import { ClipSyncController } from '../../media/ClipSyncController'
-import { gradeToFilter } from '../../media/grade'
-import { GradePanel } from '../../media/GradePanel'
-import { TransportBar } from '../../media/TransportBar'
+import { chunkIdsOf, pickClip } from '../../media/renditions'
 import { useGrade } from '../../media/useGrade'
 import { useHdrCapability } from '../../media/useHdrCapability'
 import { VideoTile } from '../../media/VideoTile'
@@ -18,7 +14,15 @@ import type { ClipAsset } from '../../../../shared/models'
 /** Cap simultaneous playing tiles to keep GPU decode load sane. */
 const MAX_PLAYING = 12
 
-function useLazyPlayObserver(): IntersectionObserver {
+/**
+ * Lazy play/pause for the wall, suspended while the preview overlay is open.
+ *
+ * `suspended` gates the OBSERVER, not the elements. The playing set is closure
+ * state mutated only from observer callbacks, so pausing elements directly
+ * would leave all 12 slots marked occupied for as long as the overlay is up,
+ * and nothing would resume on close because no intersection change fires.
+ */
+function useLazyPlayObserver(suspended: boolean): IntersectionObserver {
   const observer = useMemo(() => {
     // Closure-local state (not a ref): only touched from observer callbacks.
     const playing = new Set<HTMLVideoElement>()
@@ -38,145 +42,22 @@ function useLazyPlayObserver(): IntersectionObserver {
       { threshold: 0.25 }
     )
   }, [])
+
+  useEffect(() => {
+    if (!suspended) return
+    // Disconnecting drops every observation, so the set empties as the
+    // elements stop being watched; re-observing happens through VideoTile's
+    // effect when the overlay closes and the tiles re-register.
+    const observed = document.querySelectorAll<HTMLVideoElement>('.vr-tile video')
+    observed.forEach((v) => v.pause())
+    observer.disconnect()
+    return () => {
+      observed.forEach((v) => observer.observe(v))
+    }
+  }, [observer, suspended])
+
   useEffect(() => () => observer.disconnect(), [observer])
   return observer
-}
-
-function Inspector({
-  clip,
-  frames,
-  onClose
-}: {
-  clip: ClipAsset
-  frames: Array<{ frame: number; absPath: string; sizeBytes: number }>
-  onClose: () => void
-}): React.JSX.Element {
-  const hdrCapable = useHdrCapability()
-  const [hdrMode, setHdrMode] = useState(false)
-  const [showGrade, setShowGrade] = useState(false)
-  const grade = useGrade()
-  const [currentFrame, setCurrentFrame] = useState(0)
-
-  const controller = useMemo(
-    () => new ClipSyncController({ fps: clip.fps, totalFrames: clip.frames }),
-    [clip.fps, clip.frames]
-  )
-  useEffect(() => {
-    const off = controller.subscribe((f) => setCurrentFrame(f))
-    return () => {
-      off()
-      controller.destroy()
-    }
-  }, [controller])
-
-  const effectiveHdr = hdrMode && hdrCapable
-  const quality = `${clip.width}×${clip.height} · ${clip.codec} · ${effectiveHdr ? 'HDR HLG' : 'SDR'}`
-  const frameStripRef = useRef<HTMLDivElement>(null)
-
-  // Keep the current frame's strip entry in view.
-  useEffect(() => {
-    const el = frameStripRef.current?.querySelector<HTMLElement>(`[data-frame="${currentFrame}"]`)
-    el?.scrollIntoView({ block: 'nearest', inline: 'center' })
-  }, [currentFrame])
-
-  return (
-    <div
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        gap: SCALE.space3,
-        height: '100%',
-        minHeight: 0
-      }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', gap: SCALE.space2 }}>
-        <button style={btn({ variant: 'ghost', size: 'sm' })} onClick={onClose}>
-          ← wall
-        </button>
-        <span style={{ ...mono, fontSize: SCALE.textSm, color: TOKENS.textSecondary }}>
-          {clip.label}
-        </span>
-        <span style={{ flex: 1 }} />
-        {hdrCapable && clip.hdr ? (
-          <button
-            title="HDR passthrough (disables grading)"
-            style={btn({ size: 'sm', active: hdrMode })}
-            onClick={() => setHdrMode(!hdrMode)}
-          >
-            HDR
-          </button>
-        ) : null}
-        <button
-          title="Grade panel"
-          style={iconBtn({ size: 'sm', active: showGrade })}
-          onClick={() => setShowGrade(!showGrade)}
-        >
-          ◑
-        </button>
-      </div>
-
-      <div style={{ display: 'flex', gap: SCALE.space3, flex: 1, minHeight: 0 }}>
-        <div
-          style={{
-            flex: 1,
-            minWidth: 0,
-            display: 'flex',
-            alignItems: 'flex-start',
-            justifyContent: 'center'
-          }}
-        >
-          <div style={{ maxWidth: 'min(100%, 78vh)', width: '100%' }}>
-            <VideoTile
-              clip={clip}
-              hdrMode={effectiveHdr}
-              gradeFilter={gradeToFilter(grade)}
-              controller={controller}
-            />
-          </div>
-        </div>
-        {showGrade ? <GradePanel hdrMode={effectiveHdr} /> : null}
-      </div>
-
-      <TransportBar controller={controller} quality={quality} />
-
-      {frames.length > 0 ? (
-        <div
-          ref={frameStripRef}
-          style={{
-            ...panel(),
-            display: 'flex',
-            gap: 2,
-            padding: SCALE.space2,
-            overflowX: 'auto',
-            flexShrink: 0
-          }}
-        >
-          {frames.map((f, i) => (
-            <button
-              key={f.frame}
-              data-frame={i}
-              title={`${f.absPath} (${fmtBytes(f.sizeBytes)}) — click to seek, double-click to open`}
-              onClick={() => controller.seekFrame(i)}
-              onDoubleClick={() => void ipc.invoke('shell:openPath', f.absPath)}
-              style={{
-                ...mono,
-                fontSize: 'var(--text-2xs)',
-                padding: '3px 6px',
-                borderRadius: 4,
-                cursor: 'pointer',
-                background: i === currentFrame ? TOKENS.accent : TOKENS.surface,
-                color: i === currentFrame ? TOKENS.accentFg : TOKENS.textMuted,
-                border: `1px solid ${i === currentFrame ? TOKENS.accent : TOKENS.border}`,
-                flexShrink: 0
-              }}
-            >
-              {f.frame}
-            </button>
-          ))}
-        </div>
-      ) : null}
-    </div>
-  )
 }
 
 export function GalleryScreen({
@@ -193,36 +74,20 @@ export function GalleryScreen({
   const hdrCapable = useHdrCapability()
   const [hdrWall, setHdrWall] = useState(false)
   const grade = useGrade()
-  const [expanded, setExpanded] = useState<string | null>(null)
-  const observer = useLazyPlayObserver()
+  const previewOpen = usePreview((s) => s.target != null)
+  const openPreview = usePreview((s) => s.open)
+  const observer = useLazyPlayObserver(previewOpen)
 
+  // One clip per chunk for the wall, using the cheap-decode ordering.
   const clips = useMemo(() => {
-    let all = index?.clips ?? []
-    if (chunkId) all = all.filter((c) => c.chunkId === chunkId)
-    // Wall shows the small proxies; HDR wall shows HDR clips when present.
-    const kind = hdrWall ? 'previewHdr' : 'proxy'
-    const preferred = all.filter((c) => c.kind === kind)
-    return preferred.length > 0 ? preferred : all.filter((c) => c.kind === 'previewSdr')
+    const all = (index?.clips ?? []).filter((c) => !chunkId || c.chunkId === chunkId)
+    const byChunk = new Map<string, ClipAsset>()
+    for (const id of chunkIdsOf(all)) {
+      const pick = pickClip(all, { chunkId: id, preferHdr: hdrWall, wall: true })
+      if (pick) byChunk.set(id, pick)
+    }
+    return [...byChunk.values()]
   }, [index, chunkId, hdrWall])
-
-  const expandedClip = useMemo(() => {
-    if (!expanded || !index) return null
-    // Inspect the best rendition of the expanded chunk: HDR > SDR > proxy.
-    const of = index.clips.filter((c) => c.chunkId === expanded)
-    return (
-      of.find((c) => c.kind === (hdrWall ? 'previewHdr' : 'previewSdr')) ??
-      of.find((c) => c.kind === 'previewSdr') ??
-      of[0] ??
-      null
-    )
-  }, [expanded, index, hdrWall])
-
-  const expandedFrames = useMemo(() => {
-    if (!expandedClip || !index) return []
-    return index.frames
-      .filter((f) => f.chunkId === expandedClip.chunkId)
-      .sort((a, b) => a.frame - b.frame)
-  }, [expandedClip, index])
 
   const jobOptions = (jobs ?? []).filter((j) => j.framesDone > 0 || j.state === 'complete')
 
@@ -271,13 +136,7 @@ export function GalleryScreen({
         }
       />
       <div style={{ flex: 1, overflow: 'auto', padding: SCALE.space4, minHeight: 0 }}>
-        {expandedClip ? (
-          <Inspector
-            clip={expandedClip}
-            frames={expandedFrames}
-            onClose={() => setExpanded(null)}
-          />
-        ) : clips.length === 0 ? (
+        {clips.length === 0 ? (
           <div style={{ ...panel(), padding: SCALE.space6, textAlign: 'center' }}>
             <span style={{ color: TOKENS.textFaint }}>
               {activeJobId
@@ -295,12 +154,16 @@ export function GalleryScreen({
           >
             {clips.map((c) => (
               <VideoTile
-                key={c.absPath}
+                // Keyed by chunk, not by path: there is exactly one tile per
+                // chunk, and the picked rendition's path CHANGES when the HDR
+                // wall is toggled — keying on it would remount every tile
+                // (tearing down its video element) instead of re-rendering.
+                key={c.chunkId}
                 clip={c}
                 hdrMode={hdrWall && hdrCapable && c.hdr}
-                gradeFilter={gradeToFilter(grade)}
+                grade={grade}
                 observer={observer}
-                onExpand={() => setExpanded(c.chunkId)}
+                onExpand={() => openPreview({ jobId: activeJobId as string, chunkId: c.chunkId })}
               />
             ))}
           </div>

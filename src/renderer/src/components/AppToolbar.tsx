@@ -1,9 +1,14 @@
 import type { CSSProperties, ReactNode } from 'react'
 import { SCALE, TOKENS } from '../lib/theme'
 import { mono, readout } from '../lib/controls'
-import { fmtEnergy, fmtRate } from '../lib/format'
+import { compareCo2 } from '../lib/co2'
+import { fmtCo2, fmtEnergy, fmtRate } from '../lib/format'
+import { HINTS } from '../lib/hints'
+import { InfoDot, Tooltip } from './Tooltip'
 import { ipc } from '../lib/ipc'
+import { useNav } from '../lib/nav'
 import { useFleetCost, useNodes, useSettings } from '../lib/queries'
+import type { HistoryMetric } from '../../../shared/models'
 
 const bar: CSSProperties = {
   display: 'flex',
@@ -56,9 +61,13 @@ function FleetReadouts(): React.JSX.Element {
   const { data: cost } = useFleetCost()
   const { data: nodes } = useNodes()
   const { data: settings } = useSettings()
+  const navigate = useNav((s) => s.navigate)
   const active = (nodes ?? []).filter(
     (n) => !['destroyed', 'failed', 'destroying'].includes(n.state)
   ).length
+  // Every readout is a live number with a past — clicking one opens its series.
+  const toHistory = (metric: HistoryMetric) => () => navigate({ screen: 'history', metric })
+  const linked: CSSProperties = { ...readout(), cursor: 'pointer' }
   return (
     <div style={{ display: 'flex', gap: SCALE.space2 }}>
       <span style={readout()}>
@@ -67,32 +76,61 @@ function FleetReadouts(): React.JSX.Element {
           {active} / {settings?.maxActiveNodes ?? '—'}
         </span>
       </span>
-      <span style={readout()}>
-        <span style={{ color: TOKENS.textFaint }}>rate</span>
-        <span style={mono}>{cost ? fmtRate(cost.perHour) : '$0.000/hr'}</span>
-      </span>
-      <span style={readout()} title="Spend and GPU energy since the app started">
-        <span style={{ color: TOKENS.textFaint }}>session</span>
-        <span style={mono}>${(cost?.sessionTotal ?? 0).toFixed(2)}</span>
-        <span style={{ color: TOKENS.border }}>|</span>
-        <span style={{ ...mono, color: TOKENS.textMuted }}>{fmtEnergy(cost?.sessionWh ?? 0)}</span>
-      </span>
-      <button
-        title="Vast.ai balance — click to add funds"
-        style={{ ...readout(), cursor: 'pointer' }}
-        onClick={() => void ipc.invoke('shell:openExternal', 'https://cloud.vast.ai/billing/')}
+      {/* Tooltip wraps the pill rather than nesting an InfoHint inside it:
+          these pills are buttons, and a <button> inside a <button> is invalid
+          HTML. Same shape as the balance pill below. */}
+      <Tooltip text={HINTS.fleetRate}>
+        <button style={linked} onClick={toHistory('spend')}>
+          <span style={{ color: TOKENS.textFaint }}>rate</span>
+          <span style={mono}>{cost ? fmtRate(cost.perHour) : '$0.000/hr'}</span>
+          <InfoDot size={10} />
+        </button>
+      </Tooltip>
+      <Tooltip
+        text={
+          cost && cost.sessionCo2g > 0
+            ? `${HINTS.fleetSession}\n\n${fmtCo2(cost.sessionCo2g)} — ${compareCo2(cost.sessionCo2g)}`
+            : HINTS.fleetSession
+        }
       >
-        <span style={{ color: TOKENS.textFaint }}>balance</span>
-        <span
-          style={{
-            ...mono,
-            color: cost?.balance != null && cost.balance < 5 ? TOKENS.warn : TOKENS.text
-          }}
-        >
-          {cost?.balance != null ? `$${cost.balance.toFixed(2)}` : '—'}
-        </span>
-        <span style={{ color: TOKENS.accent, fontSize: SCALE.text2xs }}>+</span>
-      </button>
+        <button style={linked} onClick={toHistory('spend')}>
+          <span style={{ color: TOKENS.textFaint }}>session</span>
+          <span style={mono}>${(cost?.sessionTotal ?? 0).toFixed(2)}</span>
+          <span style={{ color: TOKENS.border }}>|</span>
+          <span style={{ ...mono, color: TOKENS.textMuted }}>
+            {fmtEnergy(cost?.sessionWh ?? 0)}
+          </span>
+          <InfoDot size={10} />
+        </button>
+      </Tooltip>
+      {/* The `+` already reads as an action, so this pill gets the tooltip
+          without a second glyph competing with it. The pill itself opens the
+          balance history; only the `+` leaves the app for the billing page. */}
+      <Tooltip text={HINTS.balance}>
+        <button style={linked} onClick={toHistory('balance')}>
+          <span style={{ color: TOKENS.textFaint }}>balance</span>
+          <span
+            style={{
+              ...mono,
+              color: cost?.balance != null && cost.balance < 5 ? TOKENS.warn : TOKENS.text
+            }}
+          >
+            {cost?.balance != null ? `$${cost.balance.toFixed(2)}` : '—'}
+          </span>
+          <span
+            role="button"
+            tabIndex={0}
+            title="Add funds"
+            style={{ color: TOKENS.accent, fontSize: SCALE.text2xs, cursor: 'pointer' }}
+            onClick={(e) => {
+              e.stopPropagation()
+              void ipc.invoke('shell:openExternal', 'https://cloud.vast.ai/billing/')
+            }}
+          >
+            +
+          </span>
+        </button>
+      </Tooltip>
     </div>
   )
 }

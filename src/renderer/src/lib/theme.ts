@@ -4,6 +4,8 @@
  * rename is one edit. The app is dark-only — no theme switching machinery.
  */
 
+import type { ChunkState } from '../../../shared/models'
+
 export const TOKENS = {
   // Surfaces / structure
   surface: 'var(--surface)',
@@ -109,4 +111,20 @@ export const STATUS_VARS: Record<StatusTone, { fill: string; border: string; tex
     border: 'var(--status-dead-border)',
     text: 'var(--status-dead-text)'
   }
+}
+
+/**
+ * Chunk state → status tone. Lives here rather than beside any one consumer:
+ * Fleet's workload panel, JobDetail's chunk cells and the filmstrip's gap
+ * placeholders must agree, or the same chunk reads as a different colour
+ * depending on which screen you are looking at.
+ */
+export const CHUNK_TONE: Record<ChunkState, StatusTone> = {
+  pending: 'queued',
+  assigned: 'queued',
+  rendering: 'running',
+  encoding: 'running',
+  downloading: 'running',
+  complete: 'done',
+  failed: 'error'
 }

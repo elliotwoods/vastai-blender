@@ -111,6 +111,12 @@ const PATHS = {
       <path d="M9.2 9.5a2.8 2.8 0 0 1 5.5.8c0 1.9-2.7 2.4-2.7 4M12 17.5h.01" />
     </>
   ),
+  info: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 11v5M12 8h.01" />
+    </>
+  ),
   alert: (
     <>
       <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
@@ -123,6 +129,54 @@ const PATHS = {
       <path d="m3.3 7 8.7 5 8.7-5M12 22V12" />
     </>
   ),
+  // -- grading controls (media/GradePanel) --------------------------------
+  /** exposure: sun */
+  exposure: (
+    <>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+    </>
+  ),
+  /** contrast: half-filled circle */
+  contrast: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
+    </>
+  ),
+  /** brightness: small sun, no rays below */
+  brightness: (
+    <>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 3v3M12 18v3M3 12h3M18 12h3" />
+    </>
+  ),
+  /** saturation: droplet */
+  saturation: <path d="M12 3s6 6.4 6 10a6 6 0 0 1-12 0c0-3.6 6-10 6-10z" />,
+  /** gamma: a curve */
+  gamma: (
+    <>
+      <path d="M3 21V3M3 21h18" />
+      <path d="M3 18C9 18 12 6 21 6" />
+    </>
+  ),
+  /** temperature: thermometer-ish arrows, warm/cool */
+  whitebalance: (
+    <>
+      <circle cx="12" cy="12" r="5" />
+      <path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
+      <path d="M12 7a5 5 0 0 1 0 10z" fill="currentColor" stroke="none" />
+    </>
+  ),
+  /** lift: raise-the-floor arrow */
+  lift: (
+    <>
+      <path d="M3 21h18" />
+      <path d="M12 17V7M8 11l4-4 4 4" />
+    </>
+  ),
+  /** histogram */
+  histogram: <path d="M4 20V12M9 20V6M14 20V9M19 20V14" />,
   layers: (
     <>
       <path d="m12 2 10 5-10 5L2 7z" />

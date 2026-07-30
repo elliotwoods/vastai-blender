@@ -14,6 +14,7 @@ const ITEMS: Item[] = [
   { key: 'fleet', title: 'Fleet', glyph: '⬡', route: { screen: 'fleet' } },
   { key: 'jobs', title: 'Jobs', glyph: '☰', route: { screen: 'jobs' } },
   { key: 'gallery', title: 'Gallery', glyph: '▦', route: { screen: 'gallery' } },
+  { key: 'history', title: 'History', glyph: '◷', route: { screen: 'history' } },
   { key: 'settings', title: 'Settings', glyph: '⚙', route: { screen: 'settings' } }
 ]
 

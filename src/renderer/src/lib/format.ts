@@ -18,6 +18,13 @@ export function fmtEnergy(wh: number): string {
   return wh >= 1000 ? `${(wh / 1000).toFixed(2)} kWh` : `${wh.toFixed(0)} Wh`
 }
 
+/** Estimated emissions — grams below a kilo, kg to a tonne, then tonnes. */
+export function fmtCo2(grams: number): string {
+  if (grams >= 1_000_000) return `${(grams / 1_000_000).toFixed(2)} t CO₂e`
+  if (grams >= 1000) return `${(grams / 1000).toFixed(2)} kg CO₂e`
+  return `${grams.toFixed(0)} g CO₂e`
+}
+
 export function fmtFrames(done: number, total: number): string {
   return `${done.toLocaleString()} / ${total.toLocaleString()}`
 }

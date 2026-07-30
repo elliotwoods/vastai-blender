@@ -41,6 +41,14 @@ function JobRow({ job }: { job: JobSummary }): React.JSX.Element {
             {job.name || basename(job.blendPath)}
           </span>
           <span style={{ ...chip({ tone: 'accent' }), ...engineChipStyle }}>{job.engine}</span>
+          {job.shareNode ? (
+            <span
+              style={{ ...chip({ tone: 'neutral' }), ...engineChipStyle }}
+              title="May run alongside other renders on one node"
+            >
+              shared
+            </span>
+          ) : null}
           <span style={{ ...mono, fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
             {job.frameStart}–{job.frameEnd}
             {job.frameStep > 1 ? ` ×${job.frameStep}` : ''}

@@ -40,6 +40,7 @@ export function SubmitJobDialog({ onClose }: { onClose: () => void }): React.JSX
   const [frameEnd, setFrameEnd] = useState(250)
   const [frameStep, setFrameStep] = useState(1)
   const [chunkSize, setChunkSize] = useState<number | ''>('')
+  const [shareNode, setShareNode] = useState(false)
   const [selectedAddons, setSelectedAddons] = useState<Set<string>>(new Set())
   const [error, setError] = useState<string | null>(null)
 
@@ -56,7 +57,8 @@ export function SubmitJobDialog({ onClose }: { onClose: () => void }): React.JSX
           frameEnd,
           frameStep,
           addonIds: [...selectedAddons],
-          chunkSize: chunkSize === '' ? null : chunkSize
+          chunkSize: chunkSize === '' ? null : chunkSize,
+          shareNode
         })
       }
       onClose()
@@ -167,6 +169,26 @@ export function SubmitJobDialog({ onClose }: { onClose: () => void }): React.JSX
           <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
             frames per node chunk (auto recommended)
           </span>
+        </div>
+
+        <div style={{ ...row, alignItems: 'flex-start' }}>
+          <span style={label}>Share node</span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <label
+              style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: SCALE.textSm }}
+            >
+              <input
+                type="checkbox"
+                checked={shareNode}
+                onChange={(e) => setShareNode(e.target.checked)}
+              />
+              run alongside other renders
+            </label>
+            <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
+              For scenes that leave the node under-used — a long CPU step before each frame, say.
+              Off means one chunk per node. How many actually share is judged per node.
+            </span>
+          </div>
         </div>
 
         {(addons ?? []).length > 0 ? (

@@ -15,33 +15,28 @@ import { basename, fmtFrames, fmtMoney } from '../../lib/format'
 import { ipc } from '../../lib/ipc'
 import { useLogStore } from '../../lib/logStore'
 import { useNav } from '../../lib/nav'
-import { useJob } from '../../lib/queries'
-import { SCALE, STATUS_VARS, TOKENS, type StatusTone } from '../../lib/theme'
-import type { ChunkSnapshot, ChunkState } from '../../../../shared/models'
-
-const CHUNK_TONE: Record<ChunkState, StatusTone> = {
-  pending: 'queued',
-  assigned: 'queued',
-  rendering: 'running',
-  encoding: 'running',
-  downloading: 'running',
-  complete: 'done',
-  failed: 'error'
-}
+import { usePreview } from '../../lib/preview'
+import { useChunkProgress } from '../../lib/progressStore'
+import { useJob, useSetJobShareNode } from '../../lib/queries'
+import { CHUNK_TONE, SCALE, STATUS_VARS, TOKENS } from '../../lib/theme'
+import { Filmstrip } from '../../media/Filmstrip'
+import type { ChunkSnapshot } from '../../../../shared/models'
 
 function ChunkCell({ chunk }: { chunk: ChunkSnapshot }): React.JSX.Element {
-  const { navigate } = useNav()
+  const openPreview = usePreview((s) => s.open)
+  const live = useChunkProgress(chunk.id)
   const tone = STATUS_VARS[CHUNK_TONE[chunk.state]]
   const total = chunk.frameEnd - chunk.frameStart + 1
-  const pct = total > 0 ? Math.min(100, (chunk.framesDone / total) * 100) : 0
-  const clickable = chunk.state === 'complete'
+  // The DB column is a floor: it only moves when the poller writes it. Live
+  // progress leads it, so prefer whichever is further along.
+  const done = Math.max(chunk.framesDone, live?.framesDone ?? 0)
+  const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0
+  // Openable as soon as there is anything to see, not only when complete —
+  // watching a chunk render is the point of the live preview.
+  const clickable = done > 0 || chunk.state !== 'pending'
   return (
     <div
-      onClick={
-        clickable
-          ? () => navigate({ screen: 'gallery', jobId: chunk.jobId, chunkId: chunk.id })
-          : undefined
-      }
+      onClick={clickable ? () => openPreview({ jobId: chunk.jobId, chunkId: chunk.id }) : undefined}
       title={`${chunk.id}${chunk.nodeId ? ` on ${chunk.nodeId.slice(0, 8)}` : ''}${chunk.retries ? ` (retry ${chunk.retries})` : ''}`}
       style={{
         border: `1px solid ${tone.border}`,
@@ -183,6 +178,8 @@ function LogPanel({ nodeIds }: { nodeIds: string[] }): React.JSX.Element {
 export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element {
   const { data: job } = useJob(jobId)
   const { navigate } = useNav()
+  const setShare = useSetJobShareNode()
+  const openPreview = usePreview((s) => s.open)
 
   const nodeIds = useMemo(() => {
     const ids = new Set<string>()
@@ -239,6 +236,30 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
               </span>
             ) : null}
             {job ? <OpenInExplorerButton path={job.blendPath} /> : null}
+            {job ? (
+              <label
+                title={
+                  'Let this job run alongside other renders on one node. Takes effect for chunks ' +
+                  'not yet assigned — anything already rendering keeps its current placement.'
+                }
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 5,
+                  fontSize: SCALE.textXs,
+                  color: TOKENS.textMuted,
+                  cursor: setShare.isPending ? 'wait' : 'pointer'
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={job.shareNode}
+                  disabled={setShare.isPending}
+                  onChange={(e) => setShare.mutate({ jobId, shareNode: e.target.checked })}
+                />
+                share node
+              </label>
+            ) : null}
           </>
         }
       />
@@ -254,6 +275,27 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
             minHeight: 0
           }}
         >
+          {job ? (
+            <>
+              <span style={sectionLabel()}>frames</span>
+              <div style={{ ...panel(), padding: SCALE.space2 }}>
+                <Filmstrip
+                  jobId={jobId}
+                  frameStart={job.frameStart}
+                  frameEnd={job.frameEnd}
+                  frameStep={job.frameStep}
+                  chunks={job.chunks}
+                  onSelect={(frame) => {
+                    const owner = job.chunks.find(
+                      (c) => frame >= c.frameStart && frame <= c.frameEnd
+                    )
+                    if (owner) openPreview({ jobId, chunkId: owner.id, frame })
+                  }}
+                />
+              </div>
+            </>
+          ) : null}
+
           <span style={sectionLabel()}>chunks</span>
           <div
             style={{

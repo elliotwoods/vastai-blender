@@ -32,6 +32,7 @@ interface JobRow {
   output_dir: string
   cost_so_far: number
   submitted_at: number
+  share_node: number
 }
 
 interface ChunkRow {
@@ -69,7 +70,8 @@ function rowToSummary(r: JobRow): JobSummary {
     costSoFar: r.cost_so_far,
     submittedAt: r.submitted_at,
     outputDir: r.output_dir,
-    blenderVersion: r.blender_version
+    blenderVersion: r.blender_version,
+    shareNode: r.share_node === 1
   }
 }
 
@@ -109,6 +111,36 @@ export function emitJobChanged(jobId: string): void {
   if (row) emit('job:changed', rowToSummary(row))
 }
 
+/**
+ * Announce a chunk's lifecycle change, re-reading the row so the payload is
+ * whatever actually landed rather than what the caller believed it wrote.
+ *
+ * Every chunk state write must go through here. There are eight of them across
+ * scheduler.ts (dispatch, the render/encode/download transitions, finish,
+ * restart recovery, requeue, cancel) and index.ts (the VR_JOB_SPEC revive), and
+ * `requeue()` in particular INSERTs brand-new `-rN` rows mid-render — a
+ * consumer that only heard about ChunkRun's own writes would keep showing
+ * requeued chunks as live and never learn the retry ids exist.
+ */
+export function emitChunkChanged(chunkId: string): void {
+  const row = getDb()
+    .prepare('SELECT id, job_id, node_id, state FROM chunks WHERE id = ?')
+    .get(chunkId) as
+    { id: string; job_id: string; node_id: string | null; state: ChunkState } | undefined
+  if (!row) return
+  emit('chunk:changed', {
+    chunkId: row.id,
+    jobId: row.job_id,
+    nodeId: row.node_id,
+    state: row.state
+  })
+}
+
+/** Bulk variant for the statements that touch many rows at once. */
+export function emitChunksChanged(chunkIds: readonly string[]): void {
+  for (const id of chunkIds) emitChunkChanged(id)
+}
+
 /** Create job + chunks + frame rows; returns the job id. */
 export async function createJob(sub: JobSubmission): Promise<string> {
   const settings = getSettings()
@@ -131,8 +163,9 @@ export async function createJob(sub: JobSubmission): Promise<string> {
   const insertAll = db.transaction(() => {
     db.prepare(
       `INSERT INTO jobs (id, name, blend_path, engine, frame_start, frame_end, frame_step,
-                         state, blender_version, addon_ids, chunk_size, output_dir, cost_so_far, submitted_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?)`
+                         state, blender_version, addon_ids, chunk_size, output_dir, cost_so_far, submitted_at,
+                         share_node)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?, ?)`
     ).run(
       id,
       name,
@@ -145,7 +178,8 @@ export async function createJob(sub: JobSubmission): Promise<string> {
       JSON.stringify(sub.addonIds),
       sub.chunkSize,
       outputDir,
-      Date.now()
+      Date.now(),
+      sub.shareNode ? 1 : 0
     )
     const insChunk = db.prepare(
       `INSERT INTO chunks (id, job_id, frame_start, frame_end, state, frames_done, retries)
@@ -163,6 +197,21 @@ export async function createJob(sub: JobSubmission): Promise<string> {
   insertAll()
   emitJobChanged(id)
   return id
+}
+
+/**
+ * Toggle whether a job's chunks may share a node.
+ *
+ * Applies to future assignments only — chunks already dispatched keep the
+ * placement they were given, because moving a render mid-flight would throw
+ * away its progress. Turning sharing OFF therefore takes effect as the
+ * currently co-running chunks finish.
+ */
+export function setJobShareNode(jobId: string, shareNode: boolean): void {
+  getDb()
+    .prepare('UPDATE jobs SET share_node = ? WHERE id = ?')
+    .run(shareNode ? 1 : 0, jobId)
+  emitJobChanged(jobId)
 }
 
 /** Recompute a job's state from its chunks; emits on change. */

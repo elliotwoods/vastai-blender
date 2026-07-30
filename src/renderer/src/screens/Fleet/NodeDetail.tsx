@@ -3,23 +3,33 @@
  * panel. Five live gauges (%GPU, %VRAM, %CPU, %RAM, temp), the money strip,
  * what it is rendering right now, its capabilities, and the console tail.
  *
- * Everything here comes from the NodeSnapshot the row already has, plus the
- * jobs list (to turn `currentChunkId` into a clickable job).
+ * Everything here comes from the NodeSnapshot the row already has, except the
+ * workload panel, which fetches the node→chunk→job join it needs (NodeWorkload).
  */
 
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { Icon, type IconName } from '../../components/Icon'
+import { InfoHint } from '../../components/Tooltip'
 import { btn, logLine, mono, sectionLabel } from '../../lib/controls'
-import { fmtDuration, fmtEnergy, fmtMoney, fmtRate, fmtTimeAgo, fmtWatts } from '../../lib/format'
+import { HINTS } from '../../lib/hints'
+import { compareCo2 } from '../../lib/co2'
+import {
+  fmtCo2,
+  fmtDuration,
+  fmtEnergy,
+  fmtMoney,
+  fmtRate,
+  fmtTimeAgo,
+  fmtWatts
+} from '../../lib/format'
 import { ipc } from '../../lib/ipc'
 import { NO_LINES, useLogStore } from '../../lib/logStore'
-import { useNav } from '../../lib/nav'
-import { useJobs } from '../../lib/queries'
 import { SCALE, TOKENS } from '../../lib/theme'
 import { useNow } from '../../lib/useNow'
 import { TONE_COLOR, pctOf, usageTone, type Tone } from '../../lib/usage'
 import { Meter } from './meters'
-import type { JobSummary, NodeSnapshot } from '../../../../shared/models'
+import { NodeWorkload } from './NodeWorkload'
+import type { NodeSnapshot } from '../../../../shared/models'
 
 const card: CSSProperties = {
   flex: '1 1 150px',
@@ -80,17 +90,22 @@ function Gauge({
   )
 }
 
-/** Icon + label + value, used for the identity and money strips. */
+/**
+ * Icon + label + value, used for the identity and money strips. `hint` adds an
+ * ⓘ after the label for figures that need explaining (see lib/hints.ts).
+ */
 function Fact({
   icon,
   label,
   children,
-  color
+  color,
+  hint
 }: {
   icon: IconName
   label: string
   children: ReactNode
   color?: string
+  hint?: string
 }): React.JSX.Element {
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
@@ -98,6 +113,7 @@ function Fact({
         <Icon name={icon} size={13} />
       </span>
       <span style={{ ...sectionLabel(), fontSize: SCALE.text2xs }}>{label}</span>
+      {hint ? <InfoHint text={hint} /> : null}
       <span
         style={{
           ...mono,
@@ -161,37 +177,48 @@ function pct(value: number | null): string {
   return value == null ? '—' : `${value.toFixed(0)}%`
 }
 
-/** `currentChunkId` is `${jobId.slice(0,8)}-${start}-${end}` (see jobs.ts). */
-function resolveChunk(
-  chunkId: string | null,
-  jobs: JobSummary[] | undefined
-): { job: JobSummary | null; frames: string | null } {
-  if (!chunkId) return { job: null, frames: null }
-  const m = /^(.{8})-(\d+)-(\d+)$/.exec(chunkId)
-  if (!m) return { job: null, frames: null }
-  return {
-    job: (jobs ?? []).find((j) => j.id.startsWith(m[1])) ?? null,
-    frames: `${m[2]}–${m[3]}`
-  }
-}
-
 export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element {
   const lines = useLogStore((s) => s.byNode[node.id] ?? NO_LINES)
-  const { data: jobs } = useJobs()
-  const { navigate } = useNav()
   const now = useNow(10_000)
   const [flash, setFlash] = useState<string | null>(null)
+  const [consoleFlash, setConsoleFlash] = useState<string | null>(null)
+  const [hasSelection, setHasSelection] = useState(false)
   const logRef = useRef<HTMLDivElement>(null)
 
-  // Keep the console pinned to the newest line while the panel is open.
+  // Keep the console pinned to the newest line while the panel is open — but
+  // not while the user is holding a selection in it, or autoscroll would yank
+  // the text out from under them mid-drag.
   useEffect(() => {
     const el = logRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [lines.length])
+    if (el && !hasSelection) el.scrollTop = el.scrollHeight
+  }, [lines.length, hasSelection])
+
+  // `body` sets `user-select: none` app-wide, so the console opts back in (see
+  // the panel style below). Track whether the live selection is inside THIS
+  // node's console, to label the copy button and pause autoscroll.
+  useEffect(() => {
+    const onSelectionChange = (): void => {
+      const sel = window.getSelection()
+      const anchor = sel?.anchorNode ?? null
+      setHasSelection(!!sel && !sel.isCollapsed && !!anchor && !!logRef.current?.contains(anchor))
+    }
+    document.addEventListener('selectionchange', onSelectionChange)
+    return () => document.removeEventListener('selectionchange', onSelectionChange)
+  }, [])
 
   const say = (msg: string): void => {
     setFlash(msg)
     setTimeout(() => setFlash(null), 2200)
+  }
+
+  /**
+   * Console feedback goes beside the copy button, not through `say` — the
+   * identity strip's flash is at the top of a tall panel, so a confirmation
+   * for a control down at the console would land off-screen.
+   */
+  const sayConsole = (msg: string): void => {
+    setConsoleFlash(msg)
+    setTimeout(() => setConsoleFlash(null), 2200)
   }
 
   const copySsh = async (): Promise<void> => {
@@ -199,6 +226,22 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
     if (!info) return say('no ssh endpoint yet')
     await ipc.invoke('clipboard:write', info.command)
     say('ssh command copied')
+  }
+
+  /**
+   * With a highlighted range, copies just that; otherwise the whole retained
+   * buffer (logStore keeps 5000/node), not merely the last 200 the panel
+   * renders — the interesting line is usually scrolled off.
+   */
+  const copyConsole = async (): Promise<void> => {
+    const picked = hasSelection ? (window.getSelection()?.toString() ?? '') : ''
+    if (picked) {
+      await ipc.invoke('clipboard:write', picked)
+      return sayConsole('selection copied')
+    }
+    if (!lines.length) return sayConsole('nothing to copy yet')
+    await ipc.invoke('clipboard:write', lines.map((l) => l.line).join('\n'))
+    sayConsole(`${lines.length} lines copied`)
   }
 
   const openShell = async (): Promise<void> => {
@@ -223,7 +266,6 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
         : 'normal'
   const uptimeMs = node.startedAt ? now - node.startedAt : 0
   const burn = uptimeMs > 3 * 60_000 ? node.accumulatedCost / (uptimeMs / 3_600_000) : null
-  const { job, frames } = resolveChunk(node.currentChunkId, jobs)
 
   return (
     <div
@@ -365,41 +407,36 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
           gap: `6px ${SCALE.space4}`
         }}
       >
-        <Fact icon="dollar" label="rate">
+        <Fact icon="dollar" label="rate" hint={HINTS.rate}>
           {node.dphTotal != null ? fmtRate(node.dphTotal) : '—'}
         </Fact>
-        <Fact icon="cost" label="spent" color={TOKENS.text}>
+        <Fact icon="cost" label="spent" color={TOKENS.text} hint={HINTS.spent}>
           {fmtMoney(node.accumulatedCost)}
         </Fact>
-        <Fact icon="battery" label="energy" color={node.energyWh > 0 ? TOKENS.text : undefined}>
+        <Fact
+          icon="battery"
+          label="energy"
+          color={node.energyWh > 0 ? TOKENS.text : undefined}
+          hint={
+            node.co2g > 0
+              ? `${HINTS.energy}\n\n${fmtCo2(node.co2g)} — ${compareCo2(node.co2g)}\nGrid: ${node.geolocation ?? 'location not recorded, world average used'}.\n\n${HINTS.co2}`
+              : HINTS.energy
+          }
+        >
           {fmtEnergy(node.energyWh)}
         </Fact>
         {burn != null ? (
-          <Fact icon="activity" label="actual">
+          <Fact icon="activity" label="actual" hint={HINTS.actual}>
             {fmtRate(burn)}
           </Fact>
         ) : null}
-        <Fact icon="clock" label="uptime">
+        <Fact icon="clock" label="uptime" hint={HINTS.uptime}>
           {node.startedAt ? fmtDuration(uptimeMs) : '—'}
         </Fact>
-        <span style={separator} />
-        <Fact icon="layers" label="chunk" color={node.currentChunkId ? TOKENS.text : undefined}>
-          {node.currentChunkId ? (frames ? `frames ${frames}` : node.currentChunkId) : 'idle'}
-        </Fact>
-        {job ? (
-          <button
-            style={{
-              ...btn({ variant: 'ghost', size: 'sm' }),
-              color: TOKENS.accent,
-              padding: '2px 6px'
-            }}
-            onClick={() => navigate({ screen: 'job', jobId: job.id })}
-          >
-            {job.name}
-            <Icon name="external" size={11} />
-          </button>
-        ) : null}
       </div>
+
+      {/* -- workload ------------------------------------------------------- */}
+      <NodeWorkload node={node} />
 
       {/* -- capabilities --------------------------------------------------- */}
       <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: SCALE.space2 }}>
@@ -471,6 +508,27 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
           <span style={{ ...mono, color: TOKENS.textDisabled }}>
             {lines.length ? `${lines.length} lines` : ''}
           </span>
+          <span style={{ flex: 1 }} />
+          {consoleFlash ? (
+            <span style={{ fontSize: SCALE.text2xs, color: TOKENS.accent }}>{consoleFlash}</span>
+          ) : null}
+          {lines.length ? (
+            <button
+              title={
+                hasSelection
+                  ? 'Copy the highlighted text (Ctrl+C works too)'
+                  : `Copy all ${lines.length} captured lines to the clipboard (the panel only shows the last 200). Select text to copy just part of it.`
+              }
+              style={{
+                ...btn({ variant: hasSelection ? 'default' : 'ghost', size: 'sm' }),
+                padding: '2px 6px'
+              }}
+              onClick={() => void copyConsole()}
+            >
+              <Icon name="copy" size={11} />
+              {hasSelection ? 'copy selection' : 'copy'}
+            </button>
+          ) : null}
         </div>
         <div
           ref={logRef}
@@ -480,7 +538,11 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
             borderRadius: SCALE.radiusSm,
             padding: SCALE.space2,
             maxHeight: 180,
-            overflow: 'auto'
+            overflow: 'auto',
+            // Opt out of the app-wide `user-select: none` (base.css): log text
+            // is the one thing here people genuinely need to lift out.
+            userSelect: 'text',
+            cursor: 'text'
           }}
         >
           {lines.length === 0 ? (

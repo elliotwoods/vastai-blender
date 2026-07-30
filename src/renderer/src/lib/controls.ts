@@ -260,16 +260,25 @@ export function sectionLabel(): CSSProperties {
   }
 }
 
-/** Job / node table row. */
-export function tableRow(opts: { selected?: boolean; clickable?: boolean } = {}): CSSProperties {
-  const { selected = false, clickable = false } = opts
+/**
+ * Job / node table row. `expanded` hides the divider and darkens the row so it
+ * reads as one block with the detail panel below it.
+ */
+export function tableRow(
+  opts: { selected?: boolean; clickable?: boolean; expanded?: boolean } = {}
+): CSSProperties {
+  const { selected = false, clickable = false, expanded = false } = opts
   return {
     display: 'flex',
     alignItems: 'center',
     gap: SCALE.space3,
     padding: '8px 12px',
-    borderBottom: `1px solid ${TOKENS.border}`,
-    background: selected ? TOKENS.accentSoftBg : 'transparent',
+    // Always one shorthand carrying a colour — never let a caller layer the
+    // `borderBottomColor` longhand on top. React's style diff clears the
+    // longhand on the way back but skips the unchanged shorthand, leaving the
+    // border to fall through to currentColor (a white line under the row).
+    borderBottom: `1px solid ${expanded ? 'transparent' : TOKENS.border}`,
+    background: expanded ? TOKENS.surface : selected ? TOKENS.accentSoftBg : 'transparent',
     cursor: clickable ? 'pointer' : 'default',
     transition: 'background 120ms'
   }

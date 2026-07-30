@@ -39,7 +39,13 @@ function defaults(): SettingsFile {
       offerFilters: DEFAULT_FILTERS,
       sshKeyPath: '',
       concurrentTransfersPerNode: 3,
-      nodeSlots: 1
+      thumbnails: true,
+      livePreview: 'onDemand',
+      livePreviewWidth: 960,
+      maxNodeSlots: 0,
+      eagerFleet: false,
+      // ~1.6x GPU draw covers host CPU/RAM/PSU plus a typical datacentre PUE.
+      co2OverheadFactor: 1.6
     },
     secrets: {}
   }
@@ -67,10 +73,26 @@ function load(): SettingsFile {
   } catch {
     cache = defaults()
   }
+  migrateNodeSlots(cache.public)
   // The has* flags are derived, never trusted from disk.
   cache.public.hasVastApiKey = !!cache.secrets.vastApiKey
   cache.public.hasOtoyCredentials = !!cache.secrets.otoyUsername && !!cache.secrets.otoyPassword
   return cache
+}
+
+/**
+ * `nodeSlots` (a literal slot count applied to every node) became
+ * `maxNodeSlots` (an upper bound on the per-node auto-judged count).
+ *
+ * A value above 1 was a deliberate choice to run concurrently, so it carries
+ * over as the cap. A persisted 1 was merely the old default and must NOT
+ * become `maxNodeSlots: 1` — that would pin every node to a single slot and
+ * silently disable node sharing for everyone upgrading.
+ */
+function migrateNodeSlots(pub: SettingsPublic & { nodeSlots?: number }): void {
+  if (pub.nodeSlots == null) return
+  if (pub.nodeSlots > 1 && !pub.maxNodeSlots) pub.maxNodeSlots = pub.nodeSlots
+  delete pub.nodeSlots
 }
 
 function persist(): void {
