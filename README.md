@@ -20,8 +20,12 @@ gauges, ssh access, what it's rendering, and its console.*
 
 - **Fleet rendering** — set a max node count and a spend cap; jobs are split
   into frame chunks and distributed. Failed machines are replaced and only
-  missing frames re-render. `nodeSlots` (Settings) runs several Blender
-  processes per node for scenes that don't saturate a GPU on their own.
+  missing frames re-render.
+- **Node sharing** — tick *Share node* on a job whose renders leave the
+  machine under-used (a long CPU step before each frame, say) and its chunks
+  run alongside other renders instead of taking a whole node each. The app
+  measures throughput per node and tunes the number of concurrent renders on
+  its own; *Max render slots per node* in Settings caps it if you want.
 - **Engines** — Cycles (OptiX/CUDA, all GPUs), EEVEE (per-node capability
   probe), Octane (see `docs/OCTANE.md`).
 - **Automatic Blender version matching** — the app reads each `.blend`'s
@@ -73,7 +77,8 @@ was interrupted — see `docs/hdr-notes.md` for the manual fix.
    with your OS user credentials (DPAPI on Windows). An SSH keypair is
    generated on first use and registered with your Vast.ai account.
 2. **Settings → General** — set the project root (where renders land), max
-   active nodes, spend cap ($/hr), idle timeout, and render slots per node.
+   active nodes, spend cap ($/hr), idle timeout, and (optionally) a cap on
+   render slots per node — leave it blank to let the app judge concurrency.
 3. **Settings → Offer filters** — GPU allowlist, max $/hr, minimum
    VRAM/network/reliability. Turn on *CPU-bound* for scenes whose frame time
    is dominated by CPU work, so ranking stops favouring premium datacenter
@@ -126,7 +131,8 @@ at boot:
   "addonZips": ["C:/addons/auroravision-0.2.0.zip"],
   "chunkSize": null,
   "maxActiveNodes": 4,
-  "nodeSlots": 2,
+  "shareNode": true, // let these jobs co-run on a node (per-blend override too)
+  "maxNodeSlots": 0, // 0/omitted = the app decides concurrency per node
   "spendCapPerHour": 2,
   "offerFilters": { "cpuBound": true }
 }
@@ -145,10 +151,22 @@ Other environment switches (development aids):
 | Variable | Effect |
 | --- | --- |
 | `VR_MOCK=1` | Serve mock nodes/jobs to the UI — no Vast.ai calls |
-| `VR_SCREEN=jobs` | Open on a given screen (`fleet`, `jobs`, `gallery`, `settings`) |
+| `VR_SCREEN=jobs` | Open on a given screen (`fleet`, `jobs`, `job`, `gallery`, `history`, `settings`, `gradelab`) |
 | `VR_SHOT=out.png` | Capture the window after load (`VR_SHOT_DELAY` ms, default 6000) |
 | `VR_USERDATA=dir` | Use a throwaway profile (own settings, own SQLite state) |
 | `VR_E2E_BLEND=x.blend` | Single-blend end-to-end test run |
+
+`VR_SCREEN` is appended to the dev-server URL verbatim, so it can carry the
+screens' own parameters: `history&metric=power&range=7d`,
+`settings&section=general`, `job&jobId=<id>`, `gallery&jobId=<id>&chunkId=<id>`,
+`fleet&expand=1`, and `job&jobId=<id>&preview=<chunkId>&frame=<n>` to open the
+preview overlay (otherwise only reachable by clicking, so uncapturable in a
+scripted run). `gradelab&run=1` runs the grade-parity sweep and prints its result.
+
+`VR_USERDATA` must be a **non-empty** path — an empty value falls back to the real
+profile. On Windows, copy `Local State` from the real profile into a throwaway one
+if you need the stored API key to decrypt there: Chromium keeps the `safeStorage`
+key in that file, DPAPI-wrapped.
 
 ## How machines are chosen
 
@@ -168,6 +186,8 @@ in Settings → Offer filters.
 - `src/shared` — the typed IPC contract shared by both.
 - `remote/` — scripts that run **on the nodes** (provisioning, render agent,
   preview encoder). Uploaded verbatim over SFTP; stdlib Python + bash only.
+  `npm test` cannot reach these, so `python3 remote/agent/selfcheck.py` covers the
+  agent behaviour that is easiest to get wrong.
 - `docs/` — setup notes, Octane specifics, HDR/codec findings, screenshots.
 
 ## Notes
@@ -178,8 +198,10 @@ in Settings → Offer filters.
 - Blender 5.x defaults to a Vulkan GPU backend; provisioning installs the
   Vulkan loader and the EEVEE probe falls back to OpenGL when Vulkan is
   unavailable on a node.
-- Energy (Wh) is a session figure held in memory; costs are persisted in
-  SQLite.
+- Spend, energy (Wh), GPU draw and fleet size are metered once a minute and
+  persisted in SQLite, so the History screen survives a restart. Everything there
+  is what this app observed **while running** — it never reads back Vast.ai's
+  billing, so totals read low for any period the app was closed.
 - Versioning and release notes: see [CHANGELOG.md](CHANGELOG.md).
 - License: this repo previously bundled a GPL-licensed Dropbox uploader,
   which set the repo license; that bundle is gone, so the license can now be
