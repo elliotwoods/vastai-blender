@@ -15,7 +15,7 @@ import { isInside, resolveInside } from '../paths'
 import { getSettings } from '../settings'
 import { downloadFileVerified } from '../ssh/sftp'
 import type { SshConnection } from '../ssh/sshConnection'
-import { parseManifest, type ManifestEntry, type ManifestReject } from './manifest'
+import { parseFrameName, parseManifest, type ManifestEntry, type ManifestReject } from './manifest'
 
 const POLL_MS = 5_000
 
@@ -92,6 +92,12 @@ export class ChunkDownloader {
   /** Frames this downloader gave up on permanently. See drain(). */
   private lostFrames = new Set<string>()
 
+  /**
+   * Files landed for frames saved one file per view (0042_L.png, 0042_R.png):
+   * frame → view suffix → the file. See settleViewFrames.
+   */
+  private viewFrames = new Map<number, Map<string, { path: string; size: number }>>()
+
   /** Resolves when stop() is called; polls + downloads in the background. */
   start(): void {
     void this.poll()
@@ -123,6 +129,9 @@ export class ChunkDownloader {
    * Only frames count. A missing thumbnail or preview clip is cosmetic and is
    * not worth re-rendering a chunk over.
    *
+   * After a final read that worked, it also marks the frames saved one file
+   * per view whose views have all landed (settleViewFrames).
+   *
    * A downloader stopped mid-drain (its run was cancelled or its node went
    * away) returns at once, and the result is meaningless: the caller no longer
    * owns the chunk and must not act on it.
@@ -130,6 +139,7 @@ export class ChunkDownloader {
   async drain(budgetMs = DRAIN_BUDGET_MS): Promise<DrainResult> {
     const deadline = Date.now() + budgetMs
     let manifestRead = false
+    let timedOut = false
     for (let attempt = 1; ; attempt++) {
       manifestRead = (await this.poll()).ok
       if (manifestRead || this.stopped || attempt >= FINAL_READ_ATTEMPTS) break
@@ -145,6 +155,7 @@ export class ChunkDownloader {
         // Give up on whatever is left. Frames count as lost (the caller
         // re-renders them); previews do not matter enough to hold a node.
         const left = [...this.queue, ...this.active, ...this.retrying]
+        timedOut = true
         this.stop()
         for (const e of left) if (e.kind === 'frame') this.lostFrames.add(e.file)
         emit('alert', {
@@ -155,7 +166,39 @@ export class ChunkDownloader {
       }
       await new Promise((r) => setTimeout(r, 250))
     }
+    // Stopped by the caller, not by the deadline: the chunk is no longer ours.
+    if (manifestRead && (!this.stopped || timedOut)) this.settleViewFrames()
     return { manifestRead, lost: [...this.lostFrames] }
+  }
+
+  /**
+   * Mark downloaded the frames saved one file per view whose every view has
+   * landed.
+   *
+   * These are not marked as each file lands, the way a one-file frame is.
+   * Nothing says how many views a frame has, so its first view would read as
+   * the whole frame, and a requeue after the other was lost, or never even
+   * listed (a node that died, a final read that failed), would leave the
+   * frame one view short for good. Here, after a final read that worked, a
+   * frame's views are every suffix any frame of this chunk landed with. That
+   * is at least two, since Blender adds a suffix only when there are two
+   * views or more, so a lone suffix means the other view reached us for no
+   * frame at all, and nothing is marked. A frame left unmarked renders again.
+   */
+  private settleViewFrames(): void {
+    const views = new Set<string>()
+    for (const landed of this.viewFrames.values()) for (const v of landed.keys()) views.add(v)
+    if (views.size < 2) return
+    const mark = getDb().prepare(
+      `UPDATE frames SET state='downloaded', local_path=?, size_bytes=? WHERE job_id=? AND frame=?`
+    )
+    for (const [frame, landed] of this.viewFrames) {
+      if (landed.size < views.size) continue
+      // One file stands for the frame, as for any other: the first view's.
+      const first = [...landed.keys()].sort()[0]
+      const file = landed.get(first)!
+      mark.run(file.path, file.size, this.target.jobId, frame)
+    }
   }
 
   /**
@@ -361,11 +404,17 @@ export class ChunkDownloader {
 
     const db = getDb()
     if (entry.kind === 'frame') {
-      const frame = frameNumberFromName(entry.file)
-      if (frame != null) {
+      const name = parseFrameName(entry.file)
+      const frame = name?.frame ?? null
+      if (name && name.view === '') {
         db.prepare(
           `UPDATE frames SET state='downloaded', local_path=?, size_bytes=? WHERE job_id=? AND frame=?`
-        ).run(localPath, entry.size, jobId, frame)
+        ).run(localPath, entry.size, jobId, name.frame)
+      } else if (name) {
+        // One view of several: the frame is marked by settleViewFrames.
+        const landed = this.viewFrames.get(name.frame) ?? new Map()
+        landed.set(name.view, { path: localPath, size: entry.size })
+        this.viewFrames.set(name.frame, landed)
       }
       db.prepare(
         `INSERT OR IGNORE INTO assets (job_id, chunk_id, kind, abs_path, created_at) VALUES (?, ?, 'frame', ?, ?)`
@@ -379,7 +428,7 @@ export class ChunkDownloader {
       // Deliberately NOT an `assets` row: that would be ~2000 rows per job in
       // a table assets:index scans whole, for something the frames table
       // already has a row for.
-      const frame = entry.meta.frame ?? frameNumberFromName(entry.file)
+      const frame = entry.meta.frame ?? parseFrameName(entry.file)?.frame ?? null
       if (frame != null) {
         db.prepare(`UPDATE frames SET thumb_path=? WHERE job_id=? AND frame=?`).run(
           localPath,
@@ -499,9 +548,4 @@ export function unlinkLater(paths: string[], delayMs = 30_000): void {
       rm(p, { force: true }).catch(() => {})
     }
   }, delayMs).unref?.()
-}
-
-function frameNumberFromName(file: string): number | null {
-  const m = /(\d+)\.\w+$/.exec(file)
-  return m ? parseInt(m[1], 10) : null
 }

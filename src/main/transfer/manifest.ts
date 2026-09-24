@@ -76,12 +76,28 @@ export interface ParsedManifest {
  * character, a backslash or a drive letter in the first place.
  */
 const FILE_PATTERNS: Record<ManifestEntry['kind'], RegExp> = {
-  // `-o frames/####`: the zero-padded frame number and the format's extension.
-  frame: /^frames\/\d{1,9}\.[A-Za-z0-9]{1,8}$/,
-  // Named after the frame's stem (PreviewWorker._one).
-  thumb: /^thumbs\/\d{1,9}\.jpg$/,
+  // Whatever Blender printed "Saved:" for under `-o frames/####` (FrameTracker
+  // lists it as-is): the zero-padded frame number, then the view suffix of a
+  // stereo or multiview scene that saves each view to its own file (Views
+  // Format 'Individual': `_L` and `_R` by default, or whatever a view is set
+  // to), then the format's extension, which a scene with File Extensions off
+  // leaves out. 0042.exr, 0042_L.png, 0042. The suffix may not start with a
+  // digit, or it would run on into the frame number, nor hold a dot.
+  frame: /^frames\/(\d{1,9})([A-Za-z_-][A-Za-z0-9_-]{0,62})?(?:\.[A-Za-z0-9]{1,8})?$/,
+  // Named after the frame's stem (PreviewWorker._one): 0042.jpg, 0042_L.jpg.
+  thumb: /^thumbs\/(\d{1,9})([A-Za-z_-][A-Za-z0-9_-]{0,62})?\.jpg$/,
   // <chunkId>_{sdr,hdr,proxy}.mp4 and <chunkId>_live_<runToken>_<NNNN>.mp4.
   clip: /^previews\/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\.mp4$/
+}
+
+/**
+ * The frame a frame or thumbnail name is for, and its view suffix ('' for a
+ * frame saved as one file): `frames/0042_L.png` is frame 42, view `_L`. Null
+ * for any other name.
+ */
+export function parseFrameName(file: string): { frame: number; view: string } | null {
+  const m = FILE_PATTERNS.frame.exec(file) ?? FILE_PATTERNS.thumb.exec(file)
+  return m ? { frame: parseInt(m[1], 10), view: m[2] ?? '' } : null
 }
 
 const MiB = 1024 ** 2
@@ -165,8 +181,9 @@ function validate(e: Json, kind: ManifestEntry['kind']): ManifestEntry | string 
 
   if (kind === 'thumb') {
     // The downloader files a thumbnail under meta.frame. The agent reports the
-    // stem's number, so anything else would attach it to some other frame.
-    const stem = Number(file.slice('thumbs/'.length, -'.jpg'.length))
+    // stem's number (null for a view's, which int() cannot read), so anything
+    // else would attach it to some other frame.
+    const stem = parseFrameName(file)!.frame
     if (meta.frame !== null && meta.frame !== stem) return 'meta.frame does not match the name'
     if (!isCount(meta.width)) return 'bad meta.width'
     return { kind, ...base, meta: { frame: meta.frame === null ? null : stem, width: meta.width } }

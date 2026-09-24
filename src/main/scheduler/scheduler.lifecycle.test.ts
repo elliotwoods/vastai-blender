@@ -1,4 +1,6 @@
+import { createHash } from 'crypto'
 import { afterEach, describe, expect, it } from 'vitest'
+import { REMOTE_ROOT } from '../test/fakeSsh'
 import { setup, type AgentSpec, type App, type FakeMachine, type World } from '../test/harness'
 
 // Chunk ownership and completion, end to end on the lifecycle harness: a run
@@ -71,6 +73,22 @@ function cat(machine: FakeMachine, command: string): { code: number; stdout: str
 }
 
 const manifestRead = /^cat '[^']*\/manifest\.jsonl'/
+
+/** Save a file on the node and list it in the chunk's manifest, as noderunner does. */
+function listSaved(machine: FakeMachine, chunkId: string, file: string): void {
+  const dir = `${REMOTE_ROOT}/renders/${chunkId}`
+  const data = Buffer.from(`fake render ${chunkId} ${file}\n`, 'utf-8')
+  machine.files.set(`${dir}/${file}`, data)
+  const line = JSON.stringify({
+    kind: 'frame',
+    file,
+    size: data.length,
+    sha256: createHash('sha256').update(data).digest('hex'),
+    mtime: 1
+  })
+  const prev = machine.files.get(`${dir}/manifest.jsonl`)?.toString('utf-8') ?? ''
+  machine.files.set(`${dir}/manifest.jsonl`, Buffer.from(`${prev}${line}\n`, 'utf-8'))
+}
 
 async function oneNode(): Promise<{ app: App; nodeId: string; machine: FakeMachine }> {
   w = await setup({ settings: { maxActiveNodes: 1 } })
@@ -261,5 +279,32 @@ describe('completion means downloaded', () => {
     app.jobs.refreshJobState(jobId)
     expect(jobState(jobId)).toBe('complete')
     expect(w.eventsOf('job:changed').at(-1)).toMatchObject({ id: jobId, state: 'complete' })
+  })
+})
+
+describe('what Blender saves', () => {
+  it('a stereo scene saving each view to its own file completes, with no refusal and no retry', async () => {
+    // Views Format 'Individual': Blender saves 0001_L.png and 0001_R.png, and
+    // the agent lists both. Refusing them failed every chunk, and each retry
+    // rendered the whole chunk again.
+    const { app, machine } = await oneNode()
+    machine.onSpec = (spec) => {
+      for (let f = spec.frameStart; f <= spec.frameEnd; f += spec.frameStep) {
+        for (const view of ['_L', '_R']) {
+          listSaved(machine, spec.chunkId, `frames/${String(f).padStart(4, '0')}${view}.png`)
+        }
+      }
+      machine.agent.finish(spec.chunkId, { frames: [] })
+    }
+    const jobId = await w.submitJob(app)
+    const chunk = onlyChunk(jobId)
+    app.scheduler.kick()
+
+    await w.until(() => ['complete', 'partial'].includes(jobState(jobId) ?? ''), 'job settled')
+
+    expect(jobState(jobId)).toBe('complete')
+    expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
+    expect(chunkRow(chunk.id).retries).toBe(0)
+    expect(w.alerts('error')).toEqual([])
   })
 })

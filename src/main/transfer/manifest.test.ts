@@ -4,7 +4,7 @@ import { join, resolve, sep } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { REMOTE_ROOT, type FakeMachine } from '../test/fakeSsh'
 import { setup, type World } from '../test/harness'
-import { parseManifest, type ParsedManifest } from './manifest'
+import { parseFrameName, parseManifest, type ParsedManifest } from './manifest'
 
 const HASH = 'a'.repeat(64)
 
@@ -109,6 +109,48 @@ describe('parseManifest', () => {
     expect(out[0].kind === 'thumb' && out[0].meta.frame).toBe(42)
   })
 
+  // Everything Blender prints "Saved:" for under `-o frames/####`, which the
+  // agent lists as-is. Refusing any of these made every chunk of such a scene
+  // fail and re-render in full, retry after retry: GPU hours for nothing.
+  it.each([
+    // Stereo or multiview, Views Format 'Individual': one file per view.
+    ['frames/0042_L.png'],
+    ['frames/0042_R.png'],
+    ['frames/0042_R.exr'],
+    ['frames/0042_cam-2.png'],
+    ['frames/0042L.png'],
+    // File Extensions off.
+    ['frames/0042'],
+    ['frames/0042_L'],
+    // Past frame 9999, `####` just grows.
+    ['frames/1048574.exr']
+  ])('accepts a frame Blender saved as %j', (file) => {
+    expect(parseManifest(lines({ ...frame, file }))).toEqual({
+      entries: [{ ...frame, file }],
+      rejected: []
+    })
+  })
+
+  it("accepts a view's thumbnail, which the agent cannot number", () => {
+    // PreviewWorker names it after the frame's stem, and int('0042_L') fails.
+    const t = { ...thumb, file: 'thumbs/0042_L.jpg', meta: { frame: null, width: 320 } }
+    expect(parseManifest(lines(t)).entries).toEqual([t])
+    expect(refused({ ...t, meta: { frame: 7, width: 320 } }).reason).toMatch(/meta.frame/)
+  })
+
+  it('reads the frame number and view off a frame or thumb name', () => {
+    expect(parseFrameName('frames/0042.exr')).toEqual({ frame: 42, view: '' })
+    expect(parseFrameName('frames/0042')).toEqual({ frame: 42, view: '' })
+    expect(parseFrameName('frames/0042_L.png')).toEqual({ frame: 42, view: '_L' })
+    expect(parseFrameName('frames/0000_R')).toEqual({ frame: 0, view: '_R' })
+    expect(parseFrameName('thumbs/0042_R.jpg')).toEqual({ frame: 42, view: '_R' })
+    // The old reading took the digits before the extension, whatever came first.
+    expect(parseFrameName('frames/0042_L2.png')).toEqual({ frame: 42, view: '_L2' })
+    for (const file of ['frames/-001.exr', 'frames/x0042.exr', 'previews/0042.mp4', '0042.exr']) {
+      expect(parseFrameName(file)).toBeNull()
+    }
+  })
+
   // What a hostile node (or a .blend's startup script) would write to plant a
   // file on the desktop: every one of these used to be downloaded to
   // join(jobDir, file), and the node supplies the size and sha256 it is
@@ -130,9 +172,12 @@ describe('parseManifest', () => {
       ['frames/0001.exr\u0000.plist'],
       // Shapes the agent never writes, even if harmless.
       ['frames/0001.exr:stream'],
-      ['frames/0001'],
       ['frames/-001.exr'],
       ['frames/.0001.exr'],
+      ['frames/0001.exr.part'],
+      ['frames/0001_L/0001.exr'],
+      ['frames/0001_L R.png'],
+      [`frames/0001_${'L'.repeat(64)}.png`],
       ['passes/0001.exr'],
       ['frames/sub/0001.exr']
     ])('%j', (file) => {
@@ -144,6 +189,7 @@ describe('parseManifest', () => {
     it('for thumbs and clips too', () => {
       expect(refused({ ...thumb, file: '../thumbs/0042.jpg' }).kind).toBe('thumb')
       expect(refused({ ...thumb, file: 'thumbs/0042.png' }).kind).toBe('thumb')
+      expect(refused({ ...thumb, file: 'thumbs/0042_L/x.jpg' }).kind).toBe('thumb')
       for (const file of [
         'previews/../../x.mp4',
         'previews/.hidden.mp4',
@@ -309,7 +355,9 @@ describe('the downloader, given a manifest line that escapes the job folder', ()
 
   it('is refused by the download itself, should the parser ever let it through', async () => {
     // The parser the downloader used to have: anything with a known kind.
-    vi.doMock('./manifest', () => ({
+    // The rest of the module is the real one.
+    vi.doMock('./manifest', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('./manifest')>()),
       parseManifest: (text: string): ParsedManifest => ({
         entries: text
           .split('\n')

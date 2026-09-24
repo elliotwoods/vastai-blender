@@ -1,3 +1,6 @@
+import { createHash } from 'crypto'
+import { existsSync } from 'fs'
+import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { SshConnection } from '../ssh/sshConnection'
 import { REMOTE_ROOT } from '../test/fakeSsh'
@@ -69,6 +72,26 @@ function downloaded(jobId: string): number[] {
 
 const manifest = /manifest\.jsonl/
 
+/**
+ * Save a file on the node and list it, as noderunner's FrameTracker lists
+ * whatever Blender printed "Saved:" for. `onNode: false` lists a file that
+ * is not there (any more).
+ */
+function saved(r: Rig, file: string, opts: { onNode?: boolean } = {}): void {
+  const dir = `${REMOTE_ROOT}/renders/${r.chunkId}`
+  const data = Buffer.from(`fake render ${r.chunkId} ${file}\n`, 'utf-8')
+  if (opts.onNode !== false) r.machine.files.set(`${dir}/${file}`, data)
+  const line = {
+    kind: 'frame',
+    file,
+    size: data.length,
+    sha256: createHash('sha256').update(data).digest('hex'),
+    mtime: 1
+  }
+  const prev = r.machine.files.get(`${dir}/manifest.jsonl`)?.toString('utf-8') ?? ''
+  r.machine.files.set(`${dir}/manifest.jsonl`, Buffer.from(prev + JSON.stringify(line) + '\n'))
+}
+
 describe('ChunkDownloader.drain', () => {
   it('retries a final manifest read that throws, then fetches what it lists', async () => {
     const r = await rig()
@@ -136,5 +159,101 @@ describe('ChunkDownloader.drain', () => {
 
     // Only the backoff already under way; no read after the stop.
     expect(r.machine.ran(manifest)).toHaveLength(1)
+  })
+})
+
+// A stereo or multiview scene with Views Format 'Individual' saves each view
+// of a frame to its own file. Nothing says how many views there are, so a
+// frame is marked downloaded only once the chunk's final pass has seen every
+// view land: never on its first view, which would read as the whole frame.
+describe('frames saved one file per view', () => {
+  function stereo(r: Rig, frames: number[]): void {
+    for (const f of frames) {
+      for (const v of ['_L', '_R']) saved(r, `frames/${String(f).padStart(4, '0')}${v}.png`)
+    }
+  }
+
+  it('marks a frame downloaded once every view of it has landed', async () => {
+    const r = await rig()
+    stereo(r, [1, 2, 3, 4])
+
+    const result = await drain(r)
+
+    expect(result).toEqual({ manifestRead: true, lost: [] })
+    expect(downloaded(r.jobId)).toEqual([1, 2, 3, 4])
+    const jobDir = join(w.settings.projectRoot, 'renders', r.jobId)
+    for (const v of ['_L', '_R']) expect(existsSync(join(jobDir, `frames/0004${v}.png`))).toBe(true)
+    const row = w.get<{ local_path: string }>(
+      'SELECT local_path FROM frames WHERE job_id = ? AND frame = 4',
+      r.jobId
+    )
+    expect(row?.local_path).toBe(join(jobDir, 'frames/0004_L.png'))
+    expect(w.alerts('error')).toEqual([])
+  })
+
+  it('leaves a frame with a view that never arrived to render again', async () => {
+    const r = await rig()
+    stereo(r, [1, 2, 3])
+    // Blender died between frame 4's two views.
+    saved(r, 'frames/0004_L.png')
+
+    await drain(r)
+
+    expect(downloaded(r.jobId)).toEqual([1, 2, 3])
+  })
+
+  it('leaves a frame with a lost view to render again', async () => {
+    const r = await rig()
+    stereo(r, [1, 3, 4])
+    saved(r, 'frames/0002_L.png')
+    saved(r, 'frames/0002_R.png', { onNode: false })
+
+    const result = await drain(r)
+
+    expect(result.lost).toEqual(['frames/0002_R.png'])
+    expect(downloaded(r.jobId)).toEqual([1, 3, 4])
+  })
+
+  it('marks nothing when only one view ever arrived', async () => {
+    // Blender adds a suffix only with two views or more, so the other one is
+    // missing from every frame.
+    const r = await rig()
+    for (const f of [1, 2, 3, 4]) saved(r, `frames/000${f}_L.png`)
+
+    await drain(r)
+
+    expect(downloaded(r.jobId)).toEqual([])
+  })
+
+  it('marks nothing when the final manifest read failed', async () => {
+    // The background polls fetched every view listed so far, but whatever the
+    // agent listed since is unknown: frame 4 could be one view short.
+    const r = await rig()
+    stereo(r, [1, 2, 3, 4])
+    r.downloader.start()
+    await w.until(
+      () => existsSync(join(w.settings.projectRoot, 'renders', r.jobId, 'frames', '0004_R.png')),
+      'views fetched in the background'
+    )
+    r.machine.onExec(manifest, () => Promise.reject(new Error('(SSH) Channel open failure')))
+
+    const result = await drain(r)
+    r.downloader.stop()
+
+    expect(result.manifestRead).toBe(false)
+    expect(downloaded(r.jobId)).toEqual([])
+  })
+
+  it('still marks a frame saved as one file, extension or not, as it lands', async () => {
+    const r = await rig()
+    saved(r, 'frames/0001')
+    saved(r, 'frames/0002')
+    saved(r, 'frames/0003.exr')
+    saved(r, 'frames/0004.exr')
+
+    const result = await drain(r)
+
+    expect(result).toEqual({ manifestRead: true, lost: [] })
+    expect(downloaded(r.jobId)).toEqual([1, 2, 3, 4])
   })
 })
