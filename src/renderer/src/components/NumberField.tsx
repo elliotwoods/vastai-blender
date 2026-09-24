@@ -10,8 +10,9 @@
  *
  * Blank is explicit. Pass `allowBlank="no cap"` and clearing the field
  * commits null, with the empty field reading "no cap". Without it, a cleared
- * field puts the last value back. Out-of-range numbers are clamped on commit
- * and flagged while typing, so the range is visible before it applies.
+ * field puts the last value back. A number outside min..max is flagged while
+ * typing and refused, not clamped, on commit: a slip must never become the
+ * field's maximum.
  *
  * While the field has focus, the draft is the user's: a background refetch
  * of `value` does not overwrite what they are typing. Switching to another

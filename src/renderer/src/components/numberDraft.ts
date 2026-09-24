@@ -37,20 +37,35 @@ export function formatValue(v: number | null): string {
   return v == null ? '' : String(v)
 }
 
-function clampRound(v: number, rules: NumberRules): number {
-  let out = rules.integer ? Math.round(v) : v
-  if (rules.min != null) out = Math.max(rules.min, out)
-  if (rules.max != null) out = Math.min(rules.max, out)
-  // -0 would print as "0" but compare unequal in a settings diff.
+/** Integer fields round; -0 would print as "0" but compare unequal in a settings diff. */
+function roundTo(v: number, rules: NumberRules): number {
+  const out = rules.integer ? Math.round(v) : v
   return out === 0 ? 0 : out
 }
 
+function clampRound(v: number, rules: NumberRules): number {
+  let out = roundTo(v, rules)
+  if (rules.min != null) out = Math.max(rules.min, out)
+  if (rules.max != null) out = Math.min(rules.max, out)
+  return out === 0 ? 0 : out
+}
+
+function rangeProblem(v: number, rules: NumberRules): string | null {
+  if (rules.min != null && v < rules.min) return `at least ${rules.min}`
+  if (rules.max != null && v > rules.max) return `at most ${rules.max}`
+  return null
+}
+
 /**
- * Judge a finished draft against the value it would replace. Out-of-range
- * numbers are clamped rather than refused: the user asked for "as much as
- * allowed", and the field shows what they got. Anything unparseable, or a
- * blank the field doesn't allow, puts `current` back. An unchanged value is
- * not a commit, so tabbing through a form writes nothing.
+ * Judge a finished draft against the value it would replace. Anything
+ * unparseable, a blank the field doesn't allow, or a number outside the
+ * range puts `current` back. Out of range is refused rather than clamped:
+ * "100" typed for "10" into max active nodes must not commit as 64, the
+ * most the field allows, and "12" on the way to "1280" must not save 256.
+ *
+ * A draft that still reads as `current` is not a commit, checked before any
+ * rounding or range test, so tabbing through a form writes nothing, even
+ * past a stored value this field would no longer accept.
  */
 export function resolveDraft(
   draft: string,
@@ -62,24 +77,26 @@ export function resolveDraft(
     if (!rules.allowBlank || current == null) return { kind: 'keep', text: formatValue(current) }
     return { kind: 'commit', value: null, text: '' }
   }
-  if (Number.isNaN(parsed)) return { kind: 'keep', text: formatValue(current) }
-  const value = clampRound(parsed, rules)
-  if (value === current) return { kind: 'keep', text: formatValue(value) }
+  if (Number.isNaN(parsed) || parsed === current) {
+    return { kind: 'keep', text: formatValue(current) }
+  }
+  const value = roundTo(parsed, rules)
+  if (value === current || rangeProblem(value, rules)) {
+    return { kind: 'keep', text: formatValue(current) }
+  }
   return { kind: 'commit', value, text: formatValue(value) }
 }
 
 /**
  * Why a draft would not commit as typed, for the field's invalid state while
- * editing — or null when it would. A clamped value is flagged too, so the
- * user sees the range before the field quietly changes their number.
+ * editing, or null when it would. The range is judged as resolveDraft judges
+ * it, after an integer field's rounding.
  */
 export function draftProblem(draft: string, rules: NumberRules = {}): string | null {
   const parsed = parseDraft(draft)
   if (parsed === '') return rules.allowBlank ? null : 'required'
   if (Number.isNaN(parsed)) return 'not a number'
-  if (rules.min != null && parsed < rules.min) return `at least ${rules.min}`
-  if (rules.max != null && parsed > rules.max) return `at most ${rules.max}`
-  return null
+  return rangeProblem(roundTo(parsed, rules), rules)
 }
 
 /**

@@ -66,17 +66,28 @@ describe('resolveDraft (plan 1.14)', () => {
     expect(resolveDraft(' 2 ', 2)).toEqual({ kind: 'keep', text: '2' })
   })
 
-  it('clamps to the range and says what it kept', () => {
-    expect(resolveDraft('99', 4, { min: 0, max: 64 })).toEqual({
+  it('refuses a number outside the range rather than committing the nearest end', () => {
+    // "100" typed for "10" into max active nodes must not rent up to 64.
+    expect(resolveDraft('100', 4, { min: 0, max: 64 })).toEqual({ kind: 'keep', text: '4' })
+    expect(resolveDraft('-3', 4, { min: 0, max: 64 })).toEqual({ kind: 'keep', text: '4' })
+    // "12" on the way to "1280" must not save the minimum.
+    expect(resolveDraft('12', 960, { min: 256, max: 3840 })).toEqual({
+      kind: 'keep',
+      text: '960'
+    })
+    // The ends themselves are in range.
+    expect(resolveDraft('64', 4, { min: 0, max: 64 })).toEqual({
       kind: 'commit',
       value: 64,
       text: '64'
     })
-    expect(resolveDraft('-3', 4, { min: 0, max: 64 })).toEqual({
-      kind: 'commit',
-      value: 0,
-      text: '0'
-    })
+  })
+
+  it('writes nothing when tabbed past a stored value the field would not accept', () => {
+    // Stored before the range existed, or written elsewhere: an untouched
+    // draft is not the user asking for the clamped or rounded value.
+    expect(resolveDraft('100', 100, { min: 0, max: 64 })).toEqual({ kind: 'keep', text: '100' })
+    expect(resolveDraft('2.5', 2.5, { integer: true })).toEqual({ kind: 'keep', text: '2.5' })
   })
 
   it('rounds integer fields', () => {
@@ -102,6 +113,20 @@ describe('draftProblem', () => {
     expect(draftProblem('70', { max: 64 })).toBe('at most 64')
     expect(draftProblem('-1', { min: 0 })).toBe('at least 0')
     expect(draftProblem('12', { min: 0, max: 64 })).toBeNull()
+  })
+
+  it('judges the range after rounding, as the commit does', () => {
+    expect(draftProblem('64.4', { integer: true, max: 64 })).toBeNull()
+    expect(draftProblem('64.6', { integer: true, max: 64 })).toBe('at most 64')
+    expect(resolveDraft('64.4', 4, { integer: true, max: 64 })).toEqual({
+      kind: 'commit',
+      value: 64,
+      text: '64'
+    })
+    expect(resolveDraft('64.6', 4, { integer: true, max: 64 })).toEqual({
+      kind: 'keep',
+      text: '4'
+    })
   })
 })
 
