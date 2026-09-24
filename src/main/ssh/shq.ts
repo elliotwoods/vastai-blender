@@ -44,14 +44,57 @@ export function shq(value: string | number): string {
 
 /**
  * Quoted only when it has to be, for command lines a person reads or copies
- * (the "open a shell" command). Same result in a shell as shq().
+ * (the "open a shell" command). Same result in a shell as shq() for an
+ * argument. Not for a command's first word: `A=b` or `if` bare there is an
+ * assignment or a keyword, not a command. shJoin handles that.
  */
 export function shqMin(value: string | number): string {
   const s = text(value)
   return SAFE.test(s) ? s : shq(s)
 }
 
-/** Arguments joined into one command line, each quoted only as needed. */
+/**
+ * Reserved words a shell reads as syntax when they come first (POSIX, plus
+ * bash's and zsh's own), where a command name was meant.
+ */
+const RESERVED = new Set([
+  'case',
+  'do',
+  'done',
+  'elif',
+  'else',
+  'esac',
+  'fi',
+  'for',
+  'if',
+  'in',
+  'then',
+  'until',
+  'while',
+  'function',
+  'select',
+  'time',
+  'coproc',
+  'repeat',
+  'foreach',
+  'end',
+  'nocorrect'
+])
+
+/**
+ * Arguments joined into one command line, each quoted only as needed. The
+ * first is the command: it is always quoted if it holds an `=` (bare, the
+ * shell would take `NAME=value` as an assignment and run the next word
+ * instead) or is a reserved word.
+ */
 export function shJoin(args: ReadonlyArray<string | number>): string {
-  return args.map(shqMin).join(' ')
+  return args
+    .map((a, i) => {
+      if (i === 0) {
+        const s = text(a)
+        if (s.includes('=') || RESERVED.has(s)) return shq(s)
+      }
+      return shqMin(a)
+    })
+    .join(' ')
 }

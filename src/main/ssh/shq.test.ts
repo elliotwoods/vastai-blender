@@ -84,6 +84,25 @@ describe('shqMin / shJoin', () => {
     )
   })
 
+  it('quotes a first word the shell would read as an assignment or a keyword', () => {
+    expect(shJoin(['FOO=bar', 'ls'])).toBe("'FOO=bar' ls")
+    expect(shJoin(['if', 'x'])).toBe("'if' x")
+    // Only the first word: later ones are plain arguments.
+    expect(shJoin(['ssh', '-o', 'A=b', 'if'])).toBe('ssh -o A=b if')
+  })
+
+  it.skipIf(!hasSh)('runs the first word as the command, never as an assignment', () => {
+    // Bare, `X=1 echo ran` sets X and runs echo. Quoted, the shell looks for
+    // a command named "X=1" and finds none (127). Nothing here runs anything
+    // but echo.
+    const status = (argv: string[]): string =>
+      execFileSync('/bin/sh', ['-c', `${shJoin(argv)} 2>/dev/null; printf '<%s>' "$?"`], {
+        encoding: 'utf-8'
+      })
+    expect(status(['X=1', 'echo', 'ran'])).toBe('<127>')
+    expect(status(['while', 'true'])).toBe('<127>')
+  })
+
   it.skipIf(!hasSh)('gives the shell exactly the arguments it was given', () => {
     const args = [...NASTY, 'plain', 42]
     expect(throughShell(shJoin(args))).toBe(args.map((a) => `<${a}>`).join(''))
