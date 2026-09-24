@@ -212,6 +212,41 @@ describe('planScaling: no work, no rent (plan 1.21, job da68b61b)', () => {
     expect(p.status).toBe('covered')
   })
 
+  describe('a fully downloaded retry chunk → no rent', () => {
+    // The leftover requeue sub-chunk: pending, but every frame of it is
+    // already on this computer.
+    const downloaded: Partial<PlanScalingInput> = {
+      pendingExclusive: 1,
+      pendingFrames: 0,
+      remainingExclusiveFrames: 0
+    }
+
+    it('with no fleet at all: after a restart', () => {
+      const p = planScaling(plan(downloaded))
+      expect(p.status).toBe('covered')
+      expect(p.reason).toMatch(/no frames left/)
+      expect(p.maxRentals).toBe(0)
+      expect(budgetOpen(p.budget)).toBe(false)
+    })
+
+    it('with a live node and no learned rate: a fresh install, or a new GPU model', () => {
+      const p = planScaling(
+        plan({
+          ...oneBusy8x4090,
+          ...downloaded,
+          fleetFramesPerHour: null
+        })
+      )
+      expect(p.status).toBe('covered')
+      expect(p.nodes).toBe(0)
+    })
+
+    it('...and a shared chunk the same way', () => {
+      const p = planScaling(plan({ pendingShared: 3, pendingFrames: 0, remainingSharedFrames: 0 }))
+      expect(p.status).toBe('covered')
+    })
+  })
+
   it('1 frame left with 1 live node → no rent, even when it waits for a lane', () => {
     const p = planScaling(
       plan({

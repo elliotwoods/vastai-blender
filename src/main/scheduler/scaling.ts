@@ -203,9 +203,14 @@ export interface PlanScalingInput {
   usableLanes: number
   /** all shared-slot targets on usable nodes, busy or free */
   usableSharedSlots: number
-  /** frames in pending chunks: the only work a new node could be given */
+  /**
+   * Frames of the pending chunks not yet downloaded: the only work a new node
+   * could be given. A frame already on this computer needs no node, so a
+   * requeued chunk whose frames have all landed counts 0 here, however many
+   * chunks it adds to pendingExclusive (job da68b61b).
+   */
   pendingFrames: number
-  /** frames not yet rendered, pending or in flight, by kind of job */
+  /** frames not yet downloaded, pending or in flight, by kind of job */
   remainingExclusiveFrames: number
   remainingSharedFrames: number
   /** frames/hr the usable and booting fleet delivers; null = not learned yet */
@@ -279,17 +284,31 @@ export function planScaling(i: PlanScalingInput): ScalingPlan {
     )
   }
 
+  // --- No frames, no rent. ---
+  // What a new node could be given: pending work, or for buy-ahead whatever
+  // is left (buy-ahead exists for queues the fleet has already prefetched).
+  // Zero frames is less than a boot at any rate, so this needs neither a
+  // fleet nor a learned rate: after a restart, on a fresh install or on a new
+  // GPU model, a pending chunk whose frames have all landed still rented a
+  // node for nothing.
+  const givable = i.eager ? i.remainingExclusiveFrames + i.remainingSharedFrames : i.pendingFrames
+  if (!(givable > 0)) {
+    return stop(
+      'covered',
+      i.eager
+        ? 'no frames left to render'
+        : 'no frames left to render: every frame of the pending chunks is downloaded'
+    )
+  }
+
   // --- The tail: never rent for work a new node could not get to in time. ---
   // Only with a fleet to do it: with no node at all, a single frame still
   // needs one rented.
   const lead = i.newNodeLeadMs ?? NEW_NODE_LEAD_MS
   if (i.usableNodes + i.booting.length > 0) {
-    // What a new node could be given: pending work, or for buy-ahead whatever
-    // is left (buy-ahead exists for queues the fleet has already prefetched).
     // Pending frames count whole, even those free lanes will take. That
     // overstates a new node's share, so this errs toward renting, as before:
     // the tail rules can only ever stop a rental, never add one.
-    const givable = i.eager ? i.remainingExclusiveFrames + i.remainingSharedFrames : i.pendingFrames
     if (i.newNodeFramesPerHour != null && i.newNodeFramesPerHour > 0) {
       const workMs = (givable / i.newNodeFramesPerHour) * 3_600_000
       if (workMs < lead) {
