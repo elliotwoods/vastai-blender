@@ -23,7 +23,8 @@ errors — see run_render.
 
 Job spec:
   { "chunkId": str, "blendFile": str (under work/scenes/),
-    "blenderVersion": "4.5.3", "engine": "cycles"|"eevee"|"octane",
+    "blenderVersion": "4.5.3" (exactly this one; absent = newest installed),
+    "engine": "cycles"|"eevee"|"octane" (octane: OctaneBlender, or fail),
     "frameStart": int, "frameEnd": int, "frameStep": int,
     "frames": [int] (render exactly these, each on the start..end/step grid;
                      absent = the whole grid),
@@ -125,10 +126,11 @@ SCRIPT_FAILED_RE = re.compile(r"script failed, (file|expr): '")
 #   "scene"      the .blend cannot render right on any node: a scene guard or a
 #                startup script in it raised. Retrying elsewhere only pays for
 #                the same failure again.
-#   "job"        the job asks for something no node can give it: one of the
+#   "job"        the job asks for something no node can give it: Octane without
+#                OctaneBlender, a frame list off the chunk's grid, one of the
 #                job's own python expressions raised.
-#   "machine"    this node cannot render it: its disk is full or failing, it has
-#                no Blender. Another node may.
+#   "machine"    this node cannot render it: its disk is full or failing, it
+#                lacks the Blender version asked for. Another node may.
 #   "transient"  anything else: a crash, a kill, an exit nothing explains.
 #                Retrying may work, which is how the app treated every failure
 #                before errorKind existed.
@@ -273,23 +275,50 @@ def manifest_files(chunk_dir, kind=None):
     return seen
 
 
+def installed_blenders():
+    """Blender versions installed under BLENDER_ROOT, newest first."""
+    try:
+        names = sorted(os.listdir(BLENDER_ROOT), reverse=True)
+    except OSError:
+        return []
+    return [v for v in names if os.path.exists(os.path.join(BLENDER_ROOT, v, "blender"))]
+
+
 def pick_blender(spec):
-    if spec.get("engine") == "octane" and os.path.exists(OCTANE_BLENDER):
-        return OCTANE_BLENDER
+    """The Blender this spec asks for, never a stand-in for it.
+
+    An Octane job used to fall back to stock Blender when OctaneBlender was
+    missing. Stock Blender does not know the engine, renders the scene with
+    its default one instead, and the wrong frames completed and were billed
+    (#85). Nothing installs OctaneBlender on the fleet's image today, so every
+    node would refuse the same way: errorKind "job" (plan 1.18).
+
+    A job that names a version gets exactly that one. The app installs it
+    during node prep, so its absence is this node's fault ("machine"), and
+    another Blender would render another program's idea of the scene. Only a
+    spec with no version takes the newest installed.
+    """
+    if spec.get("engine") == "octane":
+        if os.path.exists(OCTANE_BLENDER):
+            return OCTANE_BLENDER
+        raise ChunkFailed(
+            f"Octane job, but OctaneBlender is not installed on this node ({OCTANE_BLENDER});"
+            " stock Blender would render it with another engine",
+            "job",
+        )
+    installed = installed_blenders()
     version = spec.get("blenderVersion")
     if version:
         path = os.path.join(BLENDER_ROOT, version, "blender")
         if os.path.exists(path):
             return path
-    # Fall back to any installed version (newest first).
-    try:
-        versions = sorted(os.listdir(BLENDER_ROOT), reverse=True)
-    except OSError:
-        versions = []
-    for v in versions:
-        path = os.path.join(BLENDER_ROOT, v, "blender")
-        if os.path.exists(path):
-            return path
+        raise ChunkFailed(
+            f"Blender {version} is not installed on this node"
+            f" (installed: {', '.join(installed) or 'none'})",
+            "machine",
+        )
+    if installed:
+        return os.path.join(BLENDER_ROOT, installed[0], "blender")
     raise ChunkFailed("no blender installation found", "machine")
 
 

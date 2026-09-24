@@ -36,6 +36,8 @@ Covers the failure modes that actually bit:
     hung, so the state had no way to say "no frame for an hour".
   * a chunk sent again after an app restart rendered its whole range again,
     rewriting frames under manifest lines whose hashes no longer matched.
+  * an Octane job on a node without OctaneBlender rendered with stock Blender,
+    in another engine, and completed.
     These cases drive the real run_render and process() against a scripted
     fake `blender`, and are skipped on Windows, where its `#!/bin/sh` wrapper
     cannot run.
@@ -46,6 +48,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import sys
 import tempfile
 import threading
@@ -294,7 +297,7 @@ def fake_node():
     "record" appends each run's argv and VR_* environment to a JSON-lines file.
     """
     names = ("ROOT", "RENDERS", "STATE", "LOGS", "BLENDER_ROOT", "INBOX", "DONE", "FAILED",
-             "CONTROL", "size_stable", "SETTLE_PAUSE", "write_state")
+             "CONTROL", "OCTANE_BLENDER", "size_stable", "SETTLE_PAUSE", "write_state")
     saved = {k: getattr(nr, k) for k in names}
     with tempfile.TemporaryDirectory() as tmp:
         # The agent watches a frame's size for 0.5-1 s, and pauses 0.5 s between
@@ -313,6 +316,8 @@ def fake_node():
         nr.DONE = os.path.join(tmp, "jobs", "done")
         nr.FAILED = os.path.join(tmp, "jobs", "failed")
         nr.CONTROL = os.path.join(tmp, "control")
+        # Absent unless a case installs it.
+        nr.OCTANE_BLENDER = os.path.join(tmp, "octane", "blender")
         bin_dir = os.path.join(nr.BLENDER_ROOT, "fake")
         for d in (nr.RENDERS, nr.STATE, nr.LOGS, nr.INBOX, nr.DONE, nr.FAILED, nr.CONTROL,
                   bin_dir, os.path.join(tmp, "work", "scenes")):
@@ -736,6 +741,39 @@ def test_explicit_frame_list():
               and not os.path.exists(rec))
 
 
+def test_never_a_stand_in_blender():
+    """1.18 / #85: an Octane job on a node without OctaneBlender rendered with
+    stock Blender, which fell back to another engine; the wrong frames
+    completed and were billed. A version the job names is never swapped either."""
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        rec = os.path.join(tmp, "runs.jsonl")
+        state, _ = run_chunk(tmp, {"record": rec, "default": {"render": "f"}}, engine="octane")
+        check("octane: no OctaneBlender fails the job, and no other Blender runs",
+              state.get("errorKind") == "job" and "OctaneBlender" in (state.get("error") or "")
+              and state.get("exitCode") is None and not os.path.exists(rec))
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        os.makedirs(os.path.dirname(nr.OCTANE_BLENDER))
+        shutil.copy(os.path.join(nr.BLENDER_ROOT, "fake", "blender"), nr.OCTANE_BLENDER)
+        state, _ = run_chunk(tmp, {"default": {"render": "f"}}, engine="octane")
+        check("octane: OctaneBlender renders it when it is there",
+              state.get("status") == "done" and state["command"].startswith(nr.OCTANE_BLENDER))
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        rec = os.path.join(tmp, "runs.jsonl")
+        state, _ = run_chunk(tmp, {"record": rec, "default": {"render": "f"}},
+                             blenderVersion="4.5.3")
+        check("version: a missing version is this node's failure, not a swap for another",
+              state.get("errorKind") == "machine" and "4.5.3" in (state.get("error") or "")
+              and "installed: fake" in state["error"] and not os.path.exists(rec))
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, _ = run_chunk(tmp, {"default": {"render": "f"}}, blenderVersion=None)
+        check("version: a spec that names none renders with the newest installed",
+              state.get("status") == "done")
+
+
 def test_log_tail():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "c1.log")
@@ -856,6 +894,7 @@ def main():
         test_render_publishes_last_progress,
         test_restart_renders_only_missing_frames,
         test_explicit_frame_list,
+        test_never_a_stand_in_blender,
     ):
         if os.name == "nt":
             print(f"SKIP  {fn.__name__}: the fake blender needs a POSIX shell")
