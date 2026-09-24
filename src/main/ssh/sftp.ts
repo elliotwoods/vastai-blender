@@ -2,6 +2,9 @@
  * Promise helpers over ssh2's SFTPWrapper: recursive upload of the remote/
  * tree, hash-skipped big-file uploads, and verified downloads (.part →
  * verify → rename) driven by manifest entries.
+ *
+ * Every SFTP request goes through withSftp: on the channel current at the
+ * time, under a deadline. See there for why.
  */
 
 import { createHash } from 'crypto'
@@ -9,10 +12,162 @@ import { createReadStream, promises as fsp } from 'fs'
 import { basename, dirname, join, posix } from 'path'
 import type { SFTPWrapper } from 'ssh2'
 import { pipelinedGet, TransferStalledError, type SftpReader } from './pipelinedGet'
+import { shq } from './shq'
 import type { SshConnection } from './sshConnection'
 
 /** No bytes for this long and a download is declared stalled (see pipelinedGet). */
 export const DOWNLOAD_STALL_MS = 60_000
+
+/** No bytes for this long and an upload is declared stalled: DOWNLOAD_STALL_MS's twin. */
+export const UPLOAD_STALL_MS = 60_000
+
+/**
+ * No answer to a small SFTP request (a write, an unlink, a rename) for this
+ * long and its channel is taken to be wedged.
+ */
+export const SFTP_OP_TIMEOUT_MS = 30_000
+
+/** Deadline for a small remote command: mkdir -p, rm -f. */
+const REMOTE_CMD_TIMEOUT_MS = 60_000
+
+/**
+ * Deadline for sha256sum of a file of `bytes` on a node: a minute, plus the
+ * file read at a deliberately slow 20 MB/s, so only a hang trips it. A 2 GB
+ * scene gets under three minutes.
+ */
+function hashTimeoutMs(bytes: number): number {
+  return 60_000 + Math.ceil(bytes / 20_000)
+}
+
+/** An SFTP request unanswered (for a transfer: not moving) past its deadline. */
+export class SftpTimeoutError extends Error {
+  constructor(
+    readonly label: string,
+    readonly timeoutMs: number
+  ) {
+    super(`SFTP ${label}: no answer for ${Math.round(timeoutMs / 1000)}s`)
+  }
+}
+
+export interface WithSftpOptions {
+  /**
+   * No answer for this long (for an op that reports progress: no progress)
+   * and the op fails with SftpTimeoutError, and its channel is reset.
+   */
+  timeoutMs: number
+  /** Names the op in errors. */
+  label: string
+  /**
+   * The op may safely run again from the start (a write that overwrites, an
+   * unlink). If its channel is closed under it, by another transfer's stall
+   * reset or the node's sftp-server, it runs once more on a fresh channel
+   * instead of failing a dispatch over someone else's stall (#245).
+   */
+  retryOnReset?: boolean
+}
+
+/**
+ * Run one SFTP operation on the connection's current channel, under a
+ * deadline.
+ *
+ * Never hold an SFTPWrapper across an await. Once a channel has been reset
+ * (a stalled download anywhere on the node resets it), ssh2 registers every
+ * later request made on it and never sends it, so its callback never comes.
+ * uploadFileVerified held one wrapper across two execs, and a reset landing
+ * during the node-side sha256sum left the rename after it waiting for good,
+ * and with it the node's prep lock: every later dispatch to that node queued
+ * behind it while the node billed (#244). So each operation fetches the
+ * channel right before it runs, and the deadline covers the requests ssh2
+ * makes on its own (fastPut's open and close, writeFile's close), which no
+ * check beforehand could reach.
+ *
+ * `op` gets the channel and a `progress()` to call as bytes move; a transfer
+ * that calls it is timed by its silences, not its length.
+ */
+export async function withSftp<T>(
+  ssh: SshConnection,
+  op: (sftp: SFTPWrapper, progress: () => void) => Promise<T>,
+  opts: WithSftpOptions
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    // The open is under the same deadline: on a wedged connection it can go
+    // unanswered as surely as any request.
+    const sftp = await ssh.sftp({ timeoutMs: opts.timeoutMs })
+    let closedUnder = false
+    const onClosed = (): void => {
+      closedUnder = true
+    }
+    sftp.on('end', onClosed).on('close', onClosed)
+    try {
+      return await underDeadline(ssh, sftp, op, opts)
+    } catch (e) {
+      if (opts.retryOnReset && attempt === 1 && closedUnder && !(e instanceof SftpTimeoutError)) {
+        continue
+      }
+      throw e
+    } finally {
+      sftp.off('end', onClosed).off('close', onClosed)
+    }
+  }
+}
+
+function underDeadline<T>(
+  ssh: SshConnection,
+  sftp: SFTPWrapper,
+  op: (sftp: SFTPWrapper, progress: () => void) => Promise<T>,
+  opts: WithSftpOptions
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let last = Date.now()
+    let settled = false
+    const check = (): void => {
+      if (settled) return
+      const idle = Date.now() - last
+      if (idle < opts.timeoutMs) {
+        timer = setTimeout(check, opts.timeoutMs - idle)
+        return
+      }
+      settled = true
+      // Presumed wedged: give it up, so what comes next gets a fresh channel.
+      // Only this one, though: the cache may already hold a newer channel.
+      ssh.resetSftp(sftp)
+      reject(new SftpTimeoutError(opts.label, opts.timeoutMs))
+    }
+    let timer = setTimeout(check, opts.timeoutMs)
+    const finish = (settle: () => void): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      settle()
+    }
+    let running: Promise<T>
+    try {
+      running = op(sftp, () => {
+        last = Date.now()
+      })
+    } catch (e) {
+      finish(() => reject(e))
+      return
+    }
+    running.then(
+      (v) => finish(() => resolve(v)),
+      (e: unknown) => finish(() => reject(e))
+    )
+  })
+}
+
+/** ssh2's SFTP status code for "no such file" (err.code; fs errors carry strings). */
+const SFTP_NO_SUCH_FILE = 2
+
+/**
+ * Is this ssh2's "no such file" from the node? Decided by the numeric SFTP
+ * status code, never by the message: a local ENOENT (a project folder on an
+ * unplugged drive) says "no such file" too, and was reported as a frame gone
+ * from the node, and re-rendered.
+ */
+export function isRemoteMissing(e: unknown): boolean {
+  return (e as { code?: unknown } | null)?.code === SFTP_NO_SUCH_FILE
+}
 
 export async function sha256File(path: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -24,10 +179,24 @@ export async function sha256File(path: string): Promise<string> {
   })
 }
 
-function fastPut(sftp: SFTPWrapper, local: string, remote: string): Promise<void> {
+function fastPut(
+  sftp: SFTPWrapper,
+  local: string,
+  remote: string,
+  onStep: () => void
+): Promise<void> {
   return new Promise((resolve, reject) =>
-    sftp.fastPut(local, remote, (err) => (err ? reject(err) : resolve()))
+    sftp.fastPut(local, remote, { step: onStep }, (err) => (err ? reject(err) : resolve()))
   )
+}
+
+/** One file up, over withSftp: a stall of UPLOAD_STALL_MS fails it; a reset under it retries once. */
+function upload(ssh: SshConnection, local: string, remote: string): Promise<void> {
+  return withSftp(ssh, (sftp, progress) => fastPut(sftp, local, remote, progress), {
+    timeoutMs: UPLOAD_STALL_MS,
+    label: `upload ${basename(local)}`,
+    retryOnReset: true
+  })
 }
 
 export function sftpWriteFile(sftp: SFTPWrapper, remote: string, data: string): Promise<void> {
@@ -47,6 +216,8 @@ export function sftpReadFile(sftp: SFTPWrapper, remote: string): Promise<Buffer>
  * target exists — which happens routinely on restart recovery (e.g. a chunk's
  * inbox spec re-written while the previous spec file is still there). Unlink
  * the target first (ignoring "no such file") to get mv -f semantics.
+ *
+ * On a wrapper the caller holds, with no deadline: use renameRemote.
  */
 export function sftpRename(sftp: SFTPWrapper, from: string, to: string): Promise<void> {
   return new Promise((resolve, reject) =>
@@ -57,9 +228,63 @@ export function sftpRename(sftp: SFTPWrapper, from: string, to: string): Promise
   )
 }
 
+/**
+ * sftpRename's mv -f over withSftp: each of its two requests on the channel
+ * current at the time, each under a deadline. As one chain on one wrapper, a
+ * reset landing while the unlink was in flight stranded the rename on the
+ * dead channel, never answered.
+ */
+export async function renameRemote(
+  ssh: SshConnection,
+  from: string,
+  to: string,
+  timeoutMs = SFTP_OP_TIMEOUT_MS
+): Promise<void> {
+  await withSftp(
+    ssh,
+    (sftp) =>
+      new Promise<void>((resolve, reject) =>
+        sftp.unlink(to, (err) => (!err || isRemoteMissing(err) ? resolve() : reject(err)))
+      ),
+    { timeoutMs, label: `unlink ${posix.basename(to)}`, retryOnReset: true }
+  )
+  await withSftp(
+    ssh,
+    (sftp) =>
+      new Promise<void>((resolve, reject) =>
+        sftp.rename(from, to, (err) => (err ? reject(err) : resolve()))
+      ),
+    { timeoutMs, label: `rename ${posix.basename(to)}` }
+  )
+}
+
+/**
+ * Write a small file where a reader may pick it up at any moment (a job spec
+ * in the agent's inbox): to `tmpPath`, which the reader ignores, then renamed
+ * over `remotePath`. Every request under a deadline (withSftp), so a spec
+ * write can fail but never hang a dispatch.
+ */
+export async function writeRemoteFileAtomic(
+  ssh: SshConnection,
+  remotePath: string,
+  data: string,
+  opts: { tmpPath: string; timeoutMs?: number }
+): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? SFTP_OP_TIMEOUT_MS
+  await withSftp(ssh, (sftp) => sftpWriteFile(sftp, opts.tmpPath, data), {
+    timeoutMs,
+    label: `write ${posix.basename(opts.tmpPath)}`,
+    retryOnReset: true
+  })
+  await renameRemote(ssh, opts.tmpPath, remotePath, timeoutMs)
+}
+
 /** mkdir -p via exec (simpler and more reliable than SFTP mkdir recursion). */
 export async function remoteMkdirp(ssh: SshConnection, dir: string): Promise<void> {
-  const r = await ssh.exec(`mkdir -p '${dir}'`)
+  const r = await ssh.exec(`mkdir -p ${shq(dir)}`, {
+    timeoutMs: REMOTE_CMD_TIMEOUT_MS,
+    label: 'mkdir -p'
+  })
   if (r.code !== 0) throw new Error(`mkdir failed: ${r.stderr}`)
 }
 
@@ -72,7 +297,6 @@ export async function uploadTree(
   localDir: string,
   remoteDir: string
 ): Promise<number> {
-  const sftp = await ssh.sftp()
   let count = 0
   const walk = async (dir: string, rel: string): Promise<void> => {
     const entries = await fsp.readdir(dir, { withFileTypes: true })
@@ -83,7 +307,7 @@ export async function uploadTree(
       if (e.isDirectory()) {
         await walk(localPath, relPath)
       } else {
-        await fastPut(sftp, localPath, posix.join(remoteDir, relPath))
+        await upload(ssh, localPath, posix.join(remoteDir, relPath))
         count++
       }
     }
@@ -95,25 +319,32 @@ export async function uploadTree(
 /**
  * Upload one large file (blend/extension zip), skipping when the remote copy
  * already matches by sha256 (checked via sha256sum on the node).
+ *
+ * Runs inside the scheduler's per-node prep lock, so no step may hang: every
+ * command has a deadline, and the SFTP steps go through withSftp.
  */
 export async function uploadFileVerified(
   ssh: SshConnection,
   localPath: string,
   remotePath: string
 ): Promise<'uploaded' | 'skipped'> {
+  const { size } = await fsp.stat(localPath)
   const hash = await sha256File(localPath)
-  const check = await ssh.exec(`sha256sum '${remotePath}' 2>/dev/null | cut -d' ' -f1`)
+  const hashing = {
+    timeoutMs: hashTimeoutMs(size),
+    label: `sha256sum ${posix.basename(remotePath)}`
+  }
+  const check = await ssh.exec(`sha256sum ${shq(remotePath)} 2>/dev/null | cut -d' ' -f1`, hashing)
   if (check.stdout.trim() === hash) return 'skipped'
-  const sftp = await ssh.sftp()
   await remoteMkdirp(ssh, posix.dirname(remotePath))
   const part = `${remotePath}.part`
-  await fastPut(sftp, localPath, part)
-  const after = await ssh.exec(`sha256sum '${part}' | cut -d' ' -f1`)
+  await upload(ssh, localPath, part)
+  const after = await ssh.exec(`sha256sum ${shq(part)} | cut -d' ' -f1`, hashing)
   if (after.stdout.trim() !== hash) {
-    await ssh.exec(`rm -f '${part}'`)
+    await ssh.exec(`rm -f ${shq(part)}`, { timeoutMs: REMOTE_CMD_TIMEOUT_MS, label: 'rm -f' })
     throw new Error(`upload verify failed for ${basename(localPath)}`)
   }
-  await sftpRename(sftp, part, remotePath)
+  await renameRemote(ssh, part, remotePath)
   return 'uploaded'
 }
 
