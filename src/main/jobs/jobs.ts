@@ -243,11 +243,31 @@ export function setJobShareNode(jobId: string, shareNode: boolean): void {
   emitJobChanged(jobId)
 }
 
-/** Recompute a job's state from its chunks; emits on change. */
+/** Frames of a job that have not landed on the local disk. */
+function undownloadedFrameCount(jobId: string): number {
+  return (
+    getDb()
+      .prepare("SELECT COUNT(*) AS n FROM frames WHERE job_id = ? AND state != 'downloaded'")
+      .get(jobId) as { n: number }
+  ).n
+}
+
+/**
+ * Recompute a job's state from its chunks, and announce the job.
+ *
+ * Always announces, a cancelled job included. A cancelled job's state is
+ * final, so there is nothing to recompute, but the call still means something
+ * about it changed. Returning before the emit meant a cancel itself was never
+ * announced: the Jobs list kept showing the job as running.
+ */
 export function refreshJobState(jobId: string): void {
   const db = getDb()
   const row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId) as JobRow | undefined
-  if (!row || row.state === 'cancelled') return
+  if (!row) return
+  if (row.state === 'cancelled') {
+    emitJobChanged(jobId)
+    return
+  }
   const chunks = db
     .prepare('SELECT state, COUNT(*) AS n FROM chunks WHERE job_id = ? GROUP BY state')
     .all(jobId) as Array<{ state: ChunkState; n: number }>
@@ -258,6 +278,12 @@ export function refreshJobState(jobId: string): void {
   else if (count('failed') > 0 && count('complete') + count('failed') === total) state = 'partial'
   else if (count('pending') === total) state = 'queued'
   else state = 'running'
+  // Complete means every frame is on disk, not just that every chunk says so.
+  // The scheduler already holds each chunk to that before completing it; this
+  // is the backstop for any other way a chunk reaches 'complete'. Every chunk
+  // finished with frames still missing is a job with holes: 'partial', not a
+  // 'complete' the user only finds out about when assembling the sequence.
+  if (state === 'complete' && undownloadedFrameCount(jobId) > 0) state = 'partial'
   if (state !== row.state) {
     db.prepare('UPDATE jobs SET state = ? WHERE id = ?').run(state, jobId)
   }

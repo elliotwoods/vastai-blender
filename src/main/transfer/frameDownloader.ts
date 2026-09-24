@@ -29,6 +29,16 @@ const RETRY_BACKOFF_MS = 3_000
 const MANIFEST_READ_TIMEOUT_MS = 30_000
 
 /**
+ * The final pass's manifest read is tried this many times before drain()
+ * reports it failed, backing off FINAL_READ_BACKOFF_MS, then twice that, and
+ * so on between tries (5 + 10 + 20 s). That rides out a burst of SSH channel
+ * contention or a reconnect, both routine on a busy node, while a node that
+ * really is unreachable still fails its chunk within a few minutes.
+ */
+const FINAL_READ_ATTEMPTS = 4
+const FINAL_READ_BACKOFF_MS = 5_000
+
+/**
  * Upper bound on the final download pass. Each transfer already has a stall
  * timeout and a retry budget, so this is a backstop: whatever has not landed
  * by then is reported as lost and the chunk goes through requeue (only the
@@ -44,6 +54,18 @@ export interface ChunkDownloadTarget {
   ssh: SshConnection
   /** e.g. /root/vastai/renders/<chunkId> */
   remoteChunkDir: string
+}
+
+/** What the final download pass (drain) managed. */
+export interface DrainResult {
+  /**
+   * Did the final manifest read succeed? When it did not, whatever the agent
+   * listed after the last successful background poll was never seen at all,
+   * so `lost` cannot name it: the chunk must not be taken as complete.
+   */
+  manifestRead: boolean
+  /** Frames that were listed but could not be fetched. */
+  lost: string[]
 }
 
 /** Local landing dir for a job: <projectRoot>/renders/<jobId>/ */
@@ -82,22 +104,43 @@ export class ChunkDownloader {
   }
 
   /**
-   * One-shot: pull everything currently in the manifest, then return the
-   * FRAMES that could not be fetched at all.
+   * One-shot: pull everything currently in the manifest, then report whether
+   * that final read worked and which FRAMES could not be fetched at all.
    *
-   * This is the last download pass — the caller marks the chunk complete and
-   * stops the downloader immediately afterwards, so there is no later poll to
-   * pick anything up. A silently dropped frame here means a hole in the render
-   * that nothing else detects (job completion is decided from chunk states, and
-   * `job:retryMissing` is a stub), so the caller needs to know.
+   * This is the last download pass — the caller settles the chunk and stops
+   * the downloader immediately afterwards, so there is no later poll to pick
+   * anything up. A silently dropped frame here is a hole in the render, so the
+   * caller needs to know.
+   *
+   * The read is retried with backoff (FINAL_READ_ATTEMPTS). It used to be one
+   * poll whose failure was swallowed: with the background polls already caught
+   * up, the queue was empty, and a failed read looked exactly like "nothing
+   * left to fetch" — the chunk completed without the frames the agent had
+   * listed since the last good poll, and the node holding the only copy was
+   * later scaled down. Even when every try fails, what is already in flight is
+   * still waited for, so the requeue that follows re-renders as little as it can.
    *
    * Only frames count. A missing thumbnail or preview clip is cosmetic and is
    * not worth re-rendering a chunk over.
+   *
+   * A downloader stopped mid-drain (its run was cancelled or its node went
+   * away) returns at once, and the result is meaningless: the caller no longer
+   * owns the chunk and must not act on it.
    */
-  async drain(budgetMs = DRAIN_BUDGET_MS): Promise<string[]> {
+  async drain(budgetMs = DRAIN_BUDGET_MS): Promise<DrainResult> {
     const deadline = Date.now() + budgetMs
-    await this.poll()
-    while (this.inFlight > 0 || this.queue.length > 0 || this.retrying.size > 0) {
+    let manifestRead = false
+    for (let attempt = 1; ; attempt++) {
+      manifestRead = (await this.poll()).ok
+      if (manifestRead || this.stopped || attempt >= FINAL_READ_ATTEMPTS) break
+      const backoff = FINAL_READ_BACKOFF_MS * 2 ** (attempt - 1)
+      if (Date.now() + backoff > deadline) break
+      await new Promise((r) => setTimeout(r, backoff))
+    }
+    while (
+      !this.stopped &&
+      (this.inFlight > 0 || this.queue.length > 0 || this.retrying.size > 0)
+    ) {
       if (Date.now() > deadline) {
         // Give up on whatever is left. Frames count as lost (the caller
         // re-renders them); previews do not matter enough to hold a node.
@@ -112,11 +155,16 @@ export class ChunkDownloader {
       }
       await new Promise((r) => setTimeout(r, 250))
     }
-    return [...this.lostFrames]
+    return { manifestRead, lost: [...this.lostFrames] }
   }
 
-  private async poll(): Promise<void> {
-    if (this.stopped) return
+  /**
+   * Read the manifest and queue whatever is new. `ok` says whether the read
+   * worked; the background polls ignore it (the next one retries anyway), but
+   * drain() cannot.
+   */
+  private async poll(): Promise<{ ok: boolean }> {
+    if (this.stopped) return { ok: false }
     let text: string
     try {
       // Timed out: drain() awaits this poll, and an exec on a wedged
@@ -126,9 +174,20 @@ export class ChunkDownloader {
         `cat '${this.target.remoteChunkDir}/manifest.jsonl' 2>/dev/null`,
         { timeoutMs: MANIFEST_READ_TIMEOUT_MS }
       )
+      // Exit 1 with nothing on stdout is cat's answer for a manifest the agent
+      // has not written yet: nothing is listed, and that IS the manifest. A
+      // chunk that failed before its first frame lands here, and must not sit
+      // through drain()'s retries first. (cat says the same for a read error;
+      // on a 'done' chunk the scheduler's check of the frames table catches
+      // anything that was therefore never fetched.) Anything else non-zero,
+      // including null — the channel closed under the command, which resolves
+      // rather than throws — means the read did not happen, and whatever
+      // stdout did arrive may be cut short.
+      const missing = r.code === 1 && r.stdout === ''
+      if (r.code !== 0 && !missing) return { ok: false }
       text = r.stdout
     } catch {
-      return // connection down — reconnect logic lives with the node
+      return { ok: false } // connection down — reconnect logic lives with the node
     }
     const { entries, rejected } = parseManifest(text)
     this.noteRejected(rejected)
@@ -151,6 +210,7 @@ export class ChunkDownloader {
       this.queue.push(entry)
     }
     this.pump()
+    return { ok: true }
   }
 
   /**

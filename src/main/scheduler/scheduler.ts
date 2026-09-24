@@ -218,6 +218,25 @@ class ChunkRun {
     return getDb().prepare('SELECT * FROM jobs WHERE id = ?').get(this.jobId) as JobRow
   }
 
+  /**
+   * Frames in this chunk's CURRENT range that have not landed locally.
+   *
+   * By job and range, never by chunk_id: requeue() re-points only rows that
+   * were not yet downloaded, so a frame's chunk_id says which chunk last owned
+   * it, not which chunk covers it now.
+   */
+  private undownloadedFrames(): number[] {
+    const chunk = this.chunk()
+    const rows = getDb()
+      .prepare(
+        `SELECT frame FROM frames
+         WHERE job_id = ? AND frame BETWEEN ? AND ? AND state != 'downloaded'
+         ORDER BY frame`
+      )
+      .all(this.jobId, chunk.frame_start, chunk.frame_end) as Array<{ frame: number }>
+    return rows.map((r) => r.frame)
+  }
+
   async dispatch(): Promise<void> {
     const chunk = this.chunk()
     const job = this.job()
@@ -421,6 +440,10 @@ class ChunkRun {
     for (;;) {
       if (this.stopped) return
       const state = await this.readAgentState()
+      // Aborted during the read: the chunk now belongs to requeue() or
+      // cancelJob, and every write below would be to a row this run no longer
+      // owns — 'downloading' over the 'pending' a requeue had just set, say.
+      if (this.stopped) return
       if (state) {
         // Re-read the range every iteration rather than computing it once:
         // requeue() can narrow this chunk mid-flight, and a cached total then
@@ -448,16 +471,40 @@ class ChunkRun {
         if (state.status === 'done') {
           this.setChunk({ state: 'downloading' })
           refreshJobState(this.jobId)
-          const lost = (await this.downloader?.drain()) ?? []
+          const drained = await this.downloader?.drain()
+          // The drain can take minutes. A cancel or a node death in that time
+          // has already settled this chunk, and finishing it anyway would
+          // overwrite that: 'complete' over frames that never arrived, or
+          // 'failed' → requeue → 'pending', resurrecting cancelled work.
+          if (this.stopped) return
+          // Failing sends the chunk through requeue(), which re-splits around
+          // the frames that DID land — so only the missing ones re-render,
+          // rather than the chunk quietly completing with a hole in it.
+          if (drained && !drained.manifestRead) {
+            // What the agent listed since the last good poll was never even
+            // seen, so there is no "lost" list to trust.
+            this.finish('failed', "could not read the node's manifest for the final download pass")
+            return
+          }
+          const lost = drained?.lost ?? []
           if (lost.length > 0) {
             // The render succeeded but frames did not reach us, and this was
-            // the last download pass. Failing sends it through requeue(), which
-            // re-splits around the frames that DID land — so only the missing
-            // ones re-render, rather than the chunk quietly completing with a
-            // hole in it.
+            // the last download pass.
             this.finish(
               'failed',
               `${lost.length} frame(s) could not be downloaded: ${lost.slice(0, 3).join(', ')}`
+            )
+            return
+          }
+          // Complete means downloaded, and the frames table is what says so —
+          // not the agent's 'done', and not the downloader, which only knows
+          // what the manifest listed. A frame Blender never wrote, or never
+          // manifested, is in neither.
+          const missing = this.undownloadedFrames()
+          if (missing.length > 0) {
+            this.finish(
+              'failed',
+              `${missing.length} frame(s) never arrived: ${missing.slice(0, 3).join(', ')}`
             )
             return
           }
@@ -466,6 +513,7 @@ class ChunkRun {
         }
         if (state.status === 'failed') {
           await this.downloader?.drain()
+          if (this.stopped) return
           this.finish('failed', state.error ?? `exit ${state.exitCode}`)
           return
         }
@@ -475,6 +523,7 @@ class ChunkRun {
           ['rendering', 'encoding'].includes(state.status)
         ) {
           await this.downloader?.drain()
+          if (this.stopped) return
           this.finish(
             'failed',
             `render stalled — no agent state update for ${Math.round(STATE_STALL_MS / 60000)} min`
@@ -488,6 +537,15 @@ class ChunkRun {
 
   private finish(state: 'complete' | 'failed', error?: string): void {
     this.cleanup()
+    // cancelJob settled every chunk of a cancelled job in one go, and nothing
+    // may write over that. A run it aborted never gets here (see the stopped
+    // checks in pollUntilDone); this holds for any it could not reach.
+    // onChunkFinished still runs, to release the run and idle its node —
+    // requeue() leaves a cancelled job's chunks alone.
+    if (this.job().state === 'cancelled') {
+      scheduler.onChunkFinished(this)
+      return
+    }
     this.setChunk({ state })
     if (error) {
       emit('alert', { level: 'warn', message: `chunk ${this.chunkId} failed: ${error}` })
@@ -548,6 +606,11 @@ class ChunkRun {
         `rm -f ${REMOTE_ROOT}/jobs/inbox/${this.chunkId}.json; pkill -f '${this.chunkId}' || true`
       )
       .catch(() => {})
+  }
+
+  /** True once this run has finished or been aborted: it owns nothing any more. */
+  isStopped(): boolean {
+    return this.stopped
   }
 
   /** External stop (cancel / node death). */
@@ -616,8 +679,15 @@ class Scheduler {
     return (this.byNode.get(nodeId)?.size ?? 0) > 0
   }
 
+  /**
+   * Forget a run. The chunk's entry goes only if it is still THIS run's: once
+   * forgetNode has requeued a chunk it can be re-dispatched at once, and a
+   * stale run dropping by chunk id alone deleted its successor's entry. The
+   * chunk then read as not live (isLive, the scale-up's workRemaining) while
+   * it rendered, and a cancel could no longer find the run to stop it.
+   */
   private dropRun(run: ChunkRun): void {
-    this.runs.delete(run.chunkId)
+    if (this.runs.get(run.chunkId) === run) this.runs.delete(run.chunkId)
     const s = this.byNode.get(run.nodeId)
     if (s) {
       s.delete(run)
@@ -1011,6 +1081,22 @@ class Scheduler {
         this.runs.set(chunk.id, run)
         this.nodeRunsMut(node.id).add(run)
         void run.dispatch().catch((e) => {
+          // An abandoned run's failure is not the chunk's. forgetNode or
+          // cancelJob has already settled the chunk, and forgetNode may have
+          // re-dispatched it before this run's prep — minutes of Blender
+          // download or scene upload — failed on the closed connection.
+          // Requeueing here reset the new owner's row to 'pending' (burning a
+          // second retry), and the next tick dispatched the chunk again while
+          // the new owner kept rendering it: the same frames, paid for twice.
+          if (run.isStopped() || this.runs.get(chunk.id) !== run) {
+            emit('render:logLine', {
+              nodeId: node.id,
+              chunkId: chunk.id,
+              line: `abandoned dispatch ended: ${(e as Error).message}`,
+              ts: Date.now()
+            })
+            return
+          }
           emit('alert', {
             level: 'error',
             message: `dispatch ${chunk.id} failed: ${(e as Error).message}`
@@ -1068,6 +1154,9 @@ class Scheduler {
     const db = getDb()
     const chunk = db.prepare('SELECT * FROM chunks WHERE id = ?').get(chunkId) as ChunkRow
     const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(chunk.job_id) as JobRow
+    // A cancelled job's chunks stay as cancelJob left them. Requeueing one put
+    // it back to 'pending' — work nobody wants, which then read as unfinished.
+    if (job.state === 'cancelled') return
     if (chunk.retries >= MAX_RETRIES) {
       db.prepare("UPDATE chunks SET state = 'failed' WHERE id = ?").run(chunkId)
       emitChunkChanged(chunkId)
@@ -1233,35 +1322,51 @@ class Scheduler {
 
   private idleSince = new Map<string, number>()
 
-  /** Cancel a job: kill running chunks on their nodes, mark rows. */
+  /**
+   * Cancel a job: mark its rows, stop its runs, then kill its chunks on their
+   * nodes.
+   *
+   * Everything up to the node cleanup is synchronous, and the rows are written
+   * in one transaction. The old loop awaited a pkill per chunk and judged each
+   * chunk by a snapshot read before the first of them. A run later in the list
+   * could finish during those awaits and have its 'complete' overwritten with
+   * 'failed'. A crash mid-loop left a cancelled job with live-looking chunks
+   * for the next start() to "recover".
+   */
   async cancelJob(jobId: string): Promise<void> {
     const db = getDb()
-    db.prepare("UPDATE jobs SET state = 'cancelled' WHERE id = ?").run(jobId)
-    const chunks = db.prepare('SELECT * FROM chunks WHERE job_id = ?').all(jobId) as ChunkRow[]
-    for (const chunk of chunks) {
-      const run = this.runs.get(chunk.id)
-      if (run) {
-        run.abort()
-        this.dropRun(run)
-        const node = nodeManager.get(run.nodeId)
-        if (node?.ssh) {
-          // Remove queued spec + kill any in-flight blender for this chunk.
-          await node.ssh
-            .exec(
-              `rm -f ${REMOTE_ROOT}/jobs/inbox/${chunk.id}.json; pkill -f '${chunk.id}' || true`
-            )
-            .catch(() => {})
-        }
-        if (node && node.state === 'rendering' && !this.hasRuns(run.nodeId)) {
-          node.setState('idle')
-        }
+    const settled = db.transaction((): string[] => {
+      db.prepare("UPDATE jobs SET state = 'cancelled' WHERE id = ?").run(jobId)
+      const open = db
+        .prepare("SELECT id FROM chunks WHERE job_id = ? AND state NOT IN ('complete', 'failed')")
+        .all(jobId) as Array<{ id: string }>
+      db.prepare(
+        "UPDATE chunks SET state = 'failed' WHERE job_id = ? AND state NOT IN ('complete', 'failed')"
+      ).run(jobId)
+      return open.map((c) => c.id)
+    })()
+    const runs = [...this.runs.values()].filter((r) => r.jobId === jobId)
+    for (const run of runs) {
+      run.abort()
+      this.dropRun(run)
+    }
+    emitChunksChanged(settled)
+    emitJobCancelled(jobId)
+
+    for (const run of runs) {
+      const node = nodeManager.get(run.nodeId)
+      if (node?.ssh) {
+        // Remove queued spec + kill any in-flight blender for this chunk.
+        await node.ssh
+          .exec(
+            `rm -f ${REMOTE_ROOT}/jobs/inbox/${run.chunkId}.json; pkill -f '${run.chunkId}' || true`
+          )
+          .catch(() => {})
       }
-      if (!['complete', 'failed'].includes(chunk.state)) {
-        db.prepare("UPDATE chunks SET state = 'failed' WHERE id = ?").run(chunk.id)
-        emitChunkChanged(chunk.id)
+      if (node && node.state === 'rendering' && !this.hasRuns(run.nodeId)) {
+        node.setState('idle')
       }
     }
-    emitJobCancelled(jobId)
   }
 }
 
