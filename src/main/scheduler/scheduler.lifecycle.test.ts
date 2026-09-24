@@ -1,4 +1,6 @@
 import { createHash } from 'crypto'
+import { existsSync, readFileSync } from 'fs'
+import { join } from 'path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { REMOTE_ROOT } from '../test/fakeSsh'
 import { setup, type AgentSpec, type App, type FakeMachine, type World } from '../test/harness'
@@ -306,5 +308,42 @@ describe('what Blender saves', () => {
     expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
     expect(chunkRow(chunk.id).retries).toBe(0)
     expect(w.alerts('error')).toEqual([])
+  })
+})
+
+describe('frames outside the chunk', () => {
+  it("a manifest line for another chunk's frame never touches that frame", async () => {
+    const { app, machine } = await oneNode()
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 2 })
+    const [a, b] = w.all<ChunkRow>(
+      'SELECT * FROM chunks WHERE job_id = ? ORDER BY frame_start',
+      jobId
+    )
+    const specs: AgentSpec[] = []
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      if (spec.chunkId !== a.id) return
+      // Chunk a's node also lists a frame 3, which is chunk b's to render.
+      listSaved(machine, a.id, 'frames/0003.png')
+      machine.agent.finish(a.id)
+    }
+    app.scheduler.kick()
+    await w.until(
+      () => chunkRow(a.id).state === 'complete' && specs.length === 2,
+      'a complete, b dispatched'
+    )
+
+    // Not fetched, so nothing landed on frame 3's file, and its row still
+    // waits for chunk b. Not counted as lost either: a completed first time.
+    const frame3 = join(w.settings.projectRoot, 'renders', jobId, 'frames', '0003.png')
+    expect(downloaded(jobId)).toEqual([1, 2])
+    expect(existsSync(frame3)).toBe(false)
+    expect(chunkRow(a.id).retries).toBe(0)
+    expect(w.alerts('error')).toEqual([])
+
+    machine.agent.finish(b.id)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
+    expect(readFileSync(frame3, 'utf-8')).toBe(`fake render ${b.id} frame 3\n`)
   })
 })

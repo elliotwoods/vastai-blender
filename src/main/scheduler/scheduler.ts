@@ -394,7 +394,8 @@ class ChunkRun {
       chunkId: this.chunkId,
       nodeId: this.nodeId,
       ssh: this.ssh,
-      remoteChunkDir: posix.join(REMOTE_ROOT, 'renders', this.chunkId)
+      remoteChunkDir: posix.join(REMOTE_ROOT, 'renders', this.chunkId),
+      frames: { start: chunk.frame_start, end: chunk.frame_end, step: job.frame_step }
     })
     this.downloader.start()
     // Per-chunk log tails hold one SSH channel each for the chunk's whole

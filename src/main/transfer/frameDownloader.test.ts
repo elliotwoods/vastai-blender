@@ -25,8 +25,11 @@ interface Rig {
   downloader: ChunkDownloader
 }
 
-/** A job (frames 1-4, one chunk) and a downloader for its chunk on a fresh fake node. */
-async function rig(): Promise<Rig> {
+/**
+ * A job (frames 1-4, one chunk) and a downloader for its chunk on a fresh fake
+ * node. `frames` overrides the range the downloader is told the chunk covers.
+ */
+async function rig(frames = { start: 1, end: 4, step: 1 }): Promise<Rig> {
   const app = await w.boot({ start: false })
   const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 4 })
   const [{ id: chunkId }] = w.all<{ id: string }>('SELECT id FROM chunks WHERE job_id = ?', jobId)
@@ -48,7 +51,8 @@ async function rig(): Promise<Rig> {
     chunkId,
     nodeId: 'node-under-test',
     ssh: conn,
-    remoteChunkDir: `${REMOTE_ROOT}/renders/${chunkId}`
+    remoteChunkDir: `${REMOTE_ROOT}/renders/${chunkId}`,
+    frames
   })
   return { jobId, chunkId, machine, downloader }
 }
@@ -159,6 +163,35 @@ describe('ChunkDownloader.drain', () => {
 
     // Only the backoff already under way; no read after the stop.
     expect(r.machine.ran(manifest)).toHaveLength(1)
+  })
+})
+
+describe("frames that are not the chunk's", () => {
+  function local(r: Rig, file: string): boolean {
+    return existsSync(join(w.settings.projectRoot, 'renders', r.jobId, file))
+  }
+
+  it('are skipped, and not counted as lost', async () => {
+    // Another chunk's frames (a retry's manifest still lists the wider first
+    // attempt's), and one belonging to no chunk at all.
+    const r = await rig({ start: 2, end: 3, step: 1 })
+    for (const f of ['0001', '0002', '0003', '0004', '0009']) saved(r, `frames/${f}.png`)
+
+    const result = await drain(r)
+
+    expect(result).toEqual({ manifestRead: true, lost: [] })
+    expect(downloaded(r.jobId)).toEqual([2, 3])
+    expect(['0001', '0004', '0009'].some((f) => local(r, `frames/${f}.png`))).toBe(false)
+  })
+
+  it('are judged on the step grid too', async () => {
+    const r = await rig({ start: 1, end: 4, step: 3 })
+    for (const f of [1, 2, 3, 4]) saved(r, `frames/000${f}.png`)
+
+    await drain(r)
+
+    expect(downloaded(r.jobId)).toEqual([1, 4])
+    expect(local(r, 'frames/0002.png') || local(r, 'frames/0003.png')).toBe(false)
   })
 })
 

@@ -54,6 +54,8 @@ export interface ChunkDownloadTarget {
   ssh: SshConnection
   /** e.g. /root/vastai/renders/<chunkId> */
   remoteChunkDir: string
+  /** The frames this chunk renders: start..end, every `step`th. See isOurFrame. */
+  frames: { start: number; end: number; step: number }
 }
 
 /** What the final download pass (drain) managed. */
@@ -250,10 +252,34 @@ export class ChunkDownloader {
         entry.kind === 'clip' && entry.meta.kindKey === 'live' && entry.file !== newestLive
       this.seen.add(entry.file)
       if (superseded) continue
+      if (!this.isOurFrame(entry)) continue
       this.queue.push(entry)
     }
     this.pump()
     return { ok: true }
+  }
+
+  /**
+   * Is this entry for one of this chunk's frames? Clips always are. A frame or
+   * thumbnail for any other frame is skipped: never fetched, and not lost.
+   *
+   * Frame files share the job's folder, and a frame's row is keyed by job and
+   * frame number, so fetching another chunk's frame overwrote that chunk's
+   * file and marked the frame downloaded, and nothing ever noticed. They do
+   * not count as lost because such lines are routine: a requeue keeps the
+   * chunk id for its first missing range, and a retry on the same node reads
+   * a manifest that still lists the wider attempt's frames, each already
+   * downloaded or now another chunk's to render.
+   */
+  private isOurFrame(entry: ManifestEntry): boolean {
+    if (entry.kind === 'clip') return true
+    const frame = parseFrameName(entry.file)?.frame
+    // parseManifest passes no frame or thumb name without a number. Should one
+    // ever get through, it is not this check's to judge: download() still
+    // holds it to the job folder.
+    if (frame == null) return true
+    const { start, end, step } = this.target.frames
+    return frame >= start && frame <= end && (frame - start) % step === 0
   }
 
   /**
