@@ -755,8 +755,7 @@ class Scheduler {
     // It is worse on the node that had the chunk before. The manifest there
     // keeps each re-rendered frame's OLD size and sha256, so a frame not yet
     // downloaded when Blender re-renders over it no longer verifies and is
-    // lost.
-    // requeue() keeps this chunk id for the first missing range, and a
+    // lost. requeue() keeps this chunk id for the first missing range, and a
     // dispatch of it to the same node meets the same stale entries again,
     // possibly until the retry budget runs out. All a restart saves is
     // transfer: a frame already on local disk with its manifest's size and
