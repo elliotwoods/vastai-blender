@@ -15,14 +15,15 @@
  * <video> playing the old version is never pulled out from under itself.
  */
 
-import { rename, rm, writeFile } from 'fs/promises'
+import { mkdir, rename, rm, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
-import { basename, dirname, join } from 'path'
+import { basename, join } from 'path'
 import { getDb } from '../db/db'
 import { emit } from '../events'
 import { ffmpegPath, runFfmpeg } from '../media/ffmpeg'
 import { toMediaUrl } from '../mediaUrl'
-import { unlinkLater } from './frameDownloader'
+import { isInside } from '../paths'
+import { jobLocalDir, unlinkLater } from './frameDownloader'
 import { concatList, nextVersionName, planSegments, type SegmentPlan } from './jobClipPlan'
 
 /** Renditions that get a job clip. `live` is per-chunk progress, never stitched. */
@@ -112,6 +113,9 @@ class JobClipBuilder {
     ).map((c) => ({ id: c.id, frameStart: c.frame_start, frameEnd: c.frame_end }))
     if (chunks.length < 2) return
 
+    // Chunk clip paths were built from node-supplied names, and ffmpeg reads
+    // them with `-safe 0`: only clips inside this job's folder go in.
+    const jobDir = jobLocalDir(jobId)
     for (const kind of JOB_CLIP_KINDS) {
       const clips = (
         db
@@ -129,7 +133,9 @@ class JobClipBuilder {
           codec: string | null
           hdr: number
         }>
-      ).map((r) => ({ ...r, chunkId: r.chunk_id, absPath: r.abs_path }))
+      )
+        .filter((r) => isInside(jobDir, r.abs_path))
+        .map((r) => ({ ...r, chunkId: r.chunk_id, absPath: r.abs_path }))
       const plan = planSegments(chunks, clips, job.frame_step)
       // One chunk's worth is just that chunk's clip — nothing to stitch.
       if (!plan || plan.files.length < 2) continue
@@ -152,7 +158,9 @@ class JobClipBuilder {
     const segJson = JSON.stringify(plan.segments)
     if (prev.length === 1 && prev[0].segments === segJson) return
 
-    const outDir = dirname(plan.files[0])
+    // The job's own previews folder, never one derived from a clip's path.
+    const outDir = join(jobLocalDir(jobId), 'previews')
+    await mkdir(outDir, { recursive: true })
     const outPath = join(outDir, nextVersionName(kind, prev[0]?.abs_path ?? null))
     const partPath = `${outPath}.part`
     const listPath = join(tmpdir(), `vr-${jobId.slice(0, 8)}-${kind}-${Date.now()}.txt`)

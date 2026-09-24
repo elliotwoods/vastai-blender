@@ -1,6 +1,6 @@
 import { app, shell, BrowserWindow, protocol } from 'electron'
 import { createReadStream, statSync } from 'fs'
-import { extname, join, normalize, sep } from 'path'
+import { extname, join } from 'path'
 import { Readable } from 'stream'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -13,6 +13,7 @@ import {
   setSlotInfoProvider
 } from './nodes/nodeManager'
 import { installBlender, probeEevee, provisionBase } from './nodes/provisioner'
+import { resolveInside } from './paths'
 import { scheduler } from './scheduler/scheduler'
 import { jobClips } from './transfer/jobClip'
 import { getSettings } from './settings'
@@ -83,12 +84,10 @@ function registerMediaProtocol(): void {
     const url = new URL(request.url)
     const root = mediaRoots()[url.host]
     if (!root) return new Response('unknown media root', { status: 404 })
-    const abs = normalize(join(root, decodeURIComponent(url.pathname)))
-    // Trailing separator: without it `C:\renders` also admits `C:\renders-old`.
-    const guard = normalize(root) + sep
-    if (abs !== normalize(root) && !abs.startsWith(guard)) {
-      return new Response('forbidden', { status: 403 })
-    }
+    // The pathname is '/'-rooted at the media root; resolveInside wants it
+    // relative, and refuses anything that would leave the root.
+    const abs = resolveInside(root, decodeURIComponent(url.pathname).replace(/^\/+/, ''))
+    if (!abs) return new Response('forbidden', { status: 403 })
 
     let size: number
     try {

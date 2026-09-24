@@ -11,10 +11,11 @@ import { join } from 'path'
 import { getDb } from '../db/db'
 import { emit } from '../events'
 import { toMediaUrl } from '../mediaUrl'
+import { isInside, resolveInside } from '../paths'
 import { getSettings } from '../settings'
 import { downloadFileVerified } from '../ssh/sftp'
 import type { SshConnection } from '../ssh/sshConnection'
-import { parseManifest, type ManifestEntry } from './manifest'
+import { parseManifest, type ManifestEntry, type ManifestReject } from './manifest'
 
 const POLL_MS = 5_000
 
@@ -129,7 +130,8 @@ export class ChunkDownloader {
     } catch {
       return // connection down — reconnect logic lives with the node
     }
-    const entries = parseManifest(text)
+    const { entries, rejected } = parseManifest(text)
+    this.noteRejected(rejected)
 
     // Of all the live-clip versions in this read, only the newest is worth
     // fetching — earlier ones are superseded and the node prunes them, so
@@ -149,6 +151,39 @@ export class ChunkDownloader {
       this.queue.push(entry)
     }
     this.pump()
+  }
+
+  /**
+   * Manifest lines that failed validation (manifest.ts); none of them is
+   * fetched. A refused FRAME still counts as lost, or its frame would be a
+   * hole nothing notices: counting it fails the final pass, and requeue()
+   * re-renders whatever did not land. A stray line for a frame that did land
+   * costs one trip through requeue(), which then finds nothing missing.
+   *
+   * One alert per chunk. The whole manifest is re-read every poll, so the same
+   * bad line comes back every few seconds, and again on every attempt.
+   */
+  private noteRejected(rejected: ManifestReject[]): void {
+    if (rejected.length === 0) return
+    let frames = 0
+    for (const r of rejected) {
+      if (r.kind !== 'frame') continue
+      frames++
+      this.lostFrames.add(`refused ${r.file}`)
+    }
+    const { chunkId } = this.target
+    if (rejectAlerted.has(chunkId)) return
+    rejectAlerted.add(chunkId)
+    const r = rejected[0]
+    const n = rejected.length
+    emit('alert', {
+      level: 'error',
+      message:
+        `chunk ${chunkId}: refused ${n} manifest entr${n === 1 ? 'y' : 'ies'} from the node,` +
+        ` e.g. ${r.kind} ${r.file} (${r.reason}). Nothing was downloaded for ${n === 1 ? 'it' : 'them'}` +
+        `${frames > 0 ? ', and any frame still missing will re-render' : ''}.` +
+        ' Further refusals from this chunk are not reported.'
+    })
   }
 
   /**
@@ -251,7 +286,17 @@ export class ChunkDownloader {
     const remotePath = `${remoteChunkDir}/${entry.file}`
     // Frame numbers are globally unique within a job, and preview clips are
     // chunk-labelled — chunks can safely share the job's local tree.
-    const localPath = join(jobLocalDir(jobId), entry.file)
+    //
+    // `file` is the node's word, so it only ever lands inside the job folder.
+    // parseManifest already holds it to the names the agent writes; this is
+    // the backstop that still holds if those patterns are ever loosened.
+    const localPath = resolveInside(jobLocalDir(jobId), entry.file)
+    if (!localPath) {
+      this.noteRejected([
+        { kind: entry.kind, file: JSON.stringify(entry.file), reason: 'outside the job folder' }
+      ])
+      return
+    }
     await downloadFileVerified(ssh, remotePath, localPath, entry)
 
     const db = getDb()
@@ -370,13 +415,27 @@ export class ChunkDownloader {
 /** Definitive renditions — their arrival retires the live clip. */
 const CLIP_KINDS_FINAL: string[] = ['previewSdr', 'previewHdr', 'proxy']
 
+/** Chunks that have already raised their refused-entry alert. See noteRejected. */
+const rejectAlerted = new Set<string>()
+
 /**
  * Delete after a grace period, so a renderer still holding the old URL has
  * time to swap to the new one rather than losing its source mid-frame.
+ *
+ * Only ever inside the project's renders folder. The paths come from assets
+ * rows, which were built from node-supplied names, and a row written before
+ * those names were validated could point anywhere.
  */
 export function unlinkLater(paths: string[], delayMs = 30_000): void {
+  const root = join(getSettings().projectRoot, 'renders')
+  const safe = paths.filter((p) => {
+    if (isInside(root, p)) return true
+    console.warn(`[download] not deleting ${JSON.stringify(p)}: not inside ${root}`)
+    return false
+  })
+  if (safe.length === 0) return
   setTimeout(() => {
-    for (const p of paths) {
+    for (const p of safe) {
       rm(p, { force: true }).catch(() => {})
     }
   }, delayMs).unref?.()
