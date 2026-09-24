@@ -21,6 +21,21 @@ const POLL_MS = 5_000
 /** Transient-failure budget per file before we stop re-queuing it. */
 const MAX_ATTEMPTS = 4
 
+/** Backoff before a failed transfer is retried (× attempt number). */
+const RETRY_BACKOFF_MS = 3_000
+
+/** A manifest read (a tiny `cat`) that takes longer than this has hung. */
+const MANIFEST_READ_TIMEOUT_MS = 30_000
+
+/**
+ * Upper bound on the final download pass. Each transfer already has a stall
+ * timeout and a retry budget, so this is a backstop: whatever has not landed
+ * by then is reported as lost and the chunk goes through requeue (only the
+ * missing frames re-render), instead of the chunk — and the node it pins —
+ * waiting on the network forever.
+ */
+export const DRAIN_BUDGET_MS = 10 * 60_000
+
 export interface ChunkDownloadTarget {
   jobId: string
   chunkId: string
@@ -44,6 +59,10 @@ export class ChunkDownloader {
   private previewsInFlight = 0
   private attempts = new Map<string, number>()
   private queue: ManifestEntry[] = []
+  /** entries being transferred right now */
+  private active = new Set<ManifestEntry>()
+  /** entries waiting out a retry backoff (in neither queue nor active) */
+  private retrying = new Set<ManifestEntry>()
 
   constructor(private readonly target: ChunkDownloadTarget) {}
 
@@ -74,9 +93,22 @@ export class ChunkDownloader {
    * Only frames count. A missing thumbnail or preview clip is cosmetic and is
    * not worth re-rendering a chunk over.
    */
-  async drain(): Promise<string[]> {
+  async drain(budgetMs = DRAIN_BUDGET_MS): Promise<string[]> {
+    const deadline = Date.now() + budgetMs
     await this.poll()
-    while (this.inFlight > 0 || this.queue.length > 0) {
+    while (this.inFlight > 0 || this.queue.length > 0 || this.retrying.size > 0) {
+      if (Date.now() > deadline) {
+        // Give up on whatever is left. Frames count as lost (the caller
+        // re-renders them); previews do not matter enough to hold a node.
+        const left = [...this.queue, ...this.active, ...this.retrying]
+        this.stop()
+        for (const e of left) if (e.kind === 'frame') this.lostFrames.add(e.file)
+        emit('alert', {
+          level: 'warn',
+          message: `chunk ${this.target.chunkId}: download pass timed out after ${Math.round(budgetMs / 60_000)} min — ${left.length} file(s) abandoned`
+        })
+        break
+      }
       await new Promise((r) => setTimeout(r, 250))
     }
     return [...this.lostFrames]
@@ -86,8 +118,12 @@ export class ChunkDownloader {
     if (this.stopped) return
     let text: string
     try {
+      // Timed out: drain() awaits this poll, and an exec on a wedged
+      // connection otherwise never returns — which is one way a chunk used to
+      // sit in 'downloading' forever.
       const r = await this.target.ssh.exec(
-        `cat '${this.target.remoteChunkDir}/manifest.jsonl' 2>/dev/null`
+        `cat '${this.target.remoteChunkDir}/manifest.jsonl' 2>/dev/null`,
+        { timeoutMs: MANIFEST_READ_TIMEOUT_MS }
       )
       text = r.stdout
     } catch {
@@ -133,6 +169,7 @@ export class ChunkDownloader {
   }
 
   private pump(): void {
+    if (this.stopped) return
     const max = getSettings().concurrentTransfersPerNode
     while (this.inFlight < max && this.queue.length > 0) {
       // Lowest class first; ties keep manifest (i.e. frame) order.
@@ -151,6 +188,7 @@ export class ChunkDownloader {
       const preview = this.classOf(entry) < 2
       this.inFlight++
       if (preview) this.previewsInFlight++
+      this.active.add(entry)
       void this.download(entry)
         .catch((e) => {
           const message = (e as Error).message
@@ -178,16 +216,30 @@ export class ChunkDownloader {
             })
             return
           }
-          // Transient — retry. Re-queue directly rather than only clearing
-          // `seen` for the next poll: during drain() there IS no next poll (it
-          // polls once, then waits for the queue to empty and the caller stops
-          // the downloader), so a poll-only retry silently lost the file.
-          this.seen.delete(entry.file)
-          this.queue.push(entry)
-          emit('alert', { level: 'warn', message: `download failed (${entry.file}): ${message}` })
+          // Transient — retry after a short backoff (a stalled transfer
+          // resumes from its .part). Re-queue directly rather than only
+          // clearing `seen` for the next poll: during drain() there IS no next
+          // poll (it polls once, then waits for the queue to empty and the
+          // caller stops the downloader), so a poll-only retry silently lost
+          // the file. `retrying` keeps drain() waiting through the backoff.
+          this.retrying.add(entry)
+          setTimeout(() => {
+            this.retrying.delete(entry)
+            if (this.stopped) {
+              if (entry.kind === 'frame') this.lostFrames.add(entry.file)
+              return
+            }
+            this.queue.push(entry)
+            this.pump()
+          }, RETRY_BACKOFF_MS * attempts)
+          emit('alert', {
+            level: 'warn',
+            message: `download failed (${entry.file}, attempt ${attempts}/${MAX_ATTEMPTS}): ${message}`
+          })
         })
         .finally(() => {
           this.inFlight--
+          this.active.delete(entry)
           if (preview) this.previewsInFlight--
           this.pump()
         })

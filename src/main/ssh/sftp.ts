@@ -8,7 +8,11 @@ import { createHash } from 'crypto'
 import { createReadStream, promises as fsp } from 'fs'
 import { basename, dirname, join, posix } from 'path'
 import type { SFTPWrapper } from 'ssh2'
+import { pipelinedGet, TransferStalledError, type SftpReader } from './pipelinedGet'
 import type { SshConnection } from './sshConnection'
+
+/** No bytes for this long and a download is declared stalled (see pipelinedGet). */
+export const DOWNLOAD_STALL_MS = 60_000
 
 export async function sha256File(path: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -23,12 +27,6 @@ export async function sha256File(path: string): Promise<string> {
 function fastPut(sftp: SFTPWrapper, local: string, remote: string): Promise<void> {
   return new Promise((resolve, reject) =>
     sftp.fastPut(local, remote, (err) => (err ? reject(err) : resolve()))
-  )
-}
-
-function fastGet(sftp: SFTPWrapper, remote: string, local: string): Promise<void> {
-  return new Promise((resolve, reject) =>
-    sftp.fastGet(remote, local, (err) => (err ? reject(err) : resolve()))
   )
 }
 
@@ -120,15 +118,22 @@ export async function uploadFileVerified(
 }
 
 /**
- * Download one manifest-listed file: fastGet → .part, verify size + sha256
- * (size-only for legacy manifest entries without a hash), rename into place.
- * Skips if the local file already exists and verifies (resume after restart).
+ * Download one manifest-listed file: pipelined SFTP read → .part, verify size
+ * + sha256 (size-only for legacy manifest entries without a hash), rename into
+ * place. Skips if the local file already exists and verifies (resume after
+ * restart).
+ *
+ * A transfer that receives nothing for `stallMs` fails with
+ * TransferStalledError instead of hanging forever (ssh2's fastGet never calls
+ * back on a wedged channel), and the SFTP channel is reset so the retry gets a
+ * fresh one. A partial `.part` is kept and the next attempt resumes from it.
  */
 export async function downloadFileVerified(
   ssh: SshConnection,
   remotePath: string,
   localPath: string,
-  expected: { size: number; sha256?: string }
+  expected: { size: number; sha256?: string },
+  opts: { stallMs?: number } = {}
 ): Promise<'downloaded' | 'skipped'> {
   try {
     const st = await fsp.stat(localPath)
@@ -142,9 +147,35 @@ export async function downloadFileVerified(
     // not present — download
   }
   await fsp.mkdir(dirname(localPath), { recursive: true })
-  const sftp = await ssh.sftp()
   const part = `${localPath}.part`
-  await fastGet(sftp, remotePath, part)
+  // Resume from a previous attempt's prefix. A .part at or past the expected
+  // size cannot be a prefix of this file (the manifest entry changed, or it is
+  // corrupt) — start over.
+  let start = 0
+  try {
+    const prev = await fsp.stat(part)
+    if (prev.size < expected.size) start = prev.size
+    else await fsp.rm(part, { force: true })
+  } catch {
+    // no partial — start from zero
+  }
+  const stallMs = opts.stallMs ?? DOWNLOAD_STALL_MS
+  // The channel open is inside the stall budget too: sftp() on a wedged
+  // connection can hang as surely as a read can.
+  const sftp = await withTimeout(ssh.sftp(), stallMs, () => {
+    ssh.resetSftp()
+    return new TransferStalledError(remotePath, stallMs, start)
+  })
+  try {
+    await pipelinedGet(sftp as unknown as SftpReader, remotePath, part, {
+      size: expected.size,
+      start,
+      stallMs
+    })
+  } catch (e) {
+    if (e instanceof TransferStalledError) ssh.resetSftp()
+    throw e
+  }
   const st = await fsp.stat(part)
   if (st.size !== expected.size) {
     await fsp.rm(part, { force: true })
@@ -159,4 +190,20 @@ export async function downloadFileVerified(
   }
   await fsp.rename(part, localPath)
   return 'downloaded'
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(onTimeout()), ms)
+    p.then(
+      (v) => {
+        clearTimeout(t)
+        resolve(v)
+      },
+      (e) => {
+        clearTimeout(t)
+        reject(e)
+      }
+    )
+  })
 }

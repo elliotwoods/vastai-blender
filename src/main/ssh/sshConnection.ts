@@ -265,6 +265,25 @@ export class SshConnection extends EventEmitter {
     return this.sftpOpening
   }
 
+  /**
+   * Drop the cached SFTP channel so the next sftp() opens a fresh one.
+   *
+   * For a transfer that stalled: a wedged SFTP channel never answers again,
+   * and every later transfer queued on it would hang behind it. Ending it also
+   * errors out whatever else was in flight on it, which is what we want — they
+   * are retried on the new channel. If the whole TCP connection is dead, the
+   * keepalive closes it and acquire() reconnects.
+   */
+  resetSftp(): void {
+    const s = this.sftpCache
+    this.sftpCache = null
+    try {
+      s?.end()
+    } catch {
+      // already closed
+    }
+  }
+
   /** Open a forwarded TCP channel (for the VNC tunnel). */
   async forwardOut(dstHost: string, dstPort: number): Promise<NodeJS.ReadWriteStream> {
     const c = await this.acquire()
