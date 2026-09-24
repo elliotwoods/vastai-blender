@@ -16,6 +16,9 @@ Contract with the app (all under ~/vastai/):
 
 The manifest is the ONLY thing the app trusts for downloads — a file is listed
 only after it is size-stable, so partially-written frames are never pulled.
+Size-stable is not enough on its own (a file whose writer was killed is stable
+too), so a frame is listed only once Blender announced it with "Saved:", or
+when the end-of-render sweep finds it after a CLEAN exit — see run_render.
 
 Job spec:
   { "chunkId": str, "blendFile": str (under work/scenes/),
@@ -72,6 +75,8 @@ PREVIEW_FAIL_LIMIT = 4
 # anchored match never fires and currentFrame stays null in the UI.
 FRA_RE = re.compile(r"\bFra:\s*(\d+)")
 SAVED_RE = re.compile(r"Saved: '(.+?)'")
+# What `-o frames/####` produces: the zero-padded frame number and an extension.
+FRAME_NAME_RE = re.compile(r"^(\d+)\.\w+$")
 
 # Exit code Blender returns when any Python script raises (--python-exit-code).
 # Distinguishes "a scene/startup guard aborted the render" from render crashes.
@@ -214,6 +219,18 @@ class FrameTracker:
     def saw_saved(self, path):
         with self.lock:
             self.pending.append(path)
+
+    def forget_pending(self):
+        """Drop announcements not yet recorded, before a new attempt starts.
+
+        They belong to the attempt being replaced, and their files are about to
+        be deleted by discard_unmanifested and rendered again. A later flush
+        would record whatever is on disk at that moment under the OLD
+        announcement: a half-written file, if the new attempt dies mid-write on
+        it. The new attempt announces every frame it finishes itself.
+        """
+        with self.lock:
+            self.pending = []
 
     def flush(self, final=False):
         """Move stable pending files into the manifest. Returns #recorded."""
@@ -652,6 +669,91 @@ def log_line(chunk_id, message):
         pass
 
 
+def discard_unmanifested(chunk_id, chunk_dir, recorded):
+    """Before an attempt, delete every file in frames/ the manifest does not list.
+
+    An unlisted file is untrusted by definition: the frame a killed Blender was
+    mid-write on (provision.sh's `pkill` on every app restart, a cancel, an OOM
+    kill), or one a failed attempt left behind. Left in place it is a hazard
+    twice over: a .blend with Overwrite unchecked makes Blender skip any frame
+    already on disk, so it is never replaced, and the end-of-render sweep then
+    finds it and manifests it with a hash over the truncated bytes, which the
+    app verifies against and accepts.
+
+    Manifested frames are kept: the app may not have downloaded them yet, and
+    their size and hash are already promised to it. This is the one place the
+    agent deletes paid-for output, so it errs towards keeping: files are matched
+    by NAME, not by the manifest's relative path, so a path spelled differently
+    cannot cost a finished frame; and `recorded` is unioned with a fresh
+    manifest read, since manifest_files returns nothing on a failed read.
+    """
+    frames_dir = os.path.join(chunk_dir, "frames")
+    keep = {
+        os.path.basename(f)
+        for f in set(recorded) | manifest_files(chunk_dir, kind="frame")
+    }
+    try:
+        names = sorted(os.listdir(frames_dir))
+    except OSError:
+        return []
+    removed = []
+    for name in names:
+        path = os.path.join(frames_dir, name)
+        if name in keep or not os.path.isfile(path):
+            continue
+        try:
+            os.remove(path)
+            removed.append(name)
+        except OSError as e:
+            # Not fatal: the sweep's mtime filter still keeps it out of the manifest.
+            log_line(chunk_id, f"could not discard unmanifested frames/{name}: {e}")
+    if removed:
+        shown = ", ".join(removed[:10]) + (" ..." if len(removed) > 10 else "")
+        log_line(chunk_id, f"discarded {len(removed)} unmanifested file(s) from frames/: {shown}")
+    return removed
+
+
+def unannounced_frames(frames_dir, spec, since, recorded):
+    """Files this attempt wrote to frames/ whose "Saved:" line the parser missed.
+
+    The end-of-render safety net. Deliberately narrow, because whatever it
+    returns goes into the manifest with a hash over the bytes on disk:
+      * only `NNNN.ext` names, which is what `-o frames/####` produces;
+      * only frame numbers on the spec's start..end/step grid, so a leftover
+        from the wider chunk this one was split from cannot ride along;
+      * only files modified since this attempt started, so nothing an earlier,
+        killed attempt left behind (if discard_unmanifested could not delete
+        it) passes as this attempt's output.
+    Only ever call it after a CLEAN exit: the frame a crashed Blender died
+    writing passes every one of these tests.
+    """
+    start, end = int(spec["frameStart"]), int(spec["frameEnd"])
+    step = int(spec.get("frameStep") or 1)
+    chunk_dir = os.path.dirname(frames_dir)
+    try:
+        names = sorted(os.listdir(frames_dir))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        m = FRAME_NAME_RE.match(name)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if n < start or n > end or (n - start) % step:
+            continue
+        path = os.path.join(frames_dir, name)
+        if os.path.relpath(path, chunk_dir) in recorded:
+            continue
+        try:
+            if not os.path.isfile(path) or os.path.getmtime(path) < since:
+                continue
+        except OSError:
+            continue
+        found.append(path)
+    return found
+
+
 def run_render(spec, log_path, tracker, gpu=None):
     chunk_id = spec["chunkId"]
     chunk_dir = os.path.join(RENDERS, chunk_id)
@@ -721,7 +823,18 @@ def run_render(spec, log_path, tracker, gpu=None):
         env.update(gpu_env(gpu))
         log_line(chunk_id, f"pinned to GPU {gpu} ({env.get('VR_GPU_BUS') or 'bus id unknown'})")
 
+    # When the current attempt launched Blender; the end-of-render sweep only
+    # adopts files modified since. Set by run_once.
+    attempt_started = time.time()
+
     def run_once(cmd):
+        nonlocal attempt_started
+        # Each attempt starts from a frames/ holding only manifested frames, and
+        # with no announcements carried over from the attempt it replaces. See
+        # forget_pending and discard_unmanifested.
+        tracker.forget_pending()
+        discard_unmanifested(chunk_id, chunk_dir, tracker.recorded)
+        attempt_started = time.time()
         with open(log_path, "a") as log:
             log.write(f"=== {time.strftime('%F %T')} render start: {' '.join(cmd)}\n")
             log.flush()
@@ -787,15 +900,21 @@ def run_render(spec, log_path, tracker, gpu=None):
             log.write(f"=== retrying with --gpu-backend opengl (first attempt exit {code})\n")
         code = run_once(build_cmd(gpu_backend="opengl"))
 
-    # Catch any frames the log parser missed (or that settled late).
+    # Settle the frames Blender announced. It prints "Saved:" only once the
+    # write succeeded, so these are complete whatever the exit code.
     for _ in range(5):
         tracker.flush(final=True)
         time.sleep(0.5)
-    for name in sorted(os.listdir(frames_dir)):
-        path = os.path.join(frames_dir, name)
-        rel = os.path.relpath(path, os.path.join(RENDERS, chunk_id))
-        if rel not in tracker.recorded and size_stable(path, wait=0.5):
-            tracker.saw_saved(path)
+    # Then catch frames the log parser missed, but ONLY after a clean exit.
+    # After a crash or a kill, an unannounced file is the frame Blender died
+    # writing: size_stable passes it (a dead writer's size never changes), and
+    # it used to be manifested with a hash over the truncated bytes, so the app
+    # verified it, marked it downloaded and never rendered it again. It stays
+    # unlisted here and the next attempt's discard_unmanifested deletes it.
+    if code == 0:
+        for path in unannounced_frames(frames_dir, spec, attempt_started, tracker.recorded):
+            if size_stable(path, wait=0.5):
+                tracker.saw_saved(path)
     tracker.flush(final=True)
 
     state["framesDone"] = len(tracker.recorded)
