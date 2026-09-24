@@ -71,14 +71,15 @@ export async function setupOctane(ssh: SshConnection, nodeId: string): Promise<v
     .prepare('UPDATE nodes SET octane_ready = ? WHERE id = ?')
     .run(licensed ? 1 : 0, nodeId)
   if (!licensed) {
-    // The fleet view has no VNC tunnel button yet (nothing calls
-    // node:openVncTunnel), so this advice cannot be followed until plan 1.18
-    // adds it. octane_ready = 0 also re-runs this setup on the next Octane
-    // dispatch to the node.
+    // The fleet view has no VNC sign-in yet (nothing calls
+    // node:openVncTunnel; plan 1.18 adds it), so the alert must not send the
+    // user looking for one. octane_ready = 0 also re-runs this setup on the
+    // next Octane dispatch to the node.
     emit('alert', {
       level: 'warn',
       message:
-        'Octane license not confirmed — open the VNC tunnel from the fleet view and sign in manually.'
+        'Octane license not confirmed on this node, and the app cannot open a VNC sign-in yet ' +
+        '(see docs/OCTANE.md). Destroy the node if it cannot be licensed — it bills meanwhile.'
     })
   }
 }

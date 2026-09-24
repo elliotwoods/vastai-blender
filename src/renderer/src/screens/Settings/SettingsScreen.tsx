@@ -365,8 +365,9 @@ function OctaneSection(): React.JSX.Element {
     <div>
       <div style={{ ...sectionLabel(), marginBottom: SCALE.space3 }}>Octane license</div>
       <div style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint, marginBottom: SCALE.space3 }}>
-        Credentials are stored encrypted locally and only injected into the render node&apos;s
-        OctaneServer process environment — never written to node disk.
+        Stored encrypted on this computer. To license a node they are sent to it — in the setup
+        command and OctaneServer&apos;s environment — so treat them as disclosed to the owner of
+        every machine an Octane node is rented from.
       </div>
       <div style={formRow}>
         <span style={label}>OTOY account</span>
