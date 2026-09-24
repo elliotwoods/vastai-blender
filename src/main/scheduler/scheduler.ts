@@ -744,14 +744,17 @@ class Scheduler {
     // their range unchanged. Nothing narrows it around frames that already
     // downloaded, and nothing re-attaches to the old render: resuming a node
     // re-provisions it, which kills its Blender processes and clears its
-    // inbox (provision.sh `base`). So the re-dispatch renders the WHOLE range
-    // again, and is billed for it. The agent runs Blender over -s..-e and does
-    // not skip frames it has already manifested (Blender itself does only
-    // when the scene has Overwrite unchecked).
+    // inbox (provision.sh `base`). (Except a node that was unreachable at
+    // launch and reconnects later: recoverUnreachable skips onReady, so its
+    // old agent and renders keep running.) So the re-dispatch renders the
+    // WHOLE range again, and is billed for it. The agent runs Blender over
+    // -s..-e and does not skip frames it has already manifested (Blender
+    // itself does only when the scene has Overwrite unchecked).
     //
     // It is worse on the node that had the chunk before. The manifest there
-    // keeps each re-rendered frame's OLD size and sha256, so a frame that had
-    // not been downloaded yet usually no longer verifies and is lost.
+    // keeps each re-rendered frame's OLD size and sha256, so a frame not yet
+    // downloaded when Blender re-renders over it no longer verifies and is
+    // lost.
     // requeue() keeps this chunk id for the first missing range, and a
     // dispatch of it to the same node meets the same stale entries again,
     // possibly until the retry budget runs out. All a restart saves is

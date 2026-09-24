@@ -16,13 +16,14 @@ GitHub Releases with the notes from this file.
 ### Added
 
 - **Alerts reach you.** The main process raises alerts from about 25 places,
-  every "destroy failed — check the Vast.ai console" among them, and nothing in
-  the window listened. Info and warnings now show as toasts. Errors and billing
-  risks (a failed destroy, an instance left running) stay in a banner until
-  dismissed, billing risks first, with a link to the Vast.ai console. Alerts
-  raised before the window opened, or while it was closed, are replayed when it
-  opens, and an alert that repeats every tick is one entry. A new error raises
-  an OS notification while the window is in the background. Dismissals survive
+  every "destroy failed — check the Vast.ai console" among them, and nothing
+  in the window listened. Info and warnings now show as toasts. Errors and
+  billing risks (a failed destroy, an instance left running) stay in a banner
+  until dismissed, billing risks first, with a link to the Vast.ai console.
+  Errors and billing risks raised before the window opened, or while it was
+  closed, are shown when it opens, as are info and warnings from the last
+  minute. An alert that repeats every tick is one entry. A new error raises an
+  OS notification while the window is in the background. Dismissals survive
   closing and reopening the window.
 - **CI.** Every push and pull request runs both typechecks, eslint, vitest, the
   node agent's self-check, and `py_compile` / `bash -n` over `remote/`, which
@@ -69,11 +70,10 @@ GitHub Releases with the notes from this file.
   and in tooltips: `VR_MOCK` mocks only reads, and its actions reach the real
   fleet; the spend cap limits only automatic scale-up, and checks the fleet's
   current rate, not the next machine's price; the node panel's *actual* $/hr
-  can never read above the quote; the toolbar's energy counts since launch,
-  while its spend is all-time; and an app restart re-renders each in-flight
-  chunk's whole range rather than re-attaching to it.
-- `electron-store`, `react-window` and `@electron-toolkit/preload` are gone.
-  Nothing imported them, but they were packed into `app.asar`.
+  is at most about the quote (it can read slightly over in a node's first few
+  minutes, since the meter charges whole minutes); the toolbar's energy counts
+  since launch, while its spend is all-time; and an app restart re-renders
+  each in-flight chunk's whole range rather than re-attaching to it.
 - **Faster fleet ramp.** Scale-up rents several nodes per 15 s tick (up to 8,
   from one offer search) instead of one, still bounded by *Max active nodes*
   and the spend cap. A 30-node fleet is now requested in about a minute rather
@@ -90,6 +90,11 @@ GitHub Releases with the notes from this file.
   the per-chunk live view.
 - The Gallery shows one tile per job when a job clip exists; **chunks** switches
   back to the per-chunk wall.
+
+### Removed
+
+- `electron-store`, `react-window` and `@electron-toolkit/preload`. Nothing
+  imported them, but they were packed into `app.asar`.
 
 ### Fixed
 
@@ -113,10 +118,10 @@ GitHub Releases with the notes from this file.
   was dispatched again at once. The abandoned preparation then failed on the
   closed connection, requeued the chunk its successor now owned and dropped the
   successor's bookkeeping, so the next tick dispatched it a third time while
-  the successor was still rendering it: the same frames, billed twice. An abandoned
-  run now writes nothing. Cancelling a job during a chunk's final download no
-  longer puts the chunk back in the queue, and the cancel now shows in the Jobs
-  list.
+  the successor was still rendering it: the same frames, billed twice. An
+  abandoned run now writes nothing. Cancelling a job during a chunk's final
+  download no longer puts the chunk back in the queue, and the cancel now shows
+  in the Jobs list.
 - **A chunk could complete without all its frames.** The final download pass
   read the manifest once and took a failed read for an empty one, so frames
   listed since the last good poll were never fetched, and idle scale-down then

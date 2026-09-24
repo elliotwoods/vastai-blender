@@ -154,11 +154,14 @@ does about that, and what it doesn't:
 - **Quitting leaves the fleet billing.** Quitting the app (on Windows and
   Linux, closing its window) does not destroy nodes, and nothing on a node
   shuts it down. They bill until you open the app again and they idle out, or
-  until you destroy them. Destroy the fleet from **Fleet** before you quit, or
-  check the [Vast.ai console](https://cloud.vast.ai/instances/). Sleep is the
+  until you destroy them. Before you quit, set **Fleet → max nodes** to 0 (or
+  cancel every unfinished job), then destroy each node. Otherwise their chunks
+  go back to the queue and, within seconds, the scheduler rents replacements
+  to render them. Check the
+  [Vast.ai console](https://cloud.vast.ai/instances/) afterwards. Sleep is the
   same: nodes keep billing and nothing is metered until the computer wakes.
 - **A restart re-renders in-flight work.** On launch the app re-provisions
-  every node it still holds, which kills the renders running there. Each chunk
+  every node it can reach, which kills the renders running there. Each chunk
   that was in flight goes back to the queue and renders its whole frame range
   again. When any chunk was in flight and max nodes is above 1, renting waits
   behind a *Resume rendering* prompt; a queue with nothing in flight rents
@@ -171,9 +174,9 @@ does about that, and what it doesn't:
 - **Instance ownership.** Each instance is labelled `vastai-blender` followed
   by the first 8 characters of its node's id. At launch the app destroys any
   instance with such a label that this profile rented but no longer tracks,
-  such as one whose destroy failed. An instance another profile or install rented is left
-  running, with a warning, and instances without the label are never touched.
-  The sweep runs only at launch.
+  such as one whose destroy failed. An instance another profile or install
+  rented is left running, with a warning, and instances without the label are
+  never touched. The sweep runs only at launch.
 - **One app per profile.** A second launch on the same profile focuses the
   window that is already open; a headless one (`VR_JOB_SPEC`, `VR_E2E_BLEND`)
   exits with status 1 and submits nothing.

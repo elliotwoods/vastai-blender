@@ -16,7 +16,7 @@ export const HINTS = {
   energy:
     'GPU energy this node has drawn since the app was opened, from its power readings. It is not kept across a restart.',
   actual:
-    'Metered spend ÷ how long the node has been up. The app meters at the quoted rate, provisioning and idle time included, so this is never above that rate; it reads lower only for time the app did not meter, such as while it was closed or asleep. Estimated, not billed.',
+    'Metered spend ÷ how long the node has been up. The app meters at the quoted rate, provisioning and idle time included, so this is at most about that rate (the meter charges whole minutes, so it can read slightly over for the first few minutes). It reads lower only for time the app did not meter, such as while it was closed or asleep. Estimated, not billed.',
   uptime: 'Time since vast.ai started billing this instance.',
   power: 'Current GPU power draw against the card’s limit, and energy used this session.',
 
