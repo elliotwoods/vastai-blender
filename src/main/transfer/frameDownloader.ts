@@ -8,7 +8,7 @@
 
 import { promises as fsp } from 'fs'
 import { rm } from 'fs/promises'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { getDb } from '../db/db'
 import { emit } from '../events'
 import { toMediaUrl } from '../mediaUrl'
@@ -79,6 +79,28 @@ export const SINK_HOLD_MS = 20 * 60_000
 /** While the local disk is failing, try it again this often (probeSink). */
 const SINK_PROBE_MS = 30_000
 
+/**
+ * drain() looks around every 250 ms. A gap between looks longer than this is
+ * the machine having slept (a Mac's lid closed), not the node failing to
+ * deliver: nothing could move meanwhile, so the idle clock starts again.
+ * Counted as idle, a sleep past DRAIN_IDLE_MS gave up on every frame still
+ * to fetch, a paid re-render, on the first look after waking, before any
+ * transfer could reconnect. A hold on the local disk (SINK_HOLD_MS) does
+ * count the sleep: that bounds what the node bills while frames cannot land,
+ * and it billed all the while.
+ */
+const SUSPEND_GAP_MS = 30_000
+
+/**
+ * Once drain() has stopped its transfers, it waits this long at most for
+ * them to wind down. An abort ends a transfer's network side at once, but
+ * not a local step already under way (hashing, a rename, a truncate), which
+ * on a project folder on a hung network share may never return, and the
+ * node would be held for it. What is still running after this cannot write
+ * rows (download() checks `stopped`) or share a .part (oneWriterAt).
+ */
+const SETTLE_WAIT_MS = 60_000
+
 export interface ChunkDownloadTarget {
   jobId: string
   chunkId: string
@@ -133,7 +155,9 @@ const live = new Set<ChunkDownloader>()
  * every downloader pauses and its frames wait on their nodes. Nothing is
  * charged an attempt or counted lost: fetching again only fails the same
  * way, and a re-render would pay for frames that could not be kept either.
- * Once the disk takes files again, downloads resume by themselves.
+ * Once the disk takes files again, downloads resume by themselves. A refusal
+ * of one file only, by a disk that takes others in the same folder (a frame
+ * file another program holds, say), pauses nothing: see failed().
  *
  * The shape of FleetHolds.localSink: the scheduler should hold new dispatch
  * and scale-up while this is set, since every frame rendered meanwhile would
@@ -178,8 +202,7 @@ function sinkFailed(e: LocalSinkError, dir: string): void {
 }
 
 /**
- * Is the disk taking files again? Room for the reserve plus the most any
- * failed check wanted, and a small write that lands. Only this clears the
+ * Is the disk taking files again? See sinkTakes. Only this clears the
  * trouble: a thumbnail that slips through proves nothing about the next EXR,
  * and clearing on it would flap the alert.
  */
@@ -187,19 +210,8 @@ async function probeSink(): Promise<void> {
   const trouble = sinkTrouble
   if (!trouble || probing) return
   probing = true
-  const probe = join(trouble.dir, '.vastai-render-write-check')
   try {
-    await fsp.mkdir(trouble.dir, { recursive: true })
-    const st = await fsp.statfs(trouble.dir).catch(() => null)
-    if (st && Number(st.bavail) * Number(st.bsize) < LOCAL_FREE_RESERVE_BYTES + trouble.needBytes) {
-      return
-    }
-    const fh = await fsp.open(probe, 'w')
-    try {
-      await fh.write(Buffer.alloc(4096))
-    } finally {
-      await fh.close().catch(() => {})
-    }
+    if (!(await sinkTakes(trouble.dir, trouble.needBytes))) return
     if (sinkTrouble !== trouble) return
     sinkTrouble = null
     if (sinkProbe) clearInterval(sinkProbe)
@@ -209,11 +221,40 @@ async function probeSink(): Promise<void> {
       message: 'The project disk is taking files again: downloads resumed.'
     })
     for (const d of [...live]) d.wake()
+  } finally {
+    probing = false
+  }
+}
+
+/** Numbers each check's scratch file, so two checks at once never share one. */
+let checkSeq = 0
+
+/**
+ * Does `dir` take files now: room for the reserve plus `needBytes`, and a
+ * small write that lands? `dir` is the folder a failed file lands in, not the
+ * job's: a frames/ folder that refuses writes while the job folder takes
+ * them passed a check of the job folder every time, and the downloads it
+ * woke failed again at once.
+ */
+async function sinkTakes(dir: string, needBytes: number): Promise<boolean> {
+  const probe = join(dir, `.vastai-render-write-check-${++checkSeq}`)
+  try {
+    await fsp.mkdir(dir, { recursive: true })
+    const st = await fsp.statfs(dir).catch(() => null)
+    if (st && Number(st.bavail) * Number(st.bsize) < LOCAL_FREE_RESERVE_BYTES + needBytes) {
+      return false
+    }
+    const fh = await fsp.open(probe, 'w')
+    try {
+      await fh.write(Buffer.alloc(4096))
+    } finally {
+      await fh.close().catch(() => {})
+    }
+    return true
   } catch {
-    // still failing
+    return false
   } finally {
     await fsp.rm(probe, { force: true }).catch(() => {})
-    probing = false
   }
 }
 
@@ -240,6 +281,8 @@ export class ChunkDownloader {
   private retrying = new Set<ManifestEntry>()
   /** The last time a byte landed or a file finished, across every transfer here. */
   private lastProgressAt = Date.now()
+  /** The last time a file finished: what ends a hold on the local disk (drain). */
+  private lastLandedAt = 0
 
   constructor(private readonly target: ChunkDownloadTarget) {}
 
@@ -263,12 +306,26 @@ export class ChunkDownloader {
    * Stop polling, and stop the transfers in flight too: the chunk is no
    * longer this run's. A transfer left running once kept writing into a .part
    * that the requeued chunk's download of the same frame then shared (#243).
+   *
+   * Whatever the run had not landed leaves no partial behind in the job
+   * folder, the user's delivery folder. Partials are named for their content
+   * (#240), so the re-render's frame never resumes one and nothing else
+   * would ever remove it. Each goes once its transfer, if any, has let go.
    */
   stop(): void {
+    if (this.stopped) return
     this.stopped = true
     if (this.timer) clearInterval(this.timer)
     live.delete(this)
+    const left = this.leftovers()
     for (const t of this.active.values()) t.abort.abort()
+    for (const e of left) this.discardPartialOf(e)
+  }
+
+  /** Remove `entry`'s partial, in turn with any transfer of it (discardPartial). */
+  private discardPartialOf(entry: ManifestEntry): void {
+    const localPath = resolveInside(jobLocalDir(this.target.jobId), entry.file)
+    if (localPath) void discardPartial(localPath, entry)
   }
 
   /** The local disk takes files again: start what was waiting for it. */
@@ -300,11 +357,13 @@ export class ChunkDownloader {
    * per view whose views have all landed (settleViewFrames).
    *
    * The pass gives up on the node only after DRAIN_IDLE_MS with nothing
-   * landing: a slow transfer that keeps moving is waited for. While the local
+   * landing: a slow transfer that keeps moving is waited for, and time the
+   * machine spent asleep does not count (SUSPEND_GAP_MS). While the local
    * disk will not take files, it holds instead (the frames are safe on the
-   * node) for up to SINK_HOLD_MS, then reports them as `localSinkBlocked`.
-   * Either way it returns only once every transfer it started has stopped, so
-   * none goes on writing files or rows after the caller has moved on.
+   * node), for up to SINK_HOLD_MS from the first refusal until a file lands,
+   * then reports them as `localSinkBlocked`. Either way it stops every
+   * transfer it started and waits for them (SETTLE_WAIT_MS at most), so none
+   * goes on writing files or rows after the caller has moved on.
    *
    * A downloader stopped mid-drain (its run was cancelled or its node went
    * away) starts no further read, but returns only once what it is waiting on
@@ -313,7 +372,9 @@ export class ChunkDownloader {
    * meaningless: the caller no longer owns the chunk and must not act on it.
    */
   async drain(idleMs = DRAIN_IDLE_MS): Promise<DrainResult> {
-    live.add(this)
+    // Stopped before the drain began (its run aborted meanwhile): stop() has
+    // already let go of it, and nothing would ever remove it from `live`.
+    if (!this.stopped) live.add(this)
     let manifestRead = false
     let gaveUp = false
     const blocked: string[] = []
@@ -324,15 +385,23 @@ export class ChunkDownloader {
     }
     this.lastProgressAt = Date.now()
     let heldSince: number | null = null
+    let lookedAt = Date.now()
     while (
       !this.stopped &&
       (this.inFlight > 0 || this.queue.length > 0 || this.retrying.size > 0)
     ) {
       const now = Date.now()
+      // Slept: see SUSPEND_GAP_MS.
+      if (now - lookedAt > SUSPEND_GAP_MS) this.lastProgressAt = now
+      lookedAt = now
       if (sinkTrouble) {
         // Waiting on the local disk, not on the node: the idle clock stands
-        // still while the hold's runs.
-        heldSince ??= now
+        // still while the hold's runs. The hold is not restarted by the disk
+        // clearing for a moment, only by a file landing. It was: a disk that
+        // took the probe's write and refused the frames again straight after
+        // began a fresh hold every 30 s, and the drain held its node, billing,
+        // for good.
+        if (heldSince === null || this.lastLandedAt > heldSince) heldSince = now
         this.lastProgressAt = now
         if (now - heldSince > SINK_HOLD_MS) {
           const left = this.leftovers()
@@ -348,28 +417,30 @@ export class ChunkDownloader {
           })
           break
         }
-      } else {
-        heldSince = null
-        if (now - this.lastProgressAt > idleMs) {
-          // Give up on whatever is left. Frames count as lost (the caller
-          // re-renders them); previews do not matter enough to hold a node.
-          const left = this.leftovers()
-          gaveUp = true
-          this.stop()
-          for (const e of left) if (e.kind === 'frame') this.lostFrames.add(e.file)
-          emit('alert', {
-            level: 'warn',
-            message: `chunk ${this.target.chunkId}: nothing downloaded for ${Math.round(idleMs / 60_000)} min — ${left.length} file(s) abandoned`
-          })
-          break
-        }
+      } else if (now - this.lastProgressAt > idleMs) {
+        // Give up on whatever is left. Frames count as lost (the caller
+        // re-renders them); previews do not matter enough to hold a node.
+        const left = this.leftovers()
+        gaveUp = true
+        this.stop()
+        for (const e of left) if (e.kind === 'frame') this.lostFrames.add(e.file)
+        emit('alert', {
+          level: 'warn',
+          message: `chunk ${this.target.chunkId}: nothing downloaded for ${Math.round(idleMs / 60_000)} min — ${left.length} file(s) abandoned`
+        })
+        break
       }
       await new Promise((r) => setTimeout(r, 250))
     }
     // stop() aborted whatever was in flight; each winds down within moments.
     // The caller requeues next, and a transfer still running then would land
     // bytes and rows for a chunk that is no longer this run's (#243).
-    await Promise.allSettled([...this.active.values()].map((t) => t.settled))
+    let settleTimer: NodeJS.Timeout | undefined
+    await Promise.race([
+      Promise.allSettled([...this.active.values()].map((t) => t.settled)),
+      new Promise((r) => (settleTimer = setTimeout(r, SETTLE_WAIT_MS)))
+    ])
+    clearTimeout(settleTimer)
     // Stopped by the caller, not by giving up: the chunk is no longer ours.
     if (manifestRead && (!this.stopped || gaveUp)) this.settleViewFrames()
     return { manifestRead, lost: [...this.lostFrames], localSinkBlocked: blocked }
@@ -566,7 +637,7 @@ export class ChunkDownloader {
       const settled = this.download(entry, abort.signal)
         .then(
           () => {
-            this.lastProgressAt = Date.now()
+            this.lastProgressAt = this.lastLandedAt = Date.now()
           },
           (e: unknown) => this.failed(entry, e)
         )
@@ -586,15 +657,9 @@ export class ChunkDownloader {
     // has already counted whatever was in flight.
     if (this.stopped) return
     if (e instanceof LocalSinkError) {
-      // Not the node's fault, nor the network's: the file is safe on the
-      // node, and fetching it again fails the same way until the disk is
-      // fixed. It was charged attempts, counted lost after four, and
-      // re-rendered on a paid GPU (B6). No attempt now: it waits in the queue.
-      this.queue.unshift(entry)
-      sinkFailed(e, jobLocalDir(this.target.jobId))
+      this.sinkRefused(entry, e)
       return
     }
-    const message = (e as Error).message
     // A file the node has already unlinked (a superseded live clip, or a
     // chunk dir torn down) is PERMANENT. The old code deleted it from `seen`
     // unconditionally, so it was re-queued every 5s poll forever, emitting
@@ -611,6 +676,49 @@ export class ChunkDownloader {
       })
       return
     }
+    this.retryOrGiveUp(entry, (e as Error).message)
+  }
+
+  /**
+   * The local disk refused a file. Not the node's fault, nor the network's:
+   * the file is safe on the node. It was charged attempts, counted lost after
+   * four, and re-rendered on a paid GPU (B6).
+   *
+   * If the disk will not take files in that folder at all (sinkTakes, asked
+   * right away), fetching again only fails the same way until it is fixed:
+   * the file waits in the queue, charged nothing, and every downloader
+   * pauses. If it takes them, the refusal is this file's own (a frame file
+   * another program holds, one the user may not overwrite), so it is charged
+   * an attempt like any other failure, and MAX_ATTEMPTS bounds it. Taken as
+   * the disk's, such a file paused everything, the probe found the disk fine
+   * 30 s later, the file failed again, and so on: a final pass waiting on it
+   * never ended while its node billed.
+   */
+  private sinkRefused(entry: ManifestEntry, e: LocalSinkError): void {
+    const localPath = resolveInside(jobLocalDir(this.target.jobId), entry.file)
+    const dir = localPath ? dirname(localPath) : jobLocalDir(this.target.jobId)
+    if (sinkTrouble) {
+      // Already paused: the probe decides when it is tried again.
+      this.queue.unshift(entry)
+      sinkFailed(e, dir)
+      return
+    }
+    // In `retrying` meanwhile, so drain() waits for the verdict.
+    this.retrying.add(entry)
+    void sinkTakes(dir, e.needBytes ?? 0).then((takes) => {
+      this.retrying.delete(entry)
+      if (this.stopped) return
+      if (takes) {
+        this.retryOrGiveUp(entry, `the project folder would not take it: ${e.message}`)
+        return
+      }
+      this.queue.unshift(entry)
+      sinkFailed(e, dir)
+    })
+  }
+
+  /** A failure to charge: retry after a backoff, or give up after MAX_ATTEMPTS. */
+  private retryOrGiveUp(entry: ManifestEntry, message: string): void {
     const attempts = (this.attempts.get(entry.file) ?? 0) + 1
     this.attempts.set(entry.file, attempts)
     if (attempts >= MAX_ATTEMPTS) {
@@ -620,8 +728,7 @@ export class ChunkDownloader {
         message: `giving up on ${entry.file} after ${attempts} attempts: ${message}`
       })
       // Its partial would stay in the job folder, the user's delivery folder.
-      const localPath = resolveInside(jobLocalDir(this.target.jobId), entry.file)
-      if (localPath) void discardPartial(localPath, entry)
+      this.discardPartialOf(entry)
       return
     }
     // Transient — retry after a short backoff (a stalled transfer resumes

@@ -1,6 +1,13 @@
 import { createHash } from 'crypto'
-import { existsSync, mkdirSync, promises as fsp, writeFileSync, type StatsFs } from 'fs'
-import { dirname, join } from 'path'
+import {
+  existsSync,
+  mkdirSync,
+  promises as fsp,
+  readdirSync,
+  writeFileSync,
+  type StatsFs
+} from 'fs'
+import { basename, dirname, join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SFTPWrapper } from 'ssh2'
 import type { SshConnection } from '../ssh/sshConnection'
@@ -66,6 +73,13 @@ async function drain(r: Rig): Promise<DrainResult> {
   void r.downloader.drain().then((d) => (out = d))
   await w.until(() => out !== null, 'drain returns')
   return out!
+}
+
+/** The .part files under the rig's job folder: a download's leftovers. */
+function partsIn(r: Rig): string[] {
+  const dir = join(w.settings.projectRoot, 'renders', r.jobId)
+  if (!existsSync(dir)) return []
+  return readdirSync(dir, { recursive: true, encoding: 'utf-8' }).filter((f) => f.endsWith('.part'))
 }
 
 function downloaded(jobId: string): number[] {
@@ -359,39 +373,39 @@ function savedAll(r: Rig, size?: number): void {
   for (const f of [1, 2, 3, 4]) saved(r, `frames/000${f}.exr`, { size })
 }
 
+/**
+ * A thin link: reads are answered one at a time, `perReadMs` apart, in the
+ * order asked. Every transfer keeps moving, just slowly.
+ */
+function thinLink(conn: SshConnection, perReadMs: number): void {
+  const open = conn.sftp.bind(conn)
+  let linkFree = 0
+  conn.sftp = (async (opts?: { timeoutMs?: number }) => {
+    const sftp = await open(opts)
+    return new Proxy(sftp, {
+      get(target, key) {
+        if (key === 'read') {
+          return (...args: Parameters<SFTPWrapper['read']>) => {
+            const cb = args[5]
+            const at = Math.max(Date.now(), linkFree) + perReadMs
+            linkFree = at
+            target.read(args[0], args[1], args[2], args[3], args[4], (err, n, buf, pos) => {
+              setTimeout(() => cb(err, n, buf, pos), at - Date.now())
+            })
+          }
+        }
+        const v = Reflect.get(target, key) as unknown
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v
+      }
+    })
+  }) as typeof conn.sftp
+}
+
 describe('the final pass on a slow or dead link (1.10 #242, #243)', () => {
   afterEach(() => {
     vi.restoreAllMocks()
     vi.doUnmock('../ssh/sftp')
   })
-
-  /**
-   * A thin link: reads are answered one at a time, `perReadMs` apart, in the
-   * order asked. Every transfer keeps moving, just slowly.
-   */
-  function thinLink(conn: SshConnection, perReadMs: number): void {
-    const open = conn.sftp.bind(conn)
-    let linkFree = 0
-    conn.sftp = (async (opts?: { timeoutMs?: number }) => {
-      const sftp = await open(opts)
-      return new Proxy(sftp, {
-        get(target, key) {
-          if (key === 'read') {
-            return (...args: Parameters<SFTPWrapper['read']>) => {
-              const cb = args[5]
-              const at = Math.max(Date.now(), linkFree) + perReadMs
-              linkFree = at
-              target.read(args[0], args[1], args[2], args[3], args[4], (err, n, buf, pos) => {
-                setTimeout(() => cb(err, n, buf, pos), at - Date.now())
-              })
-            }
-          }
-          const v = Reflect.get(target, key) as unknown
-          return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v
-        }
-      })
-    }) as typeof conn.sftp
-  }
 
   it('1.10 #242: a slow pass that keeps moving is not cut off (the 10-minute budget re-rendered delivered frames)', async () => {
     const r = await rig()
@@ -433,14 +447,17 @@ describe('the final pass on a slow or dead link (1.10 #242, #243)', () => {
   /**
    * downloadFileVerified replaced: each call waits until the test settles it
    * or its signal aborts, as a transfer with no watchdog of its own would.
+   * `ignoreAbort`: an abort does not end it either, as a local step hung on a
+   * network share would not end.
    */
-  function heldDownloads(): Array<{
+  function heldDownloads(opts: { ignoreAbort?: boolean } = {}): Array<{
     file: string
     aborted: boolean
     settled: boolean
     finish: () => void
   }> {
     const calls: ReturnType<typeof heldDownloads> = []
+    const { ignoreAbort = false } = opts
     vi.doMock('../ssh/sftp', async (importOriginal) => ({
       ...(await importOriginal<typeof import('../ssh/sftp')>()),
       downloadFileVerified: (
@@ -463,6 +480,7 @@ describe('the final pass on a slow or dead link (1.10 #242, #243)', () => {
           calls.push(call)
           opts.signal?.addEventListener('abort', () => {
             call.aborted = true
+            if (ignoreAbort) return
             // Winding down takes a moment (truncate, close): not synchronous.
             queueMicrotask(() => {
               call.settled = true
@@ -510,6 +528,63 @@ describe('the final pass on a slow or dead link (1.10 #242, #243)', () => {
 
     expect(downloaded(r.jobId)).toEqual([])
     expect(w.eventsOf('asset:added')).toEqual([])
+  })
+
+  it('a transfer that will not wind down holds the pass a minute at most, not for good', async () => {
+    // A hash or rename on a project folder on a hung network share: the abort
+    // cannot reach it, and waiting on it held the node, billing, for as long.
+    const calls = heldDownloads({ ignoreAbort: true })
+    const r = await rig()
+    const { DRAIN_IDLE_MS } = await import('./frameDownloader')
+    savedAll(r)
+    const started = Date.now()
+
+    let out: DrainResult | null = null
+    void r.downloader.drain().then((d) => (out = d))
+    await w.until(() => out !== null, 'drain returns', { timeoutMs: 30 * 60_000 })
+
+    expect(calls.length).toBeGreaterThan(0)
+    expect(calls.every((c) => c.aborted && !c.settled)).toBe(true)
+    expect(out!.lost).toHaveLength(4)
+    expect(Date.now() - started).toBeLessThanOrEqual(DRAIN_IDLE_MS + 2 * 60_000)
+  })
+
+  it('a Mac that slept through the pass does not give up on waking (the idle clock ran on through the sleep)', async () => {
+    const calls = heldDownloads()
+    const r = await rig()
+    savedAll(r)
+    let out: DrainResult | null = null
+    void r.downloader.drain().then((d) => (out = d))
+    await w.until(() => calls.length > 0, 'transfers under way')
+
+    // Asleep for five minutes: no timer runs, then the clock has jumped.
+    vi.setSystemTime(Date.now() + 5 * 60_000)
+    await w.advance(30_000)
+    expect(out).toBeNull()
+    expect(calls.some((c) => c.aborted)).toBe(false)
+
+    // Awake, the transfers deliver.
+    await w.until(() => {
+      for (const c of calls) if (!c.settled) c.finish()
+      return out !== null
+    }, 'drain returns')
+    expect(out!.lost).toEqual([])
+    expect(downloaded(r.jobId)).toEqual([1, 2, 3, 4])
+  })
+
+  it('1.10 #240: a run stopped part-way leaves no partial in the delivery folder', async () => {
+    // Named for their content, a stopped run's partials are never resumed by
+    // the re-render's frames (other bytes) and were never removed.
+    const r = await rig()
+    savedAll(r, 200_000)
+    let reads = 0
+    r.machine.onSftp('read', () => (++reads > 6 ? HANG : undefined))
+    r.downloader.start()
+    await w.until(() => partsIn(r).length > 0 && reads > 6, 'transfers under way')
+
+    r.downloader.stop()
+    await w.until(() => partsIn(r).length === 0, 'partials removed')
+    expect(downloaded(r.jobId)).toEqual([])
   })
 })
 
@@ -621,6 +696,173 @@ describe('a local disk that will not take the frames (1.10 B6)', () => {
     expect(await recheckLocalSink()).toBe(true)
     expect(localSinkHold()).toBeNull()
     await w.until(() => downloaded(r.jobId).length === 4, 'frames land')
+  })
+
+  /** statfs reports plenty: these scenarios must not hang on the test machine's own free space. */
+  function plentyOfRoom(): void {
+    vi.spyOn(fsp, 'statfs').mockResolvedValue({
+      bavail: 100 * 1024 ** 2,
+      bsize: 1024
+    } as unknown as StatsFs)
+  }
+
+  it("1.10 B6 review: one frame file the disk will not replace is that file's failure, and the pass ends", async () => {
+    // A frame another program holds (Windows antivirus, a viewer), or one the
+    // user may not overwrite, refuses its rename while the folder takes every
+    // other file. Taken as the disk's trouble, it paused every download, the
+    // probe of the folder passed 30 s later, the refetch failed again, and a
+    // new hold began: a drain that never returned while its node billed.
+    const { localSinkHold, SINK_HOLD_MS } = await import('./frameDownloader')
+    plentyOfRoom()
+    const rename = fsp.rename.bind(fsp)
+    let refused = 0
+    vi.spyOn(fsp, 'rename').mockImplementation(async (from, to) => {
+      if (String(to).endsWith(join('frames', '0004.exr'))) {
+        refused++
+        throw Object.assign(
+          new Error(`EPERM: operation not permitted, rename '${String(from)}' -> '${String(to)}'`),
+          { code: 'EPERM', syscall: 'rename', path: String(from), dest: String(to) }
+        )
+      }
+      return rename(from, to)
+    })
+    const r = await rig()
+    savedAll(r)
+    const started = Date.now()
+
+    let out: DrainResult | null = null
+    void r.downloader.drain().then((d) => (out = d))
+    await w.until(() => out !== null, 'drain returns', { timeoutMs: SINK_HOLD_MS + 5 * 60_000 })
+
+    // Its four attempts and their backoffs, not a hold.
+    expect(Date.now() - started).toBeLessThan(2 * 60_000)
+    expect(out).toEqual({ manifestRead: true, lost: ['frames/0004.exr'], localSinkBlocked: [] })
+    expect(downloaded(r.jobId)).toEqual([1, 2, 3])
+    expect(refused).toBe(4)
+    expect(localSinkHold()).toBeNull()
+    expect(w.alerts('error').filter((a) => /Cannot save downloaded frames/.test(a))).toEqual([])
+    expect(
+      w
+        .alerts('warn')
+        .some((a) =>
+          /giving up on frames\/0004\.exr after 4 attempts: the project folder would not take it: EPERM/.test(
+            a
+          )
+        )
+    ).toBe(true)
+    await w.until(() => partsIn(r).length === 0, 'its partial removed')
+  })
+
+  it('a frames folder that refuses writes, in a job folder that takes them, holds the pause without flapping', async () => {
+    // The probe used to try the job folder, which took its write every time:
+    // every 30 s the pause cleared, the downloads it woke failed again, and a
+    // new pause began, with an alert each way.
+    const { localSinkHold } = await import('./frameDownloader')
+    plentyOfRoom()
+    const r = await rig()
+    const framesDir = join(w.settings.projectRoot, 'renders', r.jobId, 'frames')
+    const lock = { on: true }
+    const open = fsp.open.bind(fsp)
+    vi.spyOn(fsp, 'open').mockImplementation(async (...args: Parameters<typeof fsp.open>) => {
+      const path = String(args[0])
+      if (lock.on && dirname(path) === framesDir) {
+        throw Object.assign(new Error(`EACCES: permission denied, open '${path}'`), {
+          code: 'EACCES',
+          syscall: 'open',
+          path
+        })
+      }
+      return open(...args)
+    })
+    savedAll(r)
+
+    let out: DrainResult | null = null
+    void r.downloader.drain().then((d) => (out = d))
+    await w.until(() => localSinkHold() !== null, 'downloads paused')
+    await w.advance(5 * 60_000)
+
+    expect(w.alerts('info').filter((a) => /taking files again/.test(a))).toEqual([])
+    expect(w.alerts('error').filter((a) => /Cannot save downloaded frames/.test(a))).toHaveLength(1)
+    expect(w.alerts().filter((a) => /download failed|giving up/.test(a))).toEqual([])
+
+    lock.on = false
+    await w.until(() => out !== null, 'drain returns')
+    expect(out).toEqual({ manifestRead: true, lost: [], localSinkBlocked: [] })
+    expect(downloaded(r.jobId)).toEqual([1, 2, 3, 4])
+  })
+
+  it('1.10 B6 review: a disk that clears for a moment and refuses again does not restart the hold', async () => {
+    // Space freed and taken again by something else, over and over: each
+    // probe's write lands, and the frames it wakes are refused straight
+    // after. Every clear restarted the 20-minute hold, so it never ran out.
+    const { SINK_HOLD_MS } = await import('./frameDownloader')
+    plentyOfRoom()
+    const disk = { probesToPass: 0 }
+    const open = fsp.open.bind(fsp)
+    vi.spyOn(fsp, 'open').mockImplementation(async (...args: Parameters<typeof fsp.open>) => {
+      const fh = await open(...args)
+      const probe = basename(String(args[0])).startsWith('.vastai-render-write-check')
+      if (probe ? disk.probesToPass-- <= 0 : true) {
+        fh.write = (() => Promise.reject(enospc())) as typeof fh.write
+      }
+      return fh
+    })
+    const r = await rig()
+    savedAll(r)
+    // Each refetch takes a second or two before its first write fails, so
+    // the drain sees the disk clear.
+    thinLink(r.conn, 1_000)
+    const started = Date.now()
+
+    let out: DrainResult | null = null
+    void r.downloader.drain().then((d) => (out = d))
+    let nextClear = Date.now() + 60_000
+    await w.until(
+      () => {
+        if (Date.now() >= nextClear) {
+          disk.probesToPass = 1
+          nextClear += 60_000
+        }
+        return out !== null
+      },
+      'drain returns',
+      { timeoutMs: SINK_HOLD_MS + 10 * 60_000 }
+    )
+
+    expect(w.alerts('info').filter((a) => /taking files again/.test(a)).length).toBeGreaterThan(10)
+    expect(Date.now() - started).toBeLessThanOrEqual(SINK_HOLD_MS + 2 * 60_000)
+    expect(out!.lost).toEqual([])
+    expect(out!.localSinkBlocked.sort()).toEqual([1, 2, 3, 4].map((f) => `frames/000${f}.exr`))
+  })
+
+  it('a run stopped before its final pass is not woken when the disk recovers', async () => {
+    // drain() on a run already stopped put it back among the downloaders to
+    // wake, where it stayed for the life of the app.
+    const disk = fullDisk()
+    const r = await rig()
+    r.downloader.stop()
+    await drain(r)
+    const wake = vi.spyOn(r.downloader, 'wake')
+
+    // Another run on the same chunk meets the full disk, and the disk recovers.
+    const { ChunkDownloader, localSinkHold } = await import('./frameDownloader')
+    const other = new ChunkDownloader({
+      jobId: r.jobId,
+      chunkId: r.chunkId,
+      nodeId: 'node-under-test',
+      ssh: r.conn,
+      remoteChunkDir: `${REMOTE_ROOT}/renders/${r.chunkId}`,
+      frames: { start: 1, end: 4, step: 1 }
+    })
+    savedAll(r)
+    let out: DrainResult | null = null
+    void other.drain().then((d) => (out = d))
+    await w.until(() => localSinkHold() !== null, 'downloads paused')
+    disk.full = false
+    await w.until(() => out !== null, 'the other run drains')
+
+    expect(w.alerts('info').filter((a) => /taking files again/.test(a))).toHaveLength(1)
+    expect(wake).not.toHaveBeenCalled()
   })
 
   it('1.10 B6: a chunk whose frames the disk would not take is not rendered again once it does', async () => {
