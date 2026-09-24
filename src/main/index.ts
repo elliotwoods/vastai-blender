@@ -1,5 +1,5 @@
 import { app, shell, BrowserWindow, protocol } from 'electron'
-import { createReadStream, statSync } from 'fs'
+import { createReadStream, statSync, writeSync } from 'fs'
 import { extname, join } from 'path'
 import { Readable } from 'stream'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
@@ -24,6 +24,45 @@ import { getSettings } from './settings'
 if (process.env.VR_USERDATA) {
   app.setPath('userData', process.env.VR_USERDATA)
 }
+
+// One main process per profile. A second one on the same userData shares the
+// SQLite state with the first, and its boot is destructive to it: init()
+// re-provisions every live node, killing the first process's paid renders
+// (seen live, 2026-09), start() resets every in-flight chunk to pending, and
+// from then on two schedulers rent against two separate spend caps. So a
+// second launch leaves here, before whenReady and any of that code. The lock
+// is keyed on userData, which is why it is taken after the VR_USERDATA
+// override: throwaway profiles still start beside the real one.
+if (!app.requestSingleInstanceLock()) {
+  const headless = Boolean(process.env.VR_JOB_SPEC || process.env.VR_E2E_BLEND)
+  const msg =
+    `[vast-render] another instance is already running on ${app.getPath('userData')}; ` +
+    (headless ? 'this headless run submitted nothing.\n' : 'focusing it instead.\n')
+  // writeSync: a piped stderr may be asynchronous, and process.exit would
+  // drop the one line that says why a scripted run did nothing.
+  try {
+    writeSync(2, msg)
+  } catch {
+    // No stderr attached (a Windows GUI launch): nothing to tell.
+  }
+  if (headless) process.exit(1)
+  app.quit()
+  process.exit(0)
+}
+
+// The primary instance: a second launch (above) is the user asking for the
+// app, so show them the one that is running. Emitted only after ready.
+app.on('second-instance', () => {
+  const win = BrowserWindow.getAllWindows()[0]
+  if (!win) {
+    // A headless run may have lost its window; the user asked for one.
+    createWindow()
+    return
+  }
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+})
 
 // media:// serves local media (proxy clips, fixtures) to the renderer with
 // Range-request support for <video> seeking. Registered before app ready.
