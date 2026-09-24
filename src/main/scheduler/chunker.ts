@@ -72,16 +72,17 @@ export function splitFrames(
  * rendering (so requeues never redo verified work).
  *
  * Throws on a step that would never advance (zero, negative, missing) and on
- * an inverted range. No writer produces an inverted range; one would come back
- * empty here, and requeue would mark the chunk complete.
+ * an inverted range. No writer produces an inverted range; one used to come
+ * back empty here, and requeue marked the chunk complete. This runs on rows
+ * already in the database, from inside the scheduler's requeue, which is only
+ * ever called through requeueOrFail: a throw fails the chunk with an alert,
+ * and the caller (destroyNode among them) carries on.
  *
- * The step check is deliberately looser than splitFrames'. This runs on rows
- * already in the database, from inside the scheduler's requeue, where a throw
- * escapes before the run is dropped or its node set back to idle — leaving a
- * billing node that never scales down. Jobs created before submissions were
- * validated can carry a fractional frame_step (the dialog accepted 2.5); those
- * requeue harmlessly and run out their retries, so only what would spin
- * forever is refused here.
+ * The step check is deliberately looser than splitFrames'. Jobs created
+ * before submissions were validated can carry a fractional frame_step (the
+ * dialog accepted 2.5); those requeue and run out their retries as they
+ * always did, rather than failing on their first requeue. Only what would
+ * spin forever is refused here.
  */
 export function missingRanges(
   range: FrameRange,

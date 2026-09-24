@@ -188,6 +188,131 @@ describe('stale runs', () => {
     // Dispatched once, and never again.
     expect(chunkStates(chunk.id).filter((s) => s === 'assigned')).toHaveLength(1)
   })
+
+  it('a run whose node goes away mid-drain never writes over the chunk its successor now owns', async () => {
+    w = await setup({ settings: { maxActiveNodes: 2 } })
+    const app = await w.boot()
+    const nodeIds = [await w.readyNode(app), await w.readyNode(app)]
+    const jobId = await w.submitJob(app)
+    const chunk = onlyChunk(jobId)
+    app.scheduler.kick()
+    await w.until(() => chunkRow(chunk.id).state === 'rendering', 'chunk rendering')
+    const first = chunkRow(chunk.id).node_id!
+    const second = nodeIds.find((id) => id !== first)!
+
+    // The agent finishes, and every manifest read on the first node hangs
+    // until the test lets it go: the run sits in its final download pass.
+    const gate = deferred<string>()
+    w.machineFor(first).onExec(manifestRead, () => gate.promise)
+    w.machineFor(first).agent.finish(chunk.id)
+    await w.until(() => chunkRow(chunk.id).state === 'downloading', 'run in its final pass')
+
+    // The node goes away. forgetNode requeues the chunk, and the second node
+    // takes it.
+    app.nodeManager.get(first)!.setState('failed', 'unreachable')
+    app.scheduler.forgetNode(first)
+    await w.until(
+      () => chunkRow(chunk.id).state === 'rendering' && chunkRow(chunk.id).node_id === second,
+      'successor rendering'
+    )
+
+    // Only now does the stale run's final pass end, its manifest read failed.
+    // Finishing anyway wrote 'failed' over the successor's row and requeued
+    // it again, and the next tick dispatched the chunk a third time.
+    gate.reject(new Error('(SSH) Channel open failure'))
+    await w.advance(20_000)
+
+    expect(chunkRow(chunk.id)).toMatchObject({ state: 'rendering', node_id: second, retries: 1 })
+    expect(app.scheduler.isLive(chunk.id)).toBe(true)
+    expect(chunkStates(chunk.id).filter((s) => s === 'assigned')).toHaveLength(2)
+    expect(w.machineFor(second).agent.inbox()).toEqual([chunk.id])
+
+    w.machineFor(second).agent.finish(chunk.id)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
+    expect(chunkRow(chunk.id).retries).toBe(1)
+  })
+})
+
+// requeue() throws on a range or step missingRanges cannot walk. Its callers
+// must carry on regardless: a throw there once skipped destroying an instance,
+// or kept a run registered so its node never went idle.
+describe('bookkeeping that throws', () => {
+  /** A range no writer produces, which missingRanges refuses (inside requeue). */
+  function invertRange(chunkId: string): void {
+    w.db.prepare('UPDATE chunks SET frame_start = 4, frame_end = 1 WHERE id = ?').run(chunkId)
+  }
+
+  it('destroyNode still destroys the instance when requeueing its chunk throws', async () => {
+    const { app, nodeId } = await oneNode()
+    const jobId = await w.submitJob(app)
+    const chunk = onlyChunk(jobId)
+    app.scheduler.kick()
+    await w.until(() => chunkRow(chunk.id).state === 'rendering', 'chunk rendering')
+    const instanceId = w.get<{ instance_id: number }>(
+      'SELECT instance_id FROM nodes WHERE id = ?',
+      nodeId
+    )!.instance_id
+    invertRange(chunk.id)
+
+    let outcome: string | null = null
+    app.nodeManager.destroyNode(nodeId).then(
+      () => (outcome = 'destroyed'),
+      (e: Error) => (outcome = e.message)
+    )
+    await w.until(() => outcome !== null, 'destroyNode settled')
+
+    expect(outcome).toBe('destroyed')
+    expect(w.vast.live()).not.toContain(instanceId)
+    expect(app.nodeManager.get(nodeId)?.state).toBe('destroyed')
+    expect(app.scheduler.isLive(chunk.id)).toBe(false)
+    // Failed, and said so, rather than left 'rendering' against a dead node.
+    expect(chunkRow(chunk.id).state).toBe('failed')
+    expect(w.alerts('error').join('\n')).toMatch(/could not be requeued.*ends before it starts/)
+  })
+
+  it('a dispatch that fails lets go of its node even when the requeue throws', async () => {
+    const { app, nodeId, machine } = await oneNode()
+    const jobId = await w.submitJob(app)
+    const chunk = onlyChunk(jobId)
+    // The range goes bad while the chunk is out being dispatched, and the
+    // dispatch then fails.
+    machine.onExec(/provision\.sh install-blender/, () => {
+      invertRange(chunk.id)
+      return { code: 1, stdout: '', stderr: 'no space left on device' }
+    })
+    app.scheduler.kick()
+    await w.until(
+      () => w.alerts('error').some((a) => a.includes(`dispatch ${chunk.id} failed`)),
+      'dispatch failed'
+    )
+    await w.advance(1_000)
+
+    expect(app.scheduler.isLive(chunk.id)).toBe(false)
+    expect(app.nodeManager.get(nodeId)?.state).toBe('idle')
+    expect(chunkRow(chunk.id).state).toBe('failed')
+    expect(w.alerts('error').join('\n')).toMatch(/could not be requeued/)
+  })
+
+  it('a run that throws while settling its chunk still lets go of its node', async () => {
+    const { app, nodeId, machine } = await oneNode()
+    const jobId = await w.submitJob(app)
+    const chunk = onlyChunk(jobId)
+    // The write of 'complete' fails, as a full disk would fail it. finish()
+    // has already stopped the run by then, and onChunkFinished never runs.
+    w.db.exec(
+      `CREATE TRIGGER harness_complete_fails BEFORE UPDATE OF state ON chunks
+       WHEN NEW.state = 'complete' BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END`
+    )
+    machine.agent.autoFinish()
+    app.scheduler.kick()
+    await w.until(() => downloaded(jobId).length === 4, 'frames downloaded')
+    await w.advance(20_000)
+
+    expect(app.scheduler.isLive(chunk.id)).toBe(false)
+    expect(app.nodeManager.get(nodeId)?.state).toBe('idle')
+    expect(w.alerts('error').join('\n')).toContain(`chunk ${chunk.id} failed as it finished`)
+  })
 })
 
 describe('completion means downloaded', () => {

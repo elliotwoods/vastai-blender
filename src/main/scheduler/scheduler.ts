@@ -728,9 +728,9 @@ class Scheduler {
       this.dropPreviewSubscription(run.chunkId, nodeId)
       // Treated exactly like a failed chunk: re-split around whatever frames
       // did land so only missing work re-renders, and burn a retry so a node
-      // that dies repeatedly still gives up eventually.
-      this.requeue(run.chunkId)
-      refreshJobState(run.jobId)
+      // that dies repeatedly still gives up eventually. Never a throw from
+      // here: destroyNode calls this before it destroys the instance.
+      this.requeueOrFail(run.chunkId, run.jobId)
     }
     emit('alert', {
       level: 'warn',
@@ -1103,30 +1103,47 @@ class Scheduler {
         this.runs.set(chunk.id, run)
         this.nodeRunsMut(node.id).add(run)
         void run.dispatch().catch((e) => {
-          // An abandoned run's failure is not the chunk's. forgetNode or
-          // cancelJob has already settled the chunk, and forgetNode may have
-          // re-dispatched it before this run's prep — minutes of Blender
-          // download or scene upload — failed on the closed connection.
-          // Requeueing here reset the new owner's row to 'pending' (burning a
-          // second retry), and the next tick dispatched the chunk again while
-          // the new owner kept rendering it: the same frames, paid for twice.
+          const message = (e as Error).message
+          const letGo = (): void => {
+            this.dropRun(run)
+            const n = nodeManager.get(node.id)
+            if (n && !this.hasRuns(node.id) && n.state === 'rendering') n.setState('idle')
+          }
+          // A stopped run's failure is not the chunk's, so it is never
+          // requeued. forgetNode or cancelJob has already settled the chunk,
+          // and forgetNode may have re-dispatched it before this run's prep —
+          // minutes of Blender download or scene upload — failed on the closed
+          // connection. Requeueing here reset the new owner's row to 'pending'
+          // (burning a second retry), and the next tick dispatched the chunk
+          // again while the new owner kept rendering it: the same frames, paid
+          // for twice.
+          //
+          // The run is still let go of. An abandoned one already has been, so
+          // for it this does nothing (dropRun leaves a successor's entry
+          // alone). But finish() stops a run too, before onChunkFinished drops
+          // it, and a throw in between (a failed DB write) left it registered
+          // for good: live to isLive, work to the eager fleet, and busy to
+          // scale-down, so its node never went idle and kept billing.
           if (run.isStopped() || this.runs.get(chunk.id) !== run) {
-            emit('render:logLine', {
-              nodeId: node.id,
-              chunkId: chunk.id,
-              line: `abandoned dispatch ended: ${(e as Error).message}`,
-              ts: Date.now()
-            })
+            if (this.runs.get(chunk.id) === run) {
+              emit('alert', {
+                level: 'error',
+                message: `chunk ${chunk.id} failed as it finished: ${message}`
+              })
+            } else {
+              emit('render:logLine', {
+                nodeId: node.id,
+                chunkId: chunk.id,
+                line: `abandoned dispatch ended: ${message}`,
+                ts: Date.now()
+              })
+            }
+            letGo()
             return
           }
-          emit('alert', {
-            level: 'error',
-            message: `dispatch ${chunk.id} failed: ${(e as Error).message}`
-          })
-          this.requeue(chunk.id)
-          this.dropRun(run)
-          const n = nodeManager.get(node.id)
-          if (n && !this.hasRuns(node.id) && n.state === 'rendering') n.setState('idle')
+          emit('alert', { level: 'error', message: `dispatch ${chunk.id} failed: ${message}` })
+          this.requeueOrFail(chunk.id, chunk.job_id)
+          letGo()
         })
       }
     }
@@ -1157,7 +1174,7 @@ class Scheduler {
     // dead weight on the node from here on.
     this.dropPreviewSubscription(run.chunkId, run.nodeId)
     const chunk = getDb().prepare('SELECT * FROM chunks WHERE id = ?').get(run.chunkId) as ChunkRow
-    if (chunk.state === 'failed') this.requeue(run.chunkId)
+    if (chunk.state === 'failed') this.requeueOrFail(run.chunkId, run.jobId)
     refreshJobState(run.jobId)
     // After refreshJobState, so a job that just finished is built promptly.
     // A failed chunk schedules too: it may have ended the job as 'partial'.
@@ -1169,8 +1186,36 @@ class Scheduler {
   }
 
   /**
+   * requeue(), for callers that must carry on whatever happens in it. forgetNode
+   * runs inside destroyNode BEFORE the instance is destroyed, and the dispatch
+   * catch and onChunkFinished have a run to let go of and a node to idle after
+   * it. A throw from requeue (missingRanges refuses a range or step it cannot
+   * walk) skipped all of that, and an instance kept billing. So a chunk
+   * requeue cannot handle is failed, loudly, and the caller goes on.
+   */
+  private requeueOrFail(chunkId: string, jobId: string): void {
+    try {
+      this.requeue(chunkId)
+      refreshJobState(jobId)
+    } catch (e) {
+      emit('alert', {
+        level: 'error',
+        message: `chunk ${chunkId} could not be requeued, so it is marked failed: ${(e as Error).message}`
+      })
+      try {
+        getDb().prepare("UPDATE chunks SET state = 'failed' WHERE id = ?").run(chunkId)
+        emitChunkChanged(chunkId)
+        refreshJobState(jobId)
+      } catch (e2) {
+        console.warn(`[scheduler] could not fail chunk ${chunkId}: ${(e2 as Error).message}`)
+      }
+    }
+  }
+
+  /**
    * Requeue a failed chunk: re-split around already-downloaded frames so only
-   * missing work re-renders; give up after MAX_RETRIES.
+   * missing work re-renders; give up after MAX_RETRIES. Throws on a range or
+   * step missingRanges refuses: call it through requeueOrFail.
    */
   private requeue(chunkId: string): void {
     const db = getDb()
