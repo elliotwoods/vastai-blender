@@ -32,8 +32,27 @@ AGENT_STALE_S=60
 # How long a restarted agent has to write its first heartbeat, which main()
 # does before anything else. (Tests shorten it.)
 AGENT_START_WAIT_S="${AGENT_START_WAIT_S:-30}"
+# Where the container's system libraries are, and ensure-optix installs the
+# OptiX ones. (Tests point it at a temp dir.)
+OPTIX_LIBDIR="${OPTIX_LIBDIR:-/usr/lib/x86_64-linux-gnu}"
 
 log() { echo "[provision] $*"; }
+
+# Take the node-wide lock <name> (fd 9) and hold it until this script exits,
+# waiting up to $2 seconds (0: not at all) for a copy of the step already
+# running; returns 1 if that copy still runs. Anything started here to
+# outlive the script gets 9>&-, or it would hold the lock for life. flock is
+# util-linux, on every Ubuntu image; without it the step runs unlocked, as it
+# always did.
+take_lock() {
+  if ! command -v flock > /dev/null 2>&1; then
+    log "flock missing — $1 runs unlocked"
+    return 0
+  fi
+  mkdir -p "$STATE_DIR"
+  exec 9> "$STATE_DIR/$1.lock"
+  if [ "$2" = 0 ]; then flock -n 9; else flock -w "$2" 9; fi
+}
 
 make_dirs() {
   mkdir -p "$VASTAI_HOME"/{jobs/inbox,jobs/done,jobs/failed,logs,state,renders,control,work/scenes,work/extensions,bin}
@@ -130,6 +149,7 @@ cmd_deps() {
   want="$(content_hash list_shipped)"
   if [ "${1:-}" != "--force" ] && deps_current "$want"; then
     log "deps already installed for this build (${want:0:12}) — skipping apt and ffmpeg"
+    start_ensure_optix
     return 0
   fi
   log "apt packages…"
@@ -178,13 +198,26 @@ cmd_deps() {
     fi
   fi
   log "ffmpeg: $("$VASTAI_HOME/bin/ffmpeg" -version | head -1)"
-  # Background (fully detached): ~300-400 MB download that overlaps the Blender
-  # install + EEVEE probe. A chunk that starts before it lands renders on CUDA.
-  setsid nohup bash "$VASTAI_HOME/provision.sh" ensure-optix \
-    > "$VASTAI_HOME/logs/ensure_optix.log" 2>&1 < /dev/null &
-  log "ensure-optix started in background (logs/ensure_optix.log)"
+  start_ensure_optix
   printf '%s\n' "$want" > "$DEPS_STAMP.tmp" && mv -f "$DEPS_STAMP.tmp" "$DEPS_STAMP"
   log "deps installed"
+}
+
+# Background (fully detached): ~300-400 MB download that overlaps the Blender
+# install + EEVEE probe. A chunk that starts before it lands renders on CUDA.
+# Started by every deps run, the skipped ones too, until the libraries are in:
+# otherwise a first try that failed on a download blip would leave the node on
+# CUDA, ~1.5x slower, for its whole paid life. A try already under way is
+# left to finish (cmd_ensure_optix's lock), and its log is appended to, not
+# cut from under it.
+start_ensure_optix() {
+  if [ -e "$OPTIX_LIBDIR/libnvoptix.so.1" ]; then
+    log "optix: already present"
+    return 0
+  fi
+  setsid nohup bash "$VASTAI_HOME/provision.sh" ensure-optix \
+    >> "$VASTAI_HOME/logs/ensure_optix.log" 2>&1 < /dev/null 9>&- &
+  log "ensure-optix started in background (logs/ensure_optix.log)"
 }
 
 # Restarting the agent kills every render on the node and empties its inbox,
@@ -365,9 +398,15 @@ cmd_probe_eevee() {
 # matches the host kernel module and install just those libraries. Best
 # effort: any failure leaves the node on CUDA, exactly as before.
 cmd_ensure_optix() {
-  local libdir=/usr/lib/x86_64-linux-gnu
+  local libdir="$OPTIX_LIBDIR"
   if [ -e "$libdir/libnvoptix.so.1" ]; then
     log "optix: already present"
+    return 0
+  fi
+  # One at a time: a second try would rm -rf the first's download from under
+  # it, and both would fail.
+  if ! take_lock ensure-optix 0; then
+    log "optix: another ensure-optix is already fetching — left to it"
     return 0
   fi
   local ver

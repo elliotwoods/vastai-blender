@@ -6,6 +6,7 @@
  * `deps` (skipped when this build already ran it) and `restart-agent` (only
  * when the agent is dead or runs other code), with `agent-status` to ask first.
  */
+import { spawnSync } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -88,6 +89,49 @@ describe.skipIf(process.platform === 'win32')('provision.sh', () => {
     // --force always runs them.
     expect(n.provision(['deps', '--force']).code).toBe(0)
     expect(aptUpdates()).toBe(3)
+  })
+
+  it('1.9: a deps run skipped as current still retries OptiX while it is missing', () => {
+    // ensure-optix is started in the background, so its stub may record the
+    // start a moment after deps returns.
+    const optixTries = (atLeast: number): number => {
+      const count = (): number =>
+        n.calls().filter((c) => c === `setsid nohup bash ${n.vastai}/provision.sh ensure-optix`)
+          .length
+      for (let i = 0; i < 40 && count() < atLeast; i++) spawnSync('sleep', ['0.05'])
+      return count()
+    }
+    expect(n.provision(['deps']).code).toBe(0)
+    expect(optixTries(1)).toBe(1)
+    const log = join(n.vastai, 'logs', 'ensure_optix.log')
+    writeFileSync(log, 'optix: driver 550.54 download failed — staying on CUDA\n')
+
+    // The first try failed on a download blip. Skipping it with the rest of
+    // deps would leave the node on CUDA (~1.5x slower) for its paid life.
+    const again = n.provision(['deps'])
+    expect(again.stdout).toMatch(/deps already installed for this build/)
+    expect(again.stdout).toMatch(/ensure-optix started in background/)
+    expect(optixTries(2)).toBe(2)
+    // The earlier try's log is kept, not cut.
+    expect(readFileSync(log, 'utf8')).toMatch(/download failed/)
+
+    // Once the libraries are in, nothing is started.
+    writeFileSync(join(n.optixLib, 'libnvoptix.so.1'), '')
+    const done = n.provision(['deps'])
+    expect(done.stdout).toMatch(/optix: already present/)
+    expect(done.stdout).not.toMatch(/ensure-optix started/)
+  })
+
+  it('1.9: an ensure-optix started while another still fetches leaves it to that one', () => {
+    expect(n.provision(['deps']).code).toBe(0)
+    const release = n.holdLock(join(n.vastai, 'state', 'ensure-optix.lock'))
+    const r = n.provision(['ensure-optix'])
+    expect(r.code).toBe(0)
+    expect(r.stdout).toMatch(/another ensure-optix is already fetching/)
+    // It did not go on to fetch (and rm -rf the other's download).
+    expect(r.stdout).not.toMatch(/optix: (driver|fetching)/)
+    release()
+    expect(n.provision(['ensure-optix']).stdout).not.toMatch(/already fetching/)
   })
 
   it('1.9 81fe2875: a second provision leaves a live, current agent its Blender renders and inbox', () => {

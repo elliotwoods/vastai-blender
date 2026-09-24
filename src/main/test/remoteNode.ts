@@ -157,6 +157,11 @@ export interface RemoteNode {
   vastai: string
   /** $X_TMPDIR: where X servers keep .X0-lock (/tmp on a node). */
   xtmp: string
+  /**
+   * $OPTIX_LIBDIR: the system library dir ensure-optix installs into, empty
+   * (no OptiX) until a test puts libnvoptix.so.1 there.
+   */
+  optixLib: string
   provision(args: string[], opts?: RunOpts): ScriptResult
   octane(args: string[], opts?: RunOpts): ScriptResult
   /** Every stub call so far, "<name> <args>". */
@@ -214,7 +219,8 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
   const rec = join(root, 'rec')
   const stubs = join(root, 'stubs')
   const xtmp = join(root, 'xtmp')
-  for (const d of [home, rec, stubs, xtmp]) mkdirSync(d, { recursive: true })
+  const optixLib = join(root, 'optixlib')
+  for (const d of [home, rec, stubs, xtmp, optixLib]) mkdirSync(d, { recursive: true })
   cpSync(REMOTE_SRC, vastai, { recursive: true })
   if (opts.provisioned) {
     for (const d of ['jobs/inbox', 'logs', 'state', 'control', 'renders'])
@@ -237,6 +243,7 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
     LANG: 'C',
     STUB_REC: rec,
     X_TMPDIR: xtmp,
+    OPTIX_LIBDIR: optixLib,
     ...opts.env
   })
 
@@ -318,6 +325,7 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
     home,
     vastai,
     xtmp,
+    optixLib,
     provision: (args, opts) => run(join(vastai, 'provision.sh'), args, opts),
     octane: (args, opts) => {
       const r = run(join(vastai, 'octane', 'setup_octane.sh'), args, opts)
