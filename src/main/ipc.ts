@@ -25,7 +25,7 @@ import type {
   NodeSnapshot,
   ThumbAsset
 } from '../shared/models'
-import { onEvent } from './events'
+import { onEvent, recentAlerts } from './events'
 import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
 import { currentUser } from './vast/vastClient'
@@ -542,6 +542,9 @@ export function registerIpc(): void {
       win.webContents.send(channel, payload)
     }
   })
+  // What a window missed: alerts raised before it existed (or while it was
+  // closed) went to no one above. events.ts keeps the recent ones.
+  handle('alerts:recent', () => recentAlerts())
 
   // -- settings (real) ------------------------------------------------------
   // VR_MOCK asserts the key too: mock mode exists to drive the UI on a

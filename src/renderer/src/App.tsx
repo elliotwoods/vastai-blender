@@ -1,4 +1,6 @@
 import { useEffect } from 'react'
+import { AlertBanner } from './components/AlertBanner'
+import { AlertToasts } from './components/AlertToasts'
 import { PageBar } from './components/PageBar'
 import { RecoveryBanner } from './components/RecoveryBanner'
 import { useNav } from './lib/nav'
@@ -65,7 +67,9 @@ function App(): React.JSX.Element {
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <main style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         {/* Above the screen, not inside it: the hold is app-wide, and every
-            screen would otherwise have to remember to show it. */}
+            screen would otherwise have to remember to show it. Alerts first:
+            an instance billing unmanaged outranks paused work. */}
+        <AlertBanner />
         <RecoveryBanner />
         <div style={{ flex: 1, minHeight: 0 }}>
           <Screen />
@@ -74,6 +78,7 @@ function App(): React.JSX.Element {
       <PageBar />
       {/* Sibling of <main>, so it covers the page bar too. */}
       <PreviewOverlay />
+      <AlertToasts />
     </div>
   )
 }
