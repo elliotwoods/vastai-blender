@@ -320,3 +320,39 @@ describe('shell:openPath', () => {
     expect(calls()).toEqual([['openPath', frame]])
   })
 })
+
+// shell:showItemInFolder through the real ipc.ts: it reveals what the app
+// itself shows (job folders and frames, a job's .blend, the SSH key) and
+// nothing a compromised renderer makes up — a UNC path on Windows would hand
+// the user's NTLM hash to whoever serves the share.
+describe('shell:showItemInFolder', () => {
+  let w: World
+  let app: App
+  beforeEach(async () => {
+    w = await setup()
+    app = await w.boot({ start: false })
+  })
+  afterEach(() => w.dispose())
+
+  const calls = (): Array<[string, unknown]> => w.desktop.map((c) => [c.method, c.args[0]])
+
+  it("reveals a job's frames and its .blend, which lives outside the project", async () => {
+    const blend = w.blend()
+    const jobId = await w.submitJob(app, { blendPath: blend })
+    const frame = join(w.settings.projectRoot, 'renders', jobId, 'frames', '0001.png')
+    await w.invoke('shell:showItemInFolder', frame)
+    await w.invoke('shell:showItemInFolder', blend)
+    expect(calls()).toEqual([
+      ['showItemInFolder', frame],
+      ['showItemInFolder', blend]
+    ])
+  })
+
+  it('refuses a UNC share, a relative path and anything the app never showed', async () => {
+    await w.submitJob(app)
+    await w.invoke('shell:showItemInFolder', '\\\\attacker\\share\\x.png')
+    await w.invoke('shell:showItemInFolder', 'renders/x.png')
+    await w.invoke('shell:showItemInFolder', join(w.dir, 'Downloads', 'invoice.pdf'))
+    expect(calls()).toEqual([])
+  })
+})

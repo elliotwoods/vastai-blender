@@ -26,7 +26,7 @@ import type {
   NodeSnapshot,
   ThumbAsset
 } from '../shared/models'
-import { externalUrl, openPathVerdict } from './app/windowPolicy'
+import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
 import { dismissAlerts, onAlertSurfaced, onEvent, recentAlerts } from './events'
 import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
@@ -164,6 +164,24 @@ function openableRoots(): string[] {
     output_dir: string
   }>
   return [getSettings().projectRoot, ...jobDirs.map((r) => r.output_dir)]
+}
+
+/**
+ * What shell:showItemInFolder may reveal: the folders shell:openPath opens
+ * things in, plus the files the renderer reveals that live outside them — a
+ * job's .blend, an addon's zip, the SSH key. Anything else (a UNC path, which
+ * on Windows would hand an NTLM hash to whoever serves it) is refused.
+ */
+function revealablePlaces(): string[] {
+  const blends = getDb().prepare('SELECT DISTINCT blend_path FROM jobs').all() as Array<{
+    blend_path: string
+  }>
+  return [
+    ...openableRoots(),
+    ...blends.map((r) => r.blend_path),
+    ...listAddons().map((a) => a.zipPath),
+    getSettings().sshKeyPath
+  ]
 }
 
 // Four fixture thumbnails cycled across the range, so a mocked filmstrip has
@@ -669,7 +687,14 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
     }
   })
   handle('shell:showItemInFolder', (p) => {
-    shell.showItemInFolder(p)
+    const abs = revealPath(p, revealablePlaces())
+    if (!abs) {
+      console.warn(
+        `[shell] refused to reveal ${JSON.stringify(p)}: not a file or folder the app shows`
+      )
+      return
+    }
+    shell.showItemInFolder(abs)
   })
   handle('dialog:pickBlendFiles', async () => {
     const r = await dialog.showOpenDialog({
