@@ -7,6 +7,7 @@ import {
   externalUrl,
   isAppPage,
   openPathVerdict,
+  revealPath,
   type OpenPathVerdict,
   type PathKind
 } from './windowPolicy'
@@ -201,6 +202,55 @@ describe('openPathVerdict', () => {
   it('ignores roots that are not absolute paths, so an unset one opens nothing', () => {
     expect(openPathVerdict('/x/y.png', ['', 'x'], () => 'file', posix).action).toBe('refuse')
     expect(openPathVerdict(resolve('y.png'), [''], () => 'file').action).toBe('refuse')
+  })
+})
+
+describe('revealPath', () => {
+  const places = [
+    'C:\\Users\\u\\vast-renders',
+    'D:\\scenes\\shot010.blend',
+    '\\\\nas\\projects\\shot020.blend',
+    'C:\\Users\\u\\AppData\\Roaming\\Vast Render\\addons'
+  ]
+  const reveal = (p: unknown): string | null => revealPath(p, places, win32)
+
+  it('reveals a place, and anything inside a folder one', () => {
+    const clip = 'C:\\Users\\u\\vast-renders\\renders\\job1\\previews\\clip.mp4'
+    expect(reveal(clip)).toBe(clip)
+    expect(reveal('C:\\Users\\u\\vast-renders')).toBe('C:\\Users\\u\\vast-renders')
+    expect(reveal('d:\\scenes\\shot010.blend')).toBe('d:\\scenes\\shot010.blend')
+    expect(reveal('C:\\Users\\u\\AppData\\Roaming\\Vast Render\\addons\\x-1a2b3c4d.zip')).toBe(
+      'C:\\Users\\u\\AppData\\Roaming\\Vast Render\\addons\\x-1a2b3c4d.zip'
+    )
+  })
+
+  it('reveals a UNC path only when it is one of the places, as a .blend the user chose', () => {
+    expect(reveal('\\\\nas\\projects\\shot020.blend')).toBe('\\\\nas\\projects\\shot020.blend')
+  })
+
+  // Explorer connects to the host of a UNC path it is asked to show, and a
+  // compromised renderer could name its own.
+  it.each([
+    ['\\\\attacker\\share\\x.png'],
+    ['\\\\attacker@SSL\\share\\x'],
+    ['\\\\?\\UNC\\attacker\\share\\x'],
+    ['\\\\.\\pipe\\x'],
+    ['\\\\nas\\projects\\other.blend'],
+    ['C:\\Windows\\System32\\calc.exe'],
+    ['C:\\Users\\u\\vast-renders-old\\x.png'],
+    ['C:\\Users\\u\\vast-renders\\..\\.ssh\\id_ed25519'],
+    ['D:\\scenes\\shot010.blend\\..\\secret.txt'],
+    ['vast-renders\\x.png'],
+    [''],
+    [null],
+    [42]
+  ])('refuses anything else: %j', (p) => {
+    expect(reveal(p)).toBeNull()
+  })
+
+  it('refuses everything when no place is set', () => {
+    expect(revealPath('/home/u/x.png', ['', 'relative/dir'], posix)).toBeNull()
+    expect(revealPath('/home/u/x.png', [], posix)).toBeNull()
   })
 })
 

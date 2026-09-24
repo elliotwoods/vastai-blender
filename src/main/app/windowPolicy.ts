@@ -198,3 +198,30 @@ export function openPathVerdict(
       return { action: 'reveal', path: abs }
   }
 }
+
+/**
+ * The path to give `shell.showItemInFolder` for `shell:showItemInFolder`, or
+ * null to refuse. Revealing runs nothing, but Explorer does open the folder:
+ * for a UNC path (`\\host\share\x`) that is an SMB connection to the host,
+ * which can hand it the user's NTLM hash. So only what the app shows the user
+ * is revealed: one of `places`, or anything inside one. The places are the
+ * folders shell:openPath opens things in plus the files the app names (a
+ * job's .blend, an addon's zip, the SSH key). One may be a UNC path the user
+ * chose, a .blend on a NAS; the renderer cannot add another.
+ */
+export function revealPath(
+  raw: unknown,
+  places: readonly string[],
+  path: PlatformPath = nodePath
+): string | null {
+  if (typeof raw !== 'string' || raw === '' || !path.isAbsolute(raw)) return null
+  const abs = path.resolve(raw)
+  const known = places.some(
+    (p) =>
+      typeof p === 'string' &&
+      p !== '' &&
+      path.isAbsolute(p) &&
+      (path.relative(path.resolve(p), abs) === '' || isInside(p, abs, path))
+  )
+  return known ? abs : null
+}
