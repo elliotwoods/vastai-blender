@@ -1,6 +1,7 @@
 import { createHash } from 'crypto'
-import { readFileSync } from 'fs'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { existsSync, promises as fsp, readFileSync, type StatsFs } from 'fs'
+import { join } from 'path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { REMOTE_ROOT } from '../test/fakeSsh'
 import { HANG, setup, type FakeMachine, type World } from '../test/harness'
 import type { SshConnection } from './sshConnection'
@@ -223,5 +224,263 @@ describe('the scheduler, uploading a scene', () => {
     )
 
     expect(machine.ran(/^sha256sum '.*\.part'/)).toHaveLength(1)
+  })
+})
+
+describe('downloadFileVerified', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const FRAME = `${REMOTE_ROOT}/renders/c1/frames/0001.exr`
+
+  /** A frame of `n` bytes on the node, as manifested: its bytes and entry. */
+  function frameOn(
+    machine: FakeMachine,
+    n: number,
+    seed = 1
+  ): { data: Buffer; entry: { size: number; sha256: string } } {
+    const data = Buffer.alloc(n)
+    for (let i = 0; i < n; i++) data[i] = (i * 31 + seed * 7) & 0xff
+    machine.files.set(FRAME, data)
+    return { data, entry: { size: n, sha256: sha256(data) } }
+  }
+
+  function localFrame(): string {
+    return join(w.settings.projectRoot, 'renders', 'job1', 'frames', '0001.exr')
+  }
+
+  /**
+   * Let the first `n` reads through, then leave every later one unanswered: a
+   * wedge, until `release()`.
+   */
+  function wedgeAfterReads(machine: FakeMachine, n: number): { release(): void } {
+    let reads = 0
+    let wedged = true
+    machine.onSftp('read', () => (wedged && ++reads > n ? HANG : undefined))
+    return {
+      release: () => {
+        wedged = false
+      }
+    }
+  }
+
+  /** Count SFTP reads from now on, letting them through. */
+  function countReads(machine: FakeMachine): { n: number } {
+    const count = { n: 0 }
+    machine.onSftp('read', () => {
+      count.n++
+      return undefined
+    })
+    return count
+  }
+
+  it('1.10 #240: a partial of other content is never resumed as a prefix', async () => {
+    // Frame 1 half-downloaded from one render, then requeued to another node,
+    // whose bytes differ (EXR metadata alone makes them). The partial was
+    // resumed anyway, failed its hash, and cost an attempt and a transfer.
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 200_000, 1)
+    const wedge = wedgeAfterReads(machine, 3)
+    const first = watch(
+      sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry, { stallMs: 5_000 })
+    )
+    await w.until(() => first.done, 'first attempt stalls')
+    expect(first.error).toBeInstanceOf(sftp.TransferStalledError)
+    expect(readFileSync(sftp.partPathFor(localFrame(), a.entry)).length).toBeGreaterThan(0)
+
+    // The re-render's frame, same name and size, different bytes.
+    wedge.release()
+    const b = frameOn(machine, 200_000, 2)
+    const second = watch(
+      sftp.downloadFileVerified(conn, FRAME, localFrame(), b.entry, { stallMs: 5_000 })
+    )
+    await w.until(() => second.done, 'second download settles')
+
+    expect(second.error).toBeUndefined()
+    expect(readFileSync(localFrame()).equals(b.data)).toBe(true)
+  })
+
+  it('1.10 #240: a partial of the same content resumes, fetching only the rest', async () => {
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 200_000)
+    const wedge = wedgeAfterReads(machine, 3)
+    const first = watch(
+      sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry, { stallMs: 5_000 })
+    )
+    await w.until(() => first.done, 'first attempt stalls')
+    wedge.release()
+    const kept = readFileSync(sftp.partPathFor(localFrame(), a.entry)).length
+    expect(kept).toBe(3 * 32_768)
+
+    const reads = countReads(machine)
+    const second = watch(
+      sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry, { stallMs: 5_000 })
+    )
+    await w.until(() => second.done, 'second download settles')
+
+    expect(second.value).toBe('downloaded')
+    expect(reads.n).toBe(Math.ceil((200_000 - kept) / 32_768))
+    expect(readFileSync(localFrame()).equals(a.data)).toBe(true)
+    expect(existsSync(sftp.partPathFor(localFrame(), a.entry))).toBe(false)
+  })
+
+  it('#245: a stall resets the channel it stalled on, by name', async () => {
+    // Not "whatever is cached": see sshConnection.test.ts for why that matters.
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 200_000)
+    const used = await conn.sftp()
+    const reset = vi.spyOn(conn, 'resetSftp')
+    wedgeAfterReads(machine, 1)
+    const got = watch(
+      sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry, { stallMs: 5_000 })
+    )
+    await w.until(() => got.done, 'download stalls')
+
+    expect(reset).toHaveBeenCalledTimes(1)
+    expect(reset).toHaveBeenCalledWith(used)
+  })
+
+  it('1.10 #243: two downloads of one file never write it at once', async () => {
+    // A stopped run's transfer still going as the requeued chunk's starts on
+    // the same frame: each one's rename or rm pulled the other's file away.
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 300_000)
+    const one = watch(sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry))
+    const two = watch(sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry))
+    await w.until(() => one.done && two.done, 'both settle')
+
+    expect(one.error).toBeUndefined()
+    expect(two.error).toBeUndefined()
+    expect([one.value, two.value].sort()).toEqual(['downloaded', 'skipped'])
+    expect(readFileSync(localFrame()).equals(a.data)).toBe(true)
+  })
+
+  it('1.10 #243: an aborted download stops at once, not at its stall timeout', async () => {
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 200_000)
+    wedgeAfterReads(machine, 2)
+    const ctl = new AbortController()
+    const got = watch(
+      sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry, { signal: ctl.signal })
+    )
+    await w.until(() => existsSync(sftp.partPathFor(localFrame(), a.entry)), 'transfer under way')
+    const abortedAt = Date.now()
+    ctl.abort()
+    await w.until(() => got.done, 'download settles')
+
+    expect(got.error).toBeInstanceOf(sftp.TransferAbortedError)
+    expect(Date.now() - abortedAt).toBeLessThan(sftp.DOWNLOAD_STALL_MS)
+  })
+
+  it('a download aborted while waiting for another writer of the file never starts', async () => {
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 200_000)
+    wedgeAfterReads(machine, 2)
+    const first = watch(sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry))
+    const ctl = new AbortController()
+    const waiting = watch(
+      sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry, { signal: ctl.signal })
+    )
+    await w.advance(1_000)
+    ctl.abort()
+    await w.until(() => waiting.done, 'the waiting one settles', { timeoutMs: 1_000 })
+    expect(waiting.error).toBeInstanceOf(sftp.TransferAbortedError)
+    expect(first.done).toBe(false)
+  })
+
+  it('reports each read as it lands', async () => {
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 100_000)
+    let landed = 0
+    await sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry, {
+      onProgress: (n) => (landed += n)
+    })
+    expect(landed).toBe(100_000)
+  })
+
+  it('B6: no room for the frame fails as LocalSinkError before a byte is fetched', async () => {
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 8 * 1024 ** 2)
+    vi.spyOn(fsp, 'statfs').mockResolvedValue({ bavail: 100, bsize: 4096 } as unknown as StatsFs)
+    let opened = 0
+    machine.onSftp('open', () => {
+      opened++
+      return undefined
+    })
+
+    const err = await sftp
+      .downloadFileVerified(conn, FRAME, localFrame(), a.entry)
+      .catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(sftp.LocalSinkError)
+    expect(err).toMatchObject({ code: 'ENOSPC' })
+    expect(opened).toBe(0)
+  })
+
+  it('B6: the reserve is kept, not just the frame', async () => {
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 8 * 1024 ** 2)
+    // Room for the frame, but it would leave less than the reserve.
+    const free = sftp.LOCAL_FREE_RESERVE_BYTES + 4 * 1024 ** 2
+    vi.spyOn(fsp, 'statfs').mockResolvedValue({
+      bavail: free / 4096,
+      bsize: 4096
+    } as unknown as StatsFs)
+    const err = await sftp
+      .downloadFileVerified(conn, FRAME, localFrame(), a.entry)
+      .catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(sftp.LocalSinkError)
+  })
+
+  it('B6: a disk that fills mid-write fails as LocalSinkError', async () => {
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 100_000)
+    const open = fsp.open.bind(fsp)
+    vi.spyOn(fsp, 'open').mockImplementation(async (...args: Parameters<typeof fsp.open>) => {
+      const fh = await open(...args)
+      fh.write = (() =>
+        Promise.reject(
+          Object.assign(new Error('ENOSPC: no space left on device, write'), {
+            code: 'ENOSPC',
+            syscall: 'write'
+          })
+        )) as typeof fh.write
+      return fh
+    })
+    const err = await sftp
+      .downloadFileVerified(conn, FRAME, localFrame(), a.entry)
+      .catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(sftp.LocalSinkError)
+    expect(sftp.isRemoteMissing(err)).toBe(false)
+  })
+
+  it("B6: a project folder whose drive is gone is the local disk's fault, not the node's", async () => {
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 1_000)
+    vi.spyOn(fsp, 'mkdir').mockRejectedValue(
+      Object.assign(new Error("ENOENT: no such file or directory, mkdir 'D:\\\\renders'"), {
+        code: 'ENOENT',
+        syscall: 'mkdir'
+      })
+    )
+    const err = await sftp
+      .downloadFileVerified(conn, FRAME, localFrame(), a.entry)
+      .catch((e: unknown) => e)
+    // It says "no such file", which frameDownloader used to read as "gone from the node".
+    expect(err).toBeInstanceOf(sftp.LocalSinkError)
+    expect(sftp.isRemoteMissing(err)).toBe(false)
+  })
+
+  it('a file gone from the node is isRemoteMissing, and leaves nothing behind', async () => {
+    const { conn, sftp } = await node()
+    const err = await sftp
+      .downloadFileVerified(conn, FRAME, localFrame(), { size: 10, sha256: 'a'.repeat(64) })
+      .catch((e: unknown) => e)
+    expect(sftp.isRemoteMissing(err)).toBe(true)
+    expect(err).not.toBeInstanceOf(sftp.LocalSinkError)
+    expect(existsSync(sftp.partPathFor(localFrame(), { size: 10, sha256: 'a'.repeat(64) }))).toBe(
+      false
+    )
   })
 })

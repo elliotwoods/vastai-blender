@@ -9,11 +9,20 @@
 
 import { createHash } from 'crypto'
 import { createReadStream, promises as fsp } from 'fs'
-import { basename, dirname, join, posix } from 'path'
+import { basename, dirname, join, posix, resolve as resolvePath } from 'path'
 import type { SFTPWrapper } from 'ssh2'
-import { pipelinedGet, TransferStalledError, type SftpReader } from './pipelinedGet'
+import {
+  asLocalSinkError,
+  LocalSinkError,
+  pipelinedGet,
+  TransferAbortedError,
+  TransferStalledError,
+  type SftpReader
+} from './pipelinedGet'
 import { shq } from './shq'
 import type { SshConnection } from './sshConnection'
+
+export { LocalSinkError, TransferAbortedError, TransferStalledError } from './pipelinedGet'
 
 /** No bytes for this long and a download is declared stalled (see pipelinedGet). */
 export const DOWNLOAD_STALL_MS = 60_000
@@ -349,6 +358,52 @@ export async function uploadFileVerified(
 }
 
 /**
+ * Keep at least this much free on the disk frames land on. A Mac whose disk
+ * filled mid-render took the app down with it (plan 1.21), and a frame
+ * squeezed into the last megabytes only moves the failure later.
+ */
+export const LOCAL_FREE_RESERVE_BYTES = 1024 ** 3
+
+/** A download this big or bigger checks free space first (one statfs). */
+const FREE_SPACE_CHECK_MIN_BYTES = 1024 ** 2
+
+/**
+ * The temporary file one manifest entry downloads into, named for its
+ * content. It was `<file>.part` whatever the content, so a partial left by an
+ * earlier render of the same frame name (a requeue to another node, whose
+ * bytes differ) was resumed as if it were a prefix of the new file, failed
+ * its hash, and cost an attempt and a whole wasted transfer (#240).
+ */
+export function partPathFor(
+  localPath: string,
+  expected: { size: number; sha256?: string }
+): string {
+  const key = expected.sha256 ? expected.sha256.slice(0, 16) : `size${expected.size}`
+  return `${localPath}.${key}.part`
+}
+
+/** Remove what a download given up on left behind: the job folder is the user's delivery folder. */
+export async function discardPartial(
+  localPath: string,
+  expected: { size: number; sha256?: string }
+): Promise<void> {
+  await fsp.rm(partPathFor(localPath, expected), { force: true }).catch(() => {})
+}
+
+export interface DownloadOptions {
+  /** No bytes for this long and the transfer is declared stalled. */
+  stallMs?: number
+  /**
+   * Stop: the download rejects with TransferAbortedError at once, having
+   * written nothing more — or, if it is still waiting its turn at this file
+   * (see oneWriterAt), without ever starting.
+   */
+  signal?: AbortSignal
+  /** Called with each read's size as it lands. */
+  onProgress?: (bytes: number) => void
+}
+
+/**
  * Download one manifest-listed file: pipelined SFTP read → .part, verify size
  * + sha256 (size-only for legacy manifest entries without a hash), rename into
  * place. Skips if the local file already exists and verifies (resume after
@@ -356,16 +411,120 @@ export async function uploadFileVerified(
  *
  * A transfer that receives nothing for `stallMs` fails with
  * TransferStalledError instead of hanging forever (ssh2's fastGet never calls
- * back on a wedged channel), and the SFTP channel is reset so the retry gets a
- * fresh one. A partial `.part` is kept and the next attempt resumes from it.
+ * back on a wedged channel), and the SFTP channel it used is reset so the
+ * retry gets a fresh one. A partial `.part` is kept and the next attempt at
+ * the same content resumes from it.
+ *
+ * Every local step that fails because the disk cannot take the file (full,
+ * read-only, not ours, the drive gone) rejects with LocalSinkError, never as
+ * if the node or the network had failed. So does a download that would leave
+ * less than LOCAL_FREE_RESERVE_BYTES free, before a byte is fetched. A file
+ * the node no longer has rejects with ssh2's own error: see isRemoteMissing.
  */
-export async function downloadFileVerified(
+export function downloadFileVerified(
   ssh: SshConnection,
   remotePath: string,
   localPath: string,
   expected: { size: number; sha256?: string },
-  opts: { stallMs?: number } = {}
+  opts: DownloadOptions = {}
 ): Promise<'downloaded' | 'skipped'> {
+  return oneWriterAt(localPath, remotePath, opts.signal, () =>
+    fetchVerified(ssh, remotePath, localPath, expected, opts)
+  )
+}
+
+/** Local writers per destination: see oneWriterAt. */
+const writers = new Map<string, Promise<void>>()
+
+/**
+ * One download per local file at a time; a later one waits for the earlier to
+ * finish, and then usually finds the file already in place. Two downloaders
+ * on one frame (a transfer still running for a run that was stopped, as the
+ * requeued chunk's starts on it) wrote the same .part at once, and each one's
+ * rename or rm deleted or corrupted the other's file (#243).
+ *
+ * Waiting is abortable; the download itself stops through its own signal.
+ */
+function oneWriterAt<T>(
+  localPath: string,
+  remotePath: string,
+  signal: AbortSignal | undefined,
+  fetch: () => Promise<T>
+): Promise<T> {
+  const key = resolvePath(localPath)
+  const prev = writers.get(key) ?? Promise.resolve()
+  let started = false
+  const turn = prev.then(() => {
+    if (signal?.aborted) throw new TransferAbortedError(remotePath)
+    started = true
+    return fetch()
+  })
+  const done = turn.then(
+    () => {},
+    () => {}
+  )
+  writers.set(key, done)
+  void done.then(() => {
+    if (writers.get(key) === done) writers.delete(key)
+  })
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      if (!started) reject(new TransferAbortedError(remotePath))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    turn.then(resolve, reject).finally(() => signal?.removeEventListener('abort', onAbort))
+  })
+}
+
+/** A local fs step: its sink failures (see asLocalSinkError) as LocalSinkError. */
+function local<T>(step: Promise<T>, alsoCodes?: readonly string[]): Promise<T> {
+  return step.catch((e: unknown) => {
+    throw asLocalSinkError(e, alsoCodes)
+  })
+}
+
+/** Fail with LocalSinkError, before fetching anything, when `bytes` would eat into the reserve. */
+async function ensureRoom(dir: string, bytes: number): Promise<void> {
+  if (bytes < FREE_SPACE_CHECK_MIN_BYTES) return
+  let free: number
+  try {
+    const st = await fsp.statfs(dir)
+    free = Number(st.bavail) * Number(st.bsize)
+  } catch {
+    return // a filesystem statfs cannot read is no reason to stop
+  }
+  if (free - bytes >= LOCAL_FREE_RESERVE_BYTES) return
+  const mb = (n: number): string => `${Math.floor(n / 1024 ** 2)} MB`
+  throw new LocalSinkError(
+    'ENOSPC',
+    `not enough free space in ${dir}: ${mb(free)} free, ${mb(bytes)} to download, and ${mb(LOCAL_FREE_RESERVE_BYTES)} kept free`,
+    dir
+  )
+}
+
+/** Resolves with the channel, or rejects as soon as `signal` fires. */
+function unlessAborted<T>(
+  p: Promise<T>,
+  signal: AbortSignal | undefined,
+  remotePath: string
+): Promise<T> {
+  if (!signal) return p
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new TransferAbortedError(remotePath))
+    if (signal.aborted) return onAbort()
+    signal.addEventListener('abort', onAbort, { once: true })
+    p.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+  })
+}
+
+async function fetchVerified(
+  ssh: SshConnection,
+  remotePath: string,
+  localPath: string,
+  expected: { size: number; sha256?: string },
+  opts: DownloadOptions
+): Promise<'downloaded' | 'skipped'> {
+  const { signal } = opts
   try {
     const st = await fsp.stat(localPath)
     if (
@@ -377,11 +536,13 @@ export async function downloadFileVerified(
   } catch {
     // not present — download
   }
-  await fsp.mkdir(dirname(localPath), { recursive: true })
-  const part = `${localPath}.part`
-  // Resume from a previous attempt's prefix. A .part at or past the expected
-  // size cannot be a prefix of this file (the manifest entry changed, or it is
-  // corrupt) — start over.
+  const dir = dirname(localPath)
+  // ENOENT here is the project folder's drive gone (Windows, Linux; macOS
+  // says EACCES): the local disk, not the node.
+  await local(fsp.mkdir(dir, { recursive: true }), ['ENOENT', 'ENOTDIR'])
+  const part = partPathFor(localPath, expected)
+  // Resume from a previous attempt's prefix of this same content. A .part at
+  // or past the expected size cannot be one (it is corrupt) — start over.
   let start = 0
   try {
     const prev = await fsp.stat(part)
@@ -390,51 +551,37 @@ export async function downloadFileVerified(
   } catch {
     // no partial — start from zero
   }
+  await ensureRoom(dir, expected.size - start)
   const stallMs = opts.stallMs ?? DOWNLOAD_STALL_MS
   // The channel open is inside the stall budget too: sftp() on a wedged
   // connection can hang as surely as a read can.
-  const sftp = await withTimeout(ssh.sftp(), stallMs, () => {
-    ssh.resetSftp()
-    return new TransferStalledError(remotePath, stallMs, start)
-  })
+  const sftp = await unlessAborted(ssh.sftp({ timeoutMs: stallMs }), signal, remotePath)
   try {
     await pipelinedGet(sftp as unknown as SftpReader, remotePath, part, {
       size: expected.size,
       start,
-      stallMs
+      stallMs,
+      signal,
+      onProgress: opts.onProgress
     })
   } catch (e) {
-    if (e instanceof TransferStalledError) ssh.resetSftp()
+    // This transfer's channel, and only it: by now the cache may hold a
+    // fresh one that another transfer opened after an earlier reset (#245).
+    if (e instanceof TransferStalledError) ssh.resetSftp(sftp)
     throw e
   }
-  const st = await fsp.stat(part)
+  const st = await local(fsp.stat(part))
   if (st.size !== expected.size) {
     await fsp.rm(part, { force: true })
     throw new Error(`size mismatch downloading ${remotePath}: ${st.size} != ${expected.size}`)
   }
   if (expected.sha256) {
-    const hash = await sha256File(part)
+    const hash = await local(sha256File(part))
     if (hash !== expected.sha256) {
       await fsp.rm(part, { force: true })
       throw new Error(`hash mismatch downloading ${remotePath}`)
     }
   }
-  await fsp.rename(part, localPath)
+  await local(fsp.rename(part, localPath))
   return 'downloaded'
-}
-
-function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(onTimeout()), ms)
-    p.then(
-      (v) => {
-        clearTimeout(t)
-        resolve(v)
-      },
-      (e) => {
-        clearTimeout(t)
-        reject(e)
-      }
-    )
-  })
 }
