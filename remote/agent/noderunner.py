@@ -32,6 +32,10 @@ Job spec:
     "nodeSlots": int, "exclusive": bool,
     "lanes": int (exclusive chunks that may run side by side; absent = 1),
     "pinGpus": bool (pin each render to one GPU; absent = false),
+    "jobChunks": int (chunks the whole job is split into; the preflight
+                      refuses an unbaked simulation when > 1),
+    "preflight": "enforce"|"warn"|"off" (the scene preflight; absent =
+                      enforce, see remote/blender/preflight.py),
     "encode": null | {"sdr": bool, "hdr": bool, "proxy": bool,
                        "codec": "hevc"|"av1", "fps": float,
                        "thumbs": bool, "thumbWidth": int} }
@@ -42,6 +46,14 @@ to a new agent (and vice versa) both degrade to the behaviour they knew.
 Blender never renders a frame whose file is already in frames/ (Overwrite is
 off; see NO_OVERWRITE_EXPR), and only manifested frames are left there, so a
 chunk sent again after a restart or a failure renders only what it lacks.
+
+Each render runs three scripts from blender/ before its first frame, in this
+order: run_startup_scripts.py (the scene's own "startup*" blocks),
+enable_gpu.py and preflight.py (files the scene needs and did not pack,
+simulations it cannot step, movie output). Each reports on a line of its own
+("VR_STARTUP_FAILED {...}", "VR_PREFLIGHT {...}") before it raises, and
+Blender then exits GUARD_EXIT; the agent turns the report into the error and
+its errorKind.
 
 Chunk state (state/<chunkId>.json, rewritten atomically; fields are only ever
 added, so an older app reads a newer agent's state):
@@ -59,7 +71,9 @@ added, so an older app reads a newer agent's state):
                               frame and each "Fra:" naming a new frame. The
                               heartbeat never moves it, so a hung Blender
                               shows it falling behind updatedAt. Rendering
-                              only: encoding makes no frame progress }
+                              only: encoding makes no frame progress,
+    "preflight": {...}        preflight.py's report once Blender ran it:
+                              {ok, summary, missing, problems, warnings} }
   A failed state keeps every field it had and adds:
     "error": str              one readable line,
     "errorKind": "scene"|"job"|"machine"|"transient"   see ERROR_KINDS,
@@ -120,12 +134,18 @@ GUARD_EXIT = 32
 # --python-exit-code: "Error: script failed, file: '<path>', exiting." or
 # "Error: script failed, expr: '<code>', exiting."
 SCRIPT_FAILED_RE = re.compile(r"script failed, (file|expr): '")
+# One-line JSON reports from the scripts in remote/blender/; see each script.
+PREFLIGHT_RE = re.compile(r"\bVR_PREFLIGHT (\{.*\})")
+STARTUP_FAILED_RE = re.compile(r"\bVR_STARTUP_FAILED (\{.*\})")
+# The frame number a file in frames/ starts with, stereo views included.
+FRAME_PREFIX_RE = re.compile(r"^(\d+)")
 
 # Why a chunk failed. Every failed state carries one as errorKind, so the app's
 # retry policy (plan 1.17) decides from a fact rather than from the wording:
-#   "scene"      the .blend cannot render right on any node: a scene guard or a
-#                startup script in it raised. Retrying elsewhere only pays for
-#                the same failure again.
+#   "scene"      the .blend cannot render right on any node: the preflight found
+#                files it lacks, a simulation it cannot step or a movie output,
+#                or a scene guard or startup script in it raised. Retrying
+#                elsewhere only pays for the same failure again.
 #   "job"        the job asks for something no node can give it: Octane without
 #                OctaneBlender, a frame list off the chunk's grid, one of the
 #                job's own python expressions raised.
@@ -997,13 +1017,39 @@ def scan_line(line, state, seen, now=None):
     m = SCRIPT_FAILED_RE.search(line)
     if m:
         seen["scriptFailed"] = m.group(1)
+    m = PREFLIGHT_RE.search(line)
+    if m:
+        # For the app to show, pass or fail: the report is the scene's.
+        state["preflight"] = parse_marker(m.group(1))
+    m = STARTUP_FAILED_RE.search(line)
+    if m:
+        seen["startupFailed"] = parse_marker(m.group(1))
     state["lastLine"] = line.strip()[:300]
     return saved, save_failed
 
 
-def classify_exit(code, save_failed, seen):
+def parse_marker(text):
+    """A marker line's JSON payload; one that does not parse is kept as text."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return {"unparsed": text[:300]}
+    return value if isinstance(value, dict) else {"unparsed": text[:300]}
+
+
+def classify_exit(code, save_failed, seen, state):
     """(errorKind, message) for a render that ended unclean. See ERROR_KINDS."""
     if code == GUARD_EXIT:
+        # The scripts' own markers first: they say which one refused, and why.
+        preflight = state.get("preflight") or {}
+        if preflight.get("ok") is False:
+            return "scene", f"scene preflight failed: {preflight.get('summary') or 'see log'}"
+        startup = seen.get("startupFailed")
+        if startup:
+            return "scene", (
+                f"startup script {startup.get('script')!r} in the .blend raised"
+                f" {startup.get('error') or 'an error'} (exit {code})"
+            )
         if seen.get("scriptFailed") == "expr":
             # The job's own --python-expr (an extension's register call),
             # the same on every node.
@@ -1017,6 +1063,29 @@ def classify_exit(code, save_failed, seen):
             " — disk full or I/O error; see log"
         )
     return "transient", f"blender exited {code}"
+
+
+def preflight_args(spec, frames, frames_dir):
+    """What preflight.py needs to know of this attempt, as its VR_PREFLIGHT.
+
+    first/last are the frames Blender will actually render. Overwrite is off,
+    so a frame already on disk is skipped, and the render then starts any
+    simulation cold, exactly as a later chunk of a split job does.
+    """
+    try:
+        names = os.listdir(frames_dir)
+    except OSError:
+        names = []
+    on_disk = {int(m.group(1)) for m in map(FRAME_PREFIX_RE.match, names) if m}
+    todo = [f for f in frames if f not in on_disk]
+    chunks = spec.get("jobChunks")
+    return {
+        "jobChunks": chunks if isinstance(chunks, int) and not isinstance(chunks, bool) else None,
+        "first": todo[0] if todo else None,
+        "last": todo[-1] if todo else None,
+        "contiguous": all(b - a == 1 for a, b in zip(todo, todo[1:])),
+        "mode": "warn" if spec.get("preflight") == "warn" else "enforce",
+    }
 
 
 def run_render(spec, log_path, tracker, gpu=None, state=None):
@@ -1049,6 +1118,16 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         # again.
         raise ChunkFailed(f"blend file missing: {blend}", "transient")
 
+    # The scene preflight (plan 1.16). "off" is the app's way past it, should
+    # it ever refuse a scene wrongly; a node whose remote/ tree predates it
+    # has no script to run.
+    preflight = os.path.join(ROOT, "blender", "preflight.py")
+    if spec.get("preflight") == "off":
+        preflight = None
+    elif not os.path.exists(preflight):
+        log_line(chunk_id, f"no {preflight}: rendering without the scene preflight")
+        preflight = None
+
     def build_cmd(gpu_backend=None):
         # --python-exit-code makes script exceptions FATAL. Without it Blender
         # renders on after a failed -P script (verified on 5.1: exit 0, frame
@@ -1062,13 +1141,20 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
             "-P", os.path.join(ROOT, "blender", "run_startup_scripts.py"),
             "-P", os.path.join(ROOT, "blender", "enable_gpu.py"),
         ]
+        # After the startup blocks, so a path one of them relinks counts. It
+        # reads the scene's own frame range: -s/-e must stay after it.
+        if preflight:
+            cmd += ["-P", preflight]
         for expr in spec.get("pythonExprs") or []:
             cmd += ["--python-expr", expr]
         # Last of the scripts, so no startup block or job expression can turn
         # Overwrite back on. Blender runs these in argv order, the render
         # (-a or -f) after all of them.
         cmd += ["--python-expr", NO_OVERWRITE_EXPR]
-        cmd += ["-o", os.path.join(frames_dir, "####")]
+        # -x 1: always a file extension. A scene with it off saves frames/0001,
+        # which neither the app's manifest check nor its frame parser accept,
+        # so every frame was rendered, never counted, and rendered again (#249).
+        cmd += ["-o", os.path.join(frames_dir, "####"), "-x", "1"]
         if listed:
             # An explicit list from the app: exactly those frames, which -f
             # renders in order. -s/-e/-j only shape -a.
@@ -1141,9 +1227,12 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         with open(log_path, "a") as log:
             log.write(f"=== {time.strftime('%F %T')} render start: {' '.join(cmd)}\n")
             log.flush()
+            attempt_env = dict(env)
+            if preflight:
+                attempt_env["VR_PREFLIGHT"] = json.dumps(preflight_args(spec, frames, frames_dir))
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                env=env
+                env=attempt_env
             )
 
             # State heartbeat: the loop below only rewrites the state file
@@ -1249,7 +1338,7 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
     state["exitCode"] = code
     if not clean:
         # process() publishes the failed state, once, with its errorKind.
-        kind, message = classify_exit(code, save_failed, seen)
+        kind, message = classify_exit(code, save_failed, seen, state)
         raise ChunkFailed(message, kind, code)
     return state
 

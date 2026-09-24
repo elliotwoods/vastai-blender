@@ -38,6 +38,10 @@ Covers the failure modes that actually bit:
     rewriting frames under manifest lines whose hashes no longer matched.
   * an Octane job on a node without OctaneBlender rendered with stock Blender,
     in another engine, and completed.
+  * nothing checked the scene: a texture or library it did not pack, an
+    unbaked simulation split across chunks, or a movie output rendered wrong
+    on every node, completed and was billed. preflight.py and the other
+    remote/blender/ scripts run here against a stand-in `bpy`.
     These cases drive the real run_render and process() against a scripted
     fake `blender`, and are skipped on Windows, where its `#!/bin/sh` wrapper
     cannot run.
@@ -45,14 +49,17 @@ Covers the failure modes that actually bit:
 
 import contextlib
 import hashlib
+import io
 import json
 import os
+import runpy
 import shlex
 import shutil
 import sys
 import tempfile
 import threading
 import time
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import noderunner as nr  # noqa: E402
@@ -61,6 +68,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import encode_preview as ep  # noqa: E402
 
 FAILED = []
+REMOTE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def check(name, cond):
@@ -329,6 +337,9 @@ def fake_node():
         with open(exe, "w") as f:
             f.write('#!/bin/sh\nexec %s %s "$@"\n' % (shlex.quote(sys.executable), shlex.quote(script)))
         os.chmod(exe, 0o755)
+        # The node's copy of remote/blender/ sits beside the Blender versions.
+        # The fake never runs its scripts; the agent only checks it is there.
+        open(os.path.join(nr.BLENDER_ROOT, "preflight.py"), "w").close()
         try:
             yield tmp
         finally:
@@ -773,6 +784,281 @@ def test_never_a_stand_in_blender():
         check("version: a spec that names none renders with the newest installed",
               state.get("status") == "done")
 
+def blender_script(name, bpy, env=None):
+    """Run remote/blender/<name> as Blender's -P would, against the stand-in
+    `bpy`. Returns (what it raised or None, what it printed)."""
+    env = env or {}
+    saved_env = {k: os.environ.get(k) for k in env}
+    saved_bpy = sys.modules.get("bpy")
+    sys.modules["bpy"] = bpy
+    os.environ.update(env)
+    out = io.StringIO()
+    err = None
+    try:
+        with contextlib.redirect_stdout(out):
+            runpy.run_path(os.path.join(REMOTE, "blender", name), run_name="__main__")
+    except Exception as e:  # noqa: BLE001
+        err = e
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if saved_bpy is None:
+            sys.modules.pop("bpy", None)
+        else:
+            sys.modules["bpy"] = saved_bpy
+    return err, out.getvalue()
+
+
+def marker(printed, tag):
+    """The JSON of the first `tag {...}` line, or None."""
+    for line in printed.splitlines():
+        if line.startswith(tag + " "):
+            return json.loads(line[len(tag) + 1:])
+    return None
+
+
+NS = types.SimpleNamespace
+
+
+def scene_bpy(tmp, **data):
+    """A stand-in bpy holding one scene, saved as <tmp>/job.blend as on a node.
+
+    `data` fills bpy.data collections (images=[...], libraries=[...], ...);
+    the scene is bpy.context.scene, its render bpy.context.scene.render.
+    """
+    blend = os.path.join(tmp, "job.blend")
+
+    def abspath(path, library=None, start=None):
+        if path.startswith("//"):
+            base = os.path.dirname(abspath(library.filepath) if library is not None else blend)
+            return os.path.join(base, path[2:])
+        return path
+
+    render = NS(engine="CYCLES", is_movie_format=False,
+                image_settings=NS(file_format="OPEN_EXR"))
+    scene = NS(name="Scene", render=render, frame_start=1, objects=[], rigidbody_world=None)
+    bpy = types.ModuleType("bpy")
+    bpy.data = NS(filepath=blend, **data)
+    bpy.context = NS(scene=scene)
+    bpy.path = NS(abspath=abspath)
+    bpy.utils = NS(blend_paths=lambda **kw: [])
+    bpy.app = NS(version=(4, 2, 0))
+    return bpy
+
+
+def image(name, path, users=1, **kw):
+    fields = dict(name=name, filepath=path, users=users, use_fake_user=False, source="FILE",
+                  type="IMAGE", packed_file=None, library=None, tiles=[])
+    fields.update(kw)
+    return NS(**fields)
+
+
+def cache(**kw):
+    fields = dict(is_baked=False, use_disk_cache=False, use_external=False, frame_start=1,
+                  filepath="")
+    fields.update(kw)
+    return NS(**fields)
+
+
+def cloth(name="Flag", pc=None, **kw):
+    fields = dict(name=name, hide_render=False, library=None,
+                  modifiers=[NS(type="CLOTH", show_render=True, point_cache=pc or cache())])
+    fields.update(kw)
+    return NS(**fields)
+
+
+def preflight(tmp, bpy, **args):
+    """(raised, report) for preflight.py over `bpy`, with VR_PREFLIGHT `args`."""
+    base = {"jobChunks": None, "first": 1, "last": 50, "contiguous": True, "mode": "enforce"}
+    base.update(args)
+    err, printed = blender_script("preflight.py", bpy, {"VR_PREFLIGHT": json.dumps(base)})
+    return err, marker(printed, "VR_PREFLIGHT")
+
+
+def test_preflight_files():
+    """1.16 / #246: only the .blend reaches a node. A texture, library or cache it
+    refers to by path renders magenta, or as placeholders, on every chunk, and
+    the job completes and is billed across the fleet."""
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "tex"))
+        for name in ("ok.png", "udim.1001.png"):
+            open(os.path.join(tmp, "tex", name), "w").close()
+        clean = [
+            image("packed", "//gone/a.png", packed_file=NS(size=1)),
+            image("on disk", "//tex/ok.png"),
+            image("fake user only", "//gone/b.png", users=1, use_fake_user=True),
+            image("generated", "", source="GENERATED"),
+            image("render result", "", type="RENDER_RESULT"),
+        ]
+        err, report = preflight(tmp, scene_bpy(tmp, images=clean))
+        check("preflight: packed, present and unused files pass",
+              err is None and report is not None and report["ok"] is True)
+
+        err, report = preflight(tmp, scene_bpy(tmp, images=clean + [
+            image("wood", "//tex/wood.png"),
+            image("udim", "//tex/udim.<UDIM>.png", source="TILED",
+                  tiles=[NS(number=1001), NS(number=1002)]),
+        ]))
+        check("preflight: a missing texture refuses the render before a frame",
+              isinstance(err, RuntimeError) and str(err).startswith("scene preflight failed: ")
+              and report is not None and report["ok"] is False)
+        check("preflight: every missing file is named, each UDIM tile on its own",
+              [(m["name"], m["path"]) for m in report["missing"]]
+              == [("wood", "//tex/wood.png"), ("udim", "//tex/udim.1002.png")]
+              and "image 'wood' (//tex/wood.png)" in report["summary"])
+
+        lib = NS(name="chars.blend", filepath="//libs/chars.blend", packed_file=None, library=None)
+        other = NS(name="props.blend", filepath="//tex/ok.png", packed_file=None, library=None)
+        objects = [NS(name="Hero", is_missing=True, users=2, use_fake_user=False, library=lib),
+                   NS(name="Chair", is_missing=True, users=1, use_fake_user=False, library=other)]
+        err, report = preflight(tmp, scene_bpy(tmp, libraries=[lib, other], objects=objects))
+        check("preflight: a missing library, and data missing from one that is there",
+              err is not None and [(m["kind"], m["name"]) for m in report["missing"]]
+              == [("library", "chars.blend"), ("linked data", "Chair")])
+
+        bpy = scene_bpy(tmp)
+        bpy.context.scene.render.is_movie_format = True
+        bpy.context.scene.render.image_settings.file_format = "FFMPEG"
+        err, report = preflight(tmp, bpy)
+        check("preflight: a movie output is refused (#249)",
+              err is not None and "movie (FFMPEG)" in report["summary"])
+
+        err, report = preflight(tmp, scene_bpy(tmp, images=[image("wood", "//tex/wood.png")]),
+                                mode="warn")
+        check("preflight: warn mode reports without refusing",
+              err is None and report["ok"] is False)
+
+        class Broken:
+            def __iter__(self):
+                raise AttributeError("renamed in a later Blender")
+
+        bpy = scene_bpy(tmp, images=Broken())
+        bpy.utils.blend_paths = lambda **kw: ["/nowhere/ies/lamp.ies", "/nowhere/frame_####.png"]
+        err, report = preflight(tmp, bpy)
+        check("preflight: a check that breaks, and a path only blend_paths knows, only warn",
+              err is None and report["ok"] is True
+              and any("check_images could not run" in w for w in report["warnings"])
+              and any("/nowhere/ies/lamp.ies" in w for w in report["warnings"])
+              and not any("####" in w for w in report["warnings"]))
+
+
+def test_preflight_simulations():
+    """1.16 / #247: an unbaked simulation steps only frame by frame from its
+    start. Every chunk but the first, and a chunk that skips frames already on
+    disk, starts it cold and renders it wrong."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def scene(*objects, **scene_kw):
+            bpy = scene_bpy(tmp)
+            bpy.context.scene.objects = list(objects)
+            for k, v in scene_kw.items():
+                setattr(bpy.context.scene, k, v)
+            return bpy
+
+        cases = [
+            ("split job", scene(cloth()), {"jobChunks": 3}, False),
+            ("one chunk from the start", scene(cloth()), {"jobChunks": 1}, True),
+            ("one chunk, frames 1-50 already on disk", scene(cloth()),
+             {"jobChunks": 1, "first": 51, "last": 60}, False),
+            ("a frame step", scene(cloth()), {"contiguous": False}, False),
+            ("every frame already on disk", scene(cloth()), {"first": None, "last": None}, True),
+            ("render ends before the sim starts", scene(cloth(pc=cache(frame_start=100))),
+             {"jobChunks": 3}, True),
+            ("starts at the scene start, after the cache's", scene(cloth(), frame_start=1001),
+             {"first": 1001, "last": 1100}, True),
+            ("baked into the .blend", scene(cloth(pc=cache(is_baked=True))),
+             {"jobChunks": 3}, True),
+            ("baked to disk, one chunk", scene(cloth(pc=cache(is_baked=True, use_disk_cache=True))),
+             {"jobChunks": 1}, False),
+            ("hidden from the render", scene(cloth(hide_render=True)), {"jobChunks": 3}, True),
+            ("hair without dynamics", scene(NS(name="Fur", hide_render=False, modifiers=[
+                NS(type="PARTICLE_SYSTEM", show_render=True, particle_system=NS(
+                    settings=NS(type="HAIR", physics_type="NEWTON"), use_hair_dynamics=False,
+                    point_cache=cache()))])), {"jobChunks": 3}, True),
+            ("rigid body world", scene(rigidbody_world=NS(
+                enabled=True, collection=NS(objects=[1]), point_cache=cache())),
+             {"jobChunks": 3}, False),
+            ("fluid bake on disk", scene(NS(name="Pool", hide_render=False, modifiers=[
+                NS(type="FLUID", show_render=True, fluid_type="DOMAIN", domain_settings=NS(
+                    cache_type="ALL", has_cache_baked_any=True, cache_frame_start=1,
+                    cache_directory="//cache_fluid"))])), {"jobChunks": 1}, False),
+        ]
+        for label, bpy, args, ok in cases:
+            err, report = preflight(tmp, bpy, **args)
+            check(f"preflight sim: {label} -> {'renders' if ok else 'refused'}",
+                  report is not None and report["ok"] is ok and (err is None) is ok)
+
+
+def test_startup_script_marker():
+    blocks = [NS(name="startup_guard.py", as_string=lambda: "raise ValueError('needs add-on foo')"),
+              NS(name="notes.txt", as_string=lambda: "not python")]
+    err, printed = blender_script("run_startup_scripts.py", NS(data=NS(texts=blocks)))
+    check("a raising startup block still fails the render, and names itself first",
+          isinstance(err, ValueError)
+          and marker(printed, "VR_STARTUP_FAILED")
+          == {"script": "startup_guard.py", "error": "ValueError: needs add-on foo"})
+    ran = NS(name="startup_ok.py", as_string=lambda: "import bpy\nbpy.data.touched = True")
+    bpy = NS(data=NS(texts=[ran]))
+    err, printed = blender_script("run_startup_scripts.py", bpy)
+    check("a startup block that works runs, with no marker",
+          err is None and getattr(bpy.data, "touched", False)
+          and marker(printed, "VR_STARTUP_FAILED") is None)
+
+
+def test_agent_runs_the_preflight():
+    """1.16: the agent runs preflight.py third, tells it which frames will
+    render, and fails a refused scene as errorKind scene."""
+    with fake_node() as tmp:
+        cdir = make_chunk(tmp)
+        finished_frame(cdir, "0001.exr", "old1")
+        rec = os.path.join(tmp, "runs.jsonl")
+        state, _ = run_chunk(tmp, {"record": rec, "default": {"render": "f"}},
+                             grid=(1, 5, 1), jobChunks=4)
+        with open(rec) as f:
+            run = json.loads(f.readline())
+        argv, env = run["argv"], run["env"]
+        scripts = [os.path.basename(argv[i + 1]) for i, a in enumerate(argv) if a == "-P"]
+        check("preflight: the third script, after the startup blocks and the GPU setup",
+              scripts == ["run_startup_scripts.py", "enable_gpu.py", "preflight.py"])
+        check("-x 1: every frame gets its file extension, set before the render",
+              "-x" in argv and argv[argv.index("-x") + 1] == "1" and argv.index("-x") < argv.index("-a"))
+        check("preflight: told the first frame that will really render, and the chunking",
+              json.loads(env.get("VR_PREFLIGHT") or "{}")
+              == {"jobChunks": 4, "first": 2, "last": 5, "contiguous": True, "mode": "enforce"})
+        check("preflight: a clean pass renders as before", state.get("status") == "done")
+
+    report = {"ok": False, "summary": "1 file(s) not packed into the .blend and not on the node:"
+              " image 'wood' (//tex/wood.png)", "missing": [], "problems": [], "warnings": []}
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, entries = run_chunk(tmp, {"default": {
+            "print": ["VR_PREFLIGHT " + json.dumps(report),
+                      "Error: script failed, file: '/root/vastai/blender/preflight.py', exiting."],
+            "exit": nr.GUARD_EXIT}})
+        check("preflight refusal: errorKind scene, with the report's summary as the error",
+              state.get("errorKind") == "scene" and state.get("exitCode") == nr.GUARD_EXIT
+              and state.get("error") == "scene preflight failed: " + report["summary"]
+              and state.get("preflight") == report and entries == [])
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, _ = run_chunk(tmp, {"default": {
+            "print": ['VR_STARTUP_FAILED {"script": "startup_guard.py", "error": "ValueError: no"}'],
+            "exit": nr.GUARD_EXIT}})
+        check("startup refusal: errorKind scene, naming the block",
+              state.get("errorKind") == "scene" and "'startup_guard.py'" in state.get("error", "")
+              and "ValueError: no" in state["error"])
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        rec = os.path.join(tmp, "runs.jsonl")
+        state, _ = run_chunk(tmp, {"record": rec, "default": {"render": "f"}}, preflight="off")
+        with open(rec) as f:
+            run = json.loads(f.readline())
+        check("preflight off: the app's way past a wrong refusal",
+              "preflight.py" not in " ".join(run["argv"]) and "VR_PREFLIGHT" not in run["env"]
+              and state.get("status") == "done")
+
 
 def test_log_tail():
     with tempfile.TemporaryDirectory() as tmp:
@@ -876,6 +1162,9 @@ def main():
         test_preview_sequence,
         test_log_tail,
         test_last_progress_at,
+        test_preflight_files,
+        test_preflight_simulations,
+        test_startup_script_marker,
     ):
         run(fn)
     # Through fake_node, whose `blender` is a `#!/bin/sh` wrapper that Windows
@@ -895,6 +1184,7 @@ def main():
         test_restart_renders_only_missing_frames,
         test_explicit_frame_list,
         test_never_a_stand_in_blender,
+        test_agent_runs_the_preflight,
     ):
         if os.name == "nt":
             print(f"SKIP  {fn.__name__}: the fake blender needs a POSIX shell")
