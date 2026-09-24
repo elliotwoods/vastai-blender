@@ -16,8 +16,12 @@
  *
  * While the field has focus, the draft is the user's: a background refetch
  * of `value` does not overwrite what they are typing. Switching to another
- * app mid-edit is not finishing it: the draft waits, uncommitted, for the
- * user to come back.
+ * app mid-edit is not finishing it: a blank never commits that way, so
+ * clearing the spend cap on the way to a new one and alt-tabbing does not
+ * uncap the scheduler. A finished number does commit then on a cap field
+ * (`commitOnWindowBlur`), so a cap typed before leaving is in force while
+ * the user is gone. Any change held back shows as "not saved", with a warn
+ * border, until the user presses Enter or clicks away.
  *
  * The behaviour lives in numberDraft's fieldEvent(), with tests; this file
  * only binds DOM events to it.
@@ -25,17 +29,21 @@
 
 import { useRef, useState, type CSSProperties } from 'react'
 import { input, mono, type ControlSize } from '../lib/controls'
+import { TOKENS } from '../lib/theme'
 import {
   draftProblem,
   fieldEvent,
   fieldKey,
   fieldText,
   leftWindowOnly,
+  notSaved,
   type FieldEvent,
   type FieldResult,
-  type FieldState,
-  type NumberRules
+  type FieldRules,
+  type FieldState
 } from './numberDraft'
+
+const NOT_SAVED = 'not saved: press Enter or click away'
 
 export interface NumberFieldProps {
   value: number | null
@@ -51,6 +59,14 @@ export interface NumberFieldProps {
    * blank: clearing the field commits null and shows this as the placeholder.
    */
   allowBlank?: string
+  /**
+   * Commit a finished number when the user switches apps mid-edit, not only
+   * when they leave the field. Set it on caps, where a smaller number only
+   * stops renting (spendCapPerHour, maxActiveNodes, maxDphTotal); leave it
+   * off lower bounds (minDiskGb, minReliability), where "0." on the way to
+   * "0.95" is the loose value. See FieldRules.commitOnWindowBlur.
+   */
+  commitOnWindowBlur?: boolean
   size?: ControlSize
   width?: number
   disabled?: boolean
@@ -67,6 +83,7 @@ export function NumberField({
   step = 1,
   integer = false,
   allowBlank,
+  commitOnWindowBlur = false,
   size = 'sm',
   width = 80,
   disabled = false,
@@ -78,7 +95,13 @@ export function NumberField({
   // Read by the handlers, so an Enter and the blur straight after it each see
   // the state the other left, whether or not React has rendered in between.
   const live = useRef(state)
-  const rules: NumberRules = { min, max, integer, allowBlank: allowBlank != null }
+  const rules: FieldRules = {
+    min,
+    max,
+    integer,
+    allowBlank: allowBlank != null,
+    commitOnWindowBlur
+  }
 
   const dispatch = (ev: FieldEvent): FieldResult => {
     const r = fieldEvent(live.current, ev, rules)
@@ -89,6 +112,7 @@ export function NumberField({
   }
 
   const problem = state.draft == null ? null : draftProblem(state.draft, rules)
+  const unsaved = problem == null && notSaved(state, rules)
 
   return (
     <input
@@ -97,7 +121,8 @@ export function NumberField({
       id={id}
       aria-label={ariaLabel}
       aria-invalid={problem != null || undefined}
-      title={problem ?? undefined}
+      aria-description={unsaved ? NOT_SAVED : undefined}
+      title={problem ?? (unsaved ? NOT_SAVED : undefined)}
       disabled={disabled}
       placeholder={allowBlank}
       value={fieldText(state, value)}
@@ -114,7 +139,13 @@ export function NumberField({
         e.preventDefault()
         dispatch(ev)
       }}
-      style={{ ...input({ size, invalid: problem != null }), ...mono, width, ...style }}
+      style={{
+        ...input({ size, invalid: problem != null }),
+        ...(unsaved ? { border: `1px solid ${TOKENS.warn}` } : {}),
+        ...mono,
+        width,
+        ...style
+      }}
     />
   )
 }

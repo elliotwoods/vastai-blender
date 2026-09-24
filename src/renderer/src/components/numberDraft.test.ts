@@ -5,12 +5,13 @@ import {
   fieldKey,
   fieldText,
   leftWindowOnly,
+  notSaved,
   parseDraft,
   resolveDraft,
   stepDraft,
   type FieldEvent,
-  type FieldState,
-  type NumberRules
+  type FieldRules,
+  type FieldState
 } from './numberDraft'
 
 describe('parseDraft', () => {
@@ -152,7 +153,7 @@ describe('stepDraft', () => {
 function play(
   value: number | null,
   events: FieldEvent[],
-  rules: NumberRules = {}
+  rules: FieldRules = {}
 ): { state: FieldState; commits: Array<number | null> } {
   let state: FieldState = { draft: null, base: value }
   const commits: Array<number | null> = []
@@ -168,7 +169,9 @@ const focus = (value: number | null): FieldEvent => ({ type: 'focus', value })
 const type = (text: string): FieldEvent => ({ type: 'change', text })
 const leave: FieldEvent = { type: 'blur', windowOnly: false }
 const switchApp: FieldEvent = { type: 'blur', windowOnly: true }
-const noCap: NumberRules = { min: 0, allowBlank: true }
+const noCap: FieldRules = { min: 0, allowBlank: true }
+/** The spend cap as Settings wires it: blank means "no cap", and a typed cap applies at once. */
+const cap: FieldRules = { ...noCap, commitOnWindowBlur: true }
 
 describe('fieldEvent (plan 1.14)', () => {
   it('never commits "no cap" when the window loses focus mid-edit (#112a)', () => {
@@ -176,14 +179,74 @@ describe('fieldEvent (plan 1.14)', () => {
     // browser to check Vast prices: that blur is the window's, not the
     // user leaving the field. Committing it would uncap the scheduler until
     // they came back.
-    const away = play(2, [focus(2), type(''), switchApp], noCap)
-    expect(away.commits).toEqual([])
-    expect(away.state.draft).toBe('')
+    for (const rules of [noCap, cap]) {
+      const away = play(2, [focus(2), type(''), switchApp], rules)
+      expect(away.commits).toEqual([])
+      expect(away.state.draft).toBe('')
+      // …and it says so: the empty field reads "no cap", which is not in force.
+      expect(notSaved(away.state, rules)).toBe(true)
+    }
 
     // Coming back re-focuses the field: the draft, and what it started from,
     // are still theirs. Typing on and leaving commits only the new cap.
     const back = play(2, [focus(2), type(''), switchApp, focus(2), type('3'), leave], noCap)
     expect(back.commits).toEqual([3])
+  })
+
+  it('puts a finished cap in force when the user switches apps, locks up or leaves (#112a review)', () => {
+    // Typing a tighter cap and then alt-tabbing used to leave it uncommitted,
+    // on screen with an ordinary border and out of force while they were
+    // gone: the scheduler could rent at the old price, or at any price.
+    expect(play(null, [focus(null), type('5'), switchApp], cap).commits).toEqual([5])
+    expect(play(10, [focus(10), type('3'), switchApp], cap).commits).toEqual([3])
+    expect(notSaved(play(10, [focus(10), type('3'), switchApp], cap).state, cap)).toBe(false)
+  })
+
+  it('carries the edit on after a window-blur commit, and commits each number once', () => {
+    // "5" on the way to "50": 5 is in force while they're away (only
+    // tighter), and coming back the draft is theirs to finish.
+    const on = play(null, [focus(null), type('5'), switchApp, focus(5), type('50'), leave], cap)
+    expect(on.commits).toEqual([5, 50])
+    const enter = play(
+      null,
+      [focus(null), type('5'), switchApp, focus(5), { type: 'enter' }, leave],
+      cap
+    )
+    expect(enter.commits).toEqual([5])
+    // The text under the caret is not rewritten: "2." does not become "2".
+    expect(play(2, [focus(2), type('2.'), switchApp], cap).state.draft).toBe('2.')
+  })
+
+  it('holds a lower bound back on a window blur, and shows it is not saved', () => {
+    // "0." on the way to "0.95" into minReliability reads as 0: any host at
+    // all. Without commitOnWindowBlur the field keeps it, visibly.
+    const floor: FieldRules = { min: 0, max: 1 }
+    const away = play(0.9, [focus(0.9), type('0.'), switchApp], floor)
+    expect(away.commits).toEqual([])
+    expect(notSaved(away.state, floor)).toBe(true)
+    const done = play(
+      0.9,
+      [focus(0.9), type('0.'), switchApp, focus(0.9), type('0.95'), leave],
+      floor
+    )
+    expect(done.commits).toEqual([0.95])
+    expect(notSaved(done.state, floor)).toBe(false)
+  })
+
+  it('says "not saved" only for a held change, and only while it still differs', () => {
+    // Ordinary typing is not flagged.
+    expect(notSaved(play(2, [focus(2), type('')], noCap).state, noCap)).toBe(false)
+    const held = play(2, [focus(2), type(''), switchApp, focus(2)], noCap)
+    expect(notSaved(held.state, noCap)).toBe(true)
+    // Typed back to the stored value: nothing left to save.
+    expect(notSaved(fieldEvent(held.state, type('2'), noCap).state, noCap)).toBe(false)
+    // Escape, Enter and leaving each end the hold.
+    for (const ev of [{ type: 'escape' }, { type: 'enter' }, leave] as FieldEvent[]) {
+      expect(notSaved(fieldEvent(held.state, ev, noCap).state, noCap), ev.type).toBe(false)
+    }
+    // Left unchanged, or as a typo that already shows its problem: no flag.
+    expect(notSaved(play(2, [focus(2), switchApp], noCap).state, noCap)).toBe(false)
+    expect(notSaved(play(2, [focus(2), type('abc'), switchApp], cap).state, cap)).toBe(false)
   })
 
   it('does not reset a kept draft when a refetch moved the value while the user was away', () => {

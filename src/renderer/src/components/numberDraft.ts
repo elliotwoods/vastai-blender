@@ -119,16 +119,37 @@ export function stepDraft(
   return formatValue(clampRound(next, rules))
 }
 
+/** fieldEvent()'s rules: the number's, plus what a window-only blur may commit. */
+export interface FieldRules extends NumberRules {
+  /**
+   * Commit a finished number when the window loses focus mid-edit, not only
+   * when the user leaves the field. For limits where a smaller number is the
+   * safe direction (the spend cap, max active nodes, a max $/hr filter): a
+   * cap typed and left behind by an alt-tab, a locked screen or a night away
+   * must be in force, and a half-typed one ("5" on the way to "50") is only
+   * tighter. Not for lower bounds such as minDiskGb or minReliability, where
+   * the half-typed number ("0." on the way to "0.95") is the loose one.
+   * A blank ("no cap") never commits this way, whatever this says.
+   */
+  commitOnWindowBlur?: boolean
+}
+
 /** NumberField's editing state, between events. */
 export interface FieldState {
   /** null = not editing: the field shows its `value`. A string = the user's draft. */
   draft: string | null
   /**
-   * The value this edit started from, moved on by an Enter commit, so a blur
+   * The value this edit started from, moved on by a commit, so a blur
    * straight after Enter doesn't commit the same number a second time while
    * the parent's `value` is still catching up.
    */
   base: number | null
+  /**
+   * A window-only blur found a change in the draft and did not commit it.
+   * The field says "not saved" for as long as the draft still differs from
+   * `base` (notSaved()); leaving the field, Enter or Escape clears it.
+   */
+  held?: true
 }
 
 export type FieldEvent =
@@ -158,19 +179,22 @@ export interface FieldResult {
  * guard the spend cap are tested without a DOM. The component only binds
  * DOM events to this and calls onCommit when a result carries `commit`.
  *
- * Only leaving the field inside the app finishes an edit. Chromium blurs the
- * focused element when the whole window loses focus, so without that
- * distinction a user who clears the spend cap on the way to a new one, then
- * alt-tabs to check Vast prices, has committed "no cap" — and the scheduler
- * may rent at any price until they come back (review of plan 1.14, #112).
- * Window focus returning re-focuses the field; the kept draft and the value
- * it started from survive that too.
+ * Leaving the field inside the app, or Enter, finishes an edit. Chromium
+ * also blurs the focused element when the whole window loses focus, and
+ * that blur is not the user done: one who clears the spend cap on the way
+ * to a new one, then alt-tabs to check Vast prices, must not have committed
+ * "no cap" — the scheduler would rent at any price until they came back
+ * (review of plan 1.14, #112). So a window-only blur never commits a blank.
+ * It commits a finished number only under `commitOnWindowBlur`, the fields
+ * where holding it back is the harm: a cap typed and alt-tabbed away from
+ * would otherwise sit out of force for as long as the user is gone. Any
+ * change it holds is marked `held`, so the field shows it is not saved.
+ *
+ * The draft text itself survives a window-only blur untouched ("2." stays
+ * "2.", not "2"), and window focus returning re-focuses the field without
+ * resetting it, so the user carries on typing where they left off.
  */
-export function fieldEvent(
-  state: FieldState,
-  ev: FieldEvent,
-  rules: NumberRules = {}
-): FieldResult {
+export function fieldEvent(state: FieldState, ev: FieldEvent, rules: FieldRules = {}): FieldResult {
   switch (ev.type) {
     case 'focus':
       // Back from another window, mid-edit: keep going where they left off.
@@ -179,22 +203,32 @@ export function fieldEvent(
     case 'change':
       return { state: { ...state, draft: ev.text } }
     case 'blur': {
-      if (ev.windowOnly || state.draft == null) return { state }
+      if (state.draft == null) return { state }
       const r = resolveDraft(state.draft, state.base, rules)
+      if (ev.windowOnly) {
+        // Still the page's focused element: the edit goes on when the window
+        // comes back. A typo or out-of-range draft is already flagged, and
+        // an unchanged one has nothing to say.
+        if (r.kind === 'keep') return { state }
+        if (r.value != null && rules.commitOnWindowBlur) {
+          return { state: { draft: state.draft, base: r.value }, commit: { value: r.value } }
+        }
+        return { state: { draft: state.draft, base: state.base, held: true } }
+      }
       return r.kind === 'commit'
         ? { state: { draft: null, base: r.value }, commit: { value: r.value } }
-        : { state: { ...state, draft: null } }
+        : { state: { draft: null, base: state.base } }
     }
     case 'enter': {
       if (state.draft == null) return { state }
       const r = resolveDraft(state.draft, state.base, rules)
       return r.kind === 'commit'
         ? { state: { draft: r.text, base: r.value }, commit: { value: r.value } }
-        : { state: { ...state, draft: r.text } }
+        : { state: { draft: r.text, base: state.base } }
     }
     case 'escape':
       if (state.draft == null) return { state }
-      return { state: { ...state, draft: formatValue(state.base) } }
+      return { state: { draft: formatValue(state.base), base: state.base } }
     case 'step':
       if (state.draft == null) return { state }
       return {
@@ -210,6 +244,20 @@ export function fieldKey(key: string, step: number): FieldEvent | null {
   if (key === 'ArrowUp') return { type: 'step', dir: 1, step }
   if (key === 'ArrowDown') return { type: 'step', dir: -1, step }
   return null
+}
+
+/**
+ * Whether the field should say its draft is not saved: a window-only blur
+ * held it back, and it still differs from the stored value. The user may
+ * have left for the night thinking the number they typed applies; this is
+ * the only sign that it doesn't until they press Enter or click away.
+ */
+export function notSaved(state: FieldState, rules: NumberRules = {}): boolean {
+  return (
+    state.held === true &&
+    state.draft != null &&
+    resolveDraft(state.draft, state.base, rules).kind === 'commit'
+  )
 }
 
 /**
