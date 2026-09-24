@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   MAX_FRAME,
+  MAX_JOB_FRAMES,
   validateRenderOptions,
   validateSubmission,
   type RenderOptions
@@ -70,7 +71,24 @@ describe('validateSubmission', () => {
       'end frame must be a whole number (got 250)'
     ])
     // Both ends of the range Blender accepts.
-    expect(validateSubmission(sub({ frameStart: 0, frameEnd: MAX_FRAME }))).toEqual([])
+    expect(validateSubmission(sub({ frameStart: 0, frameEnd: 9 }))).toEqual([])
+    expect(validateSubmission(sub({ frameStart: MAX_FRAME - 9, frameEnd: MAX_FRAME }))).toEqual([])
+    expect(validateSubmission(sub({ frameStart: 0, frameEnd: MAX_FRAME, frameStep: 11 }))).toEqual(
+      []
+    )
+  })
+
+  it('refuses more frames than one job may render', () => {
+    // Each is a row inserted on the main thread; 0-1000000 is one stray zero.
+    expect(validateSubmission(sub({ frameStart: 0, frameEnd: 1_000_000 }))).toEqual([
+      `1000001 frames is more than one job may render (${MAX_JOB_FRAMES}): split the range into several jobs`
+    ])
+    expect(validateSubmission(sub({ frameStart: 1, frameEnd: MAX_JOB_FRAMES }))).toEqual([])
+    expect(validateSubmission(sub({ frameStart: 1, frameEnd: MAX_JOB_FRAMES + 1 }))).toHaveLength(1)
+    // Counted on the step: every other frame of twice the range is as many.
+    expect(
+      validateSubmission(sub({ frameStart: 1, frameEnd: 2 * MAX_JOB_FRAMES - 1, frameStep: 2 }))
+    ).toEqual([])
   })
 
   it('does not also report an inverted range when a frame is already wrong', () => {

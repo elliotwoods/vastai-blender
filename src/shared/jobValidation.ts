@@ -21,6 +21,14 @@ import type { EngineId, JobSubmission } from './models'
  */
 export const MAX_FRAME = 1_048_574
 
+/**
+ * Most frames one job may render. createJob inserts a row per frame, and a
+ * chunk row per chunk, in one transaction on the main thread: a typo such as
+ * 0-1000000 held IPC and the scheduler's ticks for seconds, and every job:get
+ * after it carried a million frames. An hour of animation at 24 fps is 86,400.
+ */
+export const MAX_JOB_FRAMES = 100_000
+
 /** A Record, so adding an EngineId without listing it here fails to compile. */
 const ENGINE_IDS: Record<EngineId, true> = { eevee: true, cycles: true, octane: true }
 
@@ -68,8 +76,19 @@ export function validateRenderOptions(options: RenderOptions): string[] {
     if (end < start) problems.push(`end frame ${end} is before start frame ${start}`)
   }
 
-  if (!Number.isInteger(o.frameStep) || (o.frameStep as number) < 1) {
+  const stepOk = Number.isInteger(o.frameStep) && (o.frameStep as number) >= 1
+  if (!stepOk) {
     problems.push(`frame step must be a whole number of at least 1 (got ${String(o.frameStep)})`)
+  }
+  if (!startProblem && !endProblem && stepOk) {
+    const start = o.frameStart as number
+    const end = o.frameEnd as number
+    const frames = Math.floor((end - start) / (o.frameStep as number)) + 1
+    if (frames > MAX_JOB_FRAMES) {
+      problems.push(
+        `${frames} frames is more than one job may render (${MAX_JOB_FRAMES}): split the range into several jobs`
+      )
+    }
   }
 
   // null = auto. undefined too: createJob's `??` has always read it that way.
