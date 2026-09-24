@@ -1,13 +1,14 @@
 /** Job persistence + read models (the scheduler owns state transitions). */
 
 import { randomUUID } from 'crypto'
-import { mkdirSync } from 'fs'
+import { mkdirSync, statSync } from 'fs'
 import { basename, join } from 'path'
 import { resolveJobBlenderVersion } from '../blender/blendInfo'
 import { getDb } from '../db/db'
 import { emit } from '../events'
 import { getSettings } from '../settings'
 import { autoChunkSize, framesIn, splitFrames } from '../scheduler/chunker'
+import { validateSubmission } from '../../shared/jobValidation'
 import type {
   ChunkSnapshot,
   ChunkState,
@@ -141,14 +142,37 @@ export function emitChunksChanged(chunkIds: readonly string[]): void {
   for (const id of chunkIds) emitChunkChanged(id)
 }
 
-/** Create job + chunks + frame rows; returns the job id. */
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Create job + chunks + frame rows; returns the job id.
+ *
+ * Refuses an impossible submission before touching the disk or the DB. Both
+ * ways in — job:create from the dialog and the VR_JOB_SPEC campaign driver —
+ * land here, so this is where the rules hold. A chunk size of 0 used to reach
+ * splitFrames and spin the main process until it ran out of memory: no IPC,
+ * no scheduler tick, no idle scale-down, while the fleet kept billing.
+ */
 export async function createJob(sub: JobSubmission): Promise<string> {
+  const problems = validateSubmission(sub)
+  // Only main can see the disk. With a blenderVersionOverride set nothing
+  // below reads the scene, so a missing one would first surface at dispatch,
+  // failing chunk after chunk on a rented node.
+  if (problems.length === 0 && !isFile(sub.blendPath)) {
+    problems.push(`scene file not found: ${sub.blendPath}`)
+  }
+  if (problems.length) throw new Error(problems.join('; '))
+
   const settings = getSettings()
   const id = randomUUID()
   const name = sub.name || basename(sub.blendPath).replace(/\.blend$/i, '')
   const outputDir = join(settings.projectRoot, 'renders', id)
-  mkdirSync(join(outputDir, 'frames'), { recursive: true })
-  mkdirSync(join(outputDir, 'previews'), { recursive: true })
 
   const blenderVersion = await resolveJobBlenderVersion(
     sub.blendPath,
@@ -158,6 +182,11 @@ export async function createJob(sub: JobSubmission): Promise<string> {
   const totalFrames = Math.floor((sub.frameEnd - sub.frameStart) / sub.frameStep) + 1
   const chunkSize = sub.chunkSize ?? autoChunkSize(totalFrames, settings.maxActiveNodes)
   const ranges = splitFrames(sub.frameStart, sub.frameEnd, sub.frameStep, chunkSize)
+
+  // After everything above that can refuse the job, so a refusal leaves no
+  // empty renders/<id> folder behind.
+  mkdirSync(join(outputDir, 'frames'), { recursive: true })
+  mkdirSync(join(outputDir, 'previews'), { recursive: true })
 
   const db = getDb()
   const insertAll = db.transaction(() => {

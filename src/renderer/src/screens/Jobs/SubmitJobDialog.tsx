@@ -5,6 +5,7 @@ import { ipc } from '../../lib/ipc'
 import { useAddons, useSettings, useSubmitJob } from '../../lib/queries'
 import { useNav } from '../../lib/nav'
 import { SCALE, TOKENS } from '../../lib/theme'
+import { validateRenderOptions, type RenderOptions } from '../../../../shared/jobValidation'
 import type { EngineId } from '../../../../shared/models'
 
 const overlay: CSSProperties = {
@@ -46,20 +47,28 @@ export function SubmitJobDialog({ onClose }: { onClose: () => void }): React.JSX
 
   const octaneWarning = engine === 'octane' && settings && !settings.hasOtoyCredentials
 
+  const options: RenderOptions = {
+    engine,
+    frameStart,
+    frameEnd,
+    frameStep,
+    addonIds: [...selectedAddons],
+    chunkSize: chunkSize === '' ? null : chunkSize,
+    shareNode
+  }
+  // The checks createJob applies, run as the user types, so a bad field (a
+  // chunk size of 0, a fractional step) is explained here and blocks submit
+  // rather than being refused by main after the click. The scene path isn't
+  // checked here: submit already waits for one, and the picker returns real
+  // paths.
+  const problems = validateRenderOptions(options)
+  const blocked = files.length === 0 || submit.isPending || problems.length > 0
+
   const doSubmit = async (): Promise<void> => {
     setError(null)
     try {
       for (const blendPath of files) {
-        await submit.mutateAsync({
-          blendPath,
-          engine,
-          frameStart,
-          frameEnd,
-          frameStep,
-          addonIds: [...selectedAddons],
-          chunkSize: chunkSize === '' ? null : chunkSize,
-          shareNode
-        })
+        await submit.mutateAsync({ blendPath, ...options })
       }
       onClose()
     } catch (e) {
@@ -220,9 +229,12 @@ export function SubmitJobDialog({ onClose }: { onClose: () => void }): React.JSX
           </div>
         ) : null}
 
-        {error ? (
+        {problems.length > 0 || error ? (
           <div style={{ color: TOKENS.danger, fontSize: SCALE.textSm, marginBottom: SCALE.space3 }}>
-            {error}
+            {problems.map((p) => (
+              <div key={p}>{p}</div>
+            ))}
+            {error ? <div>{error}</div> : null}
           </div>
         ) : null}
 
@@ -231,11 +243,8 @@ export function SubmitJobDialog({ onClose }: { onClose: () => void }): React.JSX
             cancel
           </button>
           <button
-            style={btn({
-              variant: 'primary',
-              disabled: files.length === 0 || submit.isPending || frameEnd < frameStart
-            })}
-            disabled={files.length === 0 || submit.isPending || frameEnd < frameStart}
+            style={btn({ variant: 'primary', disabled: blocked })}
+            disabled={blocked}
             onClick={() => void doSubmit()}
           >
             {submit.isPending
