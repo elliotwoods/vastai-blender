@@ -34,11 +34,23 @@ if (process.env.VR_USERDATA) {
 // second launch leaves here, before whenReady and any of that code. The lock
 // is keyed on userData, which is why it is taken after the VR_USERDATA
 // override: throwaway profiles still start beside the real one.
-if (!app.requestSingleInstanceLock()) {
-  const headless = Boolean(process.env.VR_JOB_SPEC || process.env.VR_E2E_BLEND)
+//
+// A scripted launch (a headless campaign run, or a VR_SHOT capture) that is
+// refused exits 1, so its script can tell "did nothing" from a run that went
+// wrong: a refused capture exited 0 with no PNG, as a broken one can. It also
+// tells the running instance, through additionalData, that it was scripted,
+// and that instance then leaves its window alone.
+const headless = Boolean(process.env.VR_JOB_SPEC || process.env.VR_E2E_BLEND)
+const capture = process.env.VR_SHOT
+const scripted = headless || Boolean(capture)
+if (!app.requestSingleInstanceLock({ scripted })) {
   const msg =
     `[vast-render] another instance is already running on ${app.getPath('userData')}; ` +
-    (headless ? 'this headless run submitted nothing.\n' : 'focusing it instead.\n')
+    (headless
+      ? 'this headless run submitted nothing.\n'
+      : capture
+        ? `no capture was written to ${capture}.\n`
+        : 'focusing it instead.\n')
   // writeSync: a piped stderr may be asynchronous, and process.exit would
   // drop the one line that says why a scripted run did nothing.
   try {
@@ -46,14 +58,21 @@ if (!app.requestSingleInstanceLock()) {
   } catch {
     // No stderr attached (a Windows GUI launch): nothing to tell.
   }
-  if (headless) process.exit(1)
+  if (scripted) process.exit(1)
   app.quit()
   process.exit(0)
 }
 
-// The primary instance: a second launch (above) is the user asking for the
-// app, so show them the one that is running. Emitted only after ready.
-app.on('second-instance', () => {
+// The primary instance: a second launch (above) by a person is them asking
+// for the app, so show them the one that is running. A scripted one is not:
+// a campaign resubmitted, or a capture, on a box rendering headless must not
+// pop a window up there. A launch that sent no data (an older build) counts
+// as a person's. Emitted only after ready.
+app.on('second-instance', (_event, _argv, _cwd, data) => {
+  if ((data as { scripted?: unknown } | null)?.scripted === true) {
+    console.log('[vast-render] refused a scripted second launch; window left as it is')
+    return
+  }
   const win = BrowserWindow.getAllWindows()[0]
   if (!win) {
     // A headless run may have lost its window; the user asked for one.
