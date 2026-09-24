@@ -31,7 +31,9 @@ Job spec:
     "extraArgs": [str], "pythonExprs": [str],
     "nodeSlots": int, "exclusive": bool,
     "lanes": int (exclusive chunks that may run side by side; absent = 1),
-    "pinGpus": bool (pin each render to one GPU; absent = false),
+    "pinGpus": bool (pin each Cycles render to one GPU; other engines are
+                     never pinned, and their lanes run one at a time;
+                     absent = false),
     "cpuRender": bool (Cycles on the CPU by design; absent = a Cycles render
                       with no GPU to enable fails, errorKind machine),
     "jobChunks": int (chunks the whole job is split into; the preflight
@@ -66,6 +68,9 @@ added, so an older app reads a newer agent's state):
     "exitCode": int|null      Blender's exit code; null until it exits, and
                               in a failed state null only if it never ran,
     "gpu": int|null           the GPU the render is pinned to,
+    "pinFailed": true         the app asked for a pinned Cycles render
+                              (pinGpus) and the agent could not see two GPUs
+                              to pin it to; such lanes run one at a time,
     "updatedAt": float        epoch s of the last write; the 60 s heartbeat
                               refreshes it while Blender lives, so it says
                               the process is alive, not that it is working,
@@ -1489,6 +1494,15 @@ def process(spec_path, gpu=None):
     # object, so a late heartbeat can never put back a state the failure
     # already replaced.
     state = {"gpu": gpu}
+    if spec.get("pinGpus") and gpu is None:
+        # See pin_plan. A pinned Cycles spec is unpinned only when the agent
+        # could not see two GPUs to pin it to.
+        if is_cycles(spec):
+            state["pinFailed"] = True
+            why = "the agent cannot see two GPUs (nvidia-smi failed, or found fewer)"
+        else:
+            why = f"{spec.get('engine')} picks its own GPU; only Cycles honours the pin"
+        log_line(chunk_id, f"not pinned to a GPU as the app asked: {why}; lanes run one at a time")
     try:
         run_render(spec, log_path, tracker, gpu, state)
         # Stop and join BEFORE the definitive encode: the worker reads the same
@@ -1525,13 +1539,23 @@ def cleanup_live_stream(chunk_dir):
         pass
 
 
-def gpu_vram_mb():
-    """Total VRAM summed over every GPU in MB, or None without nvidia-smi.
+def is_cycles(spec):
+    """Does this spec render with Cycles? Absent means yes, as it always did."""
+    return (spec.get("engine") or "cycles") == "cycles"
 
-    Summed, not GPU 0's: the app's hardCap() sums nvidia-smi's rows, and the two
-    ceilings must agree or the agent silently runs fewer chunks than the
-    scheduler believes it dispatched. (GPU 0 alone capped a 4-GPU node at a
-    quarter of its VRAM.)
+
+def gpu_vram_mb(engine=None):
+    """VRAM in MB that bounds this engine's renders, or None without nvidia-smi.
+
+    Cycles: summed over every GPU. Summed, not GPU 0's: the app's hardCap()
+    sums nvidia-smi's rows, and the two ceilings must agree or the agent
+    silently runs fewer chunks than the scheduler believes it dispatched.
+    (GPU 0 alone capped a 4-GPU node at a quarter of its VRAM.)
+
+    Any other engine: the smallest single card. EEVEE and Octane pick their
+    own device, so their renders most likely all share one card, and the sum
+    let the agent pack N cards' worth of them onto it (#229). The app's
+    hardCap has to bound non-Cycles work the same way (plan 1.11).
     """
     try:
         out = subprocess.run(
@@ -1539,25 +1563,37 @@ def gpu_vram_mb():
             capture_output=True, text=True, timeout=10,
         ).stdout.strip().splitlines()
         vals = [int(float(x)) for x in out if x.strip()]
-        return sum(vals) if vals else None
     except Exception:  # noqa: BLE001
         return None
+    if not vals:
+        return None
+    return sum(vals) if engine in (None, "", "cycles") else min(vals)
 
 
+# A failed nvidia-smi is asked again after this many seconds, never cached for
+# good: one slow call as the agent started used to turn pinning off for the
+# node's whole rental, while the app went on sending pinned lanes (#230).
+GPU_LIST_RETRY = 30.0
 _GPUS = None
+_GPUS_ASKED = 0.0
 
 
 def gpu_list():
-    """[(index, pci_bus_id)] from nvidia-smi, cached; [] when unavailable.
+    """[(index, pci_bus_id)] from nvidia-smi; [] when unavailable.
 
     nvidia-smi enumerates in PCI bus order, and gpu_env() sets
     CUDA_DEVICE_ORDER=PCI_BUS_ID so CUDA's index i is the same card as
     nvidia-smi's index i — which is what lets the app match a slot's GPU to its
-    per-GPU telemetry.
+    per-GPU telemetry. A list is cached once it holds a GPU; an empty one is
+    asked again every GPU_LIST_RETRY seconds.
     """
-    global _GPUS
-    if _GPUS is not None:
+    global _GPUS, _GPUS_ASKED
+    if _GPUS:
         return _GPUS
+    now = time.monotonic()
+    if _GPUS is not None and now - _GPUS_ASKED < GPU_LIST_RETRY:
+        return _GPUS
+    _GPUS_ASKED = now
     gpus = []
     try:
         out = subprocess.run(
@@ -1591,8 +1627,11 @@ def gpu_env(gpu):
     }
 
 
-def node_ceiling():
+def node_ceiling(engine=None):
     """Hardware slot ceiling: min(threads/2, vram_gb/1, ram_gb/3, 24).
+
+    VRAM is summed over the GPUs for Cycles, the smallest card's otherwise
+    (see gpu_vram_mb).
 
     The render trace is mostly single-threaded CPU per blender process;
     EEVEE at ~1Kpx measured ~0.5 GB VRAM per process (SDF scenes,
@@ -1605,7 +1644,7 @@ def node_ceiling():
     # box measured ~10x per-frame degradation. Half the thread count tracks
     # physical cores closely across the fleet's actual hardware.
     cap = max(1, cores // 2)
-    vram = gpu_vram_mb()
+    vram = gpu_vram_mb(engine)
     if vram is not None:
         cap = min(cap, max(1, int(vram // 1024)))
     try:
@@ -1627,9 +1666,10 @@ def slot_limit(spec):
     raw = spec.get("nodeSlots")
     if raw in (None, "", 1):
         return 1
+    engine = spec.get("engine")
     if raw in (0, "auto"):
-        return node_ceiling()
-    return max(1, min(int(raw), node_ceiling()))
+        return node_ceiling(engine)
+    return max(1, min(int(raw), node_ceiling(engine)))
 
 
 def lane_limit(spec):
@@ -1641,6 +1681,39 @@ def lane_limit(spec):
         return max(1, min(int(spec.get("lanes") or 1), 32))
     except (TypeError, ValueError):
         return 1
+
+
+def pin_plan(spec, gpu_count):
+    """(pin, failed): pin this spec's render to one GPU? And if the app asked
+    for that, is it impossible here?
+
+    Only Cycles is pinned. CUDA_VISIBLE_DEVICES reaches CUDA and OptiX, which
+    is all Cycles uses; EEVEE's OpenGL or Vulkan and Octane pick their own
+    device, so a "pinned" EEVEE lane rendered wherever the driver put it,
+    most likely every one on the same card, while the Fleet screen showed
+    each on a GPU of its own (#229, #235). That is refused, not failed: the
+    engine rules it out on every node.
+
+    A Cycles pin fails when the agent cannot see two GPUs, because nvidia-smi
+    failed or found fewer cards than the offer promised. The state then says
+    pinFailed, so the app can plan the node as one lane (#230).
+    """
+    if not spec.get("pinGpus") or not is_cycles(spec):
+        return False, False
+    if gpu_count < 2:
+        return False, True
+    return True, False
+
+
+def lane_cap(spec, gpu_count):
+    """lane_limit, or 1 when the lanes were planned pinned and cannot be.
+
+    Unpinned, every Cycles lane uses every GPU and every EEVEE lane most
+    likely the same one, so N lanes put N copies of the scene on each card.
+    """
+    if spec.get("pinGpus") and not pin_plan(spec, gpu_count)[0]:
+        return 1
+    return lane_limit(spec)
 
 
 def pick_gpu(running_gpus, gpu_count):
@@ -1661,11 +1734,12 @@ def plan_launches(parsed, running, gpu_count, slots):
 
     Rules (identical to the old loop whenever lanes = 1 and nothing is pinned):
       * exclusive and shared work never run together;
-      * exclusive chunks run up to `lanes` at once (one per GPU lane);
+      * exclusive chunks run up to `lanes` at once (one per GPU lane), or one
+        at a time when their lanes cannot be pinned (lane_cap);
       * shared chunks run up to `slots` at once;
       * FIFO: the head waits rather than being overtaken (`break`, not
         `continue`), so an exclusive chunk is never starved by lighter work.
-    Pinned specs go to the least-loaded GPU.
+    Pinned specs go to the least-loaded GPU; only Cycles is pinned (pin_plan).
     """
     running = list(running)
     launches = []
@@ -1674,13 +1748,13 @@ def plan_launches(parsed, running, gpu_count, slots):
         n_excl = sum(1 for e, _g in running if e)
         n_shared = len(running) - n_excl
         if exclusive:
-            if n_shared or n_excl >= lane_limit(spec):
+            if n_shared or n_excl >= lane_cap(spec, gpu_count):
                 break
         else:
             if n_excl or len(running) >= slots:
                 break
         gpu = None
-        if spec.get("pinGpus") and gpu_count > 1:
+        if pin_plan(spec, gpu_count)[0]:
             gpu = pick_gpu([g for _e, g in running], gpu_count)
         running.append((exclusive, gpu))
         launches.append((name, gpu))
@@ -1743,7 +1817,8 @@ def main():
         running = [(excl, gpu) for _t, excl, gpu in in_progress.values()]
         launched = False
         specs_by_name = dict(parsed)
-        for name, gpu in plan_launches(parsed, running, len(gpu_list()), slots):
+        gpu_count = len(gpu_list())
+        for name, gpu in plan_launches(parsed, running, gpu_count, slots):
             exclusive = is_exclusive(specs_by_name[name])
             t = threading.Thread(
                 target=process, args=(os.path.join(INBOX, name), gpu), daemon=True
@@ -1751,7 +1826,7 @@ def main():
             in_progress[name] = (t, exclusive, gpu)
             t.start()
             launched = True
-            limit = lane_limit(specs_by_name[name]) if exclusive else slots
+            limit = lane_cap(specs_by_name[name], gpu_count) if exclusive else slots
             print(
                 f"slot start {name} ({len(in_progress)}/{limit})"
                 + (" exclusive" if exclusive else "")

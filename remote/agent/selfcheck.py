@@ -46,6 +46,8 @@ Covers the failure modes that actually bit:
     EEVEE OpenGL retry keyed on the job's engine label, not the scene's.
   * a GPU out of memory was reported as a bare exit code, and a frame
     Blender wrote after it could be manifested.
+  * GPU lanes were pinned for every engine, though only Cycles honours the
+    pin, and one failed nvidia-smi turned pinning off for good, silently.
     These cases drive the real run_render and process() against a scripted
     fake `blender`, and are skipped on Windows, where its `#!/bin/sh` wrapper
     cannot run.
@@ -691,6 +693,27 @@ def test_render_publishes_last_progress():
               isinstance(stamp, float) and started <= stamp <= state["updatedAt"])
 
 
+@contextlib.contextmanager
+def fake_nvidia_smi(answer):
+    """nvidia-smi, as the agent runs it, printing answer(query). Yields the
+    queries it was asked, in order."""
+    real = nr.subprocess.run
+    calls = []
+
+    def run(cmd, **_kw):
+        if not cmd or cmd[0] != "nvidia-smi":
+            return real(cmd, **_kw)
+        query = next(a for a in cmd if a.startswith("--query-gpu="))
+        calls.append(query)
+        return types.SimpleNamespace(stdout=answer(query), returncode=0)
+
+    nr.subprocess.run = run
+    try:
+        yield calls
+    finally:
+        nr.subprocess.run = real
+
+
 def finished_frame(cdir, name, body):
     """A frame an earlier attempt finished: on disk, manifested with its hash."""
     with open(os.path.join(cdir, "frames", name), "w") as f:
@@ -1250,9 +1273,86 @@ def test_plan_launches():
           nr.plan_launches([("a", ex()), ("s", sh())], [(False, None)], 1, 4) == [])
     got = nr.plan_launches([(f"s{i}", sh(True)) for i in range(4)], [], 2, 4)
     check("shared work is pinned least-loaded", [g for _, g in got] == [0, 1, 0, 1])
-    check("no pinning on a single-GPU node",
-          nr.plan_launches([("a", ex(2, True)), ("b", ex(2, True))], [], 1, 1)
+    check("single GPU: unpinned lanes share it, as planned",
+          nr.plan_launches([("a", ex(2)), ("b", ex(2))], [], 1, 1)
           == [("a", None), ("b", None)])
+
+
+def test_pinning_is_cycles_only():
+    """1.11 / #229 #235: EEVEE and Octane pick their own GPU, so their "pinned"
+    lanes piled onto one card while the Fleet screen showed one per GPU."""
+    ex = lambda engine, pin=True: {"exclusive": True, "lanes": 4, "pinGpus": pin, "engine": engine}  # noqa: E731
+    got = nr.plan_launches([(f"e{i}", ex("eevee")) for i in range(4)], [], 4, 1)
+    check("eevee: never pinned, and its pinned lanes run one at a time", got == [("e0", None)])
+    got = nr.plan_launches([(f"o{i}", ex("octane")) for i in range(4)], [], 4, 1)
+    check("octane: likewise", got == [("o0", None)])
+    got = nr.plan_launches([(f"c{i}", ex("cycles")) for i in range(4)], [], 4, 1)
+    check("cycles: one lane per GPU, each pinned", [g for _, g in got] == [0, 1, 2, 3])
+    shared = {"exclusive": False, "nodeSlots": 4, "pinGpus": True, "engine": "eevee"}
+    check("eevee shared work: unpinned, its slots unchanged",
+          nr.plan_launches([(f"s{i}", shared) for i in range(3)], [], 4, 4)
+          == [("s0", None), ("s1", None), ("s2", None)])
+    check("pin_plan: EEVEE is refused, not failed", nr.pin_plan(ex("eevee"), 4) == (False, False))
+
+
+def test_pin_failure_is_reported():
+    """1.11 / #230: one failed nvidia-smi as the agent started turned pinning off
+    for the rental, and the app kept sending pinned lanes that each loaded the
+    scene onto every GPU."""
+    ex = {"exclusive": True, "lanes": 4, "pinGpus": True, "engine": "cycles"}
+    check("pin failed: pinned lanes the agent cannot pin run one at a time",
+          nr.plan_launches([("a", ex), ("b", ex)], [], 0, 1) == [("a", None)]
+          and nr.plan_launches([("a", ex), ("b", ex)], [], 1, 1) == [("a", None)])
+
+    answers = ["", "0, 00000000:01:00.0\n1, 00000000:41:00.0"]
+    with fake_nvidia_smi(lambda q: answers.pop(0) if answers else "") as calls:
+        saved = {k: getattr(nr, k, None) for k in ("_GPUS", "_GPUS_ASKED", "GPU_LIST_RETRY")}
+        try:
+            nr._GPUS = None
+            first = nr.gpu_list()
+            nr.GPU_LIST_RETRY = 3600
+            soon = nr.gpu_list()
+            asked_soon = len(calls)
+            nr.GPU_LIST_RETRY = 0
+            later = nr.gpu_list()
+            cached = nr.gpu_list()
+        finally:
+            for k, v in saved.items():
+                setattr(nr, k, v)
+    check("gpu_list: an empty answer is not kept for the rental",
+          first == [] and soon == [] and asked_soon == 1
+          and later == [(0, "00000000:01:00.0"), (1, "00000000:41:00.0")])
+    check("gpu_list: a list with GPUs is kept", cached == later and len(calls) == 2)
+
+    for engine, expect in (("cycles", True), ("eevee", None)):
+        with fake_node() as tmp:
+            make_chunk(tmp)
+            state, _ = run_chunk(tmp, {"default": {"render": "f"}}, engine=engine,
+                                 pinGpus=True, lanes=4, exclusive=True)
+            check(f"pinFailed: in the state of an unpinned {engine} render the app asked to pin"
+                  if expect else "pinFailed: not for an EEVEE render, which is never pinned",
+                  state.get("pinFailed") is expect and state.get("status") == "done"
+                  and "not pinned to a GPU as the app asked" in render_log())
+    check("pin failed: pin_plan says so", nr.pin_plan(ex, 1) == (False, True))
+
+
+def test_vram_bound_by_engine():
+    """1.11 / #229: the agent summed every card's VRAM, so shared EEVEE work,
+    which lands on one card, could be packed N cards over its size."""
+    with fake_nvidia_smi(lambda q: "2048\n1024\n") as _calls:
+        cycles, eevee = nr.gpu_vram_mb("cycles"), nr.gpu_vram_mb("eevee")
+        absent = nr.gpu_vram_mb()
+        real_cpus = os.cpu_count
+        os.cpu_count = lambda: 64
+        try:
+            ceilings = (nr.node_ceiling("cycles"), nr.node_ceiling("eevee"))
+            slots = nr.slot_limit({"nodeSlots": 16, "engine": "eevee"})
+        finally:
+            os.cpu_count = real_cpus
+    check("vram: Cycles sums the cards, any other engine gets the smallest",
+          (cycles, eevee, absent) == (3072, 1024, 3072))
+    check("vram: the slot ceiling for EEVEE follows the smallest card",
+          ceilings[1] == 1 and ceilings[0] >= ceilings[1] and slots == 1)
 
 
 def test_preview_sequence():
@@ -1297,6 +1397,8 @@ def run(fn):
 def main():
     for fn in (
         test_plan_launches,
+        test_pinning_is_cycles_only,
+        test_vram_bound_by_engine,
         test_backfill_skips_unmanifested,
         test_per_frame_failures_are_tolerated,
         test_resubscribe_fills_the_gap,
@@ -1331,6 +1433,7 @@ def main():
         test_agent_runs_the_preflight,
         test_agent_gpu_and_engine,
         test_out_of_memory,
+        test_pin_failure_is_reported,
     ):
         if os.name == "nt":
             print(f"SKIP  {fn.__name__}: the fake blender needs a POSIX shell")
