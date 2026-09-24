@@ -49,6 +49,32 @@ describe('Sparkline', () => {
     expect(ys(html, 'polyline')).toEqual([[1.5, 18.5]])
   })
 
+  it('never draws outside its box, even when handed readings from before the window', () => {
+    // The 60-minute metrics ring passed straight to a 30-minute sparkline:
+    // the older half must not spill over the next column of the fleet row.
+    const html = render(
+      [
+        { x: -400, mean: 20, min: 0, max: 40 },
+        { x: -100, mean: 30, min: 10, max: 50 },
+        { x: 0, mean: 50, min: 10, max: 90 },
+        { x: 400, mean: 60, min: 20, max: 100 },
+        { x: 600, mean: 70 }
+      ],
+      { width: 80 }
+    )
+    const xs = [...html.matchAll(/(?:points|cx|x1|x2)="([^"]*)"/g)].flatMap((m) =>
+      m[1].split(' ').map((pt) => Number(pt.split(',')[0]))
+    )
+    expect(xs.length).toBeGreaterThan(0)
+    for (const x of xs) {
+      expect(x).toBeGreaterThanOrEqual(0)
+      expect(x).toBeLessThanOrEqual(80)
+    }
+    expect(html).not.toContain('overflow')
+    // …and the summary speaks for the window alone.
+    expect(html).toContain('aria-label="GPU util: mean 55%, low 10%, high 100%"')
+  })
+
   it('breaks at a gap rather than reading an unreachable node as idle', () => {
     const html = render([
       { x: 0, mean: 80 },

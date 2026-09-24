@@ -5,7 +5,10 @@
  *
  * Fixed size, so a column of them lines up, and a fixed y range, so rows
  * compare: two sparklines that both fill their box are equally busy only when
- * the box means the same thing on both.
+ * the box means the same thing on both. Nothing is drawn outside the box:
+ * readings outside fromMs..toMs are dropped (a 60-minute ring handed to a
+ * 30-minute sparkline would otherwise run over the next column), and values
+ * outside the y range pin to its edge.
  *
  * Hovering (or focusing) reads out the snapped reading through the shared
  * Tooltip, which is portalled so a scrolling fleet list can't clip it.
@@ -43,7 +46,7 @@ export interface SparklineProps {
   formatX?: (ms: number) => string
 }
 
-/** Keeps a line at the top or bottom of the range from losing half its stroke. */
+/** Keeps a line at the edge of the box from losing half its stroke to the clip. */
 const INSET = 1.5
 
 /** Runs of consecutive readings; a missing mean is a gap. */
@@ -63,7 +66,7 @@ function runs(points: readonly SparkPoint[]): Array<Array<SparkPoint & { mean: n
 }
 
 export function Sparkline({
-  points,
+  points: given,
   fromMs,
   toMs,
   yMin = 0,
@@ -77,19 +80,22 @@ export function Sparkline({
 }: SparklineProps): React.JSX.Element {
   const [hover, setHover] = useState<number | null>(null)
 
+  // Only the window's readings, so x stays inside the box and the summary
+  // describes the window the label names.
+  const points = given.filter((p) => p.x >= fromMs && p.x <= toMs)
   const windowMs = toMs - fromMs || 1
   const range = yMax - yMin || 1
-  const sx = (ms: number): number => ((ms - fromMs) / windowMs) * width
+  const sx = (ms: number): number => INSET + ((ms - fromMs) / windowMs) * (width - 2 * INSET)
   // Clamped: a reading outside the fixed range pins to the edge rather than
   // drawing outside a 16px box.
   const sy = (v: number): number =>
     INSET + (1 - Math.min(1, Math.max(0, (v - yMin) / range))) * (height - 2 * INSET)
 
-  const all = summarize(points.map((p) => p.mean))
+  const means = summarize(points.map((p) => p.mean))
   const low = summarize(points.map((p) => p.min ?? p.mean))
   const high = summarize(points.map((p) => p.max ?? p.mean))
-  const summary = all
-    ? `${label}: mean ${format(all.mean)}, low ${format(low?.min ?? all.min)}, high ${format(high?.max ?? all.max)}`
+  const summary = means
+    ? `${label}: mean ${format(means.mean)}, low ${format(low?.min ?? means.min)}, high ${format(high?.max ?? means.max)}`
     : `${label}: no readings`
 
   const hovered = hover != null && hover < points.length ? points[hover] : null
@@ -110,7 +116,7 @@ export function Sparkline({
   const onMove = (e: React.MouseEvent<SVGSVGElement>): void => {
     if (!points.length) return
     const rect = e.currentTarget.getBoundingClientRect()
-    const ms = fromMs + ((e.clientX - rect.left) / width) * windowMs
+    const ms = fromMs + ((e.clientX - rect.left - INSET) / (width - 2 * INSET)) * windowMs
     setHover(
       nearestIndex(
         points.map((p) => p.x),
@@ -128,7 +134,7 @@ export function Sparkline({
         aria-label={summary}
         onMouseMove={onMove}
         onMouseLeave={() => setHover(null)}
-        style={{ display: 'block', flex: 'none', overflow: 'visible' }}
+        style={{ display: 'block', flex: 'none' }}
       >
         {runs(points).map((run, i) => {
           const hasBand = run.some((p) => p.min != null || p.max != null)
@@ -184,7 +190,7 @@ export function Sparkline({
         ) : null}
         {/* Nothing read yet: a quiet floor line, so the cell reads as empty
             rather than broken. */}
-        {!all ? (
+        {!means ? (
           <line
             x1={0}
             x2={width}
