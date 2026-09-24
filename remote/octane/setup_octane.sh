@@ -10,7 +10,8 @@
 #     but not from root on the host, who can read the server's memory. Any
 #     credential used on a rented node is disclosed to its owner.
 #   - Safe to repeat: a second setup never kills or duplicates a running VNC
-#     or OctaneServer. Only stop-server stops the server.
+#     or OctaneServer, even while another runs. Only stop-server stops the
+#     server.
 #
 # Usage:
 #   setup_octane.sh install                          # apt deps; skipped when installed
@@ -29,11 +30,16 @@ set -euo pipefail
 
 VASTAI_HOME="${VASTAI_HOME:-$HOME/vastai}"
 VNC_DIR="$HOME/.vnc"
-PIDFILE="$VASTAI_HOME/state/octane-server.pid"
+STATE_DIR="$VASTAI_HOME/state"
+PIDFILE="$STATE_DIR/octane-server.pid"
 SERVER_LOG="$VASTAI_HOME/logs/octane-server.log"
 # Where X servers keep .X0-lock and the .X11-unix socket. (Tests point it at a
 # temp dir.)
 X_TMPDIR="${X_TMPDIR:-/tmp}"
+# How long start-server or stop-server waits for one already running on the
+# node: a stop takes up to ~31 s, and the app's exec timeouts are 45 s (stop)
+# and 60 s (start). (Tests shorten it.)
+OCTANE_LOCK_WAIT_S="${OCTANE_LOCK_WAIT_S:-40}"
 
 # Credentials go on stdin only. An app build from before this rule sends them
 # as env assignments on the command; drop them so no child inherits them.
@@ -80,6 +86,26 @@ proc_args() { ps -p "$1" -o args= 2> /dev/null || true; }
 proc_live() {
   kill -0 "$1" 2> /dev/null || return 1
   case "$(ps -p "$1" -o stat= 2> /dev/null)" in '' | *Z*) return 1 ;; esac
+}
+
+# Hold the node's OctaneServer lock (fd 9) until this script exits, after any
+# start-server or stop-server already running. The checks below only hold one
+# at a time: two setups that overlap (the app's prep deadline can give up its
+# own lock while the exec still runs here) would both find no server and
+# launch two, each taking a floating license. The server itself is launched
+# with 9>&-, or it would hold the lock for life. flock is util-linux, on every
+# Ubuntu image; without it this runs unlocked, as before.
+lock_server() {
+  mkdir -p "$STATE_DIR"
+  if ! command -v flock > /dev/null 2>&1; then
+    log "flock missing — running unlocked"
+    return 0
+  fi
+  exec 9> "$STATE_DIR/octane-server.lock"
+  if ! flock -w "$OCTANE_LOCK_WAIT_S" 9; then
+    log "another start-server or stop-server still running after ${OCTANE_LOCK_WAIT_S}s — nothing done" >&2
+    exit 1
+  fi
 }
 
 record_server_pid() {
@@ -219,7 +245,9 @@ cmd_start_server() {
     IFS= read -r -t 15 user || true
     IFS= read -r -t 15 pass || true
   fi
-  mkdir -p "$VASTAI_HOME/logs" "$VASTAI_HOME/state"
+  mkdir -p "$VASTAI_HOME/logs" "$STATE_DIR"
+  # After the read: the caller's stdin write never waits on the lock.
+  lock_server
   pid="$(server_pid)"
   if [ -z "$pid" ]; then
     for p in $(all_server_pids); do
@@ -250,10 +278,10 @@ cmd_start_server() {
     # arguments). Whether a build reads a sign-in there is unverified: one
     # that does not just reports needsLogin, and the VNC sign-in remains.
     log "launching OctaneServer, sign-in on its stdin"
-    printf '%s\n%s\n' "$user" "$pass" | nohup OctaneServer > "$SERVER_LOG" 2>&1 &
+    printf '%s\n%s\n' "$user" "$pass" | nohup OctaneServer > "$SERVER_LOG" 2>&1 9>&- &
   else
     log "launching OctaneServer — sign in by hand over VNC"
-    nohup OctaneServer < /dev/null > "$SERVER_LOG" 2>&1 &
+    nohup OctaneServer < /dev/null > "$SERVER_LOG" 2>&1 9>&- &
   fi
   pid=$!
   user="" pass=""
@@ -293,6 +321,7 @@ cmd_status() {
 # OctaneServer, not only the pidfile's, since a license is held per server.
 cmd_stop_server() {
   local pids="" pid p left
+  lock_server
   pid="$(server_pid)"
   [ -z "$pid" ] || pids="$pid"
   for p in $(all_server_pids); do

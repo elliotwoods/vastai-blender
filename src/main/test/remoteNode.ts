@@ -19,6 +19,11 @@
  *   dpkg-query  reports those packages installed once apt-get installed them
  *   curl        fails, as a node with no network would
  *   setsid      recorded only (it would start ensure-optix)
+ *   flock       `flock [-n | -w <s>] <fd>`, util-linux's form, done with
+ *               perl's flock(2), which macOS lacks as a command. The lock is
+ *               on the open file the script holds as <fd>, so it lasts, as
+ *               the real one does, until the script and every process that
+ *               inherited that fd have closed it.
  *   vncserver   `:0` starts a real sleeper named Xtightvnc and writes TightVNC's
  *               pid file; `-kill` is recorded only
  *   vncpasswd   `-f` writes "enc(<password>)", so a test can see which password
@@ -63,6 +68,23 @@ for p in "$@"; do echo "install ok installed"; done`,
 exit 7`,
   setsid: `${RECORD}
 exit 0`,
+  flock: `${RECORD}
+exec /usr/bin/perl -MFcntl=:flock -MTime::HiRes=sleep,time -e '
+  my ($wait, $nb);
+  while (@ARGV && $ARGV[0] =~ /^-/) {
+    my $o = shift @ARGV;
+    if ($o eq "-w") { $wait = shift @ARGV } elsif ($o eq "-n") { $nb = 1 }
+    else { die "flock stub: $o is not modelled\\n" }
+  }
+  my $fd = shift @ARGV;
+  $fd =~ /^\\d+$/ or die "flock stub: only the <fd> form is modelled\\n";
+  open(my $fh, ">&=", $fd) or die "flock stub: fd $fd: $!\\n";
+  my $until = defined $wait ? time + $wait : undef;
+  until (flock($fh, LOCK_EX | LOCK_NB)) {
+    exit 1 if $nb || (defined $until && time >= $until);
+    sleep 0.05;
+  }
+' -- "$@"`,
   pkill: `${RECORD}
 exit 0`,
   // procs: one "pid<TAB>name<TAB>args" per line. -f matches args as a fixed
@@ -145,6 +167,14 @@ export interface RemoteNode {
   setProcs(procs: Array<{ pid: number; name: string; args: string }>): void
   /** Each OctaneServer launch the stub saw, in order. */
   octaneLaunches(): OctaneLaunch[]
+  /** As provision() and octane(), without waiting: for runs that overlap. */
+  provisionAsync(args: string[], opts?: RunOpts): Promise<ScriptResult>
+  octaneAsync(args: string[], opts?: RunOpts): Promise<ScriptResult>
+  /**
+   * Hold an exclusive flock(2) on `path` from another process, as a copy of
+   * a script still running would; returns its release.
+   */
+  holdLock(path: string): () => void
   /**
    * A real, unrelated long-lived process (killed by dispose), shown by ps as
    * `argv0` (default `sleep`).
@@ -200,24 +230,41 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
   chmodSync(join(vastai, 'bin', 'ffmpeg'), 0o755)
   const bystanders: number[] = []
 
+  const scriptEnv = (opts: RunOpts): NodeJS.ProcessEnv => ({
+    HOME: home,
+    VASTAI_HOME: vastai,
+    PATH: `${stubs}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    LANG: 'C',
+    STUB_REC: rec,
+    X_TMPDIR: xtmp,
+    ...opts.env
+  })
+
   const run = (script: string, args: string[], opts: RunOpts = {}): ScriptResult => {
     const r = spawnSync('/bin/bash', [script, ...args], {
       input: opts.input ?? '',
       encoding: 'utf8',
       timeout: 60_000,
-      env: {
-        HOME: home,
-        VASTAI_HOME: vastai,
-        PATH: `${stubs}:/usr/bin:/bin:/usr/sbin:/sbin`,
-        LANG: 'C',
-        STUB_REC: rec,
-        X_TMPDIR: xtmp,
-        ...opts.env
-      }
+      env: scriptEnv(opts)
     })
     if (r.error) throw r.error
     return { code: r.status, stdout: r.stdout, stderr: r.stderr }
   }
+
+  const runAsync = (script: string, args: string[], opts: RunOpts = {}): Promise<ScriptResult> =>
+    new Promise((resolve, reject) => {
+      const child = spawn('/bin/bash', [script, ...args], {
+        env: scriptEnv(opts),
+        stdio: ['pipe', 'pipe', 'pipe']
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (d: Buffer) => (stdout += d.toString()))
+      child.stderr.on('data', (d: Buffer) => (stderr += d.toString()))
+      child.on('error', reject)
+      child.on('close', (code) => resolve({ code, stdout, stderr }))
+      child.stdin.end(opts.input ?? '')
+    })
 
   // setup_octane.sh launches OctaneServer in the background and returns, so
   // the stub may not have recorded anything yet: wait for the one the
@@ -276,6 +323,38 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
       const r = run(join(vastai, 'octane', 'setup_octane.sh'), args, opts)
       if (args[0] === 'start-server') settleOctane()
       return r
+    },
+    provisionAsync: (args, opts) => runAsync(join(vastai, 'provision.sh'), args, opts),
+    octaneAsync: async (args, opts) => {
+      const r = await runAsync(join(vastai, 'octane', 'setup_octane.sh'), args, opts)
+      if (args[0] === 'start-server') settleOctane()
+      return r
+    },
+    holdLock: (path) => {
+      const ready = `${path}.held`
+      const child = spawn(
+        '/usr/bin/perl',
+        [
+          '-MFcntl=:flock',
+          '-e',
+          'open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; open(my $r, ">", $ARGV[1]) or die; close $r; sleep 300',
+          path,
+          ready
+        ],
+        { detached: true, stdio: 'ignore' }
+      )
+      child.unref()
+      bystanders.push(child.pid!)
+      for (let i = 0; i < 100 && !existsSync(ready); i++) spawnSync('sleep', ['0.05'])
+      if (!existsSync(ready)) throw new Error(`could not take the lock on ${path}`)
+      return () => {
+        try {
+          process.kill(child.pid!, 'SIGKILL')
+        } catch {
+          // already gone
+        }
+        rmSync(ready, { force: true })
+      }
     },
     calls: () => {
       const f = join(rec, 'calls.log')

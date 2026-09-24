@@ -47,6 +47,7 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
 
   const pidfile = (): string => join(n.vastai, 'state', 'octane-server.pid')
   const serverLog = (): string => join(n.vastai, 'logs', 'octane-server.log')
+  const lockfile = (): string => join(n.vastai, 'state', 'octane-server.lock')
   const serverPid = (): number => Number(readFileSync(pidfile(), 'utf8').split('\n')[0])
   const state = (): OctaneState => {
     const r = n.octane(['status'])
@@ -119,6 +120,42 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
     expect(again.stdout).toMatch(/already running/)
     // It reports the live server's state, and its log was not truncated.
     expect(octaneState(again.stdout)).toBe('licensed')
+  })
+
+  it('1.18: two setups that overlap launch one OctaneServer (one license)', async () => {
+    vnc()
+    // Both are under way before either can look for a server: the app's
+    // prep deadline gave up on the first exec while it still ran here.
+    const release = n.holdLock(lockfile())
+    const first = n.octaneAsync(['start-server'])
+    const second = n.octaneAsync(['start-server'])
+    await new Promise((r) => setTimeout(r, 300))
+    release()
+    const results = await Promise.all([first, second])
+
+    for (const r of results) expect(r.code, r.stdout + r.stderr).toBe(0)
+    expect(launches()).toHaveLength(1)
+    expect(results.filter((r) => /already running/.test(r.stdout))).toHaveLength(1)
+  })
+
+  it('1.18: start-server and stop-server wait for one already running; the server holds no lock', () => {
+    const release = n.holdLock(lockfile())
+    const quick = { env: { OCTANE_LOCK_WAIT_S: '1' } }
+    vnc()
+    const start = n.octane(['start-server'], quick)
+    expect(start.code).toBe(1)
+    expect(start.stderr).toMatch(/still running after 1s/)
+    expect(launches()).toHaveLength(0)
+    expect(n.octane(['stop-server'], quick).code).toBe(1)
+    release()
+
+    expect(n.octane(['start-server'], quick).code).toBe(0)
+    // The server outlives the script that launched it, and must not keep its
+    // lock: the next setup, and the stop on destroy, would wait on it forever.
+    const again = n.octane(['start-server'], quick)
+    expect(again.code, again.stdout + again.stderr).toBe(0)
+    expect(again.stdout).toMatch(/already running/)
+    expect(n.octane(['stop-server'], quick).stdout).toMatch(/^OCTANE_STOPPED clean$/m)
   })
 
   it('1.18: a server the pidfile lost is adopted, not duplicated', () => {
