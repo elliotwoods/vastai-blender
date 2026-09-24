@@ -304,3 +304,48 @@ function legacyGuard(
 export function effectiveLanes(plan: LanePlan, guard: LaneGuard | null | undefined): number {
   return Math.max(1, Math.min(plan.lanes, guard?.limit ?? Number.POSITIVE_INFINITY))
 }
+
+/**
+ * Throughput for ONE GPU of this model, from one finished chunk: what
+ * gpu_perf stores and offer ranking multiplies back up by an offer's GPUs.
+ *
+ * The scheduler recorded the run's rate × the mean runs on the NODE, then
+ * divided by every GPU. For a pinned run that is right only when every card
+ * was busy; with fewer runs than GPUs each run had a card to itself and the
+ * figure came out at runs/GPUs of the truth: a job's last chunk alone on a
+ * 4-GPU node taught 25%, three lanes of four 75% (#225). That pulled every
+ * offer of the model down the ranking, 1-GPU offers included.
+ *
+ * Pinned: the run's own rate × how many runs shared its card (1 at one lane
+ * per GPU). Unpinned: the node's rate (run rate × runs on the node) over the
+ * GPUs one process uses: every card for Cycles and Octane, one for EEVEE.
+ * Null when there is nothing sane to record.
+ */
+export function perGpuFramesPerHour(i: {
+  /** this run's frames ÷ elapsed hours */
+  runFramesPerHour: number
+  /** the card the run was pinned to, or null when unpinned */
+  gpu: number | null
+  /** pinned: mean runs on that card while it rendered, itself included */
+  meanRunsOnGpu?: number
+  /** unpinned: mean runs on the node while it rendered, itself included */
+  meanRunsOnNode?: number
+  numGpus: number
+  engine?: EngineId | null
+}): number | null {
+  const rate = i.runFramesPerHour
+  if (!Number.isFinite(rate) || rate <= 0) return null
+  const atLeastOne = (v: number | undefined): number =>
+    v != null && Number.isFinite(v) ? Math.max(1, v) : 1
+  if (i.gpu != null) return rate * atLeastOne(i.meanRunsOnGpu)
+  const gpusUsed = i.engine === 'eevee' ? 1 : Math.max(1, Math.floor(i.numGpus || 1))
+  return (rate * atLeastOne(i.meanRunsOnNode)) / gpusUsed
+}
+
+/**
+ * Runs on the same card as `gpu` right now, itself included: the sample a
+ * pinned run averages into meanRunsOnGpu (from activeWorkForNode's `gpu`).
+ */
+export function runsOnGpu(work: ReadonlyArray<{ gpu?: number | null }>, gpu: number): number {
+  return Math.max(1, work.filter((w) => w.gpu === gpu).length)
+}

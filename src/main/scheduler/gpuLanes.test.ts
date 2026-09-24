@@ -12,7 +12,9 @@ const {
   effectiveLanes,
   laneLevels,
   normaliseSlotsPerGpu,
-  cardVramFraction
+  cardVramFraction,
+  perGpuFramesPerHour,
+  runsOnGpu
 } = await import('./gpuLanes')
 type LaneGuard = import('./gpuLanes').LaneGuard
 type LaneGuardContext = import('./gpuLanes').LaneGuardContext
@@ -273,5 +275,62 @@ describe('guardLanes with the node context (#222)', () => {
     ])
     expect(r.reasons).toEqual([])
     expect(guardedLanePlan(4, 1, 24, r.guard, 'eevee')).toEqual({ lanes: 1, pin: false })
+  })
+})
+
+describe('perGpuFramesPerHour (#225)', () => {
+  // One 4090 renders 60 frames/hour of this scene on its own.
+  it('the last chunk alone on a 4-GPU node teaches the real per-GPU rate, not 25%', () => {
+    const r = perGpuFramesPerHour({
+      runFramesPerHour: 60,
+      gpu: 2,
+      meanRunsOnGpu: 1,
+      meanRunsOnNode: 1,
+      numGpus: 4
+    })
+    // Old formula: 60 × meanConcurrency(1) ÷ 4 GPUs = 15.
+    expect(r).toBe(60)
+  })
+
+  it('three pinned lanes of four still teach 60, not 45', () => {
+    const r = perGpuFramesPerHour({
+      runFramesPerHour: 60,
+      gpu: 0,
+      meanRunsOnGpu: 1,
+      meanRunsOnNode: 3,
+      numGpus: 4
+    })
+    expect(r).toBe(60)
+  })
+
+  it('two lanes sharing a card count as that card', () => {
+    // Each of two runs on one card gets ~35 frames/hour; the card does 70.
+    expect(
+      perGpuFramesPerHour({ runFramesPerHour: 35, gpu: 1, meanRunsOnGpu: 2, numGpus: 4 })
+    ).toBe(70)
+  })
+
+  it('an unpinned run is the node rate over the GPUs it uses', () => {
+    // One Cycles process across four cards at 200 frames/hour.
+    expect(perGpuFramesPerHour({ runFramesPerHour: 200, gpu: null, numGpus: 4 })).toBe(50)
+    // Shared work: three unpinned runs at 40 each on a 1-GPU node.
+    expect(
+      perGpuFramesPerHour({ runFramesPerHour: 40, gpu: null, meanRunsOnNode: 3, numGpus: 1 })
+    ).toBe(120)
+    // EEVEE renders on one card whatever the node has.
+    expect(
+      perGpuFramesPerHour({ runFramesPerHour: 90, gpu: null, numGpus: 4, engine: 'eevee' })
+    ).toBe(90)
+  })
+
+  it('records nothing for a rate that is not a rate', () => {
+    expect(perGpuFramesPerHour({ runFramesPerHour: 0, gpu: 0, numGpus: 4 })).toBeNull()
+    expect(perGpuFramesPerHour({ runFramesPerHour: Number.NaN, gpu: null, numGpus: 4 })).toBeNull()
+  })
+
+  it('samples how many runs share a card', () => {
+    const work = [{ gpu: 0 }, { gpu: 1 }, { gpu: 1 }, { gpu: null }]
+    expect(runsOnGpu(work, 1)).toBe(2)
+    expect(runsOnGpu(work, 3)).toBe(1)
   })
 })
