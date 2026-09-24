@@ -52,6 +52,16 @@ describe('planLanes', () => {
     expect(planLanes(4, 1, 3)).toEqual({ lanes: 1, pin: false })
   })
 
+  it('gives EEVEE and Octane one unpinned lane, the whole node (#229, #235)', () => {
+    // Pinned EEVEE lanes all landed on card 0: its GL context ignores
+    // CUDA_VISIBLE_DEVICES. Octane has one server and licence per node.
+    expect(planLanes(4, 1, 24, 'eevee')).toEqual({ lanes: 1, pin: false })
+    expect(planLanes(4, 2, 24, 'octane')).toEqual({ lanes: 1, pin: false })
+    expect(planLanes(1, 2, 24, 'eevee')).toEqual({ lanes: 1, pin: false })
+    expect(planLanes(4, 1, 24, 'cycles')).toEqual({ lanes: 4, pin: true })
+    expect(planLanes(4, 1, 24, null)).toEqual({ lanes: 4, pin: true })
+  })
+
   it('treats a missing setting as 1 and clamps silly values', () => {
     expect(normaliseSlotsPerGpu(undefined)).toBe(1)
     expect(normaliseSlotsPerGpu(9)).toBe(2)

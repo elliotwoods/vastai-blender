@@ -20,7 +20,7 @@
  * the node's GPU count, the setting and the hardware ceiling.
  */
 
-import type { NodeMetrics } from '../../shared/models'
+import type { EngineId, NodeMetrics } from '../../shared/models'
 import { memoryFraction, SETTLE_MS } from './slotController'
 
 /** Hard ceiling on lanes per GPU; beyond two the extra scene copies only cost VRAM. */
@@ -51,11 +51,24 @@ export function normaliseSlotsPerGpu(v: number | null | undefined): number {
  * very little RAM for its GPU count — the node falls back to the old single
  * process across every GPU: pinning fewer lanes than GPUs would leave whole
  * cards idle, which is strictly worse.
+ *
+ * Lanes are a Cycles idea. EEVEE renders on the one GPU its OpenGL/Vulkan
+ * context lands on, which CUDA_VISIBLE_DEVICES does not move, so pinned EEVEE
+ * lanes all piled onto card 0 (#229). Octane runs one OctaneServer and one
+ * licence per node (#235). Either gets one unpinned lane: the whole node, as
+ * before lanes existed. `engine` absent keeps the Cycles plan for callers
+ * that do not pass it yet.
  */
-export function planLanes(numGpus: number, slotsPerGpu: number, cap: number): LanePlan {
+export function planLanes(
+  numGpus: number,
+  slotsPerGpu: number,
+  cap: number,
+  engine?: EngineId | null
+): LanePlan {
   const gpus = Math.max(1, Math.floor(numGpus || 1))
   const k = normaliseSlotsPerGpu(slotsPerGpu)
   const ceiling = Math.max(1, Math.floor(cap || 1))
+  if (engine === 'eevee' || engine === 'octane') return { lanes: 1, pin: false }
   if (k === 0) return { lanes: 1, pin: false }
   if (gpus === 1) {
     // Nothing to pin to; `k` lanes simply share the one GPU.
