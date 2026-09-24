@@ -11,7 +11,7 @@
 
 import { posix } from 'path'
 import { getDb } from '../db/db'
-import { emit } from '../ipc'
+import { emit } from '../events'
 import { emitChunkChanged, emitChunksChanged, refreshJobState } from '../jobs/jobs'
 import { installBlender, installExtension, REMOTE_ROOT } from '../nodes/provisioner'
 import { getAddon } from '../addons/addons'

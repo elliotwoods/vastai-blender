@@ -5,7 +5,7 @@ import { mkdirSync } from 'fs'
 import { basename, join } from 'path'
 import { resolveJobBlenderVersion } from '../blender/blendInfo'
 import { getDb } from '../db/db'
-import { emit } from '../ipc'
+import { emit } from '../events'
 import { getSettings } from '../settings'
 import { autoChunkSize, framesIn, splitFrames } from '../scheduler/chunker'
 import type {

@@ -1,12 +1,13 @@
 /**
- * Registers every ipcMain.handle channel from the shared contract and owns
- * the event-push helper. Real implementations arrive phase by phase; anything
- * not yet built returns an honest empty/stub result (and mock data under
- * VR_MOCK=1 for UI development).
+ * Registers every ipcMain.handle channel from the shared contract, and
+ * forwards the main-process event bus (events.ts) to the renderer windows.
+ * Real implementations arrive phase by phase; anything not yet built returns
+ * an honest empty/stub result (and mock data under VR_MOCK=1 for UI
+ * development).
  */
 
 import { BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
-import type { EventChannel, IpcEventMap, InvokeChannel, IpcInvokeMap } from '../shared/ipc'
+import type { InvokeChannel, IpcInvokeMap } from '../shared/ipc'
 import type {
   AssetIndex,
   ChunkSnapshot,
@@ -24,6 +25,7 @@ import type {
   NodeSnapshot,
   ThumbAsset
 } from '../shared/models'
+import { onEvent } from './events'
 import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
 import { currentUser } from './vast/vastClient'
@@ -44,24 +46,6 @@ type Handler<C extends InvokeChannel> = (
 
 function handle<C extends InvokeChannel>(channel: C, handler: Handler<C>): void {
   ipcMain.handle(channel, (_event, ...args) => handler(...(args as IpcInvokeMap[C]['args'])))
-}
-
-/** Push an event to every window. */
-export function emit<C extends EventChannel>(channel: C, payload: IpcEventMap[C]): void {
-  // E2E observability: mirror events to stdout when driving headless tests. Both headless
-  // drivers need this — without it a scripted run has no way to see why a chunk failed,
-  // because the node's render log otherwise only ever reaches the renderer window.
-  const headless = process.env.VR_E2E_BLEND || process.env.VR_JOB_SPEC
-  if (headless && channel !== 'render:logLine') {
-    console.log(`[event] ${channel} ${JSON.stringify(payload).slice(0, 240)}`)
-  }
-  if (headless && channel === 'render:logLine') {
-    const l = payload as IpcEventMap['render:logLine']
-    console.log(`[log:${l.nodeId.slice(0, 8)}] ${l.line}`)
-  }
-  for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send(channel, payload)
-  }
 }
 
 const MOCK = process.env.VR_MOCK === '1'
@@ -549,6 +533,16 @@ const mockHistory = (range: HistoryRange, now = Date.now()): HistorySummary => {
 }
 
 export function registerIpc(): void {
+  // -- events ---------------------------------------------------------------
+  // Every bus event goes to every window. Subscribed here, once, before
+  // index.ts starts the node manager and scheduler (the first emitters) and
+  // before any window exists, so nothing a window could receive is missed.
+  onEvent(({ channel, payload }) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send(channel, payload)
+    }
+  })
+
   // -- settings (real) ------------------------------------------------------
   // VR_MOCK asserts the key too: mock mode exists to drive the UI on a
   // throwaway profile, and without this Fleet renders its "no API key" empty

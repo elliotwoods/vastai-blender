@@ -11,7 +11,7 @@
 import { randomUUID } from 'crypto'
 import { co2Grams } from '../carbon/intensity'
 import { getDb } from '../db/db'
-import { emit } from '../ipc'
+import { emit } from '../events'
 import { getSettings } from '../settings'
 import { ensureKeyRegistered, readPrivateKey } from '../ssh/keys'
 import { FIRST_CONNECT_BUDGET_MS, retryWithBackoff } from '../ssh/connectRetry'

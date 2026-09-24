@@ -11,7 +11,7 @@
 import { randomBytes } from 'crypto'
 import { createServer, type Server } from 'net'
 import { getDb } from '../db/db'
-import { emit } from '../ipc'
+import { emit } from '../events'
 import { REMOTE_ROOT } from '../nodes/provisioner'
 import { getSecret } from '../settings'
 import type { SshConnection } from '../ssh/sshConnection'

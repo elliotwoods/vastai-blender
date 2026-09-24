@@ -9,7 +9,7 @@
 import { rm } from 'fs/promises'
 import { join } from 'path'
 import { getDb } from '../db/db'
-import { emit } from '../ipc'
+import { emit } from '../events'
 import { toMediaUrl } from '../mediaUrl'
 import { getSettings } from '../settings'
 import { downloadFileVerified } from '../ssh/sftp'
