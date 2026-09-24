@@ -4,6 +4,7 @@ import { extname, join } from 'path'
 import { Readable } from 'stream'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { externalUrl, isAppPage, type AppPage } from './app/windowPolicy'
 import { resolveBlenderRelease } from './blender/blendInfo'
 import { registerIpc } from './ipc'
 import {
@@ -177,6 +178,12 @@ function registerMediaProtocol(): void {
 }
 
 function createWindow(): void {
+  // The one page this window ever shows: the dev server's, or the build's.
+  const devUrl = is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined
+  const page: AppPage = devUrl
+    ? { url: devUrl }
+    : { file: join(__dirname, '../renderer/index.html') }
+
   const mainWindow = new BrowserWindow({
     width: 1440,
     height: 940,
@@ -186,7 +193,17 @@ function createWindow(): void {
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      // The renderer decodes HEVC clips and JPEG thumbnails made on rented
+      // machines, so a media-decoder bug is one crafted file away. Sandboxed,
+      // that lands inside Chromium's OS sandbox rather than as the user. The
+      // preload only needs contextBridge and ipcRenderer, which a sandboxed
+      // preload has.
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      // Already Electron's default, pinned here: a file dropped on the window
+      // (a render dragged in by mistake) must not replace the app with it.
+      navigateOnDragDrop: false
     }
   })
 
@@ -226,16 +243,28 @@ function createWindow(): void {
     })
   }
 
+  // No new windows. An http(s) link goes to the user's browser; any other
+  // scheme would launch whichever local program claims it, so it goes nowhere.
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    const url = externalUrl(details.url)
+    if (url) void shell.openExternal(url)
+    else console.warn(`[window] refused to open ${JSON.stringify(details.url)}`)
     return { action: 'deny' }
   })
 
-  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+  // No navigation away from the app's page. Whatever page loaded next would
+  // still get the preload's window.api, and with it the fleet and the shell.
+  mainWindow.webContents.on('will-navigate', (event) => {
+    if (isAppPage(event.url, page)) return
+    event.preventDefault()
+    console.warn(`[window] blocked navigation to ${JSON.stringify(event.url)}`)
+  })
+
+  if ('url' in page) {
     const screen = process.env.VR_SCREEN
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'] + (screen ? `?screen=${screen}` : ''))
+    mainWindow.loadURL(page.url + (screen ? `?screen=${screen}` : ''))
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    mainWindow.loadFile(page.file)
   }
 }
 

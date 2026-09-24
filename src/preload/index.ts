@@ -1,3 +1,8 @@
+// This preload runs sandboxed (webPreferences.sandbox in main/index.ts), so
+// its require() knows only 'electron' and a few Node shims (events, timers,
+// url). electron-vite bundles relative imports but leaves package imports as
+// require() calls, so importing any npm package here, @electron-toolkit/preload
+// included, breaks the window at boot. Type-only imports are fine: they vanish.
 import { contextBridge, ipcRenderer } from 'electron'
 import type {
   EventChannel,

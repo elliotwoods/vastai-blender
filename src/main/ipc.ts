@@ -25,6 +25,7 @@ import type {
   NodeSnapshot,
   ThumbAsset
 } from '../shared/models'
+import { externalUrl, openPathVerdict } from './app/windowPolicy'
 import { dismissAlerts, onEvent, recentAlerts } from './events'
 import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
@@ -150,6 +151,18 @@ function frameThumbs(jobId: string, from: number, to: number): ThumbAsset[] {
     absPath: r.thumb_path,
     mediaUrl: toMediaUrl(r.thumb_path)
   }))
+}
+
+/**
+ * The folders shell:openPath may open things in: the project root, and every
+ * job's output folder, since a job keeps the folder it was created under when
+ * the project root later moves.
+ */
+function openableRoots(): string[] {
+  const jobDirs = getDb().prepare('SELECT DISTINCT output_dir FROM jobs').all() as Array<{
+    output_dir: string
+  }>
+  return [getSettings().projectRoot, ...jobDirs.map((r) => r.output_dir)]
 }
 
 // Four fixture thumbnails cycled across the range, so a mocked filmstrip has
@@ -561,10 +574,24 @@ export function registerIpc(): void {
   })
   handle('shell:openExternal', async (url) => {
     // http(s) links only (billing page etc.) — never arbitrary protocols.
-    if (/^https?:\/\//.test(url)) await shell.openExternal(url)
+    const safe = externalUrl(url)
+    if (safe) await shell.openExternal(safe)
   })
   handle('shell:openPath', async (p) => {
-    await shell.openPath(p)
+    // openPath is "double-click this": on Windows it runs an .exe or .bat, and
+    // frame paths are named by rented nodes. So only folders and images or
+    // clips inside the project or a job's folder are opened; anything else
+    // there is revealed in Explorer/Finder instead, and anything outside is
+    // refused. See windowPolicy.ts.
+    const verdict = openPathVerdict(p, openableRoots())
+    if (verdict.action === 'open') {
+      const err = await shell.openPath(verdict.path)
+      if (err) console.warn(`[shell] could not open ${verdict.path}: ${err}`)
+    } else if (verdict.action === 'reveal') {
+      shell.showItemInFolder(verdict.path)
+    } else {
+      console.warn(`[shell] refused to open ${JSON.stringify(p)}: ${verdict.reason}`)
+    }
   })
   handle('shell:showItemInFolder', (p) => {
     shell.showItemInFolder(p)
