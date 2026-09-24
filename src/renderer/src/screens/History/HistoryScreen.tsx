@@ -10,6 +10,7 @@
 import type { CSSProperties } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
 import { Chart, type ChartPoint, type MarkKind } from './Chart'
+import { recordingBegan } from './recordingBegan'
 import { InfoHint, Tooltip } from '../../components/Tooltip'
 import { chip, mono, panel, sectionLabel, segmented, tableRow } from '../../lib/controls'
 import { compareCo2 } from '../../lib/co2'
@@ -383,11 +384,7 @@ export function HistoryScreen({
   }
   // Balance and energy only start accruing from the version that records them,
   // so say so rather than letting a short line read as a short history.
-  const startsAt = data.earliestMs
-  const shortSeries =
-    view.points.length === 0 ||
-    (metric === 'balance' && data.balancePoints.length < 2) ||
-    (metric === 'power' && data.totals.wh === 0)
+  const startsAt = recordingBegan(metric, data, view.points.length)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -430,7 +427,7 @@ export function HistoryScreen({
           }}
         >
           <span>{view.note}</span>
-          {shortSeries && startsAt != null ? (
+          {startsAt != null ? (
             <span>Recording began {new Date(startsAt).toLocaleDateString()}.</span>
           ) : null}
         </div>
