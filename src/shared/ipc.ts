@@ -5,6 +5,11 @@
  * whichever side is out of date, and so is a push channel the renderer does
  * not handle (useIpcEvents is exhaustive over IpcEventMap). An invoke channel
  * with no ipcMain handler is not caught: it fails at runtime.
+ *
+ * Phase 1 declared its channels here ahead of the code behind them, so every
+ * track codes against one contract. Until each handler lands, a channel
+ * marked "Phase 1" below rejects with "No handler registered". The push
+ * channels it adds wait in IpcEventMapPending, for the reason given there.
  */
 
 import type {
@@ -15,20 +20,34 @@ import type {
   ChunkChangedEvent,
   ChunkProgressEvent,
   FleetCost,
+  FleetGpuHistory,
+  FleetHoldKind,
+  FleetHolds,
   HistoryRange,
   HistorySummary,
   JobDetail,
   JobSubmission,
   JobSummary,
   LogLineEvent,
+  MetricsHistoryQuery,
+  MetricsSample,
   NodeChunkView,
+  NodeMetricsHistory,
+  NodeMetricsHistoryQuery,
   NodeSnapshot,
+  ReprovisionResult,
+  RequestNodeOptions,
+  RetryMissingResult,
   ThumbAsset,
   Offer,
   OfferFilters,
   SecretKey,
+  SettingsPatch,
+  SettingsPatchResult,
   SettingsPublic,
-  SshCommandInfo
+  SshCommandInfo,
+  UnclaimedInstance,
+  VncTunnelInfo
 } from './models'
 
 /** Request/response channels (`ipcRenderer.invoke` ↔ `ipcMain.handle`). */
@@ -36,6 +55,13 @@ export interface IpcInvokeMap {
   // settings
   'settings:get': { args: []; result: SettingsPublic }
   'settings:set': { args: [Partial<SettingsPublic>]; result: SettingsPublic }
+  /**
+   * Phase 1 (plan 1.14). Save the fields of a patch that pass
+   * sanitizeSettingsPatch, and say which did not and why, so a field can
+   * show its own error when it commits. settings:set stays for its current
+   * callers, and plan 1.14 puts it through the same sanitizer.
+   */
+  'settings:update': { args: [SettingsPatch]; result: SettingsPatchResult }
   'settings:setSecret': { args: [SecretKey, string]; result: void }
 
   // vast.ai
@@ -44,11 +70,59 @@ export interface IpcInvokeMap {
 
   // fleet / nodes
   'fleet:setMaxNodes': { args: [number]; result: void }
-  'fleet:requestNode': { args: []; result: void }
+  /**
+   * Rent one node now. Plan 1.5 makes it stop at the spend cap as scale-up
+   * does, unless `overSpendCap` says the user confirmed going past it. Until
+   * then main ignores the option, and a manual request ignores the cap.
+   */
+  'fleet:requestNode': { args: [RequestNodeOptions?]; result: void }
   'fleet:clearFailed': { args: []; result: number }
+  /**
+   * Phase 1 (plan 1.3). Instances on the Vast account that no node of this
+   * profile holds, as the latest reconcile found them.
+   */
+  'fleet:unclaimed': { args: []; result: UnclaimedInstance[] }
+  /**
+   * Phase 1 (plan 1.3). Destroy one unclaimed instance, by its instance id,
+   * and confirm it is gone. Main refuses an id its unclaimed list does not
+   * show. That includes the instance of any node of this profile, which
+   * node:destroy retires along with its row. `ok: false` = not confirmed
+   * gone, with the reason.
+   */
+  'fleet:destroyUnclaimed': { args: [number]; result: { ok: boolean; message: string } }
+  /** Phase 1. Every reason the fleet has stopped renting (plans 1.9, 1.10, 1.17, 1.20). */
+  'fleet:holds': { args: []; result: FleetHolds }
+  /**
+   * Phase 1. Release one hold, for example "I topped up, try now" for
+   * 'account'. It returns the holds that are left. A hold whose cause is
+   * still there, such as a disk that is still full, comes back on the next
+   * check.
+   */
+  'fleet:releaseHold': { args: [FleetHoldKind]; result: FleetHolds }
+  /**
+   * Phase 1 (Feature G). The whole fleet's GPU use over a window: GPUs
+   * rented and busy, mean utilisation, and the $/hr paid for idle GPUs.
+   */
+  'fleet:gpuHistory': { args: [MetricsHistoryQuery]; result: FleetGpuHistory }
   'node:destroy': { args: [string]; result: void }
-  'node:reprovision': { args: [string]; result: void }
-  'node:openVncTunnel': { args: [string]; result: { localPort: number; password: string } }
+  /**
+   * Restart the node's agent and requeue what was in flight on it, without
+   * using up any retries (plan 1.15). `void` only while main's handler is
+   * still the old empty stub. The integration wave drops it along with the
+   * stub.
+   */
+  'node:reprovision': { args: [string]; result: ReprovisionResult | void }
+  /**
+   * A local port tunnelled to the node's VNC desktop, plus its password, for
+   * signing in to Octane by hand (plan 1.18).
+   */
+  'node:openVncTunnel': { args: [string]; result: VncTunnelInfo }
+  /**
+   * Phase 1 (Feature G). One node's usage over a window, per GPU, bucketed
+   * to at most `maxPoints`. Main reads recent samples from memory and older
+   * ones from the database.
+   */
+  'node:metricsHistory': { args: [NodeMetricsHistoryQuery]; result: NodeMetricsHistory }
   /** Command line for an interactive shell on the node (null = no ssh endpoint yet). */
   'node:sshCommand': { args: [string]; result: SshCommandInfo | null }
   /** Spawn a terminal running that command; `ok: false` → caller copies instead. */
@@ -71,7 +145,13 @@ export interface IpcInvokeMap {
   'job:cancel': { args: [string]; result: void }
   /** Toggle node sharing; affects chunks not yet assigned. */
   'job:setShareNode': { args: [string, boolean]; result: void }
-  'job:retryMissing': { args: [string]; result: void }
+  /**
+   * Queue again every frame of the job that has not been downloaded,
+   * including frames from failed chunks (plan 1.15, "Re-render missing").
+   * `void` only while main's handler is still the old empty stub. The
+   * integration wave drops it along with the stub.
+   */
+  'job:retryMissing': { args: [string]; result: RetryMissingResult | void }
 
   // scheduler
   /**
@@ -130,6 +210,35 @@ export interface IpcEventMap {
   'asset:added': AssetAddedEvent
   'fleet:cost': FleetCost
   alert: AlertEvent
+}
+
+/**
+ * Phase 1 push channels, with their payloads final, waiting for their
+ * subscribers.
+ *
+ * They are not in IpcEventMap yet because useIpcEvents' handler map (the
+ * renderer's queries.ts) is exhaustive over it. That is on purpose: the
+ * `alert` channel went unheard for the app's whole life before it was
+ * exhaustive. A channel added there with no handler therefore fails
+ * typecheck:web. The integration wave moves each entry below into
+ * IpcEventMap in the same commit that gives it a handler (or an explicit
+ * null) in queries.ts. From then on main can emit it. Until then, producers
+ * and consumers are written against these payload types.
+ */
+export interface IpcEventMapPending {
+  /**
+   * One node's usage at one metrics poll (Feature G), about every 15 s per
+   * node. This is high rate, so fold it into the metrics store and never use
+   * it to invalidate a query, like chunk:progress.
+   */
+  'node:metricsSample': MetricsSample
+  /** Every hold, whenever one is set or released; `{}` = renting freely. */
+  'fleet:holds': FleetHolds
+  /**
+   * The unclaimed instances, whenever a reconcile changes the list (every
+   * 5 min, on wake, and after an API key is saved: plan 1.3).
+   */
+  'fleet:unclaimed': UnclaimedInstance[]
 }
 
 // -- alerts ------------------------------------------------------------------

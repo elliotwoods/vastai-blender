@@ -118,6 +118,18 @@ export interface GpuSample {
   powerW: number
 }
 
+/**
+ * Octane on a node (plan 1.18), as the `nodes.octane_state` column keeps it:
+ *   none           not set up: no Octane job has run here
+ *   serverRunning  OctaneServer is up, its licence not yet confirmed
+ *   licensed       the server holds a licence, so Octane chunks may dispatch
+ *   needsLogin     the server is up and waiting for a sign-in, which the user
+ *                  makes by hand over VNC (node:openVncTunnel)
+ * The column stores these exact strings, camelCase like every other stored
+ * enum (ClipKind in `assets.kind`).
+ */
+export type OctaneState = 'none' | 'serverRunning' | 'licensed' | 'needsLogin'
+
 /** One chunk the scheduler currently has in flight on a node. */
 export interface NodeWorkRef {
   chunkId: string
@@ -171,11 +183,202 @@ export interface NodeSnapshot {
   eeveeCapable: boolean | null
   octaneReady: boolean
   octaneNeedsManualLogin: boolean
+  /**
+   * Octane on this node (plan 1.18). Replaces octaneReady and
+   * octaneNeedsManualLogin, which it makes redundant: 'licensed' and
+   * 'needsLogin'. Absent = 'none'.
+   */
+  octaneState?: OctaneState
   /** Blender versions installed on the node, e.g. ["4.5.3"] */
   blenderVersions: string[]
   lastError: string | null
   /** live usage sample; null until the first metrics poll */
   metrics: NodeMetrics | null
+  /**
+   * Epoch ms when a destroy of this node's instance was confirmed: Vast
+   * answered the DELETE with 404, or showInstance no longer finds the
+   * instance. Plan 1.2's ensureInstanceGone is the only writer. While it is
+   * null the instance may still be billing, whatever `state` says. A
+   * 'destroyed' row without it has not been confirmed: a DELETE can answer
+   * 200 and leave the instance running (#140).
+   *
+   * Optional only so that snapshots built before the column existed still
+   * typecheck. nodeState.ts reads a missing value as null, which means "not
+   * confirmed".
+   */
+  destroyedAt?: number | null
+  /**
+   * Epoch ms since a create for this row has been out with no known result.
+   * It is set when `PUT /asks` is sent. It is cleared when Vast answers with
+   * the instance id (`instanceId`) or refuses, or when plan 1.4's label
+   * lookup finds the instance or confirms it does not exist. While it is set,
+   * an instance may be billing under this node's label and nobody knows its
+   * id: the reply was lost, a 5xx or timeout came after Vast had acted, or
+   * the app crashed mid-create.
+   */
+  createUnknownSince?: number | null
+  /**
+   * The instance's label on Vast, so the user can find it in the Vast.ai
+   * console (plan 1.3: `vastai-blender <install8>:<node8>`, or
+   * `vastai-blender <node8>` for rentals made before install ids).
+   */
+  label?: string | null
+  /**
+   * Epoch ms of the last command that reached the node: a metrics poll, an
+   * exec or a transfer. null = none yet this session. Plan 1.7's liveness
+   * supervisor keeps it, and it shows how long an 'unreachable' node has
+   * been silent.
+   */
+  lastContactAt?: number | null
+}
+
+/**
+ * A local VNC endpoint tunnelled to a node's desktop, for signing in to
+ * Octane by hand (plan 1.18). The result of node:openVncTunnel.
+ */
+export interface VncTunnelInfo {
+  /** Port on 127.0.0.1. Point a VNC viewer at `vnc://127.0.0.1:<localPort>`. */
+  localPort: number
+  /**
+   * The VNC password generated for the node. It is '' when this session did
+   * not start the node's VNC server, because main keeps the password in
+   * memory only and a restart loses it.
+   */
+  password: string
+}
+
+/**
+ * Who an unclaimed instance belongs to, going by its label:
+ *   thisProfile      the label names a node of this profile, but no live node
+ *                    holds the instance. It is an orphan, which the reconcile
+ *                    destroys by itself; it stays listed until that works.
+ *   otherVastRender  a Vast Render label this profile did not write: another
+ *                    install, or another profile of this one, rented it. It
+ *                    is left running unless the user destroys it, because it
+ *                    may be that app's live render.
+ *   unlabelled       no Vast Render label: rented by hand or by another tool.
+ *                    It is never destroyed automatically.
+ */
+export type UnclaimedOwner = 'thisProfile' | 'otherVastRender' | 'unlabelled'
+
+/**
+ * An instance on the Vast account that no node of this profile holds, found
+ * by the reconcile (plan 1.3). It bills like any other instance, so Fleet
+ * lists it with its rate until it is gone. fleet:unclaimed lists them and
+ * fleet:destroyUnclaimed destroys one.
+ */
+export interface UnclaimedInstance {
+  instanceId: number
+  /** its Vast label, verbatim; null = none */
+  label: string | null
+  owner: UnclaimedOwner
+  gpuName: string | null
+  numGpus: number
+  /** $/hr Vast reports for it; null = not reported */
+  dphTotal: number | null
+  /** Vast's `actual_status` ('running', 'loading', 'exited', …); null = not reported */
+  status: string | null
+  /** epoch ms Vast started it; null = not reported */
+  startedAt: number | null
+  /** epoch ms the reconcile first found it unclaimed */
+  firstSeenAt: number
+  /** why the last destroy of it failed; null = none tried, or none failed */
+  destroyError: string | null
+}
+
+/**
+ * A reason the fleet has stopped renting, each released on its own. Every
+ * hold stops scale-up, and none of them stops scale-down, so a held fleet is
+ * never also a stuck one. fleet:holds reads them and fleet:releaseHold
+ * releases one.
+ */
+export interface FleetHolds {
+  /**
+   * The Vast account cannot pay (plan 1.20), or Vast refused the account with
+   * 401, 402 or 403 (plan 1.17). This happens when the balance runs under
+   * about 10 minutes of runway, or on any `insufficient_credit` answer. No
+   * machine is blacklisted for it. The hold releases itself when the balance
+   * recovers.
+   */
+  account?: {
+    reason: string
+    /** balance when the hold was set; null = not known */
+    balance: number | null
+    since: number
+  }
+  /**
+   * Chunks a previous session left unfinished. The fleet does not scale up
+   * for them until the user says so. This is the recovery hold that
+   * scheduler:recoveryHold also reports (persisted by plan 1.9).
+   */
+  recovery?: number
+  /**
+   * This computer cannot take the frames: the disk is full, or the output
+   * folder refuses writes (plans 1.10 and 1.21). Dispatch pauses as well as
+   * renting, because a frame rendered now could not be kept.
+   */
+  localSink?: { reason: string; since: number }
+  /**
+   * Scale-up is backing off after rentals kept failing (plan 1.17). `retryAt`
+   * is when it tries again; null = when the user releases it.
+   */
+  scale?: { reason: string; since: number; retryAt: number | null }
+}
+
+export type FleetHoldKind = keyof FleetHolds
+
+/**
+ * What the fleet may still rent, under maxActiveNodes and the spend cap, and
+ * what work a scale-up batch still has to cover (plan 1.5, #227 #237). Each
+ * rental in a batch spends it down: one node, its offer's $/hr, and the
+ * lanes and shared slots that offer brings. The batch stops when any part
+ * runs out. nodeState.capacityBudget() fills in the cap parts from the nodes
+ * and settings.
+ */
+export interface CapacityBudget {
+  /**
+   * Nodes counted against maxActiveNodes: booting, working, and any that may
+   * still be billing (nodeState.countsTowardCaps).
+   */
+  nodes: number
+  maxNodes: number
+  /** how many more nodes maxActiveNodes allows; 0 when at or over it */
+  nodeRoom: number
+  /** $/hr of the counted nodes */
+  perHour: number
+  /**
+   * The cap in force ($/hr). null only when noSpendCap is on. A cap that is
+   * missing or not a number, without that flag, is 0: nothing is rented.
+   */
+  spendCap: number | null
+  /** $/hr one more rental may add and stay within the cap; null = no cap; 0 when at or over it */
+  headroomPerHour: number | null
+  /**
+   * Exclusive GPU lanes the batch still has to cover. null means the batch
+   * is not limited by demand: a manual request, or eagerFleet.
+   */
+  exclusiveLanes?: number | null
+  /** Shared slots the batch still has to cover; null = not limited by demand. */
+  sharedSlots?: number | null
+}
+
+/** How far a manual node request (fleet:requestNode) may go. */
+export interface RequestNodeOptions {
+  /**
+   * The user confirmed a rental that takes the fleet past the spend cap.
+   * Plan 1.5 makes a manual request without it stop at the cap, as scale-up
+   * does.
+   */
+  overSpendCap?: boolean
+}
+
+/** What node:reprovision did (plan 1.15). */
+export interface ReprovisionResult {
+  /**
+   * Chunks that were in flight on the node when its agent was restarted.
+   * They go back to the queue without using up a retry.
+   */
+  requeued: number
 }
 
 /** Everything the UI needs to open (or hand the user) a shell on a node. */
@@ -201,6 +404,130 @@ export interface FleetCost {
   sessionCo2g: number
   /** vast account credit balance, null until first fetched */
   balance: number | null
+}
+
+// ---------------------------------------------------------------------------
+// GPU usage over time (Feature G)
+// ---------------------------------------------------------------------------
+
+/**
+ * GPU utilisation (%) a GPU must be above to count as working. Feature G's
+ * Fleet charts shade a GPU at or below it that has a run assigned: paid for
+ * and idle, like the phantom runs of job 81fe2875 (7 of 24 GPUs).
+ * fleet:gpuHistory counts a GPU above it, or one with a run pinned to it, as
+ * busy.
+ */
+export const GPU_BUSY_UTIL_PCT = 10
+
+/**
+ * One node's usage at one metrics poll (about every 15 s). The node:metricsSample
+ * push carries it, and main's history ring keeps it.
+ */
+export interface MetricsSample {
+  nodeId: string
+  /** epoch ms of the poll */
+  ts: number
+  /**
+   * Per GPU, in nvidia-smi index order. null = no reading this time, because
+   * the node was unreachable or the poll failed. It is a gap, so a chart
+   * breaks its line there instead of drawing zero.
+   */
+  gpus: GpuSample[] | null
+  /**
+   * Runs pinned to each GPU at this poll, by GPU index (`runs[i]` for GPU
+   * i), from the scheduler. Known even when `gpus` is null.
+   */
+  runs: number[]
+  /** Runs in flight not pinned to one GPU: a single-GPU node, per-GPU slots off, or not started. */
+  unpinnedRuns: number
+  /** busy CPU % (NodeMetrics.cpuUtil); null = no reading */
+  cpuUtil: number | null
+  /** system RAM (GB); null = no reading */
+  ramUsedGb: number | null
+  ramTotalGb: number | null
+}
+
+/**
+ * One bucket of a history series: the samples that fall in
+ * [ts, ts + bucketMs). When every value is null there were none: a gap, where
+ * the chart breaks its line (the History chart's `y: null` convention).
+ */
+export interface MetricsPoint {
+  /** epoch ms of the bucket's left edge */
+  ts: number
+  mean: number | null
+  min: number | null
+  max: number | null
+}
+
+/** One GPU's history on one node. Every series shares NodeMetricsHistory's buckets. */
+export interface GpuSeries {
+  /** nvidia-smi index */
+  index: number
+  /** utilisation % */
+  util: MetricsPoint[]
+  /** VRAM used, as % of the card's total */
+  vramPct: MetricsPoint[]
+  /** package power (W); all null for a card that never reported it */
+  powerW: MetricsPoint[]
+  /**
+   * Runs pinned to this GPU. A bucket where this is above 0 and `util` is at
+   * or below GPU_BUSY_UTIL_PCT was paid for and idle.
+   */
+  runs: MetricsPoint[]
+}
+
+/** A range of one node's usage, bucketed (the result of node:metricsHistory). */
+export interface NodeMetricsHistory {
+  nodeId: string
+  fromMs: number
+  toMs: number
+  /** width of one bucket (ms) */
+  bucketMs: number
+  gpus: GpuSeries[]
+  /** runs in flight not pinned to one GPU */
+  unpinnedRuns: MetricsPoint[]
+  /** busy CPU % */
+  cpuUtil: MetricsPoint[]
+  /** GPU power summed across the node's cards (W) */
+  powerW: MetricsPoint[]
+}
+
+/** The window a history read covers, and how many buckets it may return at most. */
+export interface MetricsHistoryQuery {
+  fromMs: number
+  toMs: number
+  maxPoints: number
+}
+
+export interface NodeMetricsHistoryQuery extends MetricsHistoryQuery {
+  nodeId: string
+}
+
+/**
+ * One bucket of the whole fleet's GPU use. Each figure is a mean over the
+ * bucket's polls; null = no node was polled in it.
+ */
+export interface FleetGpuPoint {
+  /** epoch ms of the bucket's left edge */
+  ts: number
+  /** GPUs on nodes that hold an instance */
+  gpusRented: number | null
+  /** GPUs above GPU_BUSY_UTIL_PCT, or with a run pinned to them */
+  gpusBusy: number | null
+  /** mean utilisation across rented GPUs (%) */
+  meanUtil: number | null
+  /** $/hr paid for GPUs that were not busy: each node's idle GPU share times its $/hr, summed */
+  idlePerHour: number | null
+}
+
+/** The result of fleet:gpuHistory. */
+export interface FleetGpuHistory {
+  fromMs: number
+  toMs: number
+  /** width of one bucket (ms) */
+  bucketMs: number
+  points: FleetGpuPoint[]
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +662,44 @@ export interface JobSubmission {
   shareNode?: boolean
 }
 
+/**
+ * What kind of failure an error is, which decides what it costs (plan 1.17's
+ * classify):
+ *   transient  the network or Vast's API blinked: retry soon, charge nothing
+ *   machine    the node is at fault (it died, lost a GPU, ran out of disk):
+ *              charge the infrastructure budget and try another node
+ *   account    Vast refused the account (401, 402, 403, no credit): hold
+ *              renting (FleetHolds.account) and never blacklist a machine
+ *   job        the scene or its settings fail the same way on any node:
+ *              charge the render budget; on two nodes, the job needs attention
+ *   localFs    this computer could not keep the output (disk full, no
+ *              permission): hold (FleetHolds.localSink) and re-render nothing
+ */
+export type ErrorClass = 'transient' | 'machine' | 'account' | 'job' | 'localFs'
+
+/**
+ * Why a job stopped where only the user can move it on:
+ *   scene            the preflight found the scene cannot render as submitted:
+ *                    missing files or libraries, an unbaked simulation split
+ *                    over several chunks, a movie output format (plan 1.16)
+ *   repeatedFailure  the same class of error on two or more nodes, so the fault
+ *                    is the job's, not a machine's (plan 1.17's breaker)
+ *   engine           the engine cannot run: no OctaneBlender on the node's
+ *                    image, or no Cycles GPU device enabled (plans 1.16, 1.18)
+ *   extension        an extension the job needs is not in the registry (A12)
+ */
+export type JobAttentionKind = 'scene' | 'repeatedFailure' | 'engine' | 'extension'
+
+export interface JobAttention {
+  kind: JobAttentionKind
+  /** what went wrong, worded to show the user */
+  message: string
+  /** epoch ms it was raised */
+  since: number
+  /** the class of the errors behind it (for 'repeatedFailure') */
+  errorClass?: ErrorClass
+}
+
 export interface JobSummary {
   id: string
   name: string
@@ -354,6 +719,17 @@ export interface JobSummary {
   blenderVersion: string | null
   /** may co-run with other chunks on one node — see JobSubmission.shareNode */
   shareNode: boolean
+  /**
+   * Something only the user can resolve has stopped this job (plans 1.16,
+   * 1.17). null or absent = nothing.
+   */
+  attention?: JobAttention | null
+  /**
+   * sha256 of the scene as submitted. Plan 1.12 has createJob copy the .blend
+   * into the job's folder and render that copy. null = submitted before
+   * snapshots existed, so it renders whatever `blendPath` holds now.
+   */
+  blendSha256?: string | null
 }
 
 export interface ChunkSnapshot {
@@ -365,11 +741,43 @@ export interface ChunkSnapshot {
   nodeId: string | null
   framesDone: number
   retries: number
+  /**
+   * Why its last attempt failed, including the error's code, so the reason is
+   * never empty (plans 1.17, 1.20). null = no failure recorded.
+   */
+  lastError?: string | null
+  /** what kind of failure `lastError` was (plan 1.17) */
+  errorClass?: ErrorClass | null
+  /**
+   * Failed attempts charged to the machines rather than to the render: a
+   * node that died, a lost connection, a transfer that stalled (plan 1.17).
+   * They are kept apart from `retries`, the render's own budget, so an
+   * unreliable host cannot use up a chunk's chances.
+   */
+  infraRetries?: number
+  /** epoch ms before which the chunk is not dispatched again (retry backoff); null = any time */
+  notBefore?: number | null
 }
 
 export interface JobDetail extends JobSummary {
   chunks: ChunkSnapshot[]
   addonIds: string[]
+  /**
+   * The file at `blendPath` no longer matches `blendSha256`: edited, moved or
+   * deleted since submit. The job still renders its snapshot; the UI says the
+   * scene changed (plan 1.12). null = not known, because there is no snapshot
+   * or it was not checked. Only on JobDetail, because checking it means
+   * reading the file.
+   */
+  sceneChanged?: boolean | null
+}
+
+/** What job:retryMissing queued again (plan 1.15). */
+export interface RetryMissingResult {
+  /** frames not yet downloaded that are queued again */
+  frames: number
+  /** chunks those frames were split into */
+  chunks: number
 }
 
 /**
@@ -502,7 +910,12 @@ export interface SettingsPublic {
   hasOtoyCredentials: boolean
   projectRoot: string
   maxActiveNodes: number
-  /** $/hr across the whole fleet; null = uncapped */
+  /**
+   * $/hr across the whole fleet. null means uncapped only together with
+   * `noSpendCap`. sanitizeSettingsPatch never saves one without the other,
+   * and nodeState.capacityBudget reads a null without the flag (a file from
+   * before it) as $0/hr: nothing is rented.
+   */
   spendCapPerHour: number | null
   idleTimeoutMinutes: number
   proxyCodec: ProxyCodec
@@ -575,6 +988,83 @@ export interface SettingsPublic {
    * Displayed Wh figures are never scaled by this; only the CO2 estimate is.
    */
   co2OverheadFactor: number
+  /**
+   * A random id for this profile, made once (plan 1.3). Rental labels carry
+   * its first 8 characters (`vastai-blender <install8>:<node8>`), so the
+   * reconcile can tell this profile's instances from those of another install
+   * or profile on the same Vast account. Main makes it and it never changes:
+   * a settings patch cannot set it, the same as the has* flags. Absent until
+   * main has made one.
+   */
+  installId?: string
+  /**
+   * The user turned the spend cap off on purpose. This is the only way
+   * spendCapPerHour becomes null. Clearing the cap field to retype it saved
+   * null on every keystroke, and every reader took that as "no cap"
+   * (#99 #112). sanitizeSettingsPatch keeps the two in step.
+   */
+  noSpendCap?: boolean
+  /**
+   * Docker image to rent each engine's nodes with (plan 1.18). An engine
+   * with no entry uses the built-in image. Octane needs an image with
+   * OctaneBlender in it. The image name goes to Vast's create call, never to
+   * a shell, and sanitizeSettingsPatch accepts only a well-formed image
+   * reference.
+   */
+  dockerImageByEngine?: Partial<Record<EngineId, string>>
+  /** Octane (plan 1.18). Absent = every option off. */
+  octane?: OctaneSettings
+}
+
+export interface OctaneSettings {
+  /**
+   * Sign in to OTOY from a script instead of by hand over VNC. Off by
+   * default. Any credential used on a rented node is disclosed to the host's
+   * owner, who has root there, so turning this on needs a warning. With it
+   * on, the credentials must reach the node on exec stdin (`IFS= read -r`),
+   * never in argv, env or a file (plan 1.18).
+   */
+  scriptedSignIn: boolean
+  /**
+   * Rent Octane nodes only from datacenter (secure cloud) hosts, which are
+   * vetted businesses rather than individuals.
+   */
+  secureCloudOnly: boolean
+}
+
+/**
+ * A change to the settings, as the renderer or a VR_JOB_SPEC campaign sends
+ * it: any subset of the fields, including part of a nested object. Main runs
+ * it through sanitizeSettingsPatch before anything is saved.
+ */
+export type SettingsPatch = Partial<
+  Omit<SettingsPublic, 'offerFilters' | 'octane' | 'dockerImageByEngine'>
+> & {
+  offerFilters?: Partial<OfferFilters>
+  octane?: Partial<OctaneSettings>
+  /** null or '' for an engine = back to the built-in image */
+  dockerImageByEngine?: Partial<Record<EngineId, string | null>>
+}
+
+/** A patch field that was not saved as sent. */
+export interface SettingsFieldError {
+  /** dotted path of the setting: 'spendCapPerHour', 'offerFilters.minReliability', 'octane.scriptedSignIn' */
+  field: string
+  /** worded to show next to the field */
+  message: string
+  /**
+   * 'rejected': the setting kept its current value. 'clamped': the nearest
+   * value within its limits was saved instead.
+   */
+  outcome: 'rejected' | 'clamped'
+}
+
+/** The result of settings:update. */
+export interface SettingsPatchResult {
+  /** the settings as saved: every field of the patch that passed, applied */
+  settings: SettingsPublic
+  /** each field that was not saved as sent; empty = all of it was */
+  errors: SettingsFieldError[]
 }
 
 export type SecretKey = 'vastApiKey' | 'otoyUsername' | 'otoyPassword'
