@@ -28,8 +28,13 @@ Covers the failure modes that actually bit:
   * the EEVEE OpenGL retry deleted a frame the first attempt had finished but
     not yet flushed, and was skipped for a re-dispatched chunk whose manifest
     already held frames.
-    These cases drive the real run_render against a scripted fake `blender`,
-    and are skipped on Windows, where its `#!/bin/sh` wrapper cannot run.
+  * a failed state said only "failed", with exitCode null even for a crash, so
+    the app retried a scene error on every node exactly like a flaky one; and a
+    state write that failed (a full disk) left the spec in the inbox, where the
+    next scan launched it again.
+    These cases drive the real run_render and process() against a scripted
+    fake `blender`, and are skipped on Windows, where its `#!/bin/sh` wrapper
+    cannot run.
 """
 
 import contextlib
@@ -249,7 +254,8 @@ def fake_node():
     Blender does. `noOverwrite` mimics a .blend with Overwrite unchecked, which
     skips any frame already on disk.
     """
-    names = ("ROOT", "RENDERS", "STATE", "LOGS", "BLENDER_ROOT", "size_stable", "SETTLE_PAUSE")
+    names = ("ROOT", "RENDERS", "STATE", "LOGS", "BLENDER_ROOT", "INBOX", "DONE", "FAILED",
+             "CONTROL", "size_stable", "SETTLE_PAUSE", "write_state")
     saved = {k: getattr(nr, k) for k in names}
     with tempfile.TemporaryDirectory() as tmp:
         # The agent watches a frame's size for 0.5-1 s, and pauses 0.5 s between
@@ -264,8 +270,13 @@ def fake_node():
         nr.STATE = os.path.join(tmp, "state")
         nr.LOGS = os.path.join(tmp, "logs")
         nr.BLENDER_ROOT = os.path.join(tmp, "blender")
+        nr.INBOX = os.path.join(tmp, "jobs", "inbox")
+        nr.DONE = os.path.join(tmp, "jobs", "done")
+        nr.FAILED = os.path.join(tmp, "jobs", "failed")
+        nr.CONTROL = os.path.join(tmp, "control")
         bin_dir = os.path.join(nr.BLENDER_ROOT, "fake")
-        for d in (nr.RENDERS, nr.STATE, nr.LOGS, bin_dir, os.path.join(tmp, "work", "scenes")):
+        for d in (nr.RENDERS, nr.STATE, nr.LOGS, nr.INBOX, nr.DONE, nr.FAILED, nr.CONTROL,
+                  bin_dir, os.path.join(tmp, "work", "scenes")):
             os.makedirs(d, exist_ok=True)
         script = os.path.join(bin_dir, "fake_blender.py")
         with open(script, "w") as f:
@@ -281,23 +292,49 @@ def fake_node():
                 setattr(nr, k, v)
 
 
-def render(tmp, script, frames=(1, 3, 1), engine="cycles"):
-    """run_render chunk c1 against `script`. Returns (error or None, frame manifest lines)."""
+def chunk_spec(tmp, script, frames=(1, 3, 1), engine="cycles", **extra):
+    """Chunk c1's spec, with `script` saved as its "blend file"."""
     with open(os.path.join(tmp, "work", "scenes", "s.blend"), "w") as f:
         json.dump(script, f)
     spec = {
         "chunkId": "c1", "blendFile": "s.blend", "blenderVersion": "fake", "engine": engine,
         "frameStart": frames[0], "frameEnd": frames[1], "frameStep": frames[2],
     }
-    cdir = os.path.join(nr.RENDERS, "c1")
+    spec.update(extra)
+    return spec
+
+
+def frame_entries():
+    try:
+        with open(os.path.join(nr.RENDERS, "c1", "manifest.jsonl")) as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
+    return [e for e in entries if e.get("kind", "frame") == "frame"]
+
+
+def render(tmp, script, frames=(1, 3, 1), engine="cycles", **extra):
+    """run_render chunk c1 against `script`. Returns (error or None, frame manifest lines)."""
+    spec = chunk_spec(tmp, script, frames, engine, **extra)
     err = None
     try:
-        nr.run_render(spec, os.path.join(nr.LOGS, "c1.log"), nr.FrameTracker(cdir))
+        nr.run_render(spec, os.path.join(nr.LOGS, "c1.log"),
+                      nr.FrameTracker(os.path.join(nr.RENDERS, "c1")))
     except RuntimeError as e:
         err = str(e)
-    with open(os.path.join(cdir, "manifest.jsonl")) as f:
-        entries = [json.loads(line) for line in f if line.strip()]
-    return err, [e for e in entries if e.get("kind", "frame") == "frame"]
+    return err, frame_entries()
+
+
+def run_chunk(tmp, script, frames=(1, 3, 1), engine="cycles", gpu=None, **extra):
+    """Chunk c1 through process(), from the inbox, as the agent's main loop runs
+    it. Returns (the state the app would read, frame manifest lines)."""
+    spec_path = os.path.join(nr.INBOX, "c1.json")
+    with open(spec_path, "w") as f:
+        json.dump(chunk_spec(tmp, script, frames, engine, **extra), f)
+    nr.process(spec_path, gpu)
+    with open(os.path.join(nr.STATE, "c1.json")) as f:
+        state = json.load(f)
+    return state, frame_entries()
 
 
 def sha(text):
@@ -479,6 +516,87 @@ def test_eevee_retry_on_a_redispatched_chunk():
               == ["frames/0001.exr", "frames/0002.exr", "frames/0003.exr"])
 
 
+def test_failed_state_says_why():
+    """1.17: every failed state carries errorKind, exitCode and a logTail."""
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, _ = run_chunk(tmp, {"default": {
+            "print": ["Fra:1 Mem:12.00M | Syncing Cube"],
+            "write": [["0001.exr", "trun", False]], "exit": 1,
+        }})
+        check("crash: a transient failure, with Blender's exit code",
+              state.get("status") == "failed" and state.get("errorKind") == "transient"
+              and state.get("exitCode") == 1 and state.get("error") == "blender exited 1")
+        tail = state.get("logTail")
+        check("crash: logTail ends with the log's last lines",
+              isinstance(tail, list) and any("render exit code 1" in s for s in tail)
+              and tail[-1] == "=== FAILED (transient): blender exited 1")
+        check("crash: the failure keeps what the render had reported",
+              state.get("currentFrame") == 1 and " -b " in (state.get("command") or ""))
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, _ = run_chunk(tmp, {"default": {
+            "write": [["0001.exr", "part", "error"]], "exit": 0,
+        }})
+        check("write error: the node's disk, exit code 0 kept",
+              state.get("errorKind") == "machine" and state.get("exitCode") == 0)
+    for printed, kind in (
+        ("Error: script failed, file: '/root/vastai/blender/run_startup_scripts.py', exiting.",
+         "scene"),
+        ("Error: script failed, expr: 'import my_addon; my_addon.register()', exiting.", "job"),
+    ):
+        with fake_node() as tmp:
+            make_chunk(tmp)
+            state, _ = run_chunk(tmp, {"default": {"print": [printed], "exit": nr.GUARD_EXIT}})
+            check(f"guard exit: a raising {kind} script is errorKind {kind}",
+                  state.get("errorKind") == kind and state.get("exitCode") == nr.GUARD_EXIT)
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        os.remove(os.path.join(nr.BLENDER_ROOT, "fake", "blender"))
+        state, _ = run_chunk(tmp, {"default": {}})
+        check("no Blender on the node: machine, and no exit code because none ran",
+              state.get("errorKind") == "machine" and state.get("exitCode") is None
+              and isinstance(state.get("logTail"), list))
+    check("a disk errno is the machine's", nr.failure_kind(OSError(28, "full")) == ("machine", None))
+    check("an unexplained exception is transient", nr.failure_kind(ValueError("x")) == ("transient", None))
+
+
+def test_full_disk_still_retires_the_spec():
+    """1.17 / #81: a state that cannot be written must not strand the spec in the
+    inbox, where every scan of the main loop would launch it again."""
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        spec_path = os.path.join(nr.INBOX, "c1.json")
+        with open(spec_path, "w") as f:
+            json.dump(chunk_spec(tmp, {"default": {"exit": 0}}), f)
+
+        def full(_chunk_id, _state):
+            raise OSError(28, "No space left on device")
+
+        nr.write_state = full  # fake_node restores it
+        raised = None
+        try:
+            nr.process(spec_path)
+        except Exception as e:  # noqa: BLE001
+            raised = e
+        check("full disk: process() does not raise", raised is None)
+        check("full disk: the spec leaves the inbox for failed/",
+              not os.path.exists(spec_path) and os.path.exists(os.path.join(nr.FAILED, "c1.json")))
+
+
+def test_log_tail():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "c1.log")
+        with open(path, "w") as f:
+            for i in range(5000):
+                f.write(f"line {i}\n")
+            f.write("x" * 5000 + "\n")
+        tail = nr.log_tail(path)
+        check("logTail: the last 40 lines, each capped",
+              len(tail) == nr.LOG_TAIL_LINES and tail[-2] == "line 4999" and len(tail[-1]) == 400)
+        check("logTail: a missing log is an empty tail", nr.log_tail(path + ".gone") == [])
+
+
 def test_sweep_filters():
     with tempfile.TemporaryDirectory() as tmp:
         cdir = make_chunk(tmp, ["0001.exr", "0002.exr", "0003.exr", "0004.exr"])
@@ -549,6 +667,14 @@ def test_preview_sequence():
               ext == "png" and linked == ["000000.png", "000001.png"] and pattern.endswith("%06d.png"))
 
 
+def run(fn):
+    """Run one case. A case that raises is a failure, not the end of the suite."""
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001
+        check(f"{fn.__name__} ran to the end (raised {type(e).__name__}: {e})", False)
+
+
 def main():
     for fn in (
         test_plan_launches,
@@ -558,8 +684,9 @@ def main():
         test_write_state_under_threads,
         test_sweep_filters,
         test_preview_sequence,
+        test_log_tail,
     ):
-        fn()
+        run(fn)
     # Through fake_node, whose `blender` is a `#!/bin/sh` wrapper that Windows
     # cannot exec. The agent itself only ever runs on Linux nodes.
     for fn in (
@@ -571,11 +698,13 @@ def main():
         test_eevee_retry_keeps_finished_frames,
         test_eevee_retry_forgets_unrecorded_announcements,
         test_eevee_retry_on_a_redispatched_chunk,
+        test_failed_state_says_why,
+        test_full_disk_still_retires_the_spec,
     ):
         if os.name == "nt":
             print(f"SKIP  {fn.__name__}: the fake blender needs a POSIX shell")
             continue
-        fn()
+        run(fn)
     print()
     if FAILED:
         print("FAILURES: " + ", ".join(FAILED))

@@ -5,8 +5,7 @@ Contract with the app (all under ~/vastai/):
   jobs/inbox/<chunkId>.json   job specs, SFTP-written by the app (atomic move)
   jobs/done/  jobs/failed/    specs move here on completion/failure
   logs/<chunkId>.log          full blender stdout/stderr
-  state/<chunkId>.json        durable progress: {status, currentFrame,
-                              framesDone, lastLine, exitCode, updatedAt}
+  state/<chunkId>.json        durable progress; see "Chunk state" below
   state/heartbeat             touched every 10s. provisioner.ts agentAlive()
                               reads it, but nothing in the app calls that yet
   renders/<chunkId>/frames/   render output
@@ -36,8 +35,24 @@ Job spec:
 
 Every `encode` sub-key is optional and absent means off, so an old app talking
 to a new agent (and vice versa) both degrade to the behaviour they knew.
+
+Chunk state (state/<chunkId>.json, rewritten atomically; fields are only ever
+added, so an older app reads a newer agent's state):
+  { "status": "rendering"|"encoding"|"done"|"failed",
+    "currentFrame": int|null, "framesDone": int, "framesTotal": int,
+    "lastLine": str, "command": str,
+    "exitCode": int|null      Blender's exit code; null until it exits, and
+                              in a failed state null only if it never ran,
+    "gpu": int|null           the GPU the render is pinned to,
+    "updatedAt": float        epoch s of the last write; the 60 s heartbeat
+                              refreshes it while Blender lives }
+  A failed state keeps every field it had and adds:
+    "error": str              one readable line,
+    "errorKind": "scene"|"job"|"machine"|"transient"   see ERROR_KINDS,
+    "logTail": [str]          the chunk log's last ~40 lines
 """
 
+import errno
 import hashlib
 import json
 import os
@@ -87,10 +102,47 @@ FRAME_NAME_RE = re.compile(r"^(\d+)\.\w+$")
 # Exit code Blender returns when any Python script raises (--python-exit-code).
 # Distinguishes "a scene/startup guard aborted the render" from render crashes.
 GUARD_EXIT = 32
+# Blender's own line when a -P script or a --python-expr raised under
+# --python-exit-code: "Error: script failed, file: '<path>', exiting." or
+# "Error: script failed, expr: '<code>', exiting."
+SCRIPT_FAILED_RE = re.compile(r"script failed, (file|expr): '")
+
+# Why a chunk failed. Every failed state carries one as errorKind, so the app's
+# retry policy (plan 1.17) decides from a fact rather than from the wording:
+#   "scene"      the .blend cannot render right on any node: a scene guard or a
+#                startup script in it raised. Retrying elsewhere only pays for
+#                the same failure again.
+#   "job"        the job asks for something no node can give it: one of the
+#                job's own python expressions raised.
+#   "machine"    this node cannot render it: its disk is full or failing, it has
+#                no Blender. Another node may.
+#   "transient"  anything else: a crash, a kill, an exit nothing explains.
+#                Retrying may work, which is how the app treated every failure
+#                before errorKind existed.
+ERROR_KINDS = ("scene", "job", "machine", "transient")
+# OSErrors that are this node's disk failing, not the job.
+MACHINE_ERRNOS = {errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EIO}
+# Lines of the chunk log a failed state carries as logTail, so the app can show
+# why without another round trip to the node.
+LOG_TAIL_LINES = 40
 
 # Pause between run_render's end-of-render settle passes, taken only while an
 # announced frame is still not size-stable. selfcheck shortens it.
 SETTLE_PAUSE = 0.5
+
+
+class ChunkFailed(RuntimeError):
+    """A chunk failure whose errorKind (one of ERROR_KINDS) is known.
+
+    `exit_code` is Blender's, or None when the failure came before Blender ran.
+    Any other exception out of a chunk is "transient", or "machine" for a disk
+    errno; see failure_kind.
+    """
+
+    def __init__(self, message, kind, exit_code=None):
+        super().__init__(message)
+        self.kind = kind
+        self.exit_code = exit_code
 
 
 def ensure_dirs():
@@ -210,7 +262,7 @@ def pick_blender(spec):
         path = os.path.join(BLENDER_ROOT, v, "blender")
         if os.path.exists(path):
             return path
-    raise RuntimeError("no blender installation found")
+    raise ChunkFailed("no blender installation found", "machine")
 
 
 class FrameTracker:
@@ -681,6 +733,61 @@ def log_line(chunk_id, message):
         pass
 
 
+def log_tail(path, lines=LOG_TAIL_LINES, max_bytes=32768):
+    """The last `lines` lines of a chunk log, for a failed state's logTail.
+
+    Read from the end, so a day-long render's log costs what a short one's
+    does, and each line is capped: the app reads the state file every few
+    seconds, and one runaway line must not make it huge.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            text = f.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    if size > max_bytes:
+        text = text[1:]  # the seek cut the first line
+    return [line[:400] for line in text[-lines:]]
+
+
+def failure_kind(err):
+    """(errorKind, exitCode) for an exception out of a chunk. See ERROR_KINDS."""
+    if isinstance(err, ChunkFailed):
+        return err.kind, err.exit_code
+    if isinstance(err, OSError) and err.errno in MACHINE_ERRNOS:
+        return "machine", None
+    return "transient", None
+
+
+def record_failure(chunk_id, state, err, log_path, frames_done):
+    """Publish a failed state that says why. Never raises.
+
+    The failure is added to the state the render was writing, not written in
+    place of it, so the app still sees the frame, command and GPU it failed
+    on. It gains errorKind, exitCode (Blender's, or None if Blender never ran;
+    the old failure dict always said None, even for a crash) and logTail.
+    A state write that fails is only logged: the caller must still move the
+    spec out of the inbox, or the main loop would launch it again, forever.
+    """
+    kind, code = failure_kind(err)
+    log_line(chunk_id, f"FAILED ({kind}): {err}")
+    state.update({
+        "status": "failed",
+        "error": str(err),
+        "errorKind": kind,
+        "exitCode": code if code is not None else state.get("exitCode"),
+        "framesDone": frames_done,
+        "logTail": log_tail(log_path),
+    })
+    try:
+        write_state(chunk_id, state)
+    except Exception as e:  # noqa: BLE001
+        print(f"[agent] could not write the failed state of {chunk_id}: {e}", flush=True)
+
+
 def discard_unmanifested(chunk_id, chunk_dir, recorded):
     """Delete every file in frames/ the manifest does not list.
 
@@ -768,7 +875,49 @@ def unannounced_frames(frames_dir, spec, since, recorded):
     return found
 
 
-def run_render(spec, log_path, tracker, gpu=None):
+def scan_line(line, state, seen):
+    """Fold one line of Blender's output into the chunk's state.
+
+    `state` is what the app reads; `seen` collects what only the failure
+    classification needs. Returns (saved, save_failed): the path of a frame
+    Blender announced with "Saved:" or reported it could not write, or None.
+    """
+    saved = save_failed = None
+    m = FRA_RE.search(line)
+    if m:
+        state["currentFrame"] = int(m.group(1))
+    m = SAVED_RE.search(line)
+    if m:
+        saved = m.group(1)
+    m = SAVE_FAILED_RE.search(line)
+    if m:
+        save_failed = m.group(1)
+    m = SCRIPT_FAILED_RE.search(line)
+    if m:
+        seen["scriptFailed"] = m.group(1)
+    state["lastLine"] = line.strip()[:300]
+    return saved, save_failed
+
+
+def classify_exit(code, save_failed, seen):
+    """(errorKind, message) for a render that ended unclean. See ERROR_KINDS."""
+    if code == GUARD_EXIT:
+        if seen.get("scriptFailed") == "expr":
+            # The job's own --python-expr (an extension's register call),
+            # the same on every node.
+            return "job", f"a python expression of the job raised (exit {code}); see log"
+        return "scene", (
+            f"python script raised (exit {code}) — scene guard or startup script failed; see log"
+        )
+    if save_failed:
+        return "machine", (
+            f"blender could not save {os.path.basename(save_failed[0])} (exit {code})"
+            " — disk full or I/O error; see log"
+        )
+    return "transient", f"blender exited {code}"
+
+
+def run_render(spec, log_path, tracker, gpu=None, state=None):
     chunk_id = spec["chunkId"]
     chunk_dir = os.path.join(RENDERS, chunk_id)
     frames_dir = os.path.join(chunk_dir, "frames")
@@ -777,7 +926,9 @@ def run_render(spec, log_path, tracker, gpu=None):
     blender = pick_blender(spec)
     blend = os.path.join(ROOT, "work", "scenes", spec["blendFile"])
     if not os.path.exists(blend):
-        raise RuntimeError(f"blend file missing: {blend}")
+        # The app uploads it during node prep, and a re-dispatch uploads it
+        # again.
+        raise ChunkFailed(f"blend file missing: {blend}", "transient")
 
     def build_cmd(gpu_backend=None):
         # --python-exit-code makes script exceptions FATAL. Without it Blender
@@ -809,7 +960,11 @@ def run_render(spec, log_path, tracker, gpu=None):
     cmd = build_cmd()
 
     frames_total = (spec["frameEnd"] - spec["frameStart"]) // step + 1
-    state = {
+    # Filled in place: process() owns the dict, and adds a failure to it
+    # rather than replacing it (record_failure).
+    if state is None:
+        state = {}
+    state.update({
         "status": "rendering",
         "currentFrame": None,
         "framesDone": len(tracker.recorded),
@@ -820,7 +975,7 @@ def run_render(spec, log_path, tracker, gpu=None):
         # The GPU this render is pinned to (nvidia-smi index), or None. The app
         # shows it per slot on the Fleet screen.
         "gpu": gpu,
-    }
+    })
     write_state(chunk_id, state)
 
     # With many concurrent blender processes, each spawning a full BLAS/OpenMP
@@ -843,6 +998,8 @@ def run_render(spec, log_path, tracker, gpu=None):
     # Paths Blender said it could not save (SAVE_FAILED_RE), over all attempts.
     # Any one makes the render unclean, exactly like a non-zero exit.
     save_failed = []
+    # What scan_line saw that only the failure's errorKind needs.
+    seen = {}
 
     def run_once(cmd):
         nonlocal attempt_started
@@ -882,17 +1039,12 @@ def run_render(spec, log_path, tracker, gpu=None):
             last_state_write = 0.0
             for line in proc.stdout:
                 log.write(line)
-                m = FRA_RE.search(line)
-                if m:
-                    state["currentFrame"] = int(m.group(1))
-                m = SAVED_RE.search(line)
-                if m:
-                    tracker.saw_saved(m.group(1))
+                saved, failed = scan_line(line, state, seen)
+                if saved:
+                    tracker.saw_saved(saved)
                     state["framesDone"] = len(tracker.recorded) + len(tracker.pending)
-                m = SAVE_FAILED_RE.search(line)
-                if m:
-                    save_failed.append(m.group(1))
-                state["lastLine"] = line.strip()[:300]
+                if failed:
+                    save_failed.append(failed)
                 now = time.time()
                 if now - last_state_write > 2:
                     tracker.flush()
@@ -965,18 +1117,9 @@ def run_render(spec, log_path, tracker, gpu=None):
     state["framesDone"] = len(tracker.recorded)
     state["exitCode"] = code
     if not clean:
-        state["status"] = "failed"
-        write_state(chunk_id, state)
-        if code == GUARD_EXIT:
-            raise RuntimeError(
-                f"python script raised (exit {code}) — scene guard or startup script failed; see log"
-            )
-        if save_failed:
-            raise RuntimeError(
-                f"blender could not save {os.path.basename(save_failed[0])} (exit {code})"
-                " — disk full or I/O error; see log"
-            )
-        raise RuntimeError(f"blender exited {code}")
+        # process() publishes the failed state, once, with its errorKind.
+        kind, message = classify_exit(code, save_failed, seen)
+        raise ChunkFailed(message, kind, code)
     return state
 
 
@@ -1047,8 +1190,13 @@ def process(spec_path, gpu=None):
     tracker = FrameTracker(chunk_dir, on_frame=worker.submit)
     if worker.may_run:
         worker.start()
+    # The chunk's one state dict: run_render fills it in, and a failure is
+    # added to it (record_failure). The heartbeat thread writes this same
+    # object, so a late heartbeat can never put back a state the failure
+    # already replaced.
+    state = {"gpu": gpu}
     try:
-        state = run_render(spec, log_path, tracker, gpu)
+        run_render(spec, log_path, tracker, gpu, state)
         # Stop and join BEFORE the definitive encode: the worker reads the same
         # frames and there is no reason to have both competing for the CPU
         # once the render itself has finished.
@@ -1058,18 +1206,9 @@ def process(spec_path, gpu=None):
         write_state(chunk_id, state)
         shutil.move(spec_path, os.path.join(DONE, os.path.basename(spec_path)))
     except Exception as e:  # noqa: BLE001 — agent must never die on a job
-        write_state(
-            chunk_id,
-            {
-                "status": "failed",
-                "error": str(e),
-                "framesDone": len(tracker.recorded),
-                "exitCode": None,
-                "gpu": gpu,
-            },
-        )
-        with open(log_path, "a") as log:
-            log.write(f"=== FAILED: {e}\n")
+        record_failure(chunk_id, state, e, log_path, len(tracker.recorded))
+        # Even when the state could not be written (a full disk): a spec left
+        # in the inbox is launched again by the next scan, and fails again.
         shutil.move(spec_path, os.path.join(FAILED, os.path.basename(spec_path)))
     finally:
         # The failure path never reaches run_encode, so cleanup cannot live
