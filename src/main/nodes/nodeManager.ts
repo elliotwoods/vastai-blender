@@ -404,7 +404,14 @@ export class NodeManager {
           r.id.slice(0, 8)
         )
       )
-      for (const inst of instances) {
+      const labelled = instances.filter((i) => i.label?.startsWith('vastai-blender'))
+      // One stdout line so a scripted run can confirm what the sweep saw.
+      console.log(
+        `[orphans] ${labelled.length} vastai-blender instance(s) on the account, ` +
+          `${labelled.filter((i) => tracked.has(i.id)).length} tracked here: ` +
+          labelled.map((i) => `${i.id}(${i.label})`).join(', ')
+      )
+      for (const inst of labelled) {
         if (!inst.label?.startsWith('vastai-blender')) continue
         if (tracked.has(inst.id)) continue
         const prefix = inst.label.slice('vastai-blender '.length).trim()
