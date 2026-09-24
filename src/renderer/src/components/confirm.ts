@@ -31,3 +31,49 @@ export function confirmClick(
   if (elapsed < settleMs) return { armedAt, fire: false }
   return { armedAt: null, fire: true }
 }
+
+/**
+ * What a key does before the browser turns it into a click. 'swallow': a
+ * held Enter's auto-repeat, each repeat another click, so one long press
+ * would arm the button and then, past the settle time, fire it. 'disarm':
+ * Escape while armed. null: leave the key alone.
+ */
+export function confirmKey(
+  key: string,
+  repeat: boolean,
+  armed: boolean
+): 'swallow' | 'disarm' | null {
+  if (key === 'Enter' && repeat) return 'swallow'
+  if (key === 'Escape' && armed) return 'disarm'
+  return null
+}
+
+/**
+ * Follow what onConfirm returned. A promise means the action is still under
+ * way: the caller holds the button disabled until `onSettled` runs, so the
+ * destroy already sent can't be sent again (#113: a second DELETE on a node
+ * that is 'destroying' fails and raises a false "check the Vast.ai console"
+ * alarm). Returns null when there is nothing to wait for.
+ *
+ * The returned promise rejects with the action's own error, after
+ * `onSettled`: a failure is passed on, never swallowed, so it surfaces just
+ * as the bare `void ipc.invoke(...)` it replaces did.
+ */
+export function settleOf(result: unknown, onSettled: () => void): Promise<void> | null {
+  if (!isThenable(result)) return null
+  return Promise.resolve(result).then(
+    () => onSettled(),
+    (err: unknown) => {
+      onSettled()
+      throw err
+    }
+  )
+}
+
+function isThenable(v: unknown): v is PromiseLike<unknown> {
+  return (
+    v != null &&
+    (typeof v === 'object' || typeof v === 'function') &&
+    typeof (v as { then?: unknown }).then === 'function'
+  )
+}
