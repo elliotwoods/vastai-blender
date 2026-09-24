@@ -75,6 +75,9 @@ added, so an older app reads a newer agent's state):
                               heartbeat never moves it, so a hung Blender
                               shows it falling behind updatedAt. Rendering
                               only: encoding makes no frame progress,
+    "oom": true               Blender reported running out of memory ("gpu"
+                              says on which card). The attempt is stopped
+                              there and fails with errorKind machine,
     "engine": str             the engine the scene really renders with, once
                               Blender loaded it: cycles|eevee|octane|workbench
                               or another engine's id in lower case. The
@@ -133,6 +136,14 @@ SAVED_RE = re.compile(r"Saved: '(.+?)'")
 SAVE_FAILED_RE = re.compile(r"cannot save: '(.+?)'")
 # What `-o frames/####` produces: the zero-padded frame number and an extension.
 FRAME_NAME_RE = re.compile(r"^(\d+)\.\w+$")
+# Blender or Cycles running out of memory: "System is out of GPU memory",
+# "CUDA error: Out of memory in cuMemAlloc(...)", OptiX's own code. Cycles says
+# so only when an allocation has failed outright (a fallback to host memory is
+# silent), and the frame in flight is lost.
+OOM_RE = re.compile(
+    r"out of memory|cuMemAlloc|OPTIX_ERROR_OUT_OF_MEMORY|System is out of GPU memory",
+    re.IGNORECASE,
+)
 
 # Exit code Blender returns when any Python script raises (--python-exit-code).
 # Distinguishes "a scene/startup guard aborted the render" from render crashes.
@@ -167,9 +178,10 @@ FRAME_PREFIX_RE = re.compile(r"^(\d+)")
 #   "job"        the job asks for something no node can give it: Octane without
 #                OctaneBlender, a frame list off the chunk's grid, one of the
 #                job's own python expressions raised.
-#   "machine"    this node cannot render it: Cycles found no GPU to enable, its
-#                disk is full or failing, it lacks the Blender version asked
-#                for. Another node may.
+#   "machine"    this node cannot render it: Cycles found no GPU to enable, it
+#                ran out of GPU memory (state "oom", see OOM_RE), its disk is
+#                full or failing, it lacks the Blender version asked for.
+#                Another node, or fewer renders per GPU, may.
 #   "transient"  anything else: a crash, a kill, an exit nothing explains.
 #                Retrying may work, which is how the app treated every failure
 #                before errorKind existed.
@@ -1033,6 +1045,11 @@ def scan_line(line, state, seen, now=None):
     m = SAVE_FAILED_RE.search(line)
     if m:
         save_failed = m.group(1)
+    if not seen.get("oom") and OOM_RE.search(line):
+        # With "gpu", the card it ran out on: the app can put fewer renders on
+        # each GPU before it sends the chunk again (#228).
+        state["oom"] = True
+        seen["oom"] = line.strip()[:200]
     m = SCRIPT_FAILED_RE.search(line)
     if m:
         seen["scriptFailed"] = m.group(1)
@@ -1091,6 +1108,9 @@ def classify_exit(code, save_failed, seen, state):
         return "scene", (
             f"python script raised (exit {code}) — scene guard or startup script failed; see log"
         )
+    if seen.get("oom"):
+        where = f" on GPU {state['gpu']}" if state.get("gpu") is not None else ""
+        return "machine", f"out of GPU memory{where} (exit {code}): {seen['oom']}"
     if save_failed:
         return "machine", (
             f"blender could not save {os.path.basename(save_failed[0])} (exit {code})"
@@ -1294,9 +1314,20 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
 
             threading.Thread(target=_heartbeat, daemon=True).start()
             last_state_write = 0.0
+            stopped_for_oom = False
             for line in proc.stdout:
                 log.write(line)
                 saved, failed = scan_line(line, state, seen)
+                if seen.get("oom"):
+                    # Out of memory: the frame in flight may still be written
+                    # and announced, black or cut short, and so may every one
+                    # after it. Trust no announcement from here on, and stop
+                    # paying for an attempt that has already failed.
+                    saved = None
+                    if proc.poll() is None and not stopped_for_oom:
+                        stopped_for_oom = True
+                        log.write("=== out of memory reported; stopping this attempt\n")
+                        proc.terminate()
                 if saved:
                     tracker.saw_saved(saved)
                     state["framesDone"] = len(tracker.recorded) + len(tracker.pending)
@@ -1336,8 +1367,8 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
     # defaults to the Vulkan backend, which container nodes often cannot
     # initialise (no ICD for the driver) even when EGL/OpenGL works fine — the
     # process dies before frame 1. If the first attempt produced no frame,
-    # didn't fail via the script guard and hit no write error (a full disk is
-    # not a backend problem), retry once on the OpenGL backend. "No frame" is
+    # didn't fail via the script guard and hit no write error or OOM (a full
+    # disk or card is not a backend problem), retry once on the OpenGL backend. "No frame" is
     # measured against the manifest as it stood before: a chunk re-dispatched
     # to this node after a restart starts with frames recorded, and its Vulkan
     # failure is just as retryable. "EEVEE" is the engine the scene reported
@@ -1349,13 +1380,16 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         and (state.get("engine") or spec.get("engine")) == "eevee"
         and len(tracker.recorded) == recorded_before
         and not save_failed
+        and not seen.get("oom")
     ):
         with open(log_path, "a") as log:
             log.write(f"=== retrying with --gpu-backend opengl (first attempt exit {code})\n")
         code = run_once(build_cmd(gpu_backend="opengl"))
         settle()
 
-    clean = code == 0 and not save_failed
+    # An OOM is a failure whatever the exit code: Blender may render on past
+    # the frame it lost and exit 0.
+    clean = code == 0 and not save_failed and not seen.get("oom")
     if clean:
         # Catch frames the log parser missed, but ONLY after a clean run. After
         # a crash, a kill or a failed write, an unannounced file is the frame

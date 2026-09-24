@@ -44,6 +44,8 @@ Covers the failure modes that actually bit:
     remote/blender/ scripts run here against a stand-in `bpy`.
   * Cycles with no GPU to enable rendered on the CPU at GPU prices, and the
     EEVEE OpenGL retry keyed on the job's engine label, not the scene's.
+  * a GPU out of memory was reported as a bare exit code, and a frame
+    Blender wrote after it could be manifested.
     These cases drive the real run_render and process() against a scripted
     fake `blender`, and are skipped on Windows, where its `#!/bin/sh` wrapper
     cannot run.
@@ -271,7 +273,10 @@ if "render" in attempt:
         with open(path, "w") as f:
             f.write("%s%d" % (attempt["render"], n))
         print("Saved: '%s'" % path, flush=True)
-for name, body, announce in attempt.get("write", []):
+for entry in attempt.get("write", []):
+    name, body, announce = entry[:3]
+    for line in entry[3:]:
+        print(line, flush=True)
     path = os.path.join(out, name)
     if no_overwrite and os.path.exists(path):
         print("skipping existing frame '%s'" % path, flush=True)
@@ -286,6 +291,9 @@ for name, body, announce in attempt.get("write", []):
         break
     if announce:
         print("Saved: '%s'" % path, flush=True)
+if attempt.get("sleep"):
+    import time
+    time.sleep(attempt["sleep"])
 sys.exit(attempt.get("exit", 0))
 """
 
@@ -301,7 +309,9 @@ def fake_node():
     "render" renders the frames argv asks for (-s/-e/-j, or -f) as NNNN.exr
     holding body + the frame number, with "Fra:" and "Saved:" lines. In
     "write", `announce` True prints Blender's "Saved:" line, and "error" its
-    "cannot save" line, after which the fake stops writing, as Blender does.
+    "cannot save" line, after which the fake stops writing, as Blender does;
+    any further items in an entry are lines printed before it is written.
+    "sleep" seconds pass before the exit.
     Overwrite is off, skipping any frame already on disk, when `noOverwrite`
     says the .blend has it unchecked or a --python-expr sets use_overwrite.
     "record" appends each run's argv and VR_* environment to a JSON-lines file.
@@ -1159,6 +1169,40 @@ def test_agent_gpu_and_engine():
               env.get("VR_CPU_RENDER") == "1")
 
 
+def test_out_of_memory():
+    """1.11 / #228: a GPU out of memory was just "blender exited N", requeued
+    into the same lane plan until the retries ran out; and a frame Blender
+    wrote after the error, black or cut short, could be announced and kept."""
+    with fake_node() as tmp:
+        cdir = make_chunk(tmp)
+        started = time.time()
+        state, entries = run_chunk(tmp, {"default": {"write": [
+            ["0001.exr", "good", True],
+            ["0002.exr", "black", True,
+             "Fra:2 Mem:23000M | Error: System is out of GPU memory"],
+        ], "sleep": 20, "exit": 0}}, gpu=1)
+        check("oom: errorKind machine, oom and the GPU in the state, the line in the error",
+              state.get("status") == "failed" and state.get("errorKind") == "machine"
+              and state.get("oom") is True and state.get("gpu") == 1
+              and state.get("error", "").startswith("out of GPU memory on GPU 1 (exit ")
+              and "System is out of GPU memory" in state["error"])
+        check("oom: a frame announced after the error is not kept; one before it is",
+              [e["file"] for e in entries] == ["frames/0001.exr"]
+              and sorted(os.listdir(os.path.join(cdir, "frames"))) == ["0001.exr"])
+        check("oom: Blender is stopped at once, not left to render on",
+              time.time() - started < 15 and "stopping this attempt" in render_log())
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, _ = run_chunk(tmp, {"default": {
+            "print": ["CUDA error: Out of memory in cuMemAlloc_v2(&device_pointer, size)"],
+            "exit": 1}}, engine="eevee")
+        check("oom: no OpenGL retry, the backend was not the problem",
+              "retrying" not in render_log() and state.get("oom") is True)
+    st = {}
+    nr.scan_line("Fra:3 Mem:10M | Sample 12/128", st, {}, 1.0)
+    check("oom: an ordinary line is not an OOM", "oom" not in st)
+
+
 def test_log_tail():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "c1.log")
@@ -1286,6 +1330,7 @@ def main():
         test_never_a_stand_in_blender,
         test_agent_runs_the_preflight,
         test_agent_gpu_and_engine,
+        test_out_of_memory,
     ):
         if os.name == "nt":
             print(f"SKIP  {fn.__name__}: the fake blender needs a POSIX shell")
