@@ -145,6 +145,7 @@ function nodeChunks(nodeId: string, limit = 12): NodeChunkView[] {
     framesTotal: Math.floor((r.frame_end - r.frame_start) / r.frame_step) + 1,
     retries: r.retries,
     live: scheduler.isLive(r.id),
+    gpu: scheduler.gpuOf(r.id),
     assignedAt: r.assigned_at,
     thumbUrl: thumbByChunk.has(r.id) ? toMediaUrl(thumbByChunk.get(r.id) as string) : null
   }))
@@ -268,6 +269,7 @@ const mockNodeAChunks = (): NodeChunkView[] => [
     framesTotal: 25,
     retries: 0,
     live: true,
+    gpu: 0,
     assignedAt: Date.now() - 11 * 60_000,
     thumbUrl: 'media://fixtures/thumbs/0001.jpg'
   },
@@ -284,6 +286,7 @@ const mockNodeAChunks = (): NodeChunkView[] => [
     framesTotal: 25,
     retries: 1,
     live: true,
+    gpu: 1,
     assignedAt: Date.now() - 4 * 60_000,
     thumbUrl: 'media://fixtures/thumbs/0002.jpg'
   },
@@ -300,6 +303,7 @@ const mockNodeAChunks = (): NodeChunkView[] => [
     framesTotal: 25,
     retries: 0,
     live: true,
+    gpu: null,
     assignedAt: Date.now() - 26 * 60_000,
     thumbUrl: 'media://fixtures/thumbs/0003.jpg'
   },
@@ -316,6 +320,7 @@ const mockNodeAChunks = (): NodeChunkView[] => [
     framesTotal: 25,
     retries: 0,
     live: false,
+    gpu: null,
     assignedAt: Date.now() - 55 * 60_000,
     thumbUrl: 'media://fixtures/thumbs/0004.jpg'
   }

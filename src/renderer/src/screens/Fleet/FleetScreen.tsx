@@ -57,12 +57,16 @@ const COLS = {
 
 const cellSm: CSSProperties = { fontSize: SCALE.textSm }
 
+const MAX_NODES_UI = 64
+
 function MaxNodesStepper(): React.JSX.Element {
   const { data: settings } = useSettings()
   const update = useUpdateSettings()
   const value = settings?.maxActiveNodes ?? 0
   const set = (next: number): void => {
-    const clamped = Math.max(0, Math.min(16, next))
+    // 64, not 16: a headless spec can set 30+, and clamping at 16 meant a
+    // single click on "−" silently shrank such a fleet to 16.
+    const clamped = Math.max(0, Math.min(MAX_NODES_UI, next))
     update.mutate({ maxActiveNodes: clamped })
     void ipc.invoke('fleet:setMaxNodes', clamped)
   }

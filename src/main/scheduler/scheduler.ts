@@ -23,7 +23,17 @@ import type { SshConnection } from '../ssh/sshConnection'
 import { ChunkDownloader } from '../transfer/frameDownloader'
 import { jobClips } from '../transfer/jobClip'
 import { missingRanges } from './chunker'
-import { admits, hasRoom, type NodeOccupancy } from './admission'
+import { admits, freeExclusiveLanes, hasRoom, type NodeOccupancy } from './admission'
+import {
+  effectiveLanes,
+  guardLanes,
+  initialGuard,
+  normaliseSlotsPerGpu,
+  planLanes,
+  type LaneGuard,
+  type LanePlan
+} from './gpuLanes'
+import { nodesToRequest } from './scaling'
 import { decide, hardCap, initialState, recordNodeSlots, type SlotState } from './slotController'
 import type { ChunkState, EngineId, NodeSnapshot } from '../../shared/models'
 
@@ -105,6 +115,8 @@ interface AgentState {
   exitCode: number | null
   /** epoch seconds of the agent's last state write */
   updatedAt?: number
+  /** GPU index the agent pinned this chunk's Blender to; absent/null = unpinned */
+  gpu?: number | null
 }
 
 /**
@@ -132,6 +144,8 @@ class ChunkRun {
   /** Running mean of how many chunks shared this node during the render. */
   private concurrencySum = 0
   private concurrencySamples = 0
+  /** GPU the agent pinned this run to (from its state file); null = unpinned/unknown */
+  gpu: number | null = null
 
   constructor(
     readonly chunkId: string,
@@ -211,6 +225,7 @@ class ChunkRun {
     const node = nodeManager.get(this.nodeId)
     if (!node) throw new Error('node vanished')
     const slotTarget = this.shareNode ? scheduler.slotTargetFor(this.nodeId) : 1
+    const lanes = scheduler.lanePlanFor(this.nodeId)
 
     this.setChunk({ state: 'assigned', node_id: this.nodeId, assigned_at: Date.now() })
     node.setState('rendering')
@@ -297,6 +312,12 @@ class ChunkRun {
       // Backstop for the agent: the scheduler already refuses to co-locate an
       // exclusive chunk, but a spec landing as a node drains could still race.
       exclusive: !this.shareNode,
+      // GPU lanes (see gpuLanes): how many exclusive chunks may run side by
+      // side (1 = the whole node, as before), and whether each render is
+      // pinned to one GPU with CUDA_VISIBLE_DEVICES. Shared chunks are pinned
+      // too, to the least-loaded GPU. Older agents ignore both keys.
+      lanes: lanes.lanes,
+      pinGpus: lanes.pin,
       extraArgs: [],
       pythonExprs: bootstrapExprs,
       encode: {
@@ -359,7 +380,7 @@ class ChunkRun {
     // lifetime; with many slots per node they alone exhaust the server's
     // channel cap (OpenSSH MaxSessions ~10). State polling remains the
     // durable progress source — only tail on low-concurrency nodes.
-    if (slotTarget <= 2) void this.tailLog()
+    if (Math.max(slotTarget, lanes.lanes) <= 2) void this.tailLog()
     await this.pollUntilDone()
   }
 
@@ -383,7 +404,11 @@ class ChunkRun {
 
   private async readAgentState(): Promise<AgentState | null> {
     try {
-      const r = await this.ssh.exec(`cat ${REMOTE_ROOT}/state/${this.chunkId}.json 2>/dev/null`)
+      // Timed out: an exec on a wedged connection never returns, and this loop
+      // is the only thing that notices a chunk finishing or failing.
+      const r = await this.ssh.exec(`cat ${REMOTE_ROOT}/state/${this.chunkId}.json 2>/dev/null`, {
+        timeoutMs: 30_000
+      })
       if (r.stdout.trim()) return JSON.parse(r.stdout) as AgentState
     } catch {
       // connection hiccup — caller keeps polling
@@ -403,6 +428,11 @@ class ChunkRun {
         const chunk = this.chunk()
         const framesTotal = Math.floor((chunk.frame_end - chunk.frame_start) / frameStep) + 1
         this.setChunk({ frames_done: state.framesDone })
+        const gpu = typeof state.gpu === 'number' ? state.gpu : null
+        if (gpu !== this.gpu) {
+          this.gpu = gpu
+          nodeManager.get(this.nodeId)?.emitChanged()
+        }
         emit('chunk:progress', {
           chunkId: this.chunkId,
           jobId: this.jobId,
@@ -467,7 +497,8 @@ class ChunkRun {
       const elapsedH = (Date.now() - this.dispatchedAt) / 3_600_000
       const chunk = this.chunk()
       const frames = Math.floor((chunk.frame_end - chunk.frame_start) / this.job().frame_step) + 1
-      const gpuName = nodeManager.get(this.nodeId)?.snapshot.gpuName
+      const snap = nodeManager.get(this.nodeId)?.snapshot
+      const gpuName = snap?.gpuName
       if (gpuName && elapsedH > 0.005) {
         // Scale by the concurrency this chunk actually ran under. gpu_perf
         // ranks OFFERS, so it must mean "frames/hour the whole node delivers".
@@ -475,7 +506,10 @@ class ChunkRun {
         // wall-clock; recording that unscaled would teach the offer scorer
         // that packing makes a GPU slow, and it would stop buying the models
         // that pack best.
-        recordThroughput(gpuName, (frames / elapsedH) * this.meanConcurrency())
+        //
+        // Stored per GPU (recordThroughput divides by the GPU count), so a
+        // 4-GPU node and a 1-GPU node of one model teach the same figure.
+        recordThroughput(gpuName, (frames / elapsedH) * this.meanConcurrency(), snap?.numGpus ?? 1)
       }
     }
     scheduler.onChunkFinished(this)
@@ -540,6 +574,8 @@ class Scheduler {
   private requestingNode = false
   /** auto-judged concurrency per node (see slotController) */
   private slots = new Map<string, SlotState>()
+  /** memory guard on each node's exclusive GPU lanes (see gpuLanes) */
+  private laneGuards = new Map<string, LaneGuard>()
   /**
    * At most one node at a time may be held empty for a waiting exclusive
    * chunk. See reserveForExclusive.
@@ -607,6 +643,7 @@ class Scheduler {
    */
   forgetNode(nodeId: string): void {
     this.slots.delete(nodeId)
+    this.laneGuards.delete(nodeId)
     if (this.reservation?.nodeId === nodeId) this.reservation = null
 
     const orphaned = [...this.runsOn(nodeId)]
@@ -692,10 +729,45 @@ class Scheduler {
    * "current chunk" text and the per-job cost split in accrueCosts — a node
    * with two runs in flight has its minute divided between them.
    */
-  activeWorkForNode(nodeId: string): Array<{ chunkId: string; jobId: string }> {
+  activeWorkForNode(nodeId: string): Array<{ chunkId: string; jobId: string; gpu: number | null }> {
     const s = this.byNode.get(nodeId)
     if (!s || s.size === 0) return []
-    return [...s].map((r) => ({ chunkId: r.chunkId, jobId: r.jobId }))
+    return [...s].map((r) => ({ chunkId: r.chunkId, jobId: r.jobId, gpu: r.gpu }))
+  }
+
+  /** GPU a live chunk is pinned to, or null (not live, unpinned, not started). */
+  gpuOf(chunkId: string): number | null {
+    return this.runs.get(chunkId)?.gpu ?? null
+  }
+
+  /**
+   * This node's GPU lanes: how many exclusive chunks it may run at once and
+   * whether renders are pinned per GPU. Derived on demand from the node's GPU
+   * count, the setting and its hardware ceiling, then bounded by the memory
+   * guard — cheap, and never stale when the setting or metrics change.
+   */
+  lanePlanFor(nodeId: string): LanePlan {
+    const node = nodeManager.get(nodeId)?.laneInputs
+    if (!node) return { lanes: 1, pin: false }
+    const settings = getSettings()
+    const plan = planLanes(
+      node.numGpus,
+      normaliseSlotsPerGpu(settings.slotsPerGpu),
+      hardCap(node.metrics, Math.max(0, settings.maxNodeSlots ?? 0))
+    )
+    return { lanes: effectiveLanes(plan, this.laneGuards.get(nodeId)), pin: plan.pin }
+  }
+
+  /**
+   * The slot count the UI shows for a node: its GPU lanes while it runs
+   * exclusive work (or sits empty), otherwise the shared-work target.
+   */
+  displaySlotTarget(nodeId: string): number {
+    const runs = this.runsOn(nodeId)
+    const lanes = this.lanePlanFor(nodeId).lanes
+    if ([...runs].some((r) => !r.shareNode)) return lanes
+    if (runs.size === 0) return Math.max(this.slotTargetFor(nodeId), lanes)
+    return this.slotTargetFor(nodeId)
   }
 
   /**
@@ -780,14 +852,22 @@ class Scheduler {
       inFlight: runs.size,
       hasExclusive: [...runs].some((r) => !r.shareNode),
       reservedFor: this.reservation?.nodeId === nodeId ? this.reservation.chunkId : null,
-      slotTarget: this.slotTargetFor(nodeId)
+      slotTarget: this.slotTargetFor(nodeId),
+      exclusiveLanes: this.lanePlanFor(nodeId).lanes
     }
   }
 
   private slotStateFor(node: NodeSnapshot, maxNodeSlots: number): SlotState {
     let s = this.slots.get(node.id)
     if (!s) {
-      s = initialState(node.gpuName, hardCap(node.metrics, maxNodeSlots), Date.now())
+      // Floor at the node's GPU lanes: with per-GPU pinning, starting shared
+      // work below one slot per GPU would idle whole GPUs while the climb
+      // crawls up a settle period at a time.
+      const lanes = this.lanePlanFor(node.id)
+      s = initialState(node.gpuName, hardCap(node.metrics, maxNodeSlots), Date.now(), {
+        numGpus: node.numGpus,
+        floor: lanes.pin ? lanes.lanes : 1
+      })
       this.slots.set(node.id, s)
     }
     return s
@@ -804,7 +884,12 @@ class Scheduler {
       const runs = this.runsOn(node.id)
       // An exclusive chunk holds the node alone by construction, so it says
       // nothing about how well this node packs — don't let it move the target.
-      if ([...runs].some((r) => !r.shareNode)) continue
+      // What it CAN do is run out of memory when the node has several GPU
+      // lanes, each holding a copy of the scene: that has its own guard.
+      if ([...runs].some((r) => !r.shareNode)) {
+        this.guardExclusiveLanes(node, runs.size, now)
+        continue
+      }
       const prev = this.slotStateFor(node, maxNodeSlots)
 
       // Only the runs the agent is actually rendering produce frames; the
@@ -831,11 +916,21 @@ class Scheduler {
       if (settledAt != null && (state.target !== prev.target || !prev.converged)) {
         emit('alert', { level: 'info', message: `${node.gpuName ?? node.id}: ${reason}` })
         if (node.gpuName && state.bestThroughput > 0) {
-          recordNodeSlots(node.gpuName, state.bestTarget, state.bestThroughput)
+          recordNodeSlots(node.gpuName, state.bestTarget, state.bestThroughput, node.numGpus)
         }
       }
       if (state.target !== prev.target) nodeManager.get(node.id)?.emitChanged()
     }
+  }
+
+  /** One step of the exclusive-lane memory guard (see gpuLanes.guardLanes). */
+  private guardExclusiveLanes(node: NodeSnapshot, inFlight: number, now: number): void {
+    const prev = this.laneGuards.get(node.id) ?? initialGuard()
+    const { guard, reason } = guardLanes(prev, node.metrics, inFlight, now)
+    if (guard === prev) return
+    this.laneGuards.set(node.id, guard)
+    if (reason) emit('alert', { level: 'warn', message: `${node.gpuName ?? node.id}: ${reason}` })
+    nodeManager.get(node.id)?.emitChanged()
   }
 
   /**
@@ -858,8 +953,10 @@ class Scheduler {
     }
     const head = pending[0]
     if (!head || head.share_node === 1) return
-    // Something is already free — no need to hold a node back.
-    if (eligible.some((n) => this.runsOn(n.id).size === 0)) return
+    // Something is already free (an empty node, or a free GPU lane on a node
+    // running exclusive work) — no need to hold a node back.
+    const candidate = { id: head.id, sharesNode: false }
+    if (eligible.some((n) => admits(this.occupancy(n.id), candidate))) return
     // Drain whichever node is closest to empty.
     let best: { id: string; size: number } | null = null
     for (const n of eligible) {
@@ -1047,29 +1144,64 @@ class Scheduler {
         (a, n) => a + Math.max(0, this.slotTargetFor(n.id) - (this.byNode.get(n.id)?.size ?? 0)),
         0
       )
-    const exclusiveCapacity = usable.filter((n) => (this.byNode.get(n.id)?.size ?? 0) === 0).length
+    // Free GPU lanes, not empty nodes: a 4-GPU node running one exclusive
+    // chunk still has room for three more.
+    const exclusiveCapacity = usable.reduce(
+      (a, n) => a + freeExclusiveLanes(this.occupancy(n.id)),
+      0
+    )
+
+    // Capacity already on its way: nodes rented but still booting. Ignoring
+    // them made every tick of a boot re-justify another rental for the same
+    // pending chunks.
+    const slotsPerGpu = normaliseSlotsPerGpu(settings.slotsPerGpu)
+    const booting = active
+      .filter((n) => ['requested', 'provisioning'].includes(n.state))
+      .map((n) => {
+        const lanes = planLanes(n.numGpus, slotsPerGpu, hardCap(null, settings.maxNodeSlots ?? 0))
+        return { lanes: lanes.lanes, sharedSlots: Math.max(2, lanes.lanes) }
+      })
+    // What a node rented now is expected to bring. The GPU-count floor is the
+    // only thing known before an offer is picked.
+    const newNode = planLanes(
+      Math.max(1, settings.offerFilters.minNumGpus ?? 1),
+      slotsPerGpu,
+      hardCap(null, settings.maxNodeSlots ?? 0)
+    )
 
     // Buy-ahead (eagerFleet): rent to maxActiveNodes while ANY chunk is
     // unfinished. Demand-driven scaling alone can never widen a fleet whose
     // nodes prefetch the entire queue (pending pins at 0), which strands a
     // long CPU-bound drain on however many nodes happened to boot first.
     const workRemaining = pendingCount + this.runs.size
-    const wantMore =
-      pendingShared > sharedCapacity ||
-      pendingExclusive > exclusiveCapacity ||
-      (settings.eagerFleet === true && workRemaining > 0)
-    if (
-      wantMore &&
+    const toRequest = nodesToRequest({
+      pendingShared,
+      pendingExclusive,
+      sharedCapacity,
+      exclusiveCapacity,
+      booting,
+      newNodeLanes: newNode.lanes,
+      newNodeSharedSlots: Math.max(2, newNode.lanes),
+      eager: settings.eagerFleet === true,
+      workRemaining,
+      active: active.length,
+      maxActive: settings.maxActiveNodes,
+      perHour,
+      spendCap: settings.spendCapPerHour,
       // Startup recovery not yet confirmed — see start(). Scale-DOWN below is
       // deliberately still live, so a held fleet cannot also be a stuck one.
-      this.recoveryHold == null &&
-      active.length < settings.maxActiveNodes &&
-      (settings.spendCapPerHour == null || perHour < settings.spendCapPerHour) &&
-      !this.requestingNode
-    ) {
+      held: this.recoveryHold != null
+    })
+    // Several rentals per tick (see scaling.ts), still one batch at a time.
+    if (toRequest > 0 && !this.requestingNode) {
       this.requestingNode = true
       void nodeManager
-        .requestNode()
+        .requestNodes(toRequest)
+        .then((ids) => {
+          if (ids.length > 1) {
+            emit('alert', { level: 'info', message: `scale-up: rented ${ids.length} nodes` })
+          }
+        })
         .catch((e) =>
           emit('alert', { level: 'warn', message: `scale-up failed: ${(e as Error).message}` })
         )

@@ -19,6 +19,8 @@ best-effort. Getting the GPU enabled is what matters; a tiling hint is not
 worth failing a paid render over.
 """
 
+import os
+
 import bpy
 
 
@@ -55,25 +57,51 @@ if scene.render.engine == "CYCLES" and cycles is not None:
                 print(f"{refresh}() failed: {e}")
 
     types = [d.type for d in cprefs.devices]
+    backend = None
     if "OPTIX" in types:
-        cprefs.compute_device_type = "OPTIX"
-        print("Using OptiX for rendering")
+        backend = "OPTIX"
     elif "CUDA" in types:
-        cprefs.compute_device_type = "CUDA"
-        print("Using CUDA for rendering")
+        backend = "CUDA"
+    if backend:
+        cprefs.compute_device_type = backend
+        print(f"Using {backend} for rendering")
     else:
         print(f"WARNING no OptiX/CUDA device found (types: {sorted(set(types))})")
 
+    # Per-GPU slots: the agent pins this process to one card with
+    # CUDA_VISIBLE_DEVICES, so normally only that card is listed — once as CUDA
+    # and once as OPTIX, which is why devices are counted per backend below
+    # rather than all together. VR_GPU_BUS names the intended card as a
+    # backstop in case the variable did not take effect: if several cards of
+    # the chosen backend are still listed, only the one whose id carries that
+    # PCI bus:device is enabled.
+    pinned = os.environ.get("VR_GPU_INDEX")
+    bus = os.environ.get("VR_GPU_BUS", "")
+    # nvidia-smi: "00000000:41:00.0"; Cycles device ids carry e.g. "..._0000:41:00".
+    bus_key = ":".join(bus.lower().split(":")[-2:]).split(".")[0] if bus else ""
+    candidates = [d for d in cprefs.devices if d.type == backend] if backend else []
+    if pinned is not None and bus_key and len(candidates) > 1:
+        matching = [d for d in candidates if bus_key in d.id.lower()]
+        if matching:
+            print(f"CUDA_VISIBLE_DEVICES not honoured; selecting {bus} by bus id")
+            candidates = matching
+        else:
+            print(f"WARNING pinned to GPU {pinned} ({bus}) but no device id matches; using all")
+
+    chosen = {(d.type, d.id) for d in candidates}
     enabled = 0
     for device in cprefs.devices:
         # CPU devices are listed too; enabling them alongside the GPU splits the
-        # scene and is usually slower than the GPU alone.
-        if device.type == "CPU":
-            device.use = False
-            continue
-        device.use = True
-        enabled += 1
-        print(f"Enabled GPU: {device.name} ({device.type})")
+        # scene and is usually slower than the GPU alone. Devices of the other
+        # backend are left off: Cycles ignores them anyway, and counting them
+        # made one GPU read as two.
+        use = (device.type, device.id) in chosen
+        device.use = use
+        if use:
+            enabled += 1
+            print(f"Enabled GPU: {device.name} ({device.type}) id={device.id}")
+    if pinned is not None:
+        print(f"Pinned to GPU {pinned} ({bus or 'bus unknown'}): {enabled} {backend} device(s)")
     if enabled == 0:
         print("WARNING no GPU devices enabled — Cycles will fall back to CPU")
 

@@ -90,6 +90,11 @@ function Slot({ chunk, now }: { chunk: NodeChunkView; now: number }): React.JSX.
           <span style={{ ...mono, fontSize: SCALE.text2xs, color: TOKENS.textFaint }}>
             {chunk.frameStart}–{chunk.frameEnd}
           </span>
+          {chunk.live && chunk.gpu != null ? (
+            <span style={chip({ tone: 'accent' })} title="pinned to this GPU (nvidia-smi index)">
+              gpu {chunk.gpu}
+            </span>
+          ) : null}
           {chunk.retries > 0 ? (
             <span style={chip({ tone: 'warn' })} title={`retry ${chunk.retries}`}>
               r{chunk.retries}
@@ -166,6 +171,45 @@ function IdleSlot(): React.JSX.Element {
   )
 }
 
+/**
+ * One bar per GPU on a multi-GPU node. The node-level gauge averages them, which
+ * hides exactly what per-GPU slots are for: a GPU sitting idle while its
+ * neighbours render.
+ */
+function PerGpu({ node }: { node: NodeSnapshot }): React.JSX.Element | null {
+  const gpus = node.metrics?.gpus
+  if (!gpus || gpus.length < 2) return null
+  const busy = new Map<number, number>()
+  for (const w of node.currentWork) {
+    if (w.gpu != null) busy.set(w.gpu, (busy.get(w.gpu) ?? 0) + 1)
+  }
+  return (
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))',
+        gap: `4px ${SCALE.space3}`
+      }}
+    >
+      {gpus.map((g) => {
+        const n = busy.get(g.index) ?? 0
+        return (
+          <span
+            key={g.index}
+            style={{ display: 'flex', flexDirection: 'column', gap: 2 }}
+            title={`GPU ${g.index}: ${g.util.toFixed(0)}% compute, ${g.vramUsedGb.toFixed(1)}/${g.vramTotalGb.toFixed(0)} GB, ${g.temp.toFixed(0)}°C${g.powerW > 0 ? `, ${g.powerW.toFixed(0)} W` : ''} — ${n} slot${n === 1 ? '' : 's'} pinned`}
+          >
+            <span style={{ ...mono, fontSize: SCALE.text2xs, color: TOKENS.textFaint }}>
+              gpu {g.index} · {g.util.toFixed(0)}% · {n} slot{n === 1 ? '' : 's'}
+            </span>
+            <Meter pct={g.util} tone={g.util < 5 ? (n > 0 ? 'warn' : 'idle') : 'normal'} />
+          </span>
+        )
+      })}
+    </div>
+  )
+}
+
 export function NodeWorkload({ node }: { node: NodeSnapshot }): React.JSX.Element {
   const { data: chunks } = useNodeChunks(node.id)
   const now = useNow(5_000)
@@ -187,6 +231,8 @@ export function NodeWorkload({ node }: { node: NodeSnapshot }): React.JSX.Elemen
           {node.slotsInUse}/{node.slotTarget}
         </span>
       </span>
+
+      <PerGpu node={node} />
 
       {running.map((c) => (
         <Slot key={c.chunkId} chunk={c} now={now} />

@@ -96,8 +96,9 @@ CREATE TABLE IF NOT EXISTS assets (
 CREATE INDEX IF NOT EXISTS idx_assets_job ON assets(job_id);
 
 -- Learned render throughput per GPU model (EWMA of frames/hour measured from
--- our own completed chunks) — feeds offer scoring so machine selection
--- improves with every render.
+-- our own completed chunks, PER GPU — node totals are divided by the node's
+-- GPU count) — feeds offer scoring so machine selection improves with every
+-- render.
 CREATE TABLE IF NOT EXISTS gpu_perf (
   gpu_name TEXT PRIMARY KEY,
   frames_per_hour REAL NOT NULL,
@@ -109,10 +110,12 @@ CREATE TABLE IF NOT EXISTS gpu_perf (
 -- node of this GPU before adding more stopped paying (see slotController).
 -- Lets a freshly rented node of a known model start near its optimum instead
 -- of re-climbing the ramp from 2 every time.
+-- Both columns below are PER GPU (may be fractional despite the INTEGER
+-- affinity), so nodes with different GPU counts share one learned figure.
 CREATE TABLE IF NOT EXISTS gpu_slots (
   gpu_name TEXT PRIMARY KEY,
   best_slots INTEGER NOT NULL,
-  frames_per_hour REAL NOT NULL,      -- aggregate node throughput measured at best_slots
+  frames_per_hour REAL NOT NULL,      -- node throughput at best_slots, per GPU
   samples INTEGER NOT NULL DEFAULT 1,
   updated_at INTEGER NOT NULL
 );

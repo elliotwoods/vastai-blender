@@ -22,6 +22,9 @@ Job spec:
     "blenderVersion": "4.5.3", "engine": "cycles"|"eevee"|"octane",
     "frameStart": int, "frameEnd": int, "frameStep": int,
     "extraArgs": [str], "pythonExprs": [str],
+    "nodeSlots": int, "exclusive": bool,
+    "lanes": int (exclusive chunks that may run side by side; absent = 1),
+    "pinGpus": bool (pin each render to one GPU; absent = false),
     "encode": null | {"sdr": bool, "hdr": bool, "proxy": bool,
                        "codec": "hevc"|"av1", "fps": float,
                        "thumbs": bool, "thumbWidth": int} }
@@ -649,7 +652,7 @@ def log_line(chunk_id, message):
         pass
 
 
-def run_render(spec, log_path, tracker):
+def run_render(spec, log_path, tracker, gpu=None):
     chunk_id = spec["chunkId"]
     chunk_dir = os.path.join(RENDERS, chunk_id)
     frames_dir = os.path.join(chunk_dir, "frames")
@@ -698,6 +701,9 @@ def run_render(spec, log_path, tracker):
         "lastLine": "",
         "exitCode": None,
         "command": " ".join(cmd),
+        # The GPU this render is pinned to (nvidia-smi index), or None. The app
+        # shows it per slot on the Fleet screen.
+        "gpu": gpu,
     }
     write_state(chunk_id, state)
 
@@ -711,6 +717,9 @@ def run_render(spec, log_path, tracker):
             "OPENBLAS_NUM_THREADS": "1",
             "MKL_NUM_THREADS": "1",
         })
+    if gpu is not None:
+        env.update(gpu_env(gpu))
+        log_line(chunk_id, f"pinned to GPU {gpu} ({env.get('VR_GPU_BUS') or 'bus id unknown'})")
 
     def run_once(cmd):
         with open(log_path, "a") as log:
@@ -854,7 +863,7 @@ def run_encode(spec, state, log_path):
             )
 
 
-def process(spec_path):
+def process(spec_path, gpu=None):
     with open(spec_path) as f:
         spec = json.load(f)
     chunk_id = spec["chunkId"]
@@ -870,7 +879,7 @@ def process(spec_path):
     if worker.may_run:
         worker.start()
     try:
-        state = run_render(spec, log_path, tracker)
+        state = run_render(spec, log_path, tracker, gpu)
         # Stop and join BEFORE the definitive encode: the worker reads the same
         # frames and there is no reason to have both competing for the CPU
         # once the render itself has finished.
@@ -887,6 +896,7 @@ def process(spec_path):
                 "error": str(e),
                 "framesDone": len(tracker.recorded),
                 "exitCode": None,
+                "gpu": gpu,
             },
         )
         with open(log_path, "a") as log:
@@ -914,15 +924,69 @@ def cleanup_live_stream(chunk_dir):
 
 
 def gpu_vram_mb():
-    """Total VRAM of GPU 0 in MB, or None when nvidia-smi is unavailable."""
+    """Total VRAM summed over every GPU in MB, or None without nvidia-smi.
+
+    Summed, not GPU 0's: the app's hardCap() sums nvidia-smi's rows, and the two
+    ceilings must agree or the agent silently runs fewer chunks than the
+    scheduler believes it dispatched. (GPU 0 alone capped a 4-GPU node at a
+    quarter of its VRAM.)
+    """
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10,
         ).stdout.strip().splitlines()
-        return int(float(out[0])) if out else None
+        vals = [int(float(x)) for x in out if x.strip()]
+        return sum(vals) if vals else None
     except Exception:  # noqa: BLE001
         return None
+
+
+_GPUS = None
+
+
+def gpu_list():
+    """[(index, pci_bus_id)] from nvidia-smi, cached; [] when unavailable.
+
+    nvidia-smi enumerates in PCI bus order, and gpu_env() sets
+    CUDA_DEVICE_ORDER=PCI_BUS_ID so CUDA's index i is the same card as
+    nvidia-smi's index i — which is what lets the app match a slot's GPU to its
+    per-GPU telemetry.
+    """
+    global _GPUS
+    if _GPUS is not None:
+        return _GPUS
+    gpus = []
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,pci.bus_id", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip().splitlines()
+        for line in out:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2 and parts[0].isdigit():
+                gpus.append((int(parts[0]), parts[1]))
+    except Exception:  # noqa: BLE001
+        pass
+    _GPUS = gpus
+    return gpus
+
+
+def gpu_env(gpu):
+    """Environment that confines one Blender to GPU `gpu`.
+
+    CUDA_VISIBLE_DEVICES hides every other card from CUDA and OptiX alike, so
+    Cycles lists just this one (once as CUDA, once as OPTIX). VR_GPU_* tell
+    enable_gpu.py which card was meant, as a backstop should the variable not
+    take effect.
+    """
+    bus = dict(gpu_list()).get(gpu, "")
+    return {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": str(gpu),
+        "VR_GPU_INDEX": str(gpu),
+        "VR_GPU_BUS": bus,
+    }
 
 
 def node_ceiling():
@@ -966,6 +1030,61 @@ def slot_limit(spec):
     return max(1, min(int(raw), node_ceiling()))
 
 
+def lane_limit(spec):
+    """Exclusive chunks this spec allows side by side — the node's GPU lanes.
+
+    Absent → 1: an exclusive chunk holds the whole node, as before.
+    """
+    try:
+        return max(1, min(int(spec.get("lanes") or 1), 32))
+    except (TypeError, ValueError):
+        return 1
+
+
+def pick_gpu(running_gpus, gpu_count):
+    """Least-loaded GPU index (ties → lowest) given the GPUs already in use."""
+    counts = [0] * gpu_count
+    for g in running_gpus:
+        if g is not None and 0 <= g < gpu_count:
+            counts[g] += 1
+    return min(range(gpu_count), key=lambda i: (counts[i], i))
+
+
+def plan_launches(parsed, running, gpu_count, slots):
+    """Which queued specs to start now, and on which GPU. Pure.
+
+    parsed:  [(name, spec)] waiting in the inbox, FIFO order
+    running: [(exclusive, gpu)] renders already in progress
+    slots:   shared-work concurrency (max slot_limit over the queue)
+
+    Rules (identical to the old loop whenever lanes = 1 and nothing is pinned):
+      * exclusive and shared work never run together;
+      * exclusive chunks run up to `lanes` at once (one per GPU lane);
+      * shared chunks run up to `slots` at once;
+      * FIFO: the head waits rather than being overtaken (`break`, not
+        `continue`), so an exclusive chunk is never starved by lighter work.
+    Pinned specs go to the least-loaded GPU.
+    """
+    running = list(running)
+    launches = []
+    for name, spec in parsed:
+        exclusive = is_exclusive(spec)
+        n_excl = sum(1 for e, _g in running if e)
+        n_shared = len(running) - n_excl
+        if exclusive:
+            if n_shared or n_excl >= lane_limit(spec):
+                break
+        else:
+            if n_excl or len(running) >= slots:
+                break
+        gpu = None
+        if spec.get("pinGpus") and gpu_count > 1:
+            gpu = pick_gpu([g for _e, g in running], gpu_count)
+        running.append((exclusive, gpu))
+        launches.append((name, gpu))
+    return launches
+
+
 def is_exclusive(spec):
     """Must this chunk have the node to itself?
 
@@ -988,13 +1107,11 @@ def main():
     # blender subprocess + thread. All chunk state is per-chunkId (log, state
     # json, renders/<chunkId>/ dir, manifest) so workers never share files;
     # the in_progress set stops double-claims within this process.
-    in_progress = {}  # spec filename -> (Thread, exclusive)
+    in_progress = {}  # spec filename -> (Thread, exclusive, gpu)
     while True:
-        for name, (t, _excl) in list(in_progress.items()):
+        for name, (t, _excl, _gpu) in list(in_progress.items()):
             if not t.is_alive():
                 del in_progress[name]
-        # An exclusive chunk owns the whole node while it runs.
-        holding_exclusive = any(excl for _t, excl in in_progress.values())
         # FIFO by spec mtime, not filename: alphabetical order starves jobs
         # whose ids sort late whenever the inbox holds more specs than slots.
         def spec_mtime(name):
@@ -1008,7 +1125,7 @@ def main():
             key=spec_mtime,
         )
         slots = 1
-        parsed = []  # (name, exclusive)
+        parsed = []  # (name, spec)
         for name in specs:
             if name in in_progress:
                 continue
@@ -1017,32 +1134,26 @@ def main():
                     spec = json.load(f)
             except (OSError, ValueError):
                 continue  # mid-write or corrupt — retry next scan
-            parsed.append((name, is_exclusive(spec)))
+            parsed.append((name, spec))
             slots = max(slots, slot_limit(spec))
+        # Exclusive and shared work never mix; exclusive chunks take one GPU
+        # lane each (the whole node when lanes = 1). See plan_launches.
+        running = [(excl, gpu) for _t, excl, gpu in in_progress.values()]
         launched = False
-        for name, exclusive in parsed:
-            # Nothing starts alongside an exclusive chunk, and an exclusive
-            # chunk starts only on an empty node. Both directions matter: the
-            # first keeps a GPU-saturating render from being joined, the
-            # second keeps it from joining others. Staying in FIFO order (a
-            # `break`, not a `continue`) means the exclusive chunk at the head
-            # waits for the node to drain rather than being passed over
-            # forever by lighter work behind it.
-            if holding_exclusive:
-                break
-            if exclusive and in_progress:
-                break
-            if len(in_progress) >= slots:
-                break
-            t = threading.Thread(target=process, args=(os.path.join(INBOX, name),), daemon=True)
-            in_progress[name] = (t, exclusive)
-            if exclusive:
-                holding_exclusive = True
+        specs_by_name = dict(parsed)
+        for name, gpu in plan_launches(parsed, running, len(gpu_list()), slots):
+            exclusive = is_exclusive(specs_by_name[name])
+            t = threading.Thread(
+                target=process, args=(os.path.join(INBOX, name), gpu), daemon=True
+            )
+            in_progress[name] = (t, exclusive, gpu)
             t.start()
             launched = True
+            limit = lane_limit(specs_by_name[name]) if exclusive else slots
             print(
-                f"slot start {name} ({len(in_progress)}/{1 if exclusive else slots})"
-                + (" exclusive" if exclusive else ""),
+                f"slot start {name} ({len(in_progress)}/{limit})"
+                + (" exclusive" if exclusive else "")
+                + (f" gpu {gpu}" if gpu is not None else ""),
                 flush=True,
             )
         if not launched:

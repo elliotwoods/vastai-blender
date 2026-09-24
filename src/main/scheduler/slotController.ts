@@ -120,10 +120,24 @@ export function hardCap(metrics: NodeMetrics | null | undefined, maxNodeSlots: n
   return Math.max(1, cap)
 }
 
-/** Fresh state for a node, seeded from what we learned about this GPU model. */
-export function initialState(gpuName: string | null, cap: number, now: number): SlotState {
+/**
+ * Fresh state for a node, seeded from what we learned about this GPU model.
+ *
+ * `gpu_slots.best_slots` is recorded PER GPU (see recordNodeSlots), so the
+ * seed scales with the node's GPU count. `floor` is the node's GPU lane count:
+ * with per-GPU pinning, starting below it would leave whole GPUs idle while
+ * the climb crawls up one settle period per slot.
+ */
+export function initialState(
+  gpuName: string | null,
+  cap: number,
+  now: number,
+  opts: { numGpus?: number; floor?: number } = {}
+): SlotState {
   const learned = gpuName ? learnedSlots(gpuName) : null
-  const target = Math.max(1, Math.min(cap, learned?.bestSlots ?? INITIAL_TARGET))
+  const gpus = Math.max(1, Math.floor(opts.numGpus ?? 1))
+  const seed = learned ? Math.round(learned.bestSlots * gpus) : INITIAL_TARGET
+  const target = Math.max(1, Math.min(cap, Math.max(seed, opts.floor ?? 1)))
   return {
     target,
     // A learned value is a starting point, not a verdict — this node's scene
@@ -271,7 +285,7 @@ function rampOrSettle(
 }
 
 /** Worst of the VRAM and system-RAM fractions; null when neither was sampled. */
-function memoryFraction(metrics: NodeMetrics | null | undefined): number | null {
+export function memoryFraction(metrics: NodeMetrics | null | undefined): number | null {
   if (!metrics) return null
   const fracs: number[] = []
   if (metrics.vramTotalGb > 0) fracs.push(metrics.vramUsedGb / metrics.vramTotalGb)
@@ -305,8 +319,22 @@ export function learnedSlots(gpuName: string): LearnedSlots | null {
  * light case permanently under-packed, and ramping down is cheap while
  * ramping up costs a settle period per step.
  */
-export function recordNodeSlots(gpuName: string, slots: number, framesPerSec: number): void {
-  if (!Number.isFinite(slots) || slots < 1) return
+export function recordNodeSlots(
+  gpuName: string,
+  nodeSlots: number,
+  nodeFramesPerSec: number,
+  numGpus = 1
+): void {
+  // Stored PER GPU: the table is keyed by GPU model, and a 4-GPU node of a
+  // model packs four times the slots of a 1-GPU node of the same model.
+  // Keeping per-node figures would seed a 1-GPU node from a 4-GPU one (4x
+  // over-packed) and vice versa. Fractional values are kept (SQLite stores the
+  // REAL despite the column's INTEGER affinity) so 5 slots on 4 GPUs does not
+  // round away.
+  const gpus = Math.max(1, Math.floor(numGpus || 1))
+  const slots = nodeSlots / gpus
+  const framesPerSec = nodeFramesPerSec / gpus
+  if (!Number.isFinite(slots) || slots <= 0) return
   if (!Number.isFinite(framesPerSec) || framesPerSec <= 0) return
   const framesPerHour = framesPerSec * 3600
   const db = getDb()
@@ -317,7 +345,7 @@ export function recordNodeSlots(gpuName: string, slots: number, framesPerSec: nu
     db.prepare(
       'UPDATE gpu_slots SET best_slots = ?, frames_per_hour = ?, samples = samples + 1, updated_at = ? WHERE gpu_name = ?'
     ).run(
-      Math.max(row.best_slots, Math.round(slots)),
+      Math.max(row.best_slots, slots),
       row.frames_per_hour * 0.7 + framesPerHour * 0.3,
       Date.now(),
       gpuName
@@ -325,6 +353,6 @@ export function recordNodeSlots(gpuName: string, slots: number, framesPerSec: nu
   } else {
     db.prepare(
       'INSERT INTO gpu_slots (gpu_name, best_slots, frames_per_hour, samples, updated_at) VALUES (?, ?, ?, 1, ?)'
-    ).run(gpuName, Math.round(slots), framesPerHour, Date.now())
+    ).run(gpuName, slots, framesPerHour, Date.now())
   }
 }

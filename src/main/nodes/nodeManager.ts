@@ -14,6 +14,7 @@ import { getDb } from '../db/db'
 import { emit } from '../ipc'
 import { getSettings } from '../settings'
 import { ensureKeyRegistered, readPrivateKey } from '../ssh/keys'
+import { FIRST_CONNECT_BUDGET_MS, retryWithBackoff } from '../ssh/connectRetry'
 import { SshConnection } from '../ssh/sshConnection'
 import { findOffers } from '../vast/offers'
 import {
@@ -24,7 +25,14 @@ import {
   sshEndpoints,
   showInstance
 } from '../vast/vastClient'
-import type { NodeMetrics, NodeSnapshot, NodeState, NodeWorkRef } from '../../shared/models'
+import type {
+  GpuSample,
+  NodeMetrics,
+  NodeSnapshot,
+  NodeState,
+  NodeWorkRef,
+  Offer
+} from '../../shared/models'
 import type { RawInstance } from '../vast/types'
 
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
@@ -290,6 +298,17 @@ class ManagedNode {
     return this.row.state
   }
 
+  /**
+   * GPU count and latest metrics WITHOUT building a snapshot. The scheduler
+   * sizes GPU lanes from these, and the snapshot itself asks the scheduler for
+   * slot info — going through `snapshot` here would recurse.
+   */
+  get laneInputs(): { numGpus: number; metrics: NodeMetrics | null } {
+    const row = getDb().prepare('SELECT num_gpus FROM nodes WHERE id = ?').get(this.id) as
+      { num_gpus: number } | undefined
+    return { numGpus: row?.num_gpus ?? 1, metrics: metricsByNode.get(this.id) ?? null }
+  }
+
   /** Push a fresh snapshot without changing any persisted field. */
   emitChanged(): void {
     emit('node:changed', this.snapshot)
@@ -413,7 +432,9 @@ export class NodeManager {
         continue
       try {
         const r = await node.ssh.exec(
-          `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits; echo ----; cat /proc/loadavg; nproc; echo ----; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; head -1 /proc/stat`,
+          // `index` goes LAST so the columns everything below reads by position
+          // keep their positions.
+          `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,index --format=csv,noheader,nounits; echo ----; cat /proc/loadavg; nproc; echo ----; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; head -1 /proc/stat`,
           { timeoutMs: 10_000 }
         )
         const [gpuPart, cpuPart, memPart] = r.stdout.split('----')
@@ -460,7 +481,15 @@ export class NodeManager {
           cpuCores: Number.isFinite(cores) ? cores : 0,
           ramUsedGb: Math.max(0, ramTotalGb - ramAvailGb),
           ramTotalGb,
-          updatedAt: now
+          updatedAt: now,
+          gpus: gpuRows.map((xs, i): GpuSample => ({
+            index: Number.isFinite(xs[6]) ? xs[6] : i,
+            util: xs[0],
+            vramUsedGb: xs[1] / 1024,
+            vramTotalGb: xs[2] / 1024,
+            temp: xs[3],
+            powerW: Number.isFinite(xs[4]) ? xs[4] : 0
+          }))
         })
         emit('node:changed', node.snapshot)
       } catch {
@@ -489,6 +518,26 @@ export class NodeManager {
     if (this.activeCount() >= settings.maxActiveNodes) {
       throw new Error(`max active nodes (${settings.maxActiveNodes}) reached`)
     }
+    const ids = await this.requestNodes(1, { respectSpendCap: false })
+    if (ids.length === 0) throw new Error('no node could be rented')
+    return ids[0]
+  }
+
+  /**
+   * Rent up to `count` nodes from ONE offer search, best-ranked first.
+   *
+   * One search per batch rather than per node: it is the slow call, and
+   * renting down the ranked list is exactly what repeated searches would do
+   * anyway. Machines are never rented twice in a batch, and an offer that
+   * fails to rent (taken by someone else meanwhile) blacklists its machine and
+   * moves on to the next. The caps are re-checked before every rental —
+   * maxActiveNodes against the live count, and (unless told otherwise, for
+   * the manual button) the spend cap against the running $/hr, allowing a
+   * rental while the fleet is still under the cap, as scale-up always has.
+   */
+  async requestNodes(count: number, opts: { respectSpendCap?: boolean } = {}): Promise<string[]> {
+    if (count <= 0) return []
+    const settings = getSettings()
     await ensureKeyRegistered()
 
     const offers = await findOffers(settings.offerFilters, this.blacklist)
@@ -496,8 +545,42 @@ export class NodeManager {
       emit('alert', { level: 'warn', message: 'No matching Vast.ai offers found' })
       throw new Error('no matching offers')
     }
-    const offer = offers[0]
+    const ids: string[] = []
+    const usedMachines = new Set<number>()
+    let lastErr: Error | null = null
+    let failures = 0
+    for (const offer of offers) {
+      if (ids.length >= count) break
+      // A systemic refusal (no credit, a bad key) fails every offer the same
+      // way; stop before it turns into a failed node row per offer.
+      if (failures >= 3) break
+      if (this.activeCount() >= settings.maxActiveNodes) break
+      if (opts.respectSpendCap !== false && settings.spendCapPerHour != null) {
+        if (this.activePerHour() >= settings.spendCapPerHour) break
+      }
+      if (usedMachines.has(offer.machineId) || this.blacklist.has(offer.machineId)) continue
+      usedMachines.add(offer.machineId)
+      try {
+        ids.push(await this.rentOffer(offer, settings.offerFilters.minDiskGb))
+      } catch (e) {
+        lastErr = e as Error
+        failures++
+      }
+    }
+    if (ids.length === 0 && lastErr) throw lastErr
+    return ids
+  }
 
+  /** $/hr of every node that is (or may still be) billing. */
+  private activePerHour(): number {
+    return [...this.nodes.values()]
+      .map((n) => n.snapshot)
+      .filter((s) => !['destroyed', 'destroying', 'failed'].includes(s.state))
+      .reduce((a, s) => a + (s.dphTotal ?? 0), 0)
+  }
+
+  /** Create an instance from one offer and start driving it to ready. */
+  private async rentOffer(offer: Offer, diskGb: number): Promise<string> {
     const id = randomUUID()
     getDb()
       .prepare(
@@ -515,7 +598,7 @@ export class NodeManager {
       const instanceId = await createInstance({
         offerId: offer.id,
         image: DOCKER_IMAGE,
-        diskGb: settings.offerFilters.minDiskGb,
+        diskGb,
         onstart: ONSTART,
         env: { NVIDIA_DRIVER_CAPABILITIES: 'all' },
         label: `vastai-blender ${id.slice(0, 8)}`
@@ -553,30 +636,50 @@ export class NodeManager {
       }
 
       const startedAt = inst!.start_date ? Math.round(inst!.start_date * 1000) : Date.now()
-      // Try endpoints in order (direct preferred, proxy fallback).
-      let connected = false
-      let lastErr: Error | null = null
-      for (const ep of sshEndpoints(inst!)) {
-        node.update({ ssh_host: ep.host, ssh_port: ep.port, started_at: startedAt })
-        try {
-          node.closeSsh()
-          const ssh = await node.connectSsh()
-          const r = await ssh.exec(
-            'echo ok && cat /proc/driver/nvidia/version 2>/dev/null | head -1',
-            {
-              timeoutMs: 30_000
-            }
-          )
-          if (r.stdout.includes('ok')) {
-            connected = true
-            break
+      // "running" means the container started, not that sshd is listening: the
+      // first attempt is routinely refused. Retry every endpoint (direct
+      // preferred, proxy fallback) with backoff for a few minutes, re-reading
+      // the instance each round in case its endpoints moved.
+      let endpoints = sshEndpoints(inst!)
+      await retryWithBackoff(
+        async (attempt) => {
+          if (attempt > 1) {
+            const fresh = await showInstance(instanceId).catch(() => null)
+            const eps = fresh ? sshEndpoints(fresh) : []
+            if (eps.length > 0) endpoints = eps
           }
-          lastErr = new Error(`unexpected echo result: ${r.stderr || r.stdout}`)
-        } catch (e) {
-          lastErr = e as Error
+          let lastErr: Error | null = null
+          for (const ep of endpoints) {
+            node.update({ ssh_host: ep.host, ssh_port: ep.port, started_at: startedAt })
+            try {
+              node.closeSsh()
+              const ssh = await node.connectSsh()
+              const r = await ssh.exec(
+                'echo ok && cat /proc/driver/nvidia/version 2>/dev/null | head -1',
+                { timeoutMs: 30_000 }
+              )
+              if (r.stdout.includes('ok')) return
+              lastErr = new Error(`unexpected echo result: ${r.stderr || r.stdout}`)
+            } catch (e) {
+              lastErr = e as Error
+            }
+          }
+          throw lastErr ?? new Error('no SSH endpoints')
+        },
+        {
+          budgetMs: FIRST_CONNECT_BUDGET_MS,
+          initialDelayMs: 5_000,
+          maxDelayMs: 30_000,
+          shouldAbort: () => node.state === 'destroying' || node.state === 'destroyed',
+          onRetry: (e, n, delayMs) =>
+            emit('render:logLine', {
+              nodeId: node.id,
+              chunkId: null,
+              line: `ssh attempt ${n} failed (${e.message}) — retrying in ${Math.round(delayMs / 1000)}s`,
+              ts: Date.now()
+            })
         }
-      }
-      if (!connected) throw lastErr ?? new Error('all SSH endpoints failed')
+      )
 
       node.setState('provisioning')
       if (this.onReady && node.ssh) {

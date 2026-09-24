@@ -43,6 +43,7 @@ function defaults(): SettingsFile {
       livePreview: 'onDemand',
       livePreviewWidth: 960,
       maxNodeSlots: 0,
+      slotsPerGpu: 1,
       eagerFleet: false,
       // ~1.6x GPU draw covers host CPU/RAM/PSU plus a typical datacentre PUE.
       co2OverheadFactor: 1.6

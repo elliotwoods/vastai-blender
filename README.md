@@ -26,7 +26,11 @@ gauges, ssh access, what it's rendering, and its console.*
   run alongside other renders instead of taking a whole node each. The app
   measures throughput per node and tunes the number of concurrent renders on
   its own; *Max render slots per node* in Settings caps it if you want.
-- **Engines** — Cycles (OptiX/CUDA, all GPUs), EEVEE (per-node capability
+- **Per-GPU render slots** — on a multi-GPU node each GPU renders its own
+  chunk (pinned with `CUDA_VISIBLE_DEVICES`), so per-frame CPU work such as
+  scene sync doesn't idle the other GPUs. One or two slots per GPU, or off, in
+  Settings; *Min GPUs per node* in the offer filters.
+- **Engines** — Cycles (OptiX/CUDA), EEVEE (per-node capability
   probe), Octane (see `docs/OCTANE.md`).
 - **Automatic Blender version matching** — the app reads each `.blend`'s
   header and installs the matching Blender release on the nodes
@@ -137,8 +141,9 @@ at boot:
   "maxActiveNodes": 4,
   "shareNode": true, // let these jobs co-run on a node (per-blend override too)
   "maxNodeSlots": 0, // 0/omitted = the app decides concurrency per node
+  "slotsPerGpu": 1,  // renders per GPU on a node (0 = one process on all GPUs)
   "spendCapPerHour": 2,
-  "offerFilters": { "cpuBound": true }
+  "offerFilters": { "cpuBound": true, "minNumGpus": 4 }
 }
 ```
 
@@ -181,7 +186,8 @@ key in that file, DPAPI-wrapped.
 
 Offers are ranked by `perf-per-dollar × reliability² × network`, where
 perf-per-dollar prefers **your own measured render throughput** for a GPU
-model (learned from completed chunks) over Vast's synthetic benchmark. In
+model (learned from completed chunks, per GPU, and scaled by each offer's GPU
+count) over Vast's synthetic benchmark. In
 CPU-bound mode, machines with no measured throughput are ranked by CPU clock
 and effective cores per dollar instead, with the GPU benchmark capped so it
 only tie-breaks. The strategy lives in `src/main/vast/offers.ts`; filters are

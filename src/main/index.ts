@@ -224,7 +224,7 @@ app.whenReady().then(() => {
   setActiveWorkProvider((nodeId) => scheduler.activeWorkForNode(nodeId))
   setSlotInfoProvider((nodeId) => ({
     inUse: scheduler.slotsInUse(nodeId),
-    target: scheduler.slotTargetFor(nodeId)
+    target: scheduler.displaySlotTarget(nodeId)
   }))
   setForgetNodeProvider((nodeId) => scheduler.forgetNode(nodeId))
   nodeManager.init()
@@ -243,7 +243,9 @@ app.whenReady().then(() => {
   //     "addonZips": ["C:/.../auroravision-0.2.0.zip"],
   //     "chunkSize": null, "maxActiveNodes": 4, "spendCapPerHour": 2,
   //     "shareNode": true,      // jobs may co-run on one node (per-blend override too)
-  //     "maxNodeSlots": 0       // 0 = let the app judge concurrency per node
+  //     "maxNodeSlots": 0,      // 0 = let the app judge concurrency per node
+  //     "slotsPerGpu": 1,       // renders per GPU on a node (0 = one process, all GPUs)
+  //     "offerFilters": { "minNumGpus": 4 }  // partial override of the stored filters
   //   }
   const jobSpecPath = process.env.VR_JOB_SPEC
   if (jobSpecPath) {
@@ -267,6 +269,8 @@ app.whenReady().then(() => {
         if (slotCap != null) patch.maxNodeSlots = slotCap
         // Buy-ahead fleet: rent to maxActiveNodes while any chunk is open.
         if (spec.eagerFleet != null) patch.eagerFleet = spec.eagerFleet
+        // Render slots per GPU on multi-GPU nodes (0 = one process on all GPUs).
+        if (spec.slotsPerGpu != null) patch.slotsPerGpu = spec.slotsPerGpu
         // Partial offer-filter overrides (e.g. {"cpuBound": true}) merge over
         // the stored filters via updateSettings' offerFilters merge.
         if (spec.offerFilters) patch.offerFilters = spec.offerFilters

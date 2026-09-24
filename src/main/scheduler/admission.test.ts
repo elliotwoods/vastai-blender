@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { admits, hasRoom, nodeCapacity, PREFETCH, type NodeOccupancy } from './admission'
+import {
+  admits,
+  freeExclusiveLanes,
+  hasRoom,
+  nodeCapacity,
+  PREFETCH,
+  type NodeOccupancy
+} from './admission'
 
 const occ = (o: Partial<NodeOccupancy> = {}): NodeOccupancy => ({
   inFlight: 0,
@@ -92,5 +99,39 @@ describe('admits — reservations', () => {
   it('reports room only when drained', () => {
     expect(hasRoom(draining)).toBe(false)
     expect(hasRoom(occ({ inFlight: 0, reservedFor: 'c-excl' }))).toBe(true)
+  })
+})
+
+describe('GPU lanes — exclusive chunks on a multi-GPU node', () => {
+  const lanes4 = (o: Partial<NodeOccupancy> = {}): NodeOccupancy =>
+    occ({ exclusiveLanes: 4, slotTarget: 4, ...o })
+
+  it('runs one exclusive chunk per lane', () => {
+    for (let inFlight = 0; inFlight < 4; inFlight++) {
+      const o = lanes4({ inFlight, hasExclusive: inFlight > 0 })
+      expect(admits(o, exclusive)).toBe(true)
+      expect(hasRoom(o)).toBe(true)
+    }
+    const full = lanes4({ inFlight: 4, hasExclusive: true })
+    expect(admits(full, exclusive)).toBe(false)
+    expect(hasRoom(full)).toBe(false)
+  })
+
+  it('still never mixes exclusive and shared work', () => {
+    expect(admits(lanes4({ inFlight: 1, hasExclusive: true }), shared)).toBe(false)
+    expect(admits(lanes4({ inFlight: 1, hasExclusive: false }), exclusive)).toBe(false)
+  })
+
+  it('admits the reserved chunk into a freed lane, and nothing else', () => {
+    const o = lanes4({ inFlight: 3, hasExclusive: true, reservedFor: 'c-excl' })
+    expect(admits(o, exclusive)).toBe(true)
+    expect(admits(o, { id: 'c-other', sharesNode: false })).toBe(false)
+  })
+
+  it('counts free lanes for scale-up', () => {
+    expect(freeExclusiveLanes(lanes4())).toBe(4)
+    expect(freeExclusiveLanes(lanes4({ inFlight: 1, hasExclusive: true }))).toBe(3)
+    expect(freeExclusiveLanes(lanes4({ inFlight: 1, hasExclusive: false }))).toBe(0)
+    expect(freeExclusiveLanes(occ())).toBe(1)
   })
 })

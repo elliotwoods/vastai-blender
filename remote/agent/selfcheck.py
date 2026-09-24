@@ -187,8 +187,36 @@ def test_write_state_under_threads():
             nr.STATE = original
 
 
+def test_plan_launches():
+    """GPU lanes: exclusive chunks one per lane, pinned to distinct GPUs."""
+    ex = lambda lanes=1, pin=False: {"exclusive": True, "lanes": lanes, "pinGpus": pin}  # noqa: E731
+    sh = lambda pin=False: {"exclusive": False, "nodeSlots": 4, "pinGpus": pin}  # noqa: E731
+    q = [(f"c{i}", ex(4, True)) for i in range(6)]
+    got = nr.plan_launches(q, [], 4, 1)
+    check("4 lanes start 4 exclusive chunks", [n for n, _ in got] == ["c0", "c1", "c2", "c3"])
+    check("each lands on its own GPU", sorted(g for _, g in got) == [0, 1, 2, 3])
+    got = nr.plan_launches(q, [(True, 0), (True, 2), (True, 3)], 4, 1)
+    check("a freed lane is refilled on the free GPU", got == [("c0", 1)])
+    got = nr.plan_launches([(f"c{i}", ex(8, True)) for i in range(8)], [], 4, 1)
+    check("2 per GPU spreads evenly", sorted(g for _, g in got) == [0, 0, 1, 1, 2, 2, 3, 3])
+    check("legacy: one exclusive owns the node",
+          nr.plan_launches([("a", ex()), ("b", ex())], [], 4, 1) == [("a", None)])
+    check("legacy: exclusive waits for shared work to drain",
+          nr.plan_launches([("a", ex(4, True))], [(False, 0)], 4, 4) == [])
+    check("shared never joins exclusive work",
+          nr.plan_launches([("s", sh(True))], [(True, 0)], 4, 4) == [])
+    check("FIFO: an exclusive head is not overtaken",
+          nr.plan_launches([("a", ex()), ("s", sh())], [(False, None)], 1, 4) == [])
+    got = nr.plan_launches([(f"s{i}", sh(True)) for i in range(4)], [], 2, 4)
+    check("shared work is pinned least-loaded", [g for _, g in got] == [0, 1, 0, 1])
+    check("no pinning on a single-GPU node",
+          nr.plan_launches([("a", ex(2, True)), ("b", ex(2, True))], [], 1, 1)
+          == [("a", None), ("b", None)])
+
+
 def main():
     for fn in (
+        test_plan_launches,
         test_backfill_skips_unmanifested,
         test_per_frame_failures_are_tolerated,
         test_resubscribe_fills_the_gap,

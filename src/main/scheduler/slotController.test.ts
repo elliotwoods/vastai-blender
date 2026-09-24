@@ -79,6 +79,17 @@ describe('initialState', () => {
     expect(initialState('RTX 4090', 16, 0).target).toBe(9)
   })
 
+  it("scales the learned per-GPU optimum by the node's GPU count", () => {
+    learned.row = { best_slots: 2 }
+    expect(initialState('RTX 4090', 16, 0, { numGpus: 4 }).target).toBe(8)
+  })
+
+  it('never starts below one slot per GPU lane', () => {
+    expect(initialState('RTX 4090', 16, 0, { numGpus: 4, floor: 4 }).target).toBe(4)
+    // ...but the hardware ceiling still wins.
+    expect(initialState('RTX 4090', 3, 0, { numGpus: 4, floor: 4 }).target).toBe(3)
+  })
+
   it('clamps a learned value to the ceiling of this node', () => {
     learned.row = { best_slots: 20 }
     expect(initialState('RTX 4090', 6, 0).target).toBe(6)

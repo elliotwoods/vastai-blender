@@ -119,7 +119,7 @@ function GeneralSection(): React.JSX.Element {
         <input
           type="number"
           min={0}
-          max={16}
+          max={64}
           value={settings.maxActiveNodes}
           onChange={(e) => update.mutate({ maxActiveNodes: Number(e.target.value) })}
           style={{ ...input({ size: 'sm' }), ...mono, width: 80 }}
@@ -157,7 +157,26 @@ function GeneralSection(): React.JSX.Element {
         />
         <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
           blank = auto: each node&apos;s concurrency is measured and tuned on the fly. Set a number
-          to cap it. Only jobs marked &ldquo;share node&rdquo; ever run more than one at a time.
+          to cap it. Only jobs marked &ldquo;share node&rdquo; ever run more than one at a time on a
+          GPU.
+        </span>
+      </div>
+      <div style={formRow}>
+        <span style={label}>Render slots per GPU</span>
+        <select
+          value={String(settings.slotsPerGpu ?? 1)}
+          onChange={(e) => update.mutate({ slotsPerGpu: Number(e.target.value) })}
+          style={{ ...input({ size: 'sm' }), width: 180 }}
+        >
+          <option value="1">1 — one render per GPU</option>
+          <option value="2">2 — two renders per GPU</option>
+          <option value="0">off — one render, all GPUs</option>
+        </select>
+        <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
+          On a multi-GPU node, each GPU renders its own chunk (pinned with CUDA_VISIBLE_DEVICES), so
+          per-frame CPU work such as scene sync overlaps other GPUs&apos; sampling instead of idling
+          all of them. Two per GPU also overlaps it on the same GPU, at the cost of a second copy of
+          the scene in VRAM and RAM.
         </span>
       </div>
       <div style={formRow}>
@@ -459,6 +478,73 @@ function OffersSection(): React.JSX.Element {
           onChange={(e) => setFilters({ minInetDownMbps: Number(e.target.value) })}
           style={{ ...input({ size: 'sm' }), ...mono, width: 90 }}
         />
+      </div>
+      <div style={formRow}>
+        <span style={label}>Min GPUs per node</span>
+        <input
+          type="number"
+          min={1}
+          max={16}
+          placeholder="any"
+          value={f.minNumGpus ?? ''}
+          onChange={(e) =>
+            setFilters({
+              minNumGpus:
+                e.target.value === '' || Number(e.target.value) <= 1
+                  ? null
+                  : Math.min(16, Math.floor(Number(e.target.value)))
+            })
+          }
+          style={{ ...input({ size: 'sm' }), ...mono, width: 90 }}
+        />
+        <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
+          blank = any. Each GPU renders its own chunk, so a 4-GPU node is four render slots on one
+          rental; ranking is per GPU either way.
+        </span>
+      </div>
+      <div style={formRow}>
+        <span style={label}>Min CPU cores</span>
+        <input
+          type="number"
+          min={0}
+          placeholder="any"
+          value={f.minCpuCores ?? ''}
+          onChange={(e) =>
+            setFilters({
+              minCpuCores: e.target.value === '' ? null : Math.max(0, Number(e.target.value))
+            })
+          }
+          style={{ ...input({ size: 'sm' }), ...mono, width: 90 }}
+        />
+      </div>
+      <div style={formRow}>
+        <span style={label}>Min disk (GB)</span>
+        <input
+          type="number"
+          min={10}
+          value={f.minDiskGb}
+          onChange={(e) => setFilters({ minDiskGb: Number(e.target.value) })}
+          style={{ ...input({ size: 'sm' }), ...mono, width: 90 }}
+        />
+      </div>
+      <div style={formRow}>
+        <span style={label}>CPU-bound</span>
+        <label
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            fontSize: SCALE.textXs,
+            color: TOKENS.textMuted
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={f.cpuBound === true}
+            onChange={(e) => setFilters({ cpuBound: e.target.checked })}
+          />
+          rank unmeasured machines by CPU per dollar, not GPU benchmark
+        </label>
       </div>
       <div style={formRow}>
         <span style={label}>Min reliability</span>

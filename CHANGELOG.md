@@ -24,8 +24,34 @@ GitHub Releases with the notes from this file.
   holds (`assets.segments`, schema v5). ffmpeg now ships with the app
   (`ffmpeg-static`); without it, previews stay per-chunk as before.
 
+- **One render per GPU on multi-GPU nodes.** A node with N GPUs used to run one
+  Blender with every GPU enabled, so every GPU sat idle during each frame's
+  serial CPU work (scene sync, BVH build, geometry nodes). Now each GPU renders
+  its own chunk, pinned with `CUDA_VISIBLE_DEVICES`. This applies to jobs that
+  don't share nodes too: for those, one GPU is the unit of exclusivity, not the
+  whole machine. Settings → General → *Render slots per GPU*: 1 (default), 2
+  (overlaps sync with sampling on the same GPU), or off (the old behaviour).
+  `enable_gpu.py` enables only the pinned card, and only on the chosen backend,
+  since each GPU is listed once as CUDA and once as OptiX. The Fleet node panel
+  shows a bar per GPU and which GPU each slot is pinned to. A memory guard
+  drops a lane when RAM or VRAM passes 90%. `VR_JOB_SPEC` takes `slotsPerGpu`.
+- **Min GPUs per node** offer filter (`offerFilters.minNumGpus`, also in
+  Settings → Offer filters). Settings → Offer filters also gains *Min CPU
+  cores*, *Min disk* and *CPU-bound*, which could previously only be set from
+  a spec.
+
 ### Changed
 
+- **Faster fleet ramp.** Scale-up rents several nodes per 15 s tick (up to 8,
+  from one offer search) instead of one, still bounded by *Max active nodes*
+  and the spend cap. A 30-node fleet is now requested in about a minute rather
+  than 7.5. Demand now subtracts capacity that is still booting, so a short
+  queue no longer keeps renting while its first nodes boot.
+- Offer ranking treats measured throughput (`gpu_perf`) and learned slot counts
+  (`gpu_slots`) as **per GPU**. Both tables are keyed by GPU model, and 1-GPU
+  and 4-GPU nodes of the same model used to overwrite each other's node totals.
+  Existing rows are read as per-GPU figures, which is correct for rows learned
+  on 1-GPU nodes.
 - The preview overlay plays the whole job when the frame you open is in the job
   clip. `[`/`]` and the filmstrip seek within it rather than reopening per
   chunk. Frames that aren't stitched yet (a chunk still rendering) fall back to
@@ -35,6 +61,23 @@ GitHub Releases with the notes from this file.
 
 ### Fixed
 
+- **Healthy nodes were thrown away on boot.** vast.ai reports an instance as
+  running before sshd inside it listens, and one refused connection failed and
+  destroyed the node. In one 53-node run, 23 nodes were replaced this way. The
+  first connection now retries with backoff for up to 3 minutes, re-reading
+  the instance's endpoints each round. A host-key mismatch still fails at once.
+- **Stalled downloads pinned nodes forever.** A transfer that stopped mid-file
+  (4 frames at ~200 KB in one run) never completed or failed. Its chunk stayed
+  'downloading' and kept its node rented. Transfers now fail after 60 s
+  without data, reset the SFTP channel, and resume from the partial file on
+  retry. The final download pass is bounded at 10 minutes. Frames still
+  missing after that go through requeue, which re-renders only those frames.
+  Manifest and agent-state reads are also timed out.
+- The Fleet *max nodes* stepper clamped at 16, so one click on "−" shrank a
+  spec-configured 30-node fleet to 16. The limit is now 64 there and in
+  Settings.
+- The agent's slot ceiling counted only GPU 0's VRAM, but the app counts every
+  GPU. On multi-GPU nodes the two disagreed.
 - **Graded previews were cropped.** The grading canvas kept its intrinsic size
   (the video's native resolution) instead of filling its tile. A 1920×1080
   clip in a smaller tile therefore showed only its top-left corner.
