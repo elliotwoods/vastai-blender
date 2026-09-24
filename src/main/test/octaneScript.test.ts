@@ -11,12 +11,32 @@ import { spawnSync } from 'node:child_process'
 import { appendFileSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import type { OctaneState } from '../../shared/models'
 import { remoteNode, type RemoteNode } from './remoteNode'
 
 // Every character a password can hold that a careless read would mangle:
 // spaces at both ends, a backslash, quotes, a $ and a glob.
 const USER = 'render-farm@example.com'
 const PASS = ` p@ss w'rd\\n"$HOME"* `
+
+// The app writes the state word of an OCTANE_STATE line to nodes.octane_state
+// as it is, so the script must spell every OctaneState exactly, and nothing
+// else. `satisfies` makes the typecheck fail if the two lists drift apart.
+const OCTANE_STATES = {
+  none: true,
+  serverRunning: true,
+  licensed: true,
+  needsLogin: true
+} satisfies Record<OctaneState, true>
+
+/** The state an OCTANE_STATE line reports, checked against OctaneState. */
+function octaneState(stdout: string): OctaneState {
+  const lines = [...stdout.matchAll(/^OCTANE_STATE (.*)$/gm)]
+  expect(lines, stdout).toHaveLength(1)
+  const s = lines[0][1]
+  expect(Object.keys(OCTANE_STATES)).toContain(s)
+  return s as OctaneState
+}
 
 describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
   let n: RemoteNode
@@ -28,10 +48,11 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
   const pidfile = (): string => join(n.vastai, 'state', 'octane-server.pid')
   const serverLog = (): string => join(n.vastai, 'logs', 'octane-server.log')
   const serverPid = (): number => Number(readFileSync(pidfile(), 'utf8').split('\n')[0])
-  const state = (): string => {
+  const state = (): OctaneState => {
     const r = n.octane(['status'])
     expect(r.code).toBe(0)
-    return r.stdout.trim()
+    expect(r.stdout.split('\n').filter(Boolean)).toHaveLength(1)
+    return octaneState(r.stdout)
   }
   const vnc = (password = 'vncpw123'): void => {
     const r = n.octane(['start-vnc', password])
@@ -54,7 +75,7 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
     const [launch] = n.octaneLaunches()
     // Delivered intact: IFS= read -r keeps the edge spaces and the backslash.
     expect(launch.stdin).toEqual([USER, PASS])
-    expect(r.stdout).toMatch(/^OCTANE_STATE server_running$/m)
+    expect(octaneState(r.stdout)).toBe('serverRunning')
     expect(launch.argv).toEqual([])
     expect(launch.env).not.toContain(PASS)
     expect(launch.env).not.toContain(USER)
@@ -97,7 +118,7 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
     expect(n.alive(pid)).toBe(true)
     expect(again.stdout).toMatch(/already running/)
     // It reports the live server's state, and its log was not truncated.
-    expect(again.stdout).toMatch(/^OCTANE_STATE licensed$/m)
+    expect(octaneState(again.stdout)).toBe('licensed')
   })
 
   it('1.18: a server the pidfile lost is adopted, not duplicated', () => {
@@ -118,7 +139,7 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
   it('1.18: start-server refuses without a display rather than launching a GUI into nothing', () => {
     const r = n.octane(['start-server'])
     expect(r.code).toBe(1)
-    expect(r.stdout).toMatch(/^OCTANE_STATE none$/m)
+    expect(octaneState(r.stdout)).toBe('none')
     expect(launches()).toHaveLength(0)
   })
 
@@ -148,31 +169,31 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
   })
 
   it('1.18: status reads the last license line, failure patterns first', () => {
-    expect(state()).toBe('OCTANE_STATE none')
+    expect(state()).toBe('none')
     vnc()
     expect(n.octane(['start-server']).code).toBe(0)
-    expect(state()).toBe('OCTANE_STATE server_running')
+    expect(state()).toBe('serverRunning')
 
     // The old check matched /acquir|success|.../ first and called this licensed.
     appendFileSync(serverLog(), 'ERROR: Failed to acquire license\n')
-    expect(state()).toBe('OCTANE_STATE needs_login')
+    expect(state()).toBe('needsLogin')
     appendFileSync(serverLog(), 'Octane is not activated\n')
-    expect(state()).toBe('OCTANE_STATE needs_login')
+    expect(state()).toBe('needsLogin')
 
     // A sign-in by hand over VNC after the failure: the latest line wins.
     appendFileSync(serverLog(), 'Activation successful\n')
-    expect(state()).toBe('OCTANE_STATE licensed')
+    expect(state()).toBe('licensed')
 
     // Lines that say nothing about the license change nothing.
     appendFileSync(serverLog(), 'render node connected from 127.0.0.1\n')
-    expect(state()).toBe('OCTANE_STATE licensed')
+    expect(state()).toBe('licensed')
 
     appendFileSync(serverLog(), 'License expired\n')
-    expect(state()).toBe('OCTANE_STATE needs_login')
+    expect(state()).toBe('needsLogin')
 
     // A success word inside a failure line is still a failure.
     appendFileSync(serverLog(), 'Activation successful\nlogin failed: invalid password\n')
-    expect(state()).toBe('OCTANE_STATE needs_login')
+    expect(state()).toBe('needsLogin')
   })
 
   it('1.18: stop-server stops the server cleanly and forgets it', () => {
@@ -185,7 +206,7 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
     expect(r.stdout).toMatch(/^OCTANE_STOPPED clean$/m)
     expect(n.alive(pid)).toBe(false)
     expect(existsSync(pidfile())).toBe(false)
-    expect(state()).toBe('OCTANE_STATE none')
+    expect(state()).toBe('none')
     expect(n.octane(['stop-server']).stdout).toMatch(/^OCTANE_STOPPED none$/m)
   })
 
@@ -212,7 +233,7 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
     writeFileSync(pidfile(), `${bystander}\nThu Jan 1 00:00:00 1970\n`)
     expect(n.octane(['stop-server']).stdout).toMatch(/^OCTANE_STOPPED none$/m)
     expect(n.alive(bystander)).toBe(true)
-    expect(state()).toBe('OCTANE_STATE none')
+    expect(state()).toBe('none')
   })
 
   it('1.18: install runs apt once; a repeated setup skips it', () => {

@@ -20,8 +20,8 @@
 #                                                    #   it runs; sign in by hand over VNC
 #   setup_octane.sh start-server --credentials-stdin # the same, with "<user>\n<password>\n"
 #                                                    #   read from stdin for the server
-#   setup_octane.sh status                           # OCTANE_STATE none|server_running|
-#                                                    #   licensed|needs_login
+#   setup_octane.sh status                           # OCTANE_STATE none|serverRunning|
+#                                                    #   licensed|needsLogin
 #   setup_octane.sh stop-server                      # SIGTERM, 30 s, then SIGKILL; prints
 #                                                    #   OCTANE_STOPPED none|clean|killed
 #                                                    #   (a clean exit releases the floating license)
@@ -46,7 +46,7 @@ unset OCTANE_USER OCTANE_PASS
 # so a sign-in by hand after a failed scripted one does count. These phrases
 # have NOT yet been checked against a real OctaneServer log: add the exact
 # lines when plan 1.18's run with an OTOY account shows them. Until then a
-# server that logs neither reads as server_running, never as licensed.
+# server that logs neither reads as serverRunning, never as licensed.
 LOGIN_FAILED_RE='not (activated|licensed|logged in|signed in)|(activation|login|log in|sign-in|sign in|authentication|license check|license request) (has )?(failed|error|denied|refused|unsuccessful)|(failed|unable|could not|couldn.t|cannot|can.t) (to )?(activate|log ?in|sign ?in|authenticate|acquire|obtain|check ?out)|invalid (user ?name|password|credentials|login|e-?mail)|licen[cs]es? (is |are )?(already )?in use|no (free |available |valid )?licen[cs]es?|licen[cs]e (has )?expired|deactivated|logged out|signed out'
 LICENSED_RE='(activation|login|log in|sign-in|sign in|authentication) (was )?(succeeded|successful|complete)|successfully (activated|logged in|signed in|authenticated)|licen[cs]e (acquired|activated|checked out|granted|obtained)|(acquired|obtained|checked out) (a |the )?licen[cs]e|(logged|signed) in as|activated successfully|(is|has been) activated'
 
@@ -212,7 +212,7 @@ cmd_start_server() {
     # OctaneServer's stdin is the one way in left that is not argv, the
     # environment or disk (printf is a builtin: no process carries them as
     # arguments). Whether a build reads a sign-in there is unverified: one
-    # that does not just reports needs_login, and the VNC sign-in remains.
+    # that does not just reports needsLogin, and the VNC sign-in remains.
     log "launching OctaneServer, sign-in on its stdin"
     printf '%s\n%s\n' "$user" "$pass" | nohup OctaneServer > "$SERVER_LOG" 2>&1 &
   else
@@ -223,14 +223,16 @@ cmd_start_server() {
   user="" pass=""
   record_server_pid "$pid"
   log "OctaneServer launched (pid $pid)"
-  echo "OCTANE_STATE server_running"
+  echo "OCTANE_STATE serverRunning"
 }
 
-# One line, OCTANE_STATE <state>, for the app's octane_state:
-#   none            no OctaneServer running
-#   server_running  running, and its log says nothing yet about a license
-#   licensed        the last license line in its log is a success
-#   needs_login     the last license line is a failure: sign in over VNC
+# One line, OCTANE_STATE <state>. The app writes <state> verbatim to
+# nodes.octane_state, so it is spelled exactly as OctaneState
+# (src/shared/models.ts) spells it:
+#   none           no OctaneServer running
+#   serverRunning  running, and its log says nothing yet about a license
+#   licensed       the last license line in its log is a success
+#   needsLogin     the last license line is a failure: sign in over VNC
 cmd_status() {
   local pid last p
   pid="$(server_pid)"
@@ -243,9 +245,9 @@ cmd_status() {
   fi
   last="$(grep -aiE "($LOGIN_FAILED_RE)|($LICENSED_RE)" "$SERVER_LOG" 2> /dev/null | tail -1 || true)"
   if [ -z "$last" ]; then
-    echo "OCTANE_STATE server_running"
+    echo "OCTANE_STATE serverRunning"
   elif printf '%s\n' "$last" | grep -qiE "$LOGIN_FAILED_RE"; then
-    echo "OCTANE_STATE needs_login"
+    echo "OCTANE_STATE needsLogin"
   else
     echo "OCTANE_STATE licensed"
   fi
