@@ -5,8 +5,10 @@
  * and scales the fleet up/down within the user's limits.
  *
  * Single loop, event-kicked + 15s timer. All chunk/job state lives in
- * SQLite; the scheduler is restart-safe (in-flight chunks are re-attached by
- * re-reading the agent's state files).
+ * SQLite, so a restart loses no bookkeeping. It does lose in-flight work:
+ * nothing re-attaches to a render the previous process started. start()
+ * sends each such chunk back to pending, and its next dispatch renders its
+ * whole frame range again (see start()).
  */
 
 import { posix } from 'path'
@@ -738,9 +740,23 @@ class Scheduler {
 
   start(): void {
     // Restart recovery: chunks stranded in transient states (their ChunkRun
-    // died with the previous process) go back to pending. The node agent
-    // skips already-manifested frames, and downloads resume from the
-    // manifest, so re-dispatch only redoes unfinished work.
+    // died with the previous process) go back to pending, unassigned, with
+    // their range unchanged. Nothing narrows it around frames that already
+    // downloaded, and nothing re-attaches to the old render: resuming a node
+    // re-provisions it, which kills its Blender processes and clears its
+    // inbox (provision.sh `base`). So the re-dispatch renders the WHOLE range
+    // again, and is billed for it. The agent runs Blender over -s..-e and does
+    // not skip frames it has already manifested (Blender itself does only
+    // when the scene has Overwrite unchecked).
+    //
+    // It is worse on the node that had the chunk before. The manifest there
+    // keeps each re-rendered frame's OLD size and sha256, so a frame that had
+    // not been downloaded yet usually no longer verifies and is lost.
+    // requeue() keeps this chunk id for the first missing range, and a
+    // dispatch of it to the same node meets the same stale entries again,
+    // possibly until the retry budget runs out. All a restart saves is
+    // transfer: a frame already on local disk with its manifest's size and
+    // hash is not fetched again (downloadFileVerified).
     const db = getDb()
     const stranded = db
       .prepare(
@@ -757,7 +773,9 @@ class Scheduler {
     // you did not: a profile left with a day-old half-finished campaign starts
     // renting up to maxActiveNodes the moment the app opens, before you have
     // seen a single screen. Hold scale-up until it is confirmed. One node is
-    // not worth asking about; a fleet is.
+    // not worth asking about; a fleet is. Only chunks that were in flight
+    // count: a queue that had nothing in flight when the app closed is not
+    // held, and rents on the first tick.
     if (stranded.length > 0 && getSettings().maxActiveNodes > 1) {
       this.recoveryHold = stranded.length
       emit('alert', {
