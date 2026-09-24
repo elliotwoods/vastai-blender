@@ -269,6 +269,40 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
     expect(state()).toBe('none')
   })
 
+  it('1.18: a server that crashed into a zombie is launched again, not left "running"', () => {
+    vnc()
+    // What a crashed OctaneServer leaves in a container whose PID 1 never
+    // reaps: kill -0 still succeeds, the start time still matches, and pgrep
+    // still lists it.
+    const zombie = n.spawnZombie()
+    const lstart = spawnSync('ps', ['-p', String(zombie), '-o', 'lstart='], { encoding: 'utf8' })
+    writeFileSync(pidfile(), `${zombie}\n${lstart.stdout.trim().replace(/\s+/g, ' ')}\n`)
+    writeFileSync(serverLog(), 'License acquired\n')
+    n.setProcs([{ pid: zombie, name: 'OctaneServer', args: 'OctaneServer' }])
+
+    // Not licensed: nothing is running to hold the license.
+    expect(state()).toBe('none')
+    const r = n.octane(['start-server'])
+    expect(r.code, r.stdout + r.stderr).toBe(0)
+    expect(launches()).toHaveLength(1)
+    expect(serverPid()).not.toBe(zombie)
+    expect(r.stdout).not.toMatch(/already running|adopted/)
+  })
+
+  it('1.18: stop-server does not wait out its 30 s on a zombie', () => {
+    const zombie = n.spawnZombie()
+    writeFileSync(pidfile(), `${zombie}\n`)
+    n.setProcs([{ pid: zombie, name: 'OctaneServer', args: 'OctaneServer' }])
+    const t0 = Date.now()
+    expect(n.octane(['stop-server']).stdout).toMatch(/^OCTANE_STOPPED none$/m)
+
+    // A server that exits on SIGTERM but that nobody reaps has stopped.
+    const server = n.spawnUnreaped()
+    n.setProcs([{ pid: server, name: 'OctaneServer', args: 'OctaneServer' }])
+    expect(n.octane(['stop-server']).stdout).toMatch(/^OCTANE_STOPPED clean$/m)
+    expect(Date.now() - t0).toBeLessThan(4_000)
+  })
+
   it('1.18: install runs apt once; a repeated setup skips it', () => {
     expect(n.octane(['install']).code).toBe(0)
     expect(n.octane(['install']).stdout).toMatch(/already installed/)

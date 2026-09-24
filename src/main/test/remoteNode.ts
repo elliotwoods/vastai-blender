@@ -145,6 +145,16 @@ export interface RemoteNode {
   octaneLaunches(): OctaneLaunch[]
   /** A real, unrelated long-lived process (killed by dispose). */
   spawnBystander(): number
+  /**
+   * The pid of a real zombie: a process that has exited and that its parent
+   * never reaps, as in a container whose PID 1 reaps no orphans.
+   */
+  spawnZombie(): number
+  /**
+   * The pid of a real process that runs until SIGTERM, then exits and, with
+   * nobody to reap it, stays a zombie.
+   */
+  spawnUnreaped(): number
   alive(pid: number): boolean
   /** Set a file's mtime `seconds` into the past. */
   age(path: string, seconds: number): void
@@ -218,6 +228,31 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
     }
   }
 
+  /** Starts `body` in a subshell under a parent that never reaps; its pid. */
+  const spawnUnderNonReaper = (body: string): number => {
+    const out = join(rec, `unreaped.${bystanders.length}`)
+    const parent = spawn('/bin/bash', ['-c', `( ${body} ) & echo $! > '${out}'; exec sleep 300`], {
+      detached: true,
+      stdio: 'ignore'
+    })
+    parent.unref()
+    bystanders.push(parent.pid!)
+    for (let i = 0; i < 100 && !existsSync(out); i++) spawnSync('sleep', ['0.05'])
+    const pid = Number(readFileSync(out, 'utf8'))
+    // Killed before its parent at dispose, if it still runs by then.
+    bystanders.unshift(pid)
+    return pid
+  }
+
+  const waitForState = (pid: number, state: string): void => {
+    for (let i = 0; i < 100; i++) {
+      const r = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' })
+      if (r.stdout.includes(state)) return
+      spawnSync('sleep', ['0.05'])
+    }
+    throw new Error(`pid ${pid} never reached state ${state}`)
+  }
+
   const alive = (pid: number): boolean => {
     try {
       process.kill(pid, 0)
@@ -233,7 +268,7 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
     provision: (args, opts) => run(join(vastai, 'provision.sh'), args, opts),
     octane: (args, opts) => {
       const r = run(join(vastai, 'octane', 'setup_octane.sh'), args, opts)
-      settleOctane()
+      if (args[0] === 'start-server') settleOctane()
       return r
     },
     calls: () => {
@@ -268,6 +303,15 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
       bystanders.push(child.pid!)
       return child.pid!
     },
+    // The parent execs `sleep`, which never calls wait(), so the child it
+    // started is left unreaped once it exits. (The child outlives the exec:
+    // bash itself would reap it.)
+    spawnZombie: () => {
+      const pid = spawnUnderNonReaper('sleep 0.3')
+      waitForState(pid, 'Z')
+      return pid
+    },
+    spawnUnreaped: () => spawnUnderNonReaper('trap "exit 0" TERM; while :; do sleep 0.1; done'),
     alive,
     age: (path, seconds) => {
       const t = Date.now() / 1000 - seconds

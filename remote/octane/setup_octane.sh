@@ -71,6 +71,17 @@ log() { echo "[octane] $*"; }
 proc_start() { ps -p "$1" -o lstart= 2> /dev/null | awk '{$1=$1; print}'; }
 proc_args() { ps -p "$1" -o args= 2> /dev/null || true; }
 
+# Whether pid $1 is a process that still runs. kill -0 alone also succeeds for
+# a zombie: an OctaneServer that crashes after this script exits is
+# reparented, and in a container whose PID 1 never reaps it stays a zombie for
+# good. Taken for alive, it would be "already running" forever and never
+# launched again, status would read its dead log, and stop-server would wait
+# its full 30 s on it.
+proc_live() {
+  kill -0 "$1" 2> /dev/null || return 1
+  case "$(ps -p "$1" -o stat= 2> /dev/null)" in '' | *Z*) return 1 ;; esac
+}
+
 record_server_pid() {
   printf '%s\n%s\n' "$1" "$(proc_start "$1")" > "$PIDFILE.tmp" && mv -f "$PIDFILE.tmp" "$PIDFILE"
 }
@@ -83,7 +94,7 @@ server_pid() {
   [ -f "$PIDFILE" ] || return 0
   { IFS= read -r pid || true; IFS= read -r started || true; } < "$PIDFILE"
   case "$pid" in '' | *[!0-9]*) return 0 ;; esac
-  kill -0 "$pid" 2> /dev/null || return 0
+  proc_live "$pid" || return 0
   if [ -n "$started" ]; then
     [ "$(proc_start "$pid")" = "$started" ] || return 0
   else
@@ -95,7 +106,13 @@ server_pid() {
 
 # OctaneServer processes, whether or not the pidfile knows them: earlier
 # builds launched a second server on every setup and kept only the newest pid.
-all_server_pids() { pgrep -x OctaneServer 2> /dev/null || true; }
+# pgrep lists zombies too.
+all_server_pids() {
+  local p
+  for p in $(pgrep -x OctaneServer 2> /dev/null || true); do
+    if proc_live "$p"; then echo "$p"; fi
+  done
+}
 
 # The live process whose pid file $1 holds, if its command line looks like an
 # X or VNC server. X servers write .X0-lock as a space-padded pid.
@@ -105,7 +122,7 @@ live_display_pid_in() {
   IFS= read -r pid < "$1" || true
   pid="${pid//[[:space:]]/}"
   case "$pid" in '' | *[!0-9]*) return 0 ;; esac
-  kill -0 "$pid" 2> /dev/null || return 0
+  proc_live "$pid" || return 0
   case "$(proc_args "$pid")" in *vnc* | *Xorg* | *Xvfb* | *Xwayland*) echo "$pid" ;; esac
 }
 
@@ -173,7 +190,7 @@ EOF
   fi
   case "$lock_pid" in
     '' | *[!0-9]*) rm -f "$X_TMPDIR/.X0-lock" "$X_TMPDIR/.X11-unix/X0" ;;
-    *) kill -0 "$lock_pid" 2> /dev/null || rm -f "$X_TMPDIR/.X0-lock" "$X_TMPDIR/.X11-unix/X0" ;;
+    *) proc_live "$lock_pid" || rm -f "$X_TMPDIR/.X0-lock" "$X_TMPDIR/.X11-unix/X0" ;;
   esac
   # -localhost: only reachable via the SSH tunnel the app opens.
   vncserver :0 -localhost -geometry 1280x800 -depth 24 \
@@ -280,7 +297,7 @@ cmd_stop_server() {
   for _ in $(seq 30); do
     left=""
     for p in $pids; do
-      if kill -0 "$p" 2> /dev/null; then left="$left $p"; fi
+      if proc_live "$p"; then left="$left $p"; fi
     done
     if [ -z "$left" ]; then
       rm -f "$PIDFILE"
