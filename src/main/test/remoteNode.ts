@@ -133,6 +133,8 @@ export interface RemoteNode {
   home: string
   /** $VASTAI_HOME: the uploaded remote/ tree and everything the scripts write. */
   vastai: string
+  /** $X_TMPDIR: where X servers keep .X0-lock (/tmp on a node). */
+  xtmp: string
   provision(args: string[], opts?: RunOpts): ScriptResult
   octane(args: string[], opts?: RunOpts): ScriptResult
   /** Every stub call so far, "<name> <args>". */
@@ -143,8 +145,11 @@ export interface RemoteNode {
   setProcs(procs: Array<{ pid: number; name: string; args: string }>): void
   /** Each OctaneServer launch the stub saw, in order. */
   octaneLaunches(): OctaneLaunch[]
-  /** A real, unrelated long-lived process (killed by dispose). */
-  spawnBystander(): number
+  /**
+   * A real, unrelated long-lived process (killed by dispose), shown by ps as
+   * `argv0` (default `sleep`).
+   */
+  spawnBystander(argv0?: string): number
   /**
    * The pid of a real zombie: a process that has exited and that its parent
    * never reaps, as in a container whose PID 1 reaps no orphans.
@@ -265,6 +270,7 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
   return {
     home,
     vastai,
+    xtmp,
     provision: (args, opts) => run(join(vastai, 'provision.sh'), args, opts),
     octane: (args, opts) => {
       const r = run(join(vastai, 'octane', 'setup_octane.sh'), args, opts)
@@ -297,8 +303,8 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
       }
       return out
     },
-    spawnBystander: () => {
-      const child = spawn('sleep', ['300'], { detached: true, stdio: 'ignore' })
+    spawnBystander: (argv0) => {
+      const child = spawn('sleep', ['300'], { argv0, detached: true, stdio: 'ignore' })
       child.unref()
       bystanders.push(child.pid!)
       return child.pid!

@@ -115,7 +115,8 @@ all_server_pids() {
 }
 
 # The live process whose pid file $1 holds, if its command line looks like an
-# X or VNC server. X servers write .X0-lock as a space-padded pid.
+# X server, or with $2 = vnc only a VNC server (Xtightvnc, Xvnc, Xtigervnc).
+# X servers write .X0-lock as a space-padded pid.
 live_display_pid_in() {
   local pid=""
   [ -f "$1" ] || return 0
@@ -123,18 +124,22 @@ live_display_pid_in() {
   pid="${pid//[[:space:]]/}"
   case "$pid" in '' | *[!0-9]*) return 0 ;; esac
   proc_live "$pid" || return 0
-  case "$(proc_args "$pid")" in *vnc* | *Xorg* | *Xvfb* | *Xwayland*) echo "$pid" ;; esac
+  case "$(proc_args "$pid")" in
+    *vnc*) echo "$pid" ;;
+    *Xorg* | *Xvfb* | *Xwayland*) [ "${2:-}" = vnc ] || echo "$pid" ;;
+  esac
 }
 
-# pid of the X server on :0: TightVNC's own pid file ($HOME/.vnc/<host>:0.pid),
-# else the X lock, so a VNC started some other way is never started over.
+# pid of the X server on :0 (with $1 = vnc, only if it is a VNC server):
+# TightVNC's own pid file ($HOME/.vnc/<host>:0.pid), else the X lock, so a VNC
+# started some other way is never started over.
 display_pid() {
   local f pid
   for f in "$VNC_DIR"/*:0.pid; do
-    pid="$(live_display_pid_in "$f")"
+    pid="$(live_display_pid_in "$f" "${1:-}")"
     if [ -n "$pid" ]; then echo "$pid"; return 0; fi
   done
-  live_display_pid_in "$X_TMPDIR/.X0-lock"
+  live_display_pid_in "$X_TMPDIR/.X0-lock" "${1:-}"
 }
 
 cmd_install() {
@@ -173,11 +178,19 @@ openbox-session &
 xterm &
 EOF
   chmod +x "$VNC_DIR/xstartup"
-  pid="$(display_pid)"
+  pid="$(display_pid vnc)"
   if [ -n "$pid" ]; then
     # Never killed here: it may be the session the user is signing in on.
     log "VNC already running on :0 (pid $pid) — left as is"
     return 0
+  fi
+  pid="$(display_pid)"
+  if [ -n "$pid" ]; then
+    # Some images run their own X server on :0. It is not ours to stop, and
+    # nothing would listen on 5900 for the sign-in, so saying VNC is up would
+    # leave a node that needs a login with no way to make one.
+    log "display :0 is held by an X server that is not VNC (pid $pid: $(proc_args "$pid")) — left as is; no VNC sign-in on this node" >&2
+    exit 1
   fi
   # What a crashed server left would only make vncserver refuse :0 ("A VNC
   # server is already running as :0"). A lock whose process still lives is

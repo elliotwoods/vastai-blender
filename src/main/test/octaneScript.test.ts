@@ -159,6 +159,21 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
     expect(readFileSync(join(n.home, '.vnc', 'passwd'), 'utf8')).toBe('enc(second12)')
   })
 
+  it('1.18: start-vnc refuses a :0 held by an X server that is not VNC', () => {
+    // Some images run their own Xvfb on :0. Taken for a running VNC, nothing
+    // would listen on 5900 for the sign-in while the app believed VNC was up.
+    const xvfb = n.spawnBystander('Xvfb')
+    writeFileSync(join(n.xtmp, '.X0-lock'), `${String(xvfb).padStart(10)}\n`)
+    const r = n.octane(['start-vnc', 'vncpw123'])
+    expect(r.code).not.toBe(0)
+    expect(r.stderr).toMatch(/not VNC/)
+    expect(r.stdout).not.toMatch(/VNC already running/)
+    expect(n.calls().filter((c) => c.startsWith('vncserver'))).toEqual([])
+    expect(n.alive(xvfb)).toBe(true)
+    // It is still a display OctaneServer can run in.
+    expect(n.octane(['start-server']).code).toBe(0)
+  })
+
   it('1.18: a VNC that died is started again', () => {
     vnc()
     const vncPid = Number(readFileSync(vncPidFile(), 'utf8'))
