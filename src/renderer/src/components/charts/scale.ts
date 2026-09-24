@@ -256,3 +256,45 @@ export function stepHover(
       return undefined
   }
 }
+
+/** One line under a hover readout's values: a band, a marker, or a count of the rest. */
+export interface NoteRow {
+  kind: 'band' | 'marker' | 'more'
+  label: string
+}
+
+/** Most band or marker rows a hover readout lists before "+N more". */
+export const MAX_NOTE_ROWS = 3
+
+/**
+ * The band and marker rows for a hover readout at `x`: what lies within
+ * `reach` of it. Each band label is listed once, and several different
+ * labels collapse to `bandLabel` when the chart has one. Eight GPUs idle
+ * over the same minute are one "paid, idle" row, not eight under the eight
+ * series rows: a readout that tall outgrows a 200 px chart and is clipped
+ * by the fleet list's scrolling panel. Past `max`, the rest are counted.
+ */
+export function hoverNotes(
+  x: number,
+  reach: number,
+  bands: ReadonlyArray<{ fromMs: number; toMs: number; label: string }>,
+  markers: ReadonlyArray<{ atMs: number; label: string }>,
+  bandLabel?: string,
+  max = MAX_NOTE_ROWS
+): NoteRow[] {
+  const bandLabels = [
+    ...new Set(
+      bands.filter((b) => b.fromMs <= x + reach && b.toMs >= x - reach).map((b) => b.label)
+    )
+  ]
+  const markerLabels = markers.filter((m) => Math.abs(m.atMs - x) <= reach).map((m) => m.label)
+  const capped = (kind: 'band' | 'marker', labels: string[]): NoteRow[] => {
+    const rows: NoteRow[] = labels.slice(0, max).map((label) => ({ kind, label }))
+    if (labels.length > max) rows.push({ kind: 'more', label: `+${labels.length - max} more` })
+    return rows
+  }
+  return [
+    ...capped('band', bandLabels.length > 1 && bandLabel ? [bandLabel] : bandLabels),
+    ...capped('marker', markerLabels)
+  ]
+}

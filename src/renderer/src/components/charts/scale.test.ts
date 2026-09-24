@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   barSlot,
   holdStep,
+  hoverNotes,
   mergeIntervals,
   nearestIndex,
   niceCeil,
@@ -321,5 +322,60 @@ describe('summarize', () => {
   it('is null when nothing was read', () => {
     expect(summarize([null, null])).toBeNull()
     expect(summarize([])).toBeNull()
+  })
+})
+
+describe('hoverNotes', () => {
+  const idle = (gpu: number): { fromMs: number; toMs: number; label: string } => ({
+    fromMs: 0,
+    toMs: 600,
+    label: `GPU ${gpu} idle, run assigned`
+  })
+  const eightIdle = Array.from({ length: 8 }, (_, i) => idle(i))
+
+  it('lists eight GPUs idle over the same minute as one row under the chart’s band name', () => {
+    // Eight band rows under eight series rows outgrew the 200px chart and
+    // were clipped by the fleet list's scrolling panel.
+    expect(hoverNotes(300, 5, eightIdle, [], 'paid, idle')).toEqual([
+      { kind: 'band', label: 'paid, idle' }
+    ])
+  })
+
+  it('lists a band label once however many spans share it', () => {
+    const same = eightIdle.map((b) => ({ ...b, label: 'paid, idle' }))
+    expect(hoverNotes(300, 5, same, [])).toEqual([{ kind: 'band', label: 'paid, idle' }])
+  })
+
+  it('names the one band there is, even when the chart has a collective name', () => {
+    expect(hoverNotes(300, 5, [idle(3)], [], 'paid, idle')).toEqual([
+      { kind: 'band', label: 'GPU 3 idle, run assigned' }
+    ])
+  })
+
+  it('caps band and marker rows, counting the rest', () => {
+    const markers = Array.from({ length: 5 }, (_, i) => ({
+      atMs: 300 + i,
+      label: `chunk ${i} dispatched`
+    }))
+    expect(hoverNotes(300, 5, eightIdle, markers)).toEqual([
+      { kind: 'band', label: 'GPU 0 idle, run assigned' },
+      { kind: 'band', label: 'GPU 1 idle, run assigned' },
+      { kind: 'band', label: 'GPU 2 idle, run assigned' },
+      { kind: 'more', label: '+5 more' },
+      { kind: 'marker', label: 'chunk 0 dispatched' },
+      { kind: 'marker', label: 'chunk 1 dispatched' },
+      { kind: 'marker', label: 'chunk 2 dispatched' },
+      { kind: 'more', label: '+2 more' }
+    ])
+  })
+
+  it('lists only what lies within reach of the crosshair', () => {
+    const bands = [{ fromMs: 0, toMs: 100, label: 'early' }]
+    const markers = [
+      { atMs: 290, label: 'near' },
+      { atMs: 250, label: 'far' }
+    ]
+    expect(hoverNotes(300, 10, bands, markers)).toEqual([{ kind: 'marker', label: 'near' }])
+    expect(hoverNotes(105, 10, bands, [])).toEqual([{ kind: 'band', label: 'early' }])
   })
 })

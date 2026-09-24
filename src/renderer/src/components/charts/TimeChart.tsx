@@ -24,6 +24,7 @@ import { SCALE, TOKENS } from '../../lib/theme'
 import {
   barSlot,
   holdStep,
+  hoverNotes,
   mergeIntervals,
   nearestIndex,
   polylinePoints,
@@ -169,12 +170,8 @@ export function TimeChart({
   // What else sits under the crosshair: a band or marker within half a bucket
   // or a few pixels, whichever is wider — they rarely land on a sample exactly.
   const reach = Math.max((spanMs ?? 0) / 2, plotW > 0 ? (SNAP_PX / plotW) * windowMs : 0)
-  const bandsHere =
-    hoverX == null
-      ? []
-      : (bands ?? []).filter((b) => b.fromMs <= hoverX + reach && b.toMs >= hoverX - reach)
-  const markersHere =
-    hoverX == null ? [] : (markers ?? []).filter((m) => Math.abs(m.atMs - hoverX) <= reach)
+  const notes =
+    hoverX == null ? [] : hoverNotes(hoverX, reach, bands ?? [], markers ?? [], bandLabel)
 
   // A pinned series a filter has since removed must not leave the rest dimmed.
   const live = (id: string | null): string | null =>
@@ -434,16 +431,12 @@ export function TimeChart({
               {hoverValues[0] != null ? format(hoverValues[0]) : null}
             </div>
           )}
-          {bandsHere.map((b, i) => (
-            <div key={`b${i}`} style={tooltipRow}>
-              <span style={bandKey} />
-              <span style={{ color: TOKENS.textSecondary }}>{b.label}</span>
-            </div>
-          ))}
-          {markersHere.map((m, i) => (
-            <div key={`m${i}`} style={tooltipRow}>
-              <span style={markerKey} />
-              <span style={{ color: TOKENS.textSecondary }}>{m.label}</span>
+          {notes.map((n, i) => (
+            <div key={i} style={tooltipRow}>
+              {n.kind === 'more' ? null : <span style={n.kind === 'band' ? bandKey : markerKey} />}
+              <span style={{ color: n.kind === 'more' ? TOKENS.textMuted : TOKENS.textSecondary }}>
+                {n.label}
+              </span>
             </div>
           ))}
           {(tooltipExtra?.(hoverX, hoverValues) ?? []).map((line) => (
