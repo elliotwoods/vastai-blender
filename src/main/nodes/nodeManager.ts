@@ -299,6 +299,15 @@ class ManagedNode {
   }
 
   /**
+   * Destroying or destroyed: the node is on its way out, and no lifecycle
+   * step still running for it may move it back into the fleet.
+   */
+  get gone(): boolean {
+    const s = this.state
+    return s === 'destroying' || s === 'destroyed'
+  }
+
+  /**
    * GPU count and latest metrics WITHOUT building a snapshot. The scheduler
    * sizes GPU lanes from these, and the snapshot itself asks the scheduler for
    * slot info — going through `snapshot` here would recurse.
@@ -629,6 +638,13 @@ export class NodeManager {
         label: `vastai-blender ${id.slice(0, 8)}`
       })
       node.update({ instance_id: instanceId })
+      // The row is in the Fleet, destroy button and all, from before the
+      // create; a destroy that landed while it was in flight found no
+      // instance id and so destroyed nothing. The instance is ours to kill.
+      if (node.gone) {
+        await this.destroyAbandoned(node, instanceId)
+        return id
+      }
       void this.driveToReady(node, offer.machineId)
     } catch (e) {
       node.setState('failed', (e as Error).message)
@@ -638,15 +654,48 @@ export class NodeManager {
     return id
   }
 
+  /**
+   * Destroy the instance of a node that was destroyed before its instance id
+   * was recorded. destroyNode had no id to destroy, so it marked the node
+   * destroyed and moved on — and after that nothing else would ever touch
+   * the instance: accrueCosts, the Fleet and History all skip 'destroyed'
+   * rows, and the orphan sweep only runs at start-up.
+   */
+  private async destroyAbandoned(node: ManagedNode, instanceId: number): Promise<void> {
+    try {
+      await destroyInstance(instanceId)
+      node.setState('destroyed')
+    } catch (e) {
+      // As destroyNode does when its destroy throws: 'failed', with the
+      // instance id on the row, is the state that says "may still be
+      // billing" — clearFailed retries the destroy, and the orphan sweep
+      // counts a failed row's instance as untracked and destroys it.
+      node.setState('failed', `destroy failed: ${(e as Error).message}`)
+      emit('alert', {
+        level: 'error',
+        message: `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
+      })
+    }
+  }
+
   /** Poll vast until running + SSH reachable, then hand to provisioning. */
   private async driveToReady(node: ManagedNode, machineId: number | null): Promise<void> {
     const instanceId = node.snapshot.instanceId
     if (!instanceId) return
+    // Already gone before this started: the destroy came before the instance
+    // id was recorded (the race rentOffer checks for too), so nothing has
+    // destroyed the instance. A destroy from here on is destroyNode's to
+    // finish — it reads the id from the row — so the returns below leave the
+    // instance alone.
+    if (node.gone) {
+      await this.destroyAbandoned(node, instanceId)
+      return
+    }
     const deadline = Date.now() + 8 * 60_000
     try {
       let inst: RawInstance | null = null
       for (;;) {
-        if (node.state === 'destroying' || node.state === 'destroyed') return
+        if (node.gone) return
         inst = await showInstance(instanceId)
         if (inst?.actual_status === 'running') {
           const eps = sshEndpoints(inst)
@@ -695,7 +744,7 @@ export class NodeManager {
           budgetMs: FIRST_CONNECT_BUDGET_MS,
           initialDelayMs: 5_000,
           maxDelayMs: 30_000,
-          shouldAbort: () => node.state === 'destroying' || node.state === 'destroyed',
+          shouldAbort: () => node.gone,
           onRetry: (e, n, delayMs) =>
             emit('render:logLine', {
               nodeId: node.id,
@@ -706,13 +755,30 @@ export class NodeManager {
         }
       )
 
+      // shouldAbort is only asked between attempts. A destroy that lands
+      // during one closes the node's connection, but the attempt then opens a
+      // fresh one on its next endpoint, and that can succeed while the
+      // instance is still being torn down. Going on would bring the node back
+      // as 'provisioning' over 'destroying'/'destroyed'; drop the connection.
+      if (node.gone) {
+        node.closeSsh()
+        return
+      }
       node.setState('provisioning')
       if (this.onReady && node.ssh) {
         await this.onReady({ id: node.id, ssh: node.ssh })
       }
+      // Provisioning takes minutes, plenty of time to be destroyed in; a
+      // node that was must not end 'ready', where the scheduler would use it.
+      if (node.gone) return
       node.setState('ready')
       emit('alert', { level: 'info', message: `Node ${node.snapshot.gpuName} ready` })
     } catch (e) {
+      // Destroyed meanwhile: the retry gave up because of it (RetryAbortedError),
+      // or the connection destroyNode closed failed a command. Neither is the
+      // node failing. No 'failed' over 'destroyed', no blacklisted machine, no
+      // error alert, and no second destroy racing destroyNode's.
+      if (node.gone) return
       node.setState('failed', (e as Error).message)
       if (machineId != null) this.blacklist.add(machineId)
       emit('alert', { level: 'error', message: `Node failed: ${(e as Error).message}` })
