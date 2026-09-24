@@ -696,6 +696,11 @@ def test_render_publishes_last_progress():
         stamp = state.get("lastProgressAt")
         check("a render publishes lastProgressAt",
               isinstance(stamp, float) and started <= stamp <= state["updatedAt"])
+        # The heartbeat thread serialises the dict while the render loop fills
+        # these in; a key added mid-dump would fail that write.
+        check("the fields scan_line fills in are there from the first write",
+              {k: state.get(k, "absent") for k in ("engine", "preflight", "oom")}
+              == {"engine": None, "preflight": None, "oom": False})
 
 
 @contextlib.contextmanager

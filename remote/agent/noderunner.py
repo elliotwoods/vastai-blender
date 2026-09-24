@@ -81,14 +81,14 @@ added, so an older app reads a newer agent's state):
                               heartbeat never moves it, so a hung Blender
                               shows it falling behind updatedAt. Rendering
                               only: encoding makes no frame progress,
-    "oom": true               Blender reported running out of memory ("gpu"
-                              says on which card). The attempt is stopped
-                              there and fails with errorKind machine,
-    "engine": str             the engine the scene really renders with, once
+    "oom": bool               true once Blender reported running out of
+                              memory ("gpu" says on which card). The attempt
+                              is stopped there and fails, errorKind machine,
+    "engine": str|null        the engine the scene really renders with, once
                               Blender loaded it: cycles|eevee|octane|workbench
                               or another engine's id in lower case. The
                               spec's engine is only the app's label for it,
-    "preflight": {...}        preflight.py's report once Blender ran it:
+    "preflight": {...}|null   preflight.py's report once Blender ran it:
                               {ok, summary, missing, problems, warnings} }
   A failed state keeps every field it had and adds:
     "error": str              one readable line,
@@ -1248,6 +1248,12 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         "gpu": gpu,
         # Reset again as each attempt's Blender starts; see scan_line.
         "lastProgressAt": time.time(),
+        # Filled in by scan_line. Present from the start: the heartbeat thread
+        # serialises this dict while the render loop updates it, and a key
+        # added mid-dump would fail that write.
+        "engine": None,
+        "preflight": None,
+        "oom": False,
     })
     write_state(chunk_id, state)
 
