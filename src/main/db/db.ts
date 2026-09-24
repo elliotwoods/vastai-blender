@@ -24,7 +24,8 @@ export function getDb(): Db {
 
 /**
  * Bring an open database up to the current schema: create what is missing,
- * run the column migrations and the one-shot data backfills. Idempotent.
+ * run the column migrations and the one-shot data migrations (each behind a
+ * history_meta marker). Idempotent.
  *
  * Separate from getDb (which owns the file, WAL and foreign keys) so the test
  * harness builds its in-memory database through this same path, migrations
@@ -39,15 +40,20 @@ export function applySchema(db: Db): void {
   }
   migrate(db)
   backfillUsageLog(db)
+  resetGpuLearning(db)
 }
 
-const SCHEMA_VERSION = 5
+const SCHEMA_VERSION = 6
 
 /**
  * Column additions, which `CREATE TABLE IF NOT EXISTS` in schema.sql cannot
  * apply to an existing database. Each step is guarded by the column's actual
  * presence rather than the recorded version, so a DB that predates the version
  * bookkeeping (or one already patched by hand) converges either way.
+ *
+ * A new column goes at the end of its table in schema.sql too, in the order
+ * added here; db.test.ts checks that the original schema, migrated, matches a
+ * fresh database column for column.
  */
 function migrate(db: Db): void {
   if (!hasColumn(db, 'jobs', 'share_node')) {
@@ -76,7 +82,74 @@ function migrate(db: Db): void {
     // hold, as a JSON array of {start,end}. Chunk clips leave it null.
     db.exec('ALTER TABLE assets ADD COLUMN segments TEXT')
   }
+
+  // v6: what Phase 1 of the 2026-09 audit plan stores. schema.sql says what
+  // each column means; the notes here are about existing rows.
+
+  // Plan 1.2. Rows already 'destroyed' are stamped, or the billing predicate
+  // (an instance_id and no destroyed_at) would count every node this profile
+  // ever destroyed as billing still. When each went was never recorded: the
+  // stamp is its last metered minute, else started_at, else now. 'failed'
+  // rows stay null: that state already says "may still be billing", and only
+  // Vast can say otherwise.
+  addColumn(db, 'nodes', 'destroyed_at', 'INTEGER', () => {
+    db.prepare(
+      `UPDATE nodes SET destroyed_at = metered.last
+       FROM (SELECT node_id, MAX(ts) AS last FROM cost_log GROUP BY node_id) AS metered
+       WHERE nodes.id = metered.node_id AND nodes.state = 'destroyed'`
+    ).run()
+    db.prepare(
+      "UPDATE nodes SET destroyed_at = COALESCE(started_at, ?) WHERE state = 'destroyed' AND destroyed_at IS NULL"
+    ).run(Date.now())
+  })
+  // Plans 1.3, 1.4. Every build so far has labelled an instance
+  // `vastai-blender <first 8 of the node id>`, so existing rows are exact.
+  addColumn(db, 'nodes', 'label', 'TEXT', () => {
+    db.prepare("UPDATE nodes SET label = 'vastai-blender ' || substr(id, 1, 8)").run()
+  })
+  // Plan 1.18. octane_ready = 1 meant licensed; anything else becomes 'none',
+  // which is all octane_ready = 0 claimed.
+  addColumn(db, 'nodes', 'octane_state', "TEXT NOT NULL DEFAULT 'none'", () => {
+    db.prepare("UPDATE nodes SET octane_state = 'licensed' WHERE octane_ready = 1").run()
+  })
+  // Plan 1.17. Existing chunks may be dispatched at once, as now, and start
+  // with no infrastructure retries: what they already lost to machines is in
+  // `retries` and cannot be told apart after the fact.
+  addColumn(db, 'chunks', 'not_before', 'INTEGER')
+  addColumn(db, 'chunks', 'infra_retries', 'INTEGER NOT NULL DEFAULT 0')
+  addColumn(db, 'chunks', 'error_kind', 'TEXT')
+  // Plan 1.12. No existing job has a snapshot; they keep rendering blend_path.
+  addColumn(db, 'jobs', 'blend_sha256', 'TEXT')
+  addColumn(db, 'jobs', 'scene_path', 'TEXT')
+  // Plan 1.17's job breaker.
+  addColumn(db, 'jobs', 'attention', 'TEXT')
+  // Plan 1.11 (#226, #238). The rows themselves are wiped by resetGpuLearning.
+  addColumn(db, 'gpu_perf', 'num_gpus', 'INTEGER')
+  addColumn(db, 'gpu_slots', 'num_gpus', 'INTEGER')
+
   db.prepare('UPDATE schema_meta SET version = ?').run(SCHEMA_VERSION)
+}
+
+/**
+ * One migration step: add `column` unless it is there, then run `backfill`,
+ * in one transaction. `backfill` is also where an index on the column goes,
+ * which cannot live in schema.sql (see there). The step is guarded by the
+ * column alone, so a backfill that threw after its ALTER had committed would
+ * never run again; in one transaction, a failure takes the column with it
+ * and the whole step runs again at the next launch.
+ */
+function addColumn(
+  db: Db,
+  table: string,
+  column: string,
+  definition: string,
+  backfill?: () => void
+): void {
+  if (hasColumn(db, table, column)) return
+  db.transaction(() => {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+    backfill?.()
+  })()
 }
 
 function hasColumn(db: Db, table: string, column: string): boolean {
@@ -105,6 +178,55 @@ function backfillUsageLog(db: Db): void {
       String(Date.now())
     )
   })()
+}
+
+/**
+ * Throw away what gpu_perf and gpu_slots learned before they were per GPU
+ * (#226, #238). 93cbad4 switched both from per-node to per-GPU figures and
+ * converted nothing, so a total a 4-GPU node recorded is now read as one
+ * GPU's and multiplied by four again: offers of that model score 4x too
+ * high, and gpu_slots, which only ever keeps its best, seeds every node of
+ * the model at its hardware ceiling for good. Which rows hold node totals
+ * cannot be told — nothing recorded the GPU count behind a row, and
+ * updated_at moves with every sample — so both tables start again, once,
+ * behind a history_meta marker. Each re-learns from its next few chunks.
+ */
+function resetGpuLearning(db: Db): void {
+  const done = db.prepare("SELECT value FROM history_meta WHERE key = 'gpu_units_v1'").get()
+  if (done) return
+  db.transaction(() => {
+    db.prepare('DELETE FROM gpu_perf').run()
+    db.prepare('DELETE FROM gpu_slots').run()
+    db.prepare("INSERT INTO history_meta (key, value) VALUES ('gpu_units_v1', ?)").run(
+      String(Date.now())
+    )
+  })()
+}
+
+/** The app_state keys; schema.sql says what each holds. */
+export type AppStateKey = 'install_id' | 'recovery_hold' | 'account_hold'
+
+/**
+ * An app_state value, or null when the key was never written or was cleared.
+ * Takes the database rather than calling getDb(), so it works on whichever
+ * handle the caller has, the test harness's included.
+ */
+export function readAppState(db: Db, key: AppStateKey): string | null {
+  const row = db.prepare('SELECT value FROM app_state WHERE key = ?').get(key) as
+    { value: string } | undefined
+  return row?.value ?? null
+}
+
+/** Set an app_state key, stamping updated_at; null deletes it. */
+export function writeAppState(db: Db, key: AppStateKey, value: string | null): void {
+  if (value == null) {
+    db.prepare('DELETE FROM app_state WHERE key = ?').run(key)
+    return
+  }
+  db.prepare(
+    `INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).run(key, value, Date.now())
 }
 
 export function closeDb(): void {

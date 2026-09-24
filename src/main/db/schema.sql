@@ -1,6 +1,15 @@
 -- Operational data. Settings/secrets live in settings.json (see settings.ts);
 -- this DB is the durable record of jobs/chunks/frames/nodes/costs that lets
 -- the app resume cleanly after a restart.
+--
+-- This file runs on every launch, against old databases too, BEFORE db.ts's
+-- migrate() adds the columns they lack. So:
+--  - a column added to an existing table goes at the end of it, in the order
+--    migrate() adds it, so a fresh and an upgraded database end up alike
+--    (db.test.ts compares them);
+--  - an index on such a column is created in its migrate() step, never here:
+--    on an older database the column does not exist yet when this runs, and
+--    the CREATE INDEX would throw before migrate() could add it.
 
 CREATE TABLE IF NOT EXISTS schema_meta (
   version INTEGER NOT NULL
@@ -21,7 +30,18 @@ CREATE TABLE IF NOT EXISTS jobs (
   output_dir TEXT NOT NULL,
   cost_so_far REAL NOT NULL DEFAULT 0,
   submitted_at INTEGER NOT NULL,      -- epoch ms
-  share_node INTEGER NOT NULL DEFAULT 0  -- 0 = exclusive (one chunk per node), 1 = may co-run
+  share_node INTEGER NOT NULL DEFAULT 0, -- 0 = exclusive (one chunk per node), 1 = may co-run
+  -- The scene as submitted (plan 1.12). createJob copies the .blend into the
+  -- job's folder and the job renders that copy, so saving over blend_path
+  -- mid-render cannot change what the rest of the frames are rendered from.
+  -- Both null = a job from before snapshots, which renders blend_path as it
+  -- is now.
+  blend_sha256 TEXT,                  -- hex SHA-256 of the snapshot, which nodes cache it under
+  scene_path TEXT,                    -- absolute path of the snapshot
+  -- Why the job is waiting on the user instead of rendering: the same class
+  -- of error on two or more nodes (plan 1.17's breaker), or a scene that
+  -- failed preflight (1.16). Shown as written. Null = nothing needs the user.
+  attention TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -33,7 +53,19 @@ CREATE TABLE IF NOT EXISTS chunks (
   node_id TEXT,
   frames_done INTEGER NOT NULL DEFAULT 0,
   retries INTEGER NOT NULL DEFAULT 0,
-  assigned_at INTEGER              -- epoch ms of dispatch; null = never assigned
+  assigned_at INTEGER,             -- epoch ms of dispatch; null = never assigned
+  -- Retry policy (plan 1.17). `retries` counts failed attempts against
+  -- MAX_RETRIES, whatever failed. 1.17 keeps it for the scene's failures and
+  -- counts one that was the machine's or the network's (node gone, SSH
+  -- refused, a transient error) in infra_retries instead, so a dying node
+  -- cannot use up a chunk's render retries; the chunk then waits out a
+  -- backoff before it is dispatched again.
+  not_before INTEGER,                 -- epoch ms before which it is not dispatched; null = at once
+  infra_retries INTEGER NOT NULL DEFAULT 0,
+  -- The last failed attempt's class: what classify() made of the error
+  -- (transient | machine | account | job-deterministic | local-fs), or the
+  -- agent's own errorKind, e.g. scene from preflight (1.16). Null = no failure.
+  error_kind TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_job ON chunks(job_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_state ON chunks(state);
@@ -69,13 +101,29 @@ CREATE TABLE IF NOT EXISTS nodes (
   started_at INTEGER,                 -- epoch ms
   accumulated_cost REAL NOT NULL DEFAULT 0,
   eevee_capable INTEGER,              -- null = unprobed, 0/1
-  octane_ready INTEGER NOT NULL DEFAULT 0,
+  octane_ready INTEGER NOT NULL DEFAULT 0, -- 1 = OctaneServer licensed; octane_state below says more
   blender_versions TEXT NOT NULL DEFAULT '[]', -- JSON array
   last_error TEXT,
   -- Raw vast.ai offer string, kept verbatim ("Poland, PL" / "US" / "Quebec, CA").
   -- Normalised to a country only at read time, so a parser fix never needs a
   -- backfill. Drives the grid carbon intensity behind the CO2 estimates.
-  geolocation TEXT
+  geolocation TEXT,
+  -- When the app confirmed this node's instance gone: Vast acknowledged the
+  -- destroy, or no longer knows the instance (plan 1.2). Null = not
+  -- confirmed. A row with an instance_id and no destroyed_at may still be
+  -- billing, whatever its state says; that is the billing predicate.
+  destroyed_at INTEGER,               -- epoch ms
+  -- The Vast label the instance was created under, written with the row and
+  -- so before the create: the only way to find an instance whose create
+  -- reply was lost, and how the orphan sweep tells this profile's instances
+  -- from another's (plans 1.3, 1.4). Null = not recorded, by a build from
+  -- before 1.3; that label was 'vastai-blender ' and the first 8 characters
+  -- of id.
+  label TEXT,
+  -- Octane on this node (plan 1.18): none | server_running | licensed |
+  -- needs_login. needs_login is a server that is up without a license,
+  -- waiting for the user to sign in over VNC.
+  octane_state TEXT NOT NULL DEFAULT 'none'
 );
 
 CREATE TABLE IF NOT EXISTS assets (
@@ -98,12 +146,16 @@ CREATE INDEX IF NOT EXISTS idx_assets_job ON assets(job_id);
 -- Learned render throughput per GPU model (EWMA of frames/hour measured from
 -- our own completed chunks, PER GPU — node totals are divided by the node's
 -- GPU count) — feeds offer scoring so machine selection improves with every
--- render.
+-- render. Rows from before it was per GPU were wiped once (db.ts,
+-- resetGpuLearning), as were gpu_slots'.
 CREATE TABLE IF NOT EXISTS gpu_perf (
   gpu_name TEXT PRIMARY KEY,
   frames_per_hour REAL NOT NULL,
   samples INTEGER NOT NULL DEFAULT 1,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  -- GPU count of the node behind the latest sample, so a row says which
+  -- size of node taught it. Null = not recorded.
+  num_gpus INTEGER
 );
 
 -- Learned concurrency per GPU model: how many chunks ran side-by-side on a
@@ -117,7 +169,8 @@ CREATE TABLE IF NOT EXISTS gpu_slots (
   best_slots INTEGER NOT NULL,
   frames_per_hour REAL NOT NULL,      -- node throughput at best_slots, per GPU
   samples INTEGER NOT NULL DEFAULT 1,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  num_gpus INTEGER                    -- as gpu_perf.num_gpus
 );
 
 CREATE TABLE IF NOT EXISTS cost_log (
@@ -158,8 +211,49 @@ CREATE TABLE IF NOT EXISTS balance_log (
 );
 
 -- One-shot markers for data migrations that can't be expressed as CREATE TABLE
--- IF NOT EXISTS (currently just the cost_log → usage_log backfill).
+-- IF NOT EXISTS: backfill_v1 (the cost_log → usage_log backfill) and
+-- gpu_units_v1 (the per-GPU wipe of gpu_perf and gpu_slots). Value = epoch ms
+-- the migration ran.
 CREATE TABLE IF NOT EXISTS history_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+-- Per-GPU samples behind the Fleet screen's GPU usage graphs (Feature G): one
+-- row per GPU per metrics poll (15 s), so that a GPU sitting idle while it has
+-- work assigned, which costs money and showed nowhere before, stays visible
+-- after the fact. Feature G's metricsHistory holds the last few hours in
+-- memory, writes each poll here for longer ranges and restarts, and prunes
+-- this table to 7 days.
+CREATE TABLE IF NOT EXISTS node_metrics (
+  ts INTEGER NOT NULL,                -- epoch ms of the poll
+  node_id TEXT NOT NULL,
+  gpu_index INTEGER NOT NULL,         -- 0-based, nvidia-smi's order
+  -- Null values are a gap, not a zero: the node was unreachable or offline,
+  -- and a graph breaks its line there rather than drawing an idle GPU.
+  util REAL,                          -- 0-100
+  vram_used_gb REAL,
+  vram_total_gb REAL,
+  power_w REAL,
+  runs INTEGER                        -- chunk runs in flight on this GPU at the poll
+);
+CREATE INDEX IF NOT EXISTS idx_node_metrics_node ON node_metrics(node_id, ts);
+-- The fleet-wide graph and the 7-day prune read by time alone.
+CREATE INDEX IF NOT EXISTS idx_node_metrics_ts ON node_metrics(ts);
+
+-- Small state that must outlive a restart and has no better home, one row per
+-- key. Kept here rather than in settings.json because it belongs to this
+-- database's rows: an install id that labels its nodes' instances, holds that
+-- stand for its jobs and nodes. Keys (db.ts AppStateKey):
+--   install_id     this profile's random id, carried in every instance label
+--                  so the orphan sweep can tell this profile's instances from
+--                  another's (plan 1.3)
+--   recovery_hold  the start-up recovery hold, so a relaunch does not rent a
+--                  full fleet past it (plan 1.9)
+--   account_hold   renting paused because Vast credit ran low or out, and why
+--                  (plan 1.20)
+CREATE TABLE IF NOT EXISTS app_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,                -- the key owner's format; JSON where it has fields
+  updated_at INTEGER NOT NULL         -- epoch ms of the last write
 );
