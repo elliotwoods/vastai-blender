@@ -108,10 +108,13 @@ CREATE TABLE IF NOT EXISTS nodes (
   -- Normalised to a country only at read time, so a parser fix never needs a
   -- backfill. Drives the grid carbon intensity behind the CO2 estimates.
   geolocation TEXT,
-  -- When the app confirmed this node's instance gone: Vast acknowledged the
-  -- destroy, or no longer knows the instance (plan 1.2). Null = not
-  -- confirmed. A row with an instance_id and no destroyed_at may still be
-  -- billing, whatever its state says; that is the billing predicate.
+  -- When the app confirmed this node's instance gone (plan 1.2): Vast
+  -- answered the destroy with 404, or no longer knows the instance
+  -- (showInstance, or an init reconcile whose listInstances lacks it). Null =
+  -- not confirmed, whatever state says: a DELETE can answer 200 and leave
+  -- the instance running (#140). Only a row with an instance_id has anything
+  -- to confirm. When a node may be billing is the billing predicate, after
+  -- create_unknown_since below.
   destroyed_at INTEGER,               -- epoch ms
   -- The Vast label the instance was created under, written with the row and
   -- so before the create: the only way to find an instance whose create
@@ -125,7 +128,26 @@ CREATE TABLE IF NOT EXISTS nodes (
   -- a server that is up without a license, waiting for the user to sign in
   -- over VNC. none = no server known to be up: 1.18 checks the node itself
   -- before an Octane chunk goes to it.
-  octane_state TEXT NOT NULL DEFAULT 'none'
+  octane_state TEXT NOT NULL DEFAULT 'none',
+  -- Since when a create for this row has been out with no known result
+  -- (plans 1.2, 1.4): set as PUT /asks is sent; cleared when Vast answers
+  -- with the instance id or refuses (a 4xx), or when 1.4's label lookup
+  -- adopts the instance or finds none. While set, an instance may be billing
+  -- under `label` with its id known to nobody: the reply was lost, a 5xx or
+  -- a timeout came after Vast had acted, or the app stopped mid-create.
+  create_unknown_since INTEGER        -- epoch ms
+  -- The billing predicate (shared/nodeState.ts holdsInstance): the node may
+  -- be billing, and counts against the caps, is metered and is named in the
+  -- quit dialog, whatever its state, while
+  --   (instance_id IS NOT NULL AND destroyed_at IS NULL)
+  --   OR (instance_id IS NULL
+  --       AND (create_unknown_since IS NOT NULL OR state = 'requested'))
+  -- The 'requested' term is a create in flight, or one a crash cut short.
+  -- Neither half clears itself: init's reconcile must stamp destroyed_at on
+  -- every instance Vast no longer lists (rows an older build marked
+  -- 'destroyed' included), and run 1.4's lookup on every unknown create, not
+  -- only this session's, taking a settled row out of 'requested'; or those
+  -- rows fill the caps for good.
 );
 
 CREATE TABLE IF NOT EXISTS assets (

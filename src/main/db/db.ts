@@ -128,6 +128,34 @@ function migrate(db: Db): void {
   // Plan 1.11 (#226, #238). The rows themselves are wiped by resetGpuLearning.
   addColumn(db, 'gpu_perf', 'num_gpus', 'INTEGER')
   addColumn(db, 'gpu_slots', 'num_gpus', 'INTEGER')
+  // Plans 1.2, 1.4 (Phase 0 review). A row with no instance id whose create
+  // may have gone through, which the billing predicate must count: the caps
+  // and the meter would skip that instance otherwise. Existing rows say so
+  // in two ways:
+  //  - 'requested' or 'destroying': the create was in flight when the app
+  //    stopped (the row is written before PUT /asks);
+  //  - 'failed' by a create that threw after Vast may have acted, in
+  //    vastClient's words: a lost or cut reply (network error), a 5xx, a
+  //    reply that was not JSON; and every cancelledCreateUnknown row.
+  // A create Vast refused (a 4xx, a 200 without a contract) or that was
+  // never sent (no API key) made nothing, and stays null. So do 'destroyed'
+  // rows: setState cleared their message, and 1.3's reconcile shows a
+  // labelled instance that no row holds as unclaimed. When the create was
+  // sent was never recorded, so the stamp is now: later than the truth,
+  // which only makes 1.4's lookup wait longer before it calls the instance
+  // absent.
+  addColumn(db, 'nodes', 'create_unknown_since', 'INTEGER', () => {
+    db.prepare(
+      `UPDATE nodes SET create_unknown_since = ?
+       WHERE instance_id IS NULL
+         AND (state IN ('requested', 'destroying')
+           OR (state = 'failed'
+             AND (last_error LIKE 'cancelled while creating; the create''s outcome is unknown%'
+               OR last_error LIKE 'network error:%'
+               OR last_error LIKE 'vast.ai PUT /asks/%/ → 5__: %'
+               OR last_error LIKE 'vast.ai PUT /asks/%/: non-JSON response%')))`
+    ).run(Date.now())
+  })
 
   db.prepare('UPDATE schema_meta SET version = ?').run(SCHEMA_VERSION)
 }

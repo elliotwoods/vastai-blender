@@ -142,6 +142,19 @@ const DESTROYED_NEVER_UP = nodeId('d3d3d3d3')
 const FAILED_WITH_INSTANCE = nodeId('f1f1f1f1')
 const LIVE_OCTANE = nodeId('a1a1a1a1')
 
+// Rentals that never learned their instance id, each with the last_error
+// rentOffer's catch left: vastClient's words, the same in every build since
+// the first. The c rows may have created an instance; the e rows cannot.
+const MID_CREATE = nodeId('c1c1c1c1')
+const DESTROYED_MID_CREATE = nodeId('c2c2c2c2')
+const CREATE_REPLY_LOST = nodeId('c3c3c3c3')
+const CREATE_5XX = nodeId('c4c4c4c4')
+const CREATE_NOT_JSON = nodeId('c5c5c5c5')
+const CANCELLED_CREATE_UNKNOWN = nodeId('c6c6c6c6')
+const CREATE_REFUSED = nodeId('e1e1e1e1')
+const CREATE_NO_CONTRACT = nodeId('e2e2e2e2')
+const CREATE_NO_KEY = nodeId('e3e3e3e3')
+
 /**
  * Rows a user of the first release could have, in columns every schema since
  * has: a job mid-render, and nodes in each state the migration treats apart.
@@ -171,6 +184,25 @@ function seedV1Rows(db: Db): void {
   node.run(DESTROYED_NEVER_UP, null, 'destroyed', null, 0)
   node.run(FAILED_WITH_INSTANCE, 104, 'failed', T0, 0)
   node.run(LIVE_OCTANE, 105, 'ready', T0, 1)
+  const rental = db.prepare(
+    `INSERT INTO nodes (id, instance_id, state, gpu_name, num_gpus, dph_total, last_error)
+     VALUES (?, NULL, ?, 'RTX 4090', 1, 0.4, ?)`
+  )
+  // The app stopped while the create was out, before and after a destroy.
+  rental.run(MID_CREATE, 'requested', null)
+  rental.run(DESTROYED_MID_CREATE, 'destroying', null)
+  // Threw after Vast may have acted.
+  rental.run(CREATE_REPLY_LOST, 'failed', 'network error: fetch failed')
+  rental.run(CREATE_5XX, 'failed', 'vast.ai PUT /asks/9001/ → 502: <html>Bad Gateway</html>')
+  rental.run(CREATE_NOT_JSON, 'failed', 'vast.ai PUT /asks/9001/: non-JSON response: <html>')
+  // Refused, or never sent.
+  rental.run(
+    CREATE_REFUSED,
+    'failed',
+    'vast.ai PUT /asks/9001/ → 400: {"success": false, "error": "no_such_ask"}'
+  )
+  rental.run(CREATE_NO_CONTRACT, 'failed', 'create instance failed: offer unavailable')
+  rental.run(CREATE_NO_KEY, 'failed', 'No Vast.ai API key configured')
   const cost = db.prepare(
     'INSERT INTO cost_log (node_id, ts, dph_total, delta_cost) VALUES (?, ?, 1.6, 0.0267)'
   )
@@ -199,7 +231,34 @@ function seedV5Rows(db: Db): void {
     "INSERT INTO gpu_slots (gpu_name, best_slots, frames_per_hour, samples, updated_at) VALUES ('RTX 4090', 12, 400, 5, ?)"
   ).run(T0)
   db.prepare("UPDATE nodes SET geolocation = 'Poland, PL' WHERE id = ?").run(LIVE_OCTANE)
+  // Phase 0's cancelledCreateUnknown, which ran on this schema.
+  db.prepare(
+    `INSERT INTO nodes (id, instance_id, state, gpu_name, num_gpus, dph_total, last_error)
+     VALUES (?, NULL, 'failed', 'RTX 4090', 1, 0.4, ?)`
+  ).run(
+    CANCELLED_CREATE_UNKNOWN,
+    "cancelled while creating; the create's outcome is unknown: network error: fetch failed"
+  )
 }
+
+/** Rows seedV1Rows leaves whose create may have made an instance. */
+const UNKNOWN_V1 = [
+  MID_CREATE,
+  DESTROYED_MID_CREATE,
+  CREATE_REPLY_LOST,
+  CREATE_5XX,
+  CREATE_NOT_JSON
+]
+const UNKNOWN_V5 = [...UNKNOWN_V1, CANCELLED_CREATE_UNKNOWN]
+
+/**
+ * schema.sql's billing predicate, as written there (plan 1.2's holdsInstance
+ * in SQL): the rows that count against the caps and are metered.
+ */
+const HOLDS_INSTANCE = `(instance_id IS NOT NULL AND destroyed_at IS NULL)
+  OR (instance_id IS NULL AND (create_unknown_since IS NOT NULL OR state = 'requested'))`
+
+const ids = (rows: Row[]): string[] => rows.map((r) => String(r.id)).sort()
 
 describe('a fresh database', () => {
   it('has every column and table Phase 1 stores', () => {
@@ -207,7 +266,7 @@ describe('a fresh database', () => {
     const int = { type: 'INTEGER', notnull: 0, dflt: null }
     const text = { type: 'TEXT', notnull: 0, dflt: null }
 
-    // 1.2 billing predicate, 1.3/1.4 labels, 1.18 Octane
+    // 1.2 billing predicate, 1.3/1.4 labels, 1.18 Octane, 1.4 unknown creates
     expect(column(db, 'nodes', 'destroyed_at')).toEqual(int)
     expect(column(db, 'nodes', 'label')).toEqual(text)
     expect(column(db, 'nodes', 'octane_state')).toEqual({
@@ -215,6 +274,7 @@ describe('a fresh database', () => {
       notnull: 1,
       dflt: "'none'"
     })
+    expect(column(db, 'nodes', 'create_unknown_since')).toEqual(int)
     // 1.17 retry policy, 1.16 scene errors
     expect(column(db, 'chunks', 'not_before')).toEqual(int)
     expect(column(db, 'chunks', 'infra_retries')).toEqual({
@@ -271,9 +331,21 @@ describe('a fresh database', () => {
 })
 
 describe.each([
-  { name: 'the original schema (08937c1, v1)', sql: V1, version: 1, seed: seedV1Rows },
-  { name: 'the 9d4a64c schema (v5)', sql: V5, version: 5, seed: seedV5Rows }
-])('upgrading $name', ({ sql, version, seed }) => {
+  {
+    name: 'the original schema (08937c1, v1)',
+    sql: V1,
+    version: 1,
+    seed: seedV1Rows,
+    unknownCreates: UNKNOWN_V1
+  },
+  {
+    name: 'the 9d4a64c schema (v5)',
+    sql: V5,
+    version: 5,
+    seed: seedV5Rows,
+    unknownCreates: UNKNOWN_V5
+  }
+])('upgrading $name', ({ sql, version, seed, unknownCreates }) => {
   it('migrates to exactly the shape of a fresh database, empty or not', () => {
     const fresh = shape(freshDb())
     const empty = legacyDb(sql, version)
@@ -346,6 +418,9 @@ describe.each([
     const stamps = Object.fromEntries(
       all(db, 'SELECT id, destroyed_at FROM nodes').map((r) => [r.id, r.destroyed_at])
     )
+    const noInstanceId = [...unknownCreates, CREATE_REFUSED, CREATE_NO_CONTRACT, CREATE_NO_KEY].map(
+      (id) => [id, null]
+    )
     expect(stamps).toEqual({
       [DESTROYED_METERED]: T0 + 7 * MINUTE,
       // Never metered: when it came up is the nearest thing known.
@@ -355,15 +430,40 @@ describe.each([
       // 'failed' with an instance is the node that may be billing still.
       // Nothing but Vast can clear it; the migration must not.
       [FAILED_WITH_INSTANCE]: null,
-      [LIVE_OCTANE]: null
+      [LIVE_OCTANE]: null,
+      // No instance id and not 'destroyed': nothing was destroyed.
+      ...Object.fromEntries(noInstanceId)
     })
+  })
+
+  it('counts a create whose result never came as possibly billing (plans 1.2, 1.4; Phase 0 review)', () => {
+    // cancelledCreateUnknown's row, and every create that threw after Vast
+    // may have acted, has instance_id NULL. A predicate of "an instance id
+    // and no destroyed_at" skips them all, so an instance billing under the
+    // node's label would be neither capped nor metered.
+    const db = legacyDb(sql, version, seed)
+    applySchema(db)
+    expect(ids(all(db, 'SELECT id FROM nodes WHERE create_unknown_since IS NOT NULL'))).toEqual(
+      [...unknownCreates].sort()
+    )
+    // The send time was never recorded; the migration's stands in for it.
+    expect(
+      all(
+        db,
+        'SELECT DISTINCT create_unknown_since FROM nodes WHERE create_unknown_since IS NOT NULL'
+      )
+    ).toEqual([{ create_unknown_since: NOW }])
+
+    expect(ids(all(db, `SELECT id FROM nodes WHERE ${HOLDS_INSTANCE}`))).toEqual(
+      [FAILED_WITH_INSTANCE, LIVE_OCTANE, ...unknownCreates].sort()
+    )
   })
 
   it('records the label each node was rented under (plans 1.3, 1.4)', () => {
     const db = legacyDb(sql, version, seed)
     applySchema(db)
     const labels = all(db, 'SELECT id, label FROM nodes')
-    expect(labels).toHaveLength(5)
+    expect(labels.length).toBeGreaterThan(0)
     for (const { id, label } of labels) {
       expect(label).toBe(`vastai-blender ${String(id).slice(0, 8)}`)
     }
