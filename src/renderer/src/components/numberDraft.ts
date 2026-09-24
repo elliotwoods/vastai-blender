@@ -6,7 +6,8 @@
  * one saved `null` — uncapped — and an unparseable entry reads as '' from
  * such an input, so a typo could do the same. Here the draft is raw text,
  * judged only when the user is done with it, and blank is refused unless
- * the field says what blank means.
+ * the field says what blank means. fieldEvent() is the component's whole
+ * behaviour as transitions; NumberField only binds DOM events to it.
  */
 
 export interface NumberRules {
@@ -99,4 +100,118 @@ export function stepDraft(
   const decimals = (String(step).split('.')[1] ?? '').length
   const next = Number((from + dir * step).toFixed(decimals))
   return formatValue(clampRound(next, rules))
+}
+
+/** NumberField's editing state, between events. */
+export interface FieldState {
+  /** null = not editing: the field shows its `value`. A string = the user's draft. */
+  draft: string | null
+  /**
+   * The value this edit started from, moved on by an Enter commit, so a blur
+   * straight after Enter doesn't commit the same number a second time while
+   * the parent's `value` is still catching up.
+   */
+  base: number | null
+}
+
+export type FieldEvent =
+  /** focus arrived; `value` is the field's prop at that moment */
+  | { type: 'focus'; value: number | null }
+  | { type: 'change'; text: string }
+  /**
+   * Focus left. `windowOnly`: the window lost focus (alt-tab, a click in
+   * another app) while the field stayed the page's focused element — see
+   * leftWindowOnly().
+   */
+  | { type: 'blur'; windowOnly: boolean }
+  | { type: 'enter' }
+  | { type: 'escape' }
+  | { type: 'step'; dir: 1 | -1; step: number }
+
+export interface FieldResult {
+  state: FieldState
+  /** Present when this event finished an edit with a new value: call onCommit once. */
+  commit?: { value: number | null }
+  /** a fresh edit: select the text so typing replaces it */
+  select?: boolean
+}
+
+/**
+ * Everything NumberField does with an event, pure so the transitions that
+ * guard the spend cap are tested without a DOM. The component only binds
+ * DOM events to this and calls onCommit when a result carries `commit`.
+ *
+ * Only leaving the field inside the app finishes an edit. Chromium blurs the
+ * focused element when the whole window loses focus, so without that
+ * distinction a user who clears the spend cap on the way to a new one, then
+ * alt-tabs to check Vast prices, has committed "no cap" — and the scheduler
+ * may rent at any price until they come back (review of plan 1.14, #112).
+ * Window focus returning re-focuses the field; the kept draft and the value
+ * it started from survive that too.
+ */
+export function fieldEvent(
+  state: FieldState,
+  ev: FieldEvent,
+  rules: NumberRules = {}
+): FieldResult {
+  switch (ev.type) {
+    case 'focus':
+      // Back from another window, mid-edit: keep going where they left off.
+      if (state.draft != null) return { state }
+      return { state: { draft: formatValue(ev.value), base: ev.value }, select: true }
+    case 'change':
+      return { state: { ...state, draft: ev.text } }
+    case 'blur': {
+      if (ev.windowOnly || state.draft == null) return { state }
+      const r = resolveDraft(state.draft, state.base, rules)
+      return r.kind === 'commit'
+        ? { state: { draft: null, base: r.value }, commit: { value: r.value } }
+        : { state: { ...state, draft: null } }
+    }
+    case 'enter': {
+      if (state.draft == null) return { state }
+      const r = resolveDraft(state.draft, state.base, rules)
+      return r.kind === 'commit'
+        ? { state: { draft: r.text, base: r.value }, commit: { value: r.value } }
+        : { state: { ...state, draft: r.text } }
+    }
+    case 'escape':
+      if (state.draft == null) return { state }
+      return { state: { ...state, draft: formatValue(state.base) } }
+    case 'step':
+      if (state.draft == null) return { state }
+      return {
+        state: { ...state, draft: stepDraft(state.draft, ev.dir, ev.step, state.base, rules) }
+      }
+  }
+}
+
+/** The keys NumberField handles while editing, as events; null = not its key. */
+export function fieldKey(key: string, step: number): FieldEvent | null {
+  if (key === 'Enter') return { type: 'enter' }
+  if (key === 'Escape') return { type: 'escape' }
+  if (key === 'ArrowUp') return { type: 'step', dir: 1, step }
+  if (key === 'ArrowDown') return { type: 'step', dir: -1, step }
+  return null
+}
+
+/**
+ * What the field shows: the draft while editing, else the value — so a
+ * background refetch of `value` never overwrites what the user is typing.
+ */
+export function fieldText(state: FieldState, value: number | null): string {
+  return state.draft ?? formatValue(value)
+}
+
+/**
+ * Whether a blur is the window losing focus rather than the user leaving
+ * the field. Chromium blurs the focused element on window deactivation but
+ * leaves it `document.activeElement`, and the document no longer has focus;
+ * moving focus within the page clears activeElement to <body> for the blur.
+ */
+export function leftWindowOnly(
+  target: unknown,
+  doc: { activeElement: unknown; hasFocus(): boolean }
+): boolean {
+  return doc.activeElement === target || !doc.hasFocus()
 }

@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import { draftProblem, parseDraft, resolveDraft, stepDraft } from './numberDraft'
+import {
+  draftProblem,
+  fieldEvent,
+  fieldKey,
+  fieldText,
+  leftWindowOnly,
+  parseDraft,
+  resolveDraft,
+  stepDraft,
+  type FieldEvent,
+  type FieldState,
+  type NumberRules
+} from './numberDraft'
 
 describe('parseDraft', () => {
   it('reads plain decimals', () => {
@@ -108,5 +120,136 @@ describe('stepDraft', () => {
   it('stays in range', () => {
     expect(stepDraft('64', 1, 1, 64, { max: 64 })).toBe('64')
     expect(stepDraft('0', -1, 1, 0, { min: 0 })).toBe('0')
+  })
+})
+
+/** Run events through fieldEvent from rest, collecting what onCommit would receive. */
+function play(
+  value: number | null,
+  events: FieldEvent[],
+  rules: NumberRules = {}
+): { state: FieldState; commits: Array<number | null> } {
+  let state: FieldState = { draft: null, base: value }
+  const commits: Array<number | null> = []
+  for (const ev of events) {
+    const r = fieldEvent(state, ev, rules)
+    state = r.state
+    if (r.commit) commits.push(r.commit.value)
+  }
+  return { state, commits }
+}
+
+const focus = (value: number | null): FieldEvent => ({ type: 'focus', value })
+const type = (text: string): FieldEvent => ({ type: 'change', text })
+const leave: FieldEvent = { type: 'blur', windowOnly: false }
+const switchApp: FieldEvent = { type: 'blur', windowOnly: true }
+const noCap: NumberRules = { min: 0, allowBlank: true }
+
+describe('fieldEvent (plan 1.14)', () => {
+  it('never commits "no cap" when the window loses focus mid-edit (#112a)', () => {
+    // Backspace the spend cap on the way to a new one, then alt-tab to the
+    // browser to check Vast prices: that blur is the window's, not the
+    // user leaving the field. Committing it would uncap the scheduler until
+    // they came back.
+    const away = play(2, [focus(2), type(''), switchApp], noCap)
+    expect(away.commits).toEqual([])
+    expect(away.state.draft).toBe('')
+
+    // Coming back re-focuses the field: the draft, and what it started from,
+    // are still theirs. Typing on and leaving commits only the new cap.
+    const back = play(2, [focus(2), type(''), switchApp, focus(2), type('3'), leave], noCap)
+    expect(back.commits).toEqual([3])
+  })
+
+  it('does not reset a kept draft when a refetch moved the value while the user was away', () => {
+    const r = play(2, [focus(2), type('2.'), switchApp, focus(5)], noCap)
+    expect(r.state).toEqual({ draft: '2.', base: 2 })
+  })
+
+  it('does commit a deliberate blank when the user leaves the field in the app', () => {
+    expect(play(2, [focus(2), type(''), leave], noCap).commits).toEqual([null])
+  })
+
+  it('writes nothing per keystroke — only once, when the edit is done', () => {
+    const r = play(2, [focus(2), type(''), type('2'), type('2.'), type('2.5')], noCap)
+    expect(r.commits).toEqual([])
+    expect(play(2, [focus(2), type('2'), type('2.'), type('2.5'), leave]).commits).toEqual([2.5])
+  })
+
+  it('commits once for Enter then the blur that follows it', () => {
+    const r = play(2, [focus(2), type('4'), { type: 'enter' }, leave])
+    expect(r.commits).toEqual([4])
+    expect(r.state).toEqual({ draft: null, base: 4 })
+  })
+
+  it('selects the text only when an edit starts', () => {
+    expect(fieldEvent({ draft: null, base: 2 }, focus(2)).select).toBe(true)
+    expect(fieldEvent({ draft: '', base: 2 }, focus(2)).select).toBeUndefined()
+  })
+
+  it('writes nothing when tabbed through', () => {
+    expect(play(2, [focus(2), leave]).commits).toEqual([])
+  })
+
+  it('puts the value this edit started from back on Escape, and commits nothing', () => {
+    const r = play(2, [focus(2), type(''), { type: 'escape' }, leave], noCap)
+    expect(r.commits).toEqual([])
+  })
+
+  it('steps the draft on arrows without committing', () => {
+    const r = play(2, [focus(2), { type: 'step', dir: 1, step: 0.5 }], noCap)
+    expect(r).toEqual({ state: { draft: '2.5', base: 2 }, commits: [] })
+  })
+
+  it('ignores keys and blurs that arrive while not editing', () => {
+    for (const ev of [leave, switchApp, { type: 'enter' }, { type: 'escape' }] as FieldEvent[]) {
+      expect(fieldEvent({ draft: null, base: 2 }, ev)).toEqual({
+        state: { draft: null, base: 2 }
+      })
+    }
+  })
+})
+
+describe('fieldKey', () => {
+  it('maps the field’s own keys and leaves the rest alone', () => {
+    expect(fieldKey('Enter', 1)).toEqual({ type: 'enter' })
+    expect(fieldKey('Escape', 1)).toEqual({ type: 'escape' })
+    expect(fieldKey('ArrowUp', 0.1)).toEqual({ type: 'step', dir: 1, step: 0.1 })
+    expect(fieldKey('ArrowDown', 1)).toEqual({ type: 'step', dir: -1, step: 1 })
+    expect(fieldKey('Tab', 1)).toBeNull()
+    expect(fieldKey('a', 1)).toBeNull()
+  })
+})
+
+describe('fieldText', () => {
+  it('shows the draft over a refetched value while editing, the value otherwise', () => {
+    expect(fieldText({ draft: '2.', base: 2 }, 3)).toBe('2.')
+    expect(fieldText({ draft: '', base: 2 }, 2)).toBe('')
+    expect(fieldText({ draft: null, base: 2 }, 3)).toBe('3')
+    expect(fieldText({ draft: null, base: null }, null)).toBe('')
+  })
+})
+
+describe('leftWindowOnly', () => {
+  const field = {}
+  const doc = (
+    activeElement: unknown,
+    hasFocus: boolean
+  ): { activeElement: unknown; hasFocus: () => boolean } => ({
+    activeElement,
+    hasFocus: () => hasFocus
+  })
+
+  it('reads a blur that leaves the field focused as the window going away', () => {
+    expect(leftWindowOnly(field, doc(field, false))).toBe(true)
+    expect(leftWindowOnly(field, doc(field, true))).toBe(true)
+  })
+
+  it('reads a blur while the page has lost focus as the window going away', () => {
+    expect(leftWindowOnly(field, doc({}, false))).toBe(true)
+  })
+
+  it('reads focus moving within the page as leaving the field', () => {
+    expect(leftWindowOnly(field, doc({ tagName: 'BODY' }, true))).toBe(false)
   })
 })

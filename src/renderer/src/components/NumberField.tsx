@@ -14,12 +14,27 @@
  * and flagged while typing, so the range is visible before it applies.
  *
  * While the field has focus, the draft is the user's: a background refetch
- * of `value` does not overwrite what they are typing.
+ * of `value` does not overwrite what they are typing. Switching to another
+ * app mid-edit is not finishing it: the draft waits, uncommitted, for the
+ * user to come back.
+ *
+ * The behaviour lives in numberDraft's fieldEvent(), with tests; this file
+ * only binds DOM events to it.
  */
 
 import { useRef, useState, type CSSProperties } from 'react'
 import { input, mono, type ControlSize } from '../lib/controls'
-import { draftProblem, formatValue, resolveDraft, stepDraft, type NumberRules } from './numberDraft'
+import {
+  draftProblem,
+  fieldEvent,
+  fieldKey,
+  fieldText,
+  leftWindowOnly,
+  type FieldEvent,
+  type FieldResult,
+  type FieldState,
+  type NumberRules
+} from './numberDraft'
 
 export interface NumberFieldProps {
   value: number | null
@@ -58,24 +73,21 @@ export function NumberField({
   'aria-label': ariaLabel,
   style
 }: NumberFieldProps): React.JSX.Element {
-  // null = not editing: the field shows `value`. A string = the user's draft.
-  const [draft, setDraft] = useState<string | null>(null)
-  // The value this edit started from, moved on by an Enter commit, so a blur
-  // straight after Enter doesn't commit the same number a second time while
-  // the parent's `value` is still catching up.
-  const base = useRef<number | null>(value)
+  const [state, setState] = useState<FieldState>({ draft: null, base: value })
+  // Read by the handlers, so an Enter and the blur straight after it each see
+  // the state the other left, whether or not React has rendered in between.
+  const live = useRef(state)
   const rules: NumberRules = { min, max, integer, allowBlank: allowBlank != null }
 
-  const finish = (text: string): string => {
-    const r = resolveDraft(text, base.current, rules)
-    if (r.kind === 'commit') {
-      base.current = r.value
-      onCommit(r.value)
-    }
-    return r.text
+  const dispatch = (ev: FieldEvent): FieldResult => {
+    const r = fieldEvent(live.current, ev, rules)
+    live.current = r.state
+    setState(r.state)
+    if (r.commit) onCommit(r.commit.value)
+    return r
   }
 
-  const problem = draft == null ? null : draftProblem(draft, rules)
+  const problem = state.draft == null ? null : draftProblem(state.draft, rules)
 
   return (
     <input
@@ -87,29 +99,19 @@ export function NumberField({
       title={problem ?? undefined}
       disabled={disabled}
       placeholder={allowBlank}
-      value={draft ?? formatValue(value)}
+      value={fieldText(state, value)}
       onFocus={(e) => {
-        base.current = value
-        setDraft(formatValue(value))
-        e.currentTarget.select()
+        if (dispatch({ type: 'focus', value }).select) e.currentTarget.select()
       }}
-      onChange={(e) => setDraft(e.target.value)}
-      onBlur={() => {
-        if (draft != null) finish(draft)
-        setDraft(null)
-      }}
+      onChange={(e) => dispatch({ type: 'change', text: e.target.value })}
+      onBlur={(e) =>
+        dispatch({ type: 'blur', windowOnly: leftWindowOnly(e.currentTarget, document) })
+      }
       onKeyDown={(e) => {
-        if (draft == null) return
-        if (e.key === 'Enter') {
-          e.preventDefault()
-          setDraft(finish(draft))
-        } else if (e.key === 'Escape') {
-          e.preventDefault()
-          setDraft(formatValue(base.current))
-        } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-          e.preventDefault()
-          setDraft(stepDraft(draft, e.key === 'ArrowUp' ? 1 : -1, step, base.current, rules))
-        }
+        const ev = fieldKey(e.key, step)
+        if (ev == null || live.current.draft == null) return
+        e.preventDefault()
+        dispatch(ev)
       }}
       style={{ ...input({ size, invalid: problem != null }), ...mono, width, ...style }}
     />
