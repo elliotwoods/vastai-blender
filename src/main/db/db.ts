@@ -107,11 +107,13 @@ function migrate(db: Db): void {
   addColumn(db, 'nodes', 'label', 'TEXT', () => {
     db.prepare("UPDATE nodes SET label = 'vastai-blender ' || substr(id, 1, 8)").run()
   })
-  // Plan 1.18. octane_ready = 1 meant licensed; anything else becomes 'none',
-  // which is all octane_ready = 0 claimed.
-  addColumn(db, 'nodes', 'octane_state', "TEXT NOT NULL DEFAULT 'none'", () => {
-    db.prepare("UPDATE nodes SET octane_state = 'licensed' WHERE octane_ready = 1").run()
-  })
+  // Plan 1.18. Every existing row starts at 'none', octane_ready = 1 or not:
+  // the check that set it (#85) tested for success before failure, so
+  // 'Failed to acquire license' set it too, and a node carried across the
+  // upgrade as 'licensed' would never have its license checked again. 1.18
+  // reads the state off the node instead: setupOctane skips a server that is
+  // already up, and the corrected check says licensed or needsLogin.
+  addColumn(db, 'nodes', 'octane_state', "TEXT NOT NULL DEFAULT 'none'")
   // Plan 1.17. Existing chunks may be dispatched at once, as now, and start
   // with no infrastructure retries: what they already lost to machines is in
   // `retries` and cannot be told apart after the fact.

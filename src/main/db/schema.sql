@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   started_at INTEGER,                 -- epoch ms
   accumulated_cost REAL NOT NULL DEFAULT 0,
   eevee_capable INTEGER,              -- null = unprobed, 0/1
-  octane_ready INTEGER NOT NULL DEFAULT 0, -- 1 = OctaneServer licensed; octane_state below says more
+  octane_ready INTEGER NOT NULL DEFAULT 0, -- 1 = the license check passed, which #85 made unreliable; see octane_state
   blender_versions TEXT NOT NULL DEFAULT '[]', -- JSON array
   last_error TEXT,
   -- Raw vast.ai offer string, kept verbatim ("Poland, PL" / "US" / "Quebec, CA").
@@ -120,9 +120,11 @@ CREATE TABLE IF NOT EXISTS nodes (
   -- before 1.3; that label was 'vastai-blender ' and the first 8 characters
   -- of id.
   label TEXT,
-  -- Octane on this node (plan 1.18): none | server_running | licensed |
-  -- needs_login. needs_login is a server that is up without a license,
-  -- waiting for the user to sign in over VNC.
+  -- Octane on this node (plan 1.18), spelled as shared/models.ts's
+  -- OctaneState: none | serverRunning | licensed | needsLogin. needsLogin is
+  -- a server that is up without a license, waiting for the user to sign in
+  -- over VNC. none = no server known to be up: 1.18 checks the node itself
+  -- before an Octane chunk goes to it.
   octane_state TEXT NOT NULL DEFAULT 'none'
 );
 

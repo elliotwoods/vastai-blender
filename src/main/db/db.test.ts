@@ -369,13 +369,16 @@ describe.each([
     }
   })
 
-  it('carries a confirmed Octane license into octane_state (plan 1.18)', () => {
+  it('does not carry octane_ready into octane_state: #85 set it on a failed license (plan 1.18)', () => {
+    // octaneLicense tested /acquir|success/ before /fail/, so "Failed to
+    // acquire license" read as licensed. As 'licensed', the node would never
+    // be checked again; as 'none', 1.18 checks the node itself.
     const db = legacyDb(sql, version, seed)
     applySchema(db)
-    expect(all(db, "SELECT id FROM nodes WHERE octane_state = 'licensed'")).toEqual([
-      { id: LIVE_OCTANE }
-    ])
-    expect(get(db, "SELECT COUNT(*) AS n FROM nodes WHERE octane_state = 'none'")).toEqual({ n: 4 })
+    expect(
+      get(db, 'SELECT octane_ready, octane_state FROM nodes WHERE id = ?', LIVE_OCTANE)
+    ).toEqual({ octane_ready: 1, octane_state: 'none' })
+    expect(all(db, 'SELECT DISTINCT octane_state FROM nodes')).toEqual([{ octane_state: 'none' }])
   })
 
   it('forgets what gpu_perf and gpu_slots learned per node, exactly once (plan 1.11, #226, #238)', () => {
