@@ -62,7 +62,9 @@ export class LocalSinkError extends Error {
     readonly code: string,
     message: string,
     /** The local path the failing step was writing. */
-    readonly path?: string
+    readonly path?: string,
+    /** For a free-space check that failed: the bytes it needed on top of the reserve. */
+    readonly needBytes?: number
   ) {
     super(message)
   }

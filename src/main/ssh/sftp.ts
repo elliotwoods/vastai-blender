@@ -498,7 +498,8 @@ async function ensureRoom(dir: string, bytes: number): Promise<void> {
   throw new LocalSinkError(
     'ENOSPC',
     `not enough free space in ${dir}: ${mb(free)} free, ${mb(bytes)} to download, and ${mb(LOCAL_FREE_RESERVE_BYTES)} kept free`,
-    dir
+    dir,
+    bytes
   )
 }
 

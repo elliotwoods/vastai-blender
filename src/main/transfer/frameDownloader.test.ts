@@ -1,10 +1,11 @@
 import { createHash } from 'crypto'
-import { existsSync, mkdirSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, promises as fsp, writeFileSync, type StatsFs } from 'fs'
 import { dirname, join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { SFTPWrapper } from 'ssh2'
 import type { SshConnection } from '../ssh/sshConnection'
 import { REMOTE_ROOT } from '../test/fakeSsh'
-import { setup, type FakeMachine, type World } from '../test/harness'
+import { HANG, setup, type FakeMachine, type World } from '../test/harness'
 import type { ChunkDownloader, DrainResult } from './frameDownloader'
 import type { ParsedManifest } from './manifest'
 
@@ -23,6 +24,7 @@ interface Rig {
   jobId: string
   chunkId: string
   machine: FakeMachine
+  conn: SshConnection
   downloader: ChunkDownloader
 }
 
@@ -55,7 +57,7 @@ async function rig(frames = { start: 1, end: 4, step: 1 }): Promise<Rig> {
     remoteChunkDir: `${REMOTE_ROOT}/renders/${chunkId}`,
     frames
   })
-  return { jobId, chunkId, machine, downloader }
+  return { jobId, chunkId, machine, conn, downloader }
 }
 
 /** drain() to completion on the fake clock. */
@@ -82,9 +84,13 @@ const manifest = /manifest\.jsonl/
  * whatever Blender printed "Saved:" for. `onNode: false` lists a file that
  * is not there (any more).
  */
-function saved(r: Rig, file: string, opts: { onNode?: boolean } = {}): void {
+function saved(r: Rig, file: string, opts: { onNode?: boolean; size?: number } = {}): void {
   const dir = `${REMOTE_ROOT}/renders/${r.chunkId}`
-  const data = Buffer.from(`fake render ${r.chunkId} ${file}\n`, 'utf-8')
+  let data = Buffer.from(`fake render ${r.chunkId} ${file}\n`, 'utf-8')
+  if (opts.size) {
+    data = Buffer.alloc(opts.size)
+    for (let i = 0; i < opts.size; i++) data[i] = (i * 13 + file.length) & 0xff
+  }
   if (opts.onNode !== false) r.machine.files.set(`${dir}/${file}`, data)
   const line = {
     kind: 'frame',
@@ -108,7 +114,7 @@ describe('ChunkDownloader.drain', () => {
     const result = await drain(r)
 
     expect(r.machine.ran(manifest)).toHaveLength(3)
-    expect(result).toEqual({ manifestRead: true, lost: [] })
+    expect(result).toEqual({ manifestRead: true, lost: [], localSinkBlocked: [] })
     expect(downloaded(r.jobId)).toEqual([1, 2, 3, 4])
   })
 
@@ -147,7 +153,7 @@ describe('ChunkDownloader.drain', () => {
     // cat exits 1 with nothing on stdout: a chunk that failed before its first frame.
     const result = await drain(r)
 
-    expect(result).toEqual({ manifestRead: true, lost: [] })
+    expect(result).toEqual({ manifestRead: true, lost: [], localSinkBlocked: [] })
     expect(r.machine.ran(manifest)).toHaveLength(1)
     expect(Date.now()).toBe(started)
   })
@@ -209,7 +215,7 @@ describe("frames that are not the chunk's", () => {
 
     const result = await drain(r)
 
-    expect(result).toEqual({ manifestRead: true, lost: [] })
+    expect(result).toEqual({ manifestRead: true, lost: [], localSinkBlocked: [] })
     expect(downloaded(r.jobId)).toEqual([2, 3])
     expect(['0001', '0004', '0009'].some((f) => local(r, `frames/${f}.png`))).toBe(false)
   })
@@ -242,7 +248,7 @@ describe('frames saved one file per view', () => {
 
     const result = await drain(r)
 
-    expect(result).toEqual({ manifestRead: true, lost: [] })
+    expect(result).toEqual({ manifestRead: true, lost: [], localSinkBlocked: [] })
     expect(downloaded(r.jobId)).toEqual([1, 2, 3, 4])
     const jobDir = join(w.settings.projectRoot, 'renders', r.jobId)
     for (const v of ['_L', '_R']) expect(existsSync(join(jobDir, `frames/0004${v}.png`))).toBe(true)
@@ -316,7 +322,7 @@ describe('frames saved one file per view', () => {
 
     const result = await drain(r)
 
-    expect(result).toEqual({ manifestRead: true, lost: [] })
+    expect(result).toEqual({ manifestRead: true, lost: [], localSinkBlocked: [] })
     expect(downloaded(r.jobId)).toEqual([1, 2, 3, 4])
   })
 })
@@ -345,5 +351,308 @@ describe('unlinkLater', () => {
     await w.advance(1_000)
 
     for (const p of outside) expect(existsSync(p)).toBe(true)
+  })
+})
+
+/** Every frame 1-4 of the chunk saved on the node and listed, at `size` bytes each. */
+function savedAll(r: Rig, size?: number): void {
+  for (const f of [1, 2, 3, 4]) saved(r, `frames/000${f}.exr`, { size })
+}
+
+describe('the final pass on a slow or dead link (1.10 #242, #243)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.doUnmock('../ssh/sftp')
+  })
+
+  /**
+   * A thin link: reads are answered one at a time, `perReadMs` apart, in the
+   * order asked. Every transfer keeps moving, just slowly.
+   */
+  function thinLink(conn: SshConnection, perReadMs: number): void {
+    const open = conn.sftp.bind(conn)
+    let linkFree = 0
+    conn.sftp = (async (opts?: { timeoutMs?: number }) => {
+      const sftp = await open(opts)
+      return new Proxy(sftp, {
+        get(target, key) {
+          if (key === 'read') {
+            return (...args: Parameters<SFTPWrapper['read']>) => {
+              const cb = args[5]
+              const at = Math.max(Date.now(), linkFree) + perReadMs
+              linkFree = at
+              target.read(args[0], args[1], args[2], args[3], args[4], (err, n, buf, pos) => {
+                setTimeout(() => cb(err, n, buf, pos), at - Date.now())
+              })
+            }
+          }
+          const v = Reflect.get(target, key) as unknown
+          return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v
+        }
+      })
+    }) as typeof conn.sftp
+  }
+
+  it('1.10 #242: a slow pass that keeps moving is not cut off (the 10-minute budget re-rendered delivered frames)', async () => {
+    const r = await rig()
+    // 4 × ~1 MB over a link that lands one 32 KB read every 6 s: about 13
+    // minutes. No transfer stalls; the old absolute budget cut it at 10. One
+    // transfer at a time: this first-come link would otherwise make the
+    // third wait out the first two's reads, longer than a stall.
+    w.settings.concurrentTransfersPerNode = 1
+    savedAll(r, 1_000_000)
+    thinLink(r.conn, 6_000)
+    const started = Date.now()
+
+    let out: DrainResult | null = null
+    void r.downloader.drain().then((d) => (out = d))
+    await w.until(() => out !== null, 'drain returns', { timeoutMs: 30 * 60_000, stepMs: 2_000 })
+
+    expect(out).toEqual({ manifestRead: true, lost: [], localSinkBlocked: [] })
+    expect(downloaded(r.jobId)).toEqual([1, 2, 3, 4])
+    expect(Date.now() - started).toBeGreaterThan(10 * 60_000)
+    expect(w.alerts().filter((a) => /download failed|abandoned|giving up/.test(a))).toEqual([])
+  })
+
+  it('a pass that lands nothing is given up on within minutes, its frames lost', async () => {
+    const { DRAIN_IDLE_MS } = await import('./frameDownloader')
+    const r = await rig()
+    savedAll(r, 100_000)
+    r.machine.onSftp('read', HANG)
+    const started = Date.now()
+
+    let out: DrainResult | null = null
+    void r.downloader.drain().then((d) => (out = d))
+    await w.until(() => out !== null, 'drain returns', { timeoutMs: 30 * 60_000 })
+
+    expect(out!.lost.sort()).toEqual([1, 2, 3, 4].map((f) => `frames/000${f}.exr`))
+    expect(Date.now() - started).toBeLessThanOrEqual(DRAIN_IDLE_MS + 30_000)
+    expect(downloaded(r.jobId)).toEqual([])
+  })
+
+  /**
+   * downloadFileVerified replaced: each call waits until the test settles it
+   * or its signal aborts, as a transfer with no watchdog of its own would.
+   */
+  function heldDownloads(): Array<{
+    file: string
+    aborted: boolean
+    settled: boolean
+    finish: () => void
+  }> {
+    const calls: ReturnType<typeof heldDownloads> = []
+    vi.doMock('../ssh/sftp', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../ssh/sftp')>()),
+      downloadFileVerified: (
+        _ssh: unknown,
+        remotePath: string,
+        _local: string,
+        _expected: unknown,
+        opts: { signal?: AbortSignal } = {}
+      ): Promise<'downloaded'> =>
+        new Promise((resolve, reject) => {
+          const call = {
+            file: remotePath.split('/').slice(-2).join('/'),
+            aborted: false,
+            settled: false,
+            finish: () => {
+              call.settled = true
+              resolve('downloaded')
+            }
+          }
+          calls.push(call)
+          opts.signal?.addEventListener('abort', () => {
+            call.aborted = true
+            // Winding down takes a moment (truncate, close): not synchronous.
+            queueMicrotask(() => {
+              call.settled = true
+              reject(new Error('transfer aborted'))
+            })
+          })
+        })
+    }))
+    return calls
+  }
+
+  it('1.10 #243: when the pass gives up, it stops its transfers and waits for them', async () => {
+    // A transfer abandoned by the old timeout went on writing into a .part the
+    // requeued chunk's download then shared, and marked its frame downloaded
+    // while the frame was being re-rendered.
+    const calls = heldDownloads()
+    const r = await rig()
+    savedAll(r)
+
+    let out: DrainResult | null = null
+    let settledAtReturn: boolean[] = []
+    void r.downloader.drain().then((d) => {
+      settledAtReturn = calls.map((c) => c.settled)
+      out = d
+    })
+    await w.until(() => out !== null, 'drain returns', { timeoutMs: 30 * 60_000 })
+
+    expect(calls.length).toBeGreaterThan(0)
+    expect(calls.every((c) => c.aborted)).toBe(true)
+    expect(settledAtReturn.every(Boolean)).toBe(true)
+    expect(out!.lost).toHaveLength(4)
+  })
+
+  it('1.10 #243: a transfer that finishes after its run was stopped writes no rows', async () => {
+    const calls = heldDownloads()
+    const r = await rig()
+    savedAll(r)
+    r.downloader.start()
+    await w.until(() => calls.length > 0, 'transfers under way')
+
+    // A cancel, or its node gone: the chunk is no longer this run's.
+    r.downloader.stop()
+    for (const c of calls) c.finish()
+    await w.advance(5_000)
+
+    expect(downloaded(r.jobId)).toEqual([])
+    expect(w.eventsOf('asset:added')).toEqual([])
+  })
+})
+
+describe('a local disk that will not take the frames (1.10 B6)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  const enospc = (): Error =>
+    Object.assign(new Error('ENOSPC: no space left on device, write'), {
+      code: 'ENOSPC',
+      syscall: 'write'
+    })
+
+  /**
+   * Every file opened while `full` refuses writes, as a full disk does; statfs
+   * reports plenty (the full disk is the writes' to show), so the only thing
+   * a recovery can go by is a write that lands.
+   */
+  function fullDisk(): { full: boolean } {
+    const disk = { full: true }
+    const open = fsp.open.bind(fsp)
+    vi.spyOn(fsp, 'open').mockImplementation(async (...args: Parameters<typeof fsp.open>) => {
+      const fh = await open(...args)
+      if (disk.full) fh.write = (() => Promise.reject(enospc())) as typeof fh.write
+      return fh
+    })
+    vi.spyOn(fsp, 'statfs').mockResolvedValue({
+      bavail: 100 * 1024 ** 2,
+      bsize: 1024
+    } as unknown as StatsFs)
+    return disk
+  }
+
+  it('1.10 B6 (field: the Mac disk filled mid-render): frames wait on the node, charged nothing, and land once space returns', async () => {
+    const { localSinkHold } = await import('./frameDownloader')
+    const disk = fullDisk()
+    const r = await rig()
+    savedAll(r)
+
+    let out: DrainResult | null = null
+    void r.downloader.drain().then((d) => (out = d))
+    await w.until(() => localSinkHold() !== null, 'downloads paused')
+    expect(localSinkHold()!.reason).toMatch(/ENOSPC/)
+    // Well past four attempts' worth of retries: none was charged, none lost.
+    await w.advance(10 * 60_000)
+    expect(out).toBeNull()
+    expect(
+      w.alerts().filter((a) => /download failed|giving up|gone from the node/.test(a))
+    ).toEqual([])
+    expect(w.alerts('error').filter((a) => /Cannot save downloaded frames/.test(a))).toHaveLength(1)
+
+    disk.full = false
+    await w.until(() => out !== null, 'drain returns')
+
+    expect(out).toEqual({ manifestRead: true, lost: [], localSinkBlocked: [] })
+    expect(downloaded(r.jobId)).toEqual([1, 2, 3, 4])
+    expect(localSinkHold()).toBeNull()
+    expect(w.alerts('info').filter((a) => /taking files again/.test(a))).toHaveLength(1)
+  })
+
+  it('the hold is bounded: the node is let go, its frames reported blocked, not lost', async () => {
+    const { localSinkHold, SINK_HOLD_MS } = await import('./frameDownloader')
+    fullDisk()
+    const r = await rig()
+    savedAll(r)
+    const started = Date.now()
+
+    let out: DrainResult | null = null
+    void r.downloader.drain().then((d) => (out = d))
+    await w.until(() => out !== null, 'drain returns', { timeoutMs: SINK_HOLD_MS + 5 * 60_000 })
+
+    expect(Date.now() - started).toBeGreaterThan(SINK_HOLD_MS)
+    expect(out!.lost).toEqual([])
+    expect(out!.localSinkBlocked.sort()).toEqual([1, 2, 3, 4].map((f) => `frames/000${f}.exr`))
+    // Still unhealthy: whatever is dispatched next would only wait too.
+    expect(localSinkHold()).not.toBeNull()
+    expect(w.alerts('error').some((a) => /node is let go/.test(a))).toBe(true)
+  })
+
+  it("a project folder on a drive that is gone is not 'gone from the node'", async () => {
+    const { localSinkHold } = await import('./frameDownloader')
+    vi.spyOn(fsp, 'mkdir').mockRejectedValue(
+      Object.assign(new Error("ENOENT: no such file or directory, mkdir 'E:\\\\renders'"), {
+        code: 'ENOENT',
+        syscall: 'mkdir'
+      })
+    )
+    const r = await rig()
+    savedAll(r)
+    void r.downloader.drain()
+    await w.until(() => localSinkHold() !== null, 'downloads paused')
+    await w.advance(2 * 60_000)
+
+    expect(w.alerts().filter((a) => /gone from the node/.test(a))).toEqual([])
+    r.downloader.stop()
+  })
+
+  it('recheckLocalSink: a user who has freed space need not wait for the next probe', async () => {
+    const { localSinkHold, recheckLocalSink } = await import('./frameDownloader')
+    const disk = fullDisk()
+    const r = await rig()
+    savedAll(r)
+    void r.downloader.drain()
+    await w.until(() => localSinkHold() !== null, 'downloads paused')
+
+    expect(await recheckLocalSink()).toBe(false)
+    disk.full = false
+    expect(await recheckLocalSink()).toBe(true)
+    expect(localSinkHold()).toBeNull()
+    await w.until(() => downloaded(r.jobId).length === 4, 'frames land')
+  })
+
+  it('1.10 B6: a chunk whose frames the disk would not take is not rendered again once it does', async () => {
+    // The whole path, through the scheduler. The frames used to burn four
+    // attempts, count as lost, fail the chunk and re-render it on a paid GPU.
+    const disk = fullDisk()
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    const machine = w.machineFor(nodeId)
+    const specs: string[] = []
+    machine.onSpec = (spec) => {
+      specs.push(spec.chunkId)
+      machine.agent.finish(spec.chunkId)
+    }
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    const { localSinkHold } = await import('./frameDownloader')
+    await w.until(() => localSinkHold() !== null, 'downloads paused')
+    await w.advance(5 * 60_000)
+
+    disk.full = false
+    await w.until(
+      () =>
+        w.get<{ state: string }>('SELECT state FROM jobs WHERE id = ?', jobId)?.state ===
+        'complete',
+      'job complete'
+    )
+
+    expect(specs).toHaveLength(1)
+    expect(
+      w.get<{ retries: number }>('SELECT retries FROM chunks WHERE job_id = ?', jobId)?.retries
+    ).toBe(0)
+    expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
   })
 })
