@@ -85,26 +85,199 @@ export function planLanes(
  * The slot controller's hill-climb only governs SHARED work; exclusive lanes
  * are a fixed count, so they need their own backstop against the one failure
  * that loses a whole chunk — an OOM kill when N copies of a heavy scene do not
- * fit. Same law as the slot controller's memory branch: one step down per
- * settle period while memory is above 90%, never back up for this node.
+ * fit.
+ *
+ * The first version stepped the limit down by one every settle period while
+ * node memory stayed above 90%, and never back up (#222). Lowering a limit
+ * only stops new admissions, so the renders that caused the pressure kept
+ * running and kept it above 90%: a 4-GPU node under a heavy scene reached one
+ * lane in about three minutes, pinned to card 0 with three paid cards idle,
+ * for the rest of its rental. With one lane per GPU each card already holds
+ * one scene, so fewer lanes could not lower any card's VRAM at all.
+ *
+ * With a LaneGuardContext (the node's GPUs, the setting and its ceiling) the
+ * guard now:
+ *   - moves between the plans planLanes can make (N×k pinned, N pinned, one
+ *     unpinned process across every GPU), never to a pinned count below the
+ *     GPU count (guardedLanePlan);
+ *   - steps again only once the previous step has taken effect (in-flight at
+ *     or below the limit) and a settle period has passed;
+ *   - reads VRAM per card from metrics.gpus, and steps for VRAM only when the
+ *     lower plan puts fewer scenes on a card; RAM falls with every process
+ *     removed;
+ *   - recovers one plan at a time once memory has stayed low for a settle
+ *     period and the plan above is projected to fit under 75%.
+ * Without a context it keeps the old count-down, gated on the previous step
+ * having taken effect, for callers not yet passing one.
  */
 export interface LaneGuard {
   /** upper bound on lanes for this node (Infinity = unconstrained) */
   limit: number
-  /** epoch ms of the last backoff */
+  /** epoch ms of the last step down */
   backoffAt: number | null
+  /**
+   * epoch ms since which the plan above has been projected to fit; null while
+   * it would not. Recovery waits a settle period on it.
+   */
+  calmSince?: number | null
+}
+
+/** What the guard needs to know about the node to move between lane plans. */
+export interface LaneGuardContext {
+  numGpus: number
+  slotsPerGpu: number
+  /** the node's hardware/user slot ceiling (slotController.hardCap) */
+  cap: number
+  engine?: EngineId | null
 }
 
 export const BACKOFF_MEM_FRAC = 0.9
+/** The plan above must be projected to use at most this much memory to recover to it. */
+export const RECOVER_MEM_FRAC = 0.75
 
 export function initialGuard(): LaneGuard {
-  return { limit: Number.POSITIVE_INFINITY, backoffAt: null }
+  return { limit: Number.POSITIVE_INFINITY, backoffAt: null, calmSince: null }
 }
+
+/**
+ * The lane counts this node can run, highest first: N×k pinned, N pinned,
+ * then one unpinned process (those its ceiling allows). The guard only ever
+ * moves between these.
+ */
+export function laneLevels(
+  numGpus: number,
+  slotsPerGpu: number,
+  cap: number,
+  engine?: EngineId | null
+): number[] {
+  const gpus = Math.max(1, Math.floor(numGpus || 1))
+  const caps = [cap, gpus, 1].map((c) => Math.min(cap, c))
+  const lanes = caps.map((c) => planLanes(gpus, slotsPerGpu, c, engine).lanes)
+  return [...new Set(lanes)].sort((a, b) => b - a)
+}
+
+/**
+ * The node's lane plan under its memory guard: planLanes with the guard's
+ * limit as one more ceiling. A limit below the GPU count therefore becomes
+ * one unpinned process across every card, never a few pinned lanes with the
+ * other cards idle (#222). Use this rather than effectiveLanes().
+ */
+export function guardedLanePlan(
+  numGpus: number,
+  slotsPerGpu: number,
+  cap: number,
+  guard: LaneGuard | null | undefined,
+  engine?: EngineId | null
+): LanePlan {
+  const limit = guard?.limit ?? Number.POSITIVE_INFINITY
+  return planLanes(numGpus, slotsPerGpu, Math.min(cap, limit), engine)
+}
+
+/** Scene copies each card holds when the node runs `lanes`. */
+function scenesPerCard(lanes: number, gpus: number): number {
+  if (gpus === 1) return lanes
+  // One unpinned process loads the scene once onto every card it uses.
+  if (lanes <= 1) return 1
+  return Math.ceil(lanes / gpus)
+}
+
+/** System RAM used, 0..1, or null when not sampled. */
+export function ramFraction(metrics: NodeMetrics | null | undefined): number | null {
+  if (!metrics || !(metrics.ramTotalGb > 0)) return null
+  return metrics.ramUsedGb / metrics.ramTotalGb
+}
+
+/**
+ * VRAM used on the fullest card, 0..1, or null when not sampled. The node
+ * total (vramUsedGb / vramTotalGb) hides one full card among empty ones, and
+ * a card is what runs out.
+ */
+export function cardVramFraction(metrics: NodeMetrics | null | undefined): number | null {
+  if (!metrics) return null
+  const cards = (metrics.gpus ?? []).filter((g) => g.vramTotalGb > 0)
+  if (cards.length > 0) return Math.max(...cards.map((g) => g.vramUsedGb / g.vramTotalGb))
+  return metrics.vramTotalGb > 0 ? metrics.vramUsedGb / metrics.vramTotalGb : null
+}
+
+const pct = (f: number): string => `${Math.round(f * 100)}%`
 
 export function guardLanes(
   prev: LaneGuard,
   metrics: NodeMetrics | null | undefined,
   /** exclusive lanes currently running */
+  inFlight: number,
+  now: number,
+  /** the node's GPUs, setting and ceiling; absent = the legacy count-down */
+  ctx?: LaneGuardContext
+): { guard: LaneGuard; reason: string | null } {
+  if (!ctx) return legacyGuard(prev, metrics, inFlight, now)
+  const keep = { guard: prev, reason: null }
+  const gpus = Math.max(1, Math.floor(ctx.numGpus || 1))
+  const levels = laneLevels(gpus, ctx.slotsPerGpu, ctx.cap, ctx.engine)
+  const current = guardedLanePlan(gpus, ctx.slotsPerGpu, ctx.cap, prev, ctx.engine).lanes
+  const ram = ramFraction(metrics)
+  const vram = cardVramFraction(metrics)
+  if (ram == null && vram == null) return keep
+  const ramHot = ram != null && ram > BACKOFF_MEM_FRAC
+  const vramHot = vram != null && vram > BACKOFF_MEM_FRAC
+  const calmCleared = (): { guard: LaneGuard; reason: null } =>
+    prev.calmSince != null ? { guard: { ...prev, calmSince: null }, reason: null } : keep
+
+  if (ramHot || vramHot) {
+    // Lowering the limit stops admissions, not the renders already running:
+    // wait for the node to come down to it before judging it again.
+    if (inFlight > current) return calmCleared()
+    if (prev.backoffAt != null && now - prev.backoffAt < SETTLE_MS) return calmCleared()
+    // Every process removed frees its RAM; VRAM falls only when a card holds
+    // fewer scenes. With one lane per GPU nothing lower helps VRAM, so the
+    // guard leaves every card working rather than idle some of them.
+    const next = levels.find(
+      (l) => l < current && (ramHot || scenesPerCard(l, gpus) < scenesPerCard(current, gpus))
+    )
+    if (next == null) return calmCleared()
+    const what = ramHot
+      ? `RAM at ${pct(ram ?? 0)}`
+      : `VRAM at ${pct(vram ?? 0)} on the fullest card`
+    const shape = next === 1 && gpus > 1 ? ' (one process across every GPU)' : ''
+    return {
+      guard: { limit: next, backoffAt: now, calmSince: null },
+      reason: `lanes capped at ${next}${shape} — ${what}`
+    }
+  }
+
+  // Recovery, one plan at a time. Memory is projected to the plan above from
+  // what the renders running now use: RAM per process, VRAM per scene copy.
+  // Both overestimate (the OS and the driver are counted as if per render),
+  // which keeps a node from climbing back into the pressure it just left.
+  const above = levels.filter((l) => l > current).pop()
+  if (above == null || inFlight <= 0 || inFlight > current) return calmCleared()
+  const projectedRam = ram == null ? 0 : (ram * above) / inFlight
+  const projectedVram =
+    vram == null ? 0 : (vram * scenesPerCard(above, gpus)) / scenesPerCard(current, gpus)
+  if (projectedRam > RECOVER_MEM_FRAC || projectedVram > RECOVER_MEM_FRAC) return calmCleared()
+  if (prev.calmSince == null) return { guard: { ...prev, calmSince: now }, reason: null }
+  if (now - prev.calmSince < SETTLE_MS) return keep
+  if (prev.backoffAt != null && now - prev.backoffAt < SETTLE_MS) return keep
+  const top = levels[0]
+  return {
+    guard: {
+      limit: above >= top ? Number.POSITIVE_INFINITY : above,
+      backoffAt: prev.backoffAt,
+      calmSince: null
+    },
+    reason: `lanes back up to ${above} — memory has room (RAM ${pct(ram ?? 0)}, VRAM ${pct(vram ?? 0)})`
+  }
+}
+
+/**
+ * The count-down for callers that pass no context: one lane fewer per settle
+ * period, but only once the previous step has taken effect. Without that
+ * gate the renders that caused the pressure, still running, walked the limit
+ * down every settle period to one (#222).
+ */
+function legacyGuard(
+  prev: LaneGuard,
+  metrics: NodeMetrics | null | undefined,
   inFlight: number,
   now: number
 ): { guard: LaneGuard; reason: string | null } {
@@ -112,15 +285,22 @@ export function guardLanes(
   if (mem == null || mem <= BACKOFF_MEM_FRAC) return { guard: prev, reason: null }
   if (prev.backoffAt != null && now - prev.backoffAt < SETTLE_MS)
     return { guard: prev, reason: null }
+  if (inFlight > prev.limit) return { guard: prev, reason: null }
   const next = Math.max(1, Math.min(prev.limit, inFlight) - 1)
   if (next >= prev.limit) return { guard: prev, reason: null }
   return {
     guard: { limit: next, backoffAt: now },
-    reason: `lanes capped at ${next} — memory at ${Math.round(mem * 100)}%`
+    reason: `lanes capped at ${next} — memory at ${pct(mem)}`
   }
 }
 
-/** The lane count after the memory guard. */
+/**
+ * The lane count after the memory guard.
+ *
+ * @deprecated Keeps the plan's `pin` while cutting its lanes, so a limit
+ * below the GPU count pins a few lanes and idles the other cards (#222).
+ * Use guardedLanePlan().
+ */
 export function effectiveLanes(plan: LanePlan, guard: LaneGuard | null | undefined): number {
   return Math.max(1, Math.min(plan.lanes, guard?.limit ?? Number.POSITIVE_INFINITY))
 }
