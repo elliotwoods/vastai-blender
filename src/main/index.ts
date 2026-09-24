@@ -14,6 +14,7 @@ import {
 } from './nodes/nodeManager'
 import { installBlender, probeEevee, provisionBase } from './nodes/provisioner'
 import { scheduler } from './scheduler/scheduler'
+import { jobClips } from './transfer/jobClip'
 import { getSettings } from './settings'
 
 // Dev aid: VR_USERDATA=<dir> runs against a throwaway profile (own settings,
@@ -228,6 +229,9 @@ app.whenReady().then(() => {
   setForgetNodeProvider((nodeId) => scheduler.forgetNode(nodeId))
   nodeManager.init()
   scheduler.start()
+  // Stitch job clips for any job whose chunk clips outran them — e.g. chunks
+  // that finished under a build without job clips, or while ffmpeg failed.
+  jobClips.catchUp()
   createWindow()
 
   // Headless batch driver: VR_JOB_SPEC=<path to .json> submits a whole campaign at boot.

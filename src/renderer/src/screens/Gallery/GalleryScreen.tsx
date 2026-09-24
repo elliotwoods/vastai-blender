@@ -78,6 +78,27 @@ export function GalleryScreen({
   const openPreview = usePreview((s) => s.open)
   const observer = useLazyPlayObserver(previewOpen)
 
+  const [showChunks, setShowChunks] = useState(false)
+  // The job's stitched clip (see main/transfer/jobClip.ts). When there is one,
+  // it IS the wall for that job: a finely chunked job would otherwise be
+  // hundreds of tiles a few frames long. Chunks stay one toggle away.
+  const jobClip = useMemo(
+    () =>
+      chunkId
+        ? null
+        : pickClip(index?.clips ?? [], { scope: 'job', preferHdr: hdrWall, wall: true }),
+    [index, chunkId, hdrWall]
+  )
+  const wallIsJob = jobClip != null && !showChunks
+  const openJobClip = (): void => {
+    const first = jobClip?.segments?.[0]?.start
+    if (!activeJobId || first == null) return
+    // The overlay needs a chunk to anchor on; the frame puts it in job mode.
+    const owner =
+      index?.frames.find((f) => f.frame === first)?.chunkId ?? chunkIdsOf(index?.clips ?? [])[0]
+    if (owner) openPreview({ jobId: activeJobId, chunkId: owner, frame: first })
+  }
+
   // One clip per chunk for the wall, using the cheap-decode ordering.
   const clips = useMemo(() => {
     const all = (index?.clips ?? []).filter((c) => !chunkId || c.chunkId === chunkId)
@@ -109,15 +130,26 @@ export function GalleryScreen({
           </>
         }
         right={
-          hdrCapable ? (
-            <button
-              title="Prefer HDR renditions"
-              style={btn({ size: 'sm', active: hdrWall })}
-              onClick={() => setHdrWall(!hdrWall)}
-            >
-              HDR
-            </button>
-          ) : undefined
+          <>
+            {jobClip ? (
+              <button
+                title="Show one tile per chunk instead of the whole job"
+                style={btn({ size: 'sm', active: showChunks })}
+                onClick={() => setShowChunks(!showChunks)}
+              >
+                chunks
+              </button>
+            ) : null}
+            {hdrCapable ? (
+              <button
+                title="Prefer HDR renditions"
+                style={btn({ size: 'sm', active: hdrWall })}
+                onClick={() => setHdrWall(!hdrWall)}
+              >
+                HDR
+              </button>
+            ) : null}
+          </>
         }
         subRow={
           chunkId ? (
@@ -136,7 +168,21 @@ export function GalleryScreen({
         }
       />
       <div style={{ flex: 1, overflow: 'auto', padding: SCALE.space4, minHeight: 0 }}>
-        {clips.length === 0 ? (
+        {wallIsJob && jobClip ? (
+          <div style={{ maxWidth: 1280, margin: '0 auto' }}>
+            <VideoTile
+              key={`job:${activeJobId}`}
+              clip={jobClip}
+              hdrMode={hdrWall && hdrCapable && jobClip.hdr}
+              grade={grade}
+              // Sized from the clip's own dimensions: the job tile is alone on
+              // the wall, and an unloaded <video> has no height of its own.
+              fit="contain"
+              observer={observer}
+              onExpand={openJobClip}
+            />
+          </div>
+        ) : clips.length === 0 ? (
           <div style={{ ...panel(), padding: SCALE.space6, textAlign: 'center' }}>
             <span style={{ color: TOKENS.textFaint }}>
               {activeJobId

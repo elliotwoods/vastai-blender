@@ -62,3 +62,52 @@ export function chunkRange(
     to: indexOf(domain, Math.min(frameEnd, domain.end))
   }
 }
+
+// -- stitched job clips -------------------------------------------------------
+//
+// A job clip holds the job's complete chunks back to back, so where a chunk is
+// still missing the clip simply skips ahead: clip index and job frame diverge
+// at every gap. `segments` (from the asset index) are the job frames held, in
+// clip order; these convert between the two.
+
+export interface Segment {
+  start: number
+  end: number
+}
+
+function segLength(seg: Segment, step: number): number {
+  return seg.end >= seg.start ? Math.floor((seg.end - seg.start) / step) + 1 : 0
+}
+
+/** Clip index of a job frame, or null when the clip does not hold it. */
+export function segmentIndexOf(segments: Segment[], step: number, frame: number): number | null {
+  const s = Math.max(1, Math.floor(step) || 1)
+  let base = 0
+  for (const seg of segments) {
+    if (frame >= seg.start && frame <= seg.end) {
+      // Mid-step frames snap down, as indexOf does.
+      return base + Math.floor((frame - seg.start) / s)
+    }
+    base += segLength(seg, s)
+  }
+  return null
+}
+
+/** Job frame at a clip index (clamped to the clip). */
+export function segmentFrameAt(segments: Segment[], step: number, index: number): number {
+  const s = Math.max(1, Math.floor(step) || 1)
+  if (segments.length === 0) return 0
+  let i = Math.max(0, Math.round(Number.isFinite(index) ? index : 0))
+  for (const seg of segments) {
+    const n = segLength(seg, s)
+    if (i < n) return seg.start + i * s
+    i -= n
+  }
+  return segments[segments.length - 1].end
+}
+
+/** Total frames a segmented clip holds. */
+export function segmentsCount(segments: Segment[], step: number): number {
+  const s = Math.max(1, Math.floor(step) || 1)
+  return segments.reduce((a, seg) => a + segLength(seg, s), 0)
+}

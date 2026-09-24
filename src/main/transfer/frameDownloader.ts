@@ -322,7 +322,7 @@ const CLIP_KINDS_FINAL: string[] = ['previewSdr', 'previewHdr', 'proxy']
  * Delete after a grace period, so a renderer still holding the old URL has
  * time to swap to the new one rather than losing its source mid-frame.
  */
-function unlinkLater(paths: string[], delayMs = 30_000): void {
+export function unlinkLater(paths: string[], delayMs = 30_000): void {
   setTimeout(() => {
     for (const p of paths) {
       rm(p, { force: true }).catch(() => {})

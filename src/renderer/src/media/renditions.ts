@@ -13,6 +13,12 @@ const WALL_ORDER: ClipKind[] = ['proxy', 'previewSdr', 'previewHdr']
 
 export interface PickOptions {
   chunkId?: string
+  /**
+   * 'chunk' (default) picks among per-chunk clips only; 'job' among the
+   * stitched whole-job clips. Never mixed: a job clip in a chunk's pool would
+   * win on rendition order and play the wrong frames.
+   */
+  scope?: 'chunk' | 'job'
   /** Prefer the HDR rendition (caller has already checked display capability). */
   preferHdr?: boolean
   /**
@@ -25,7 +31,10 @@ export interface PickOptions {
 }
 
 export function pickClip(clips: ClipAsset[], opts: PickOptions = {}): ClipAsset | null {
-  const pool = opts.chunkId ? clips.filter((c) => c.chunkId === opts.chunkId) : clips
+  const scope = opts.scope ?? 'chunk'
+  const pool = clips.filter(
+    (c) => c.scope === scope && (!opts.chunkId || c.chunkId === opts.chunkId)
+  )
   if (pool.length === 0) return null
 
   if (opts.preferLive) {
@@ -55,5 +64,5 @@ export function pickClip(clips: ClipAsset[], opts: PickOptions = {}): ClipAsset 
 
 /** Distinct chunk ids present in an asset list, in frame order where derivable. */
 export function chunkIdsOf(clips: ClipAsset[]): string[] {
-  return [...new Set(clips.map((c) => c.chunkId))]
+  return [...new Set(clips.filter((c) => c.scope === 'chunk').map((c) => c.chunkId))]
 }

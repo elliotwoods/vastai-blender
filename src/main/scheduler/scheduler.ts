@@ -21,6 +21,7 @@ import { sftpRename, sftpWriteFile, uploadFileVerified } from '../ssh/sftp'
 import { recordThroughput } from '../vast/offers'
 import type { SshConnection } from '../ssh/sshConnection'
 import { ChunkDownloader } from '../transfer/frameDownloader'
+import { jobClips } from '../transfer/jobClip'
 import { missingRanges } from './chunker'
 import { admits, hasRoom, type NodeOccupancy } from './admission'
 import { decide, hardCap, initialState, recordNodeSlots, type SlotState } from './slotController'
@@ -953,6 +954,9 @@ class Scheduler {
     const chunk = getDb().prepare('SELECT * FROM chunks WHERE id = ?').get(run.chunkId) as ChunkRow
     if (chunk.state === 'failed') this.requeue(run.chunkId)
     refreshJobState(run.jobId)
+    // After refreshJobState, so a job that just finished is built promptly.
+    // A failed chunk schedules too: it may have ended the job as 'partial'.
+    jobClips.schedule(run.jobId)
     const node = nodeManager.get(run.nodeId)
     // Only fall back to idle when the node has no other in-flight chunks.
     if (node && node.state === 'rendering' && !this.hasRuns(run.nodeId)) node.setState('idle')
@@ -989,6 +993,7 @@ class Scheduler {
       db.prepare("UPDATE chunks SET state = 'complete' WHERE id = ?").run(chunkId)
       emitChunkChanged(chunkId)
       refreshJobState(chunk.job_id)
+      jobClips.schedule(chunk.job_id)
       return
     }
     const touched: string[] = [chunkId]

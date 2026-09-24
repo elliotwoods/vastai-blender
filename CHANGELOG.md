@@ -13,6 +13,32 @@ GitHub Releases with the notes from this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Whole-job preview clips.** A job split across a wide fleet in small chunks
+  used to preview as hundreds of clips a few frames long, each ending before
+  it could be watched. The desktop now stitches finished chunks' clips into one
+  clip per job and rendition, using `ffmpeg -c copy` with no re-encode. It
+  rebuilds about 20 s after chunks complete, and at once when the job ends.
+  Chunks not finished yet are gaps, and the clip records which job frames it
+  holds (`assets.segments`, schema v5). ffmpeg now ships with the app
+  (`ffmpeg-static`); without it, previews stay per-chunk as before.
+
+### Changed
+
+- The preview overlay plays the whole job when the frame you open is in the job
+  clip. `[`/`]` and the filmstrip seek within it rather than reopening per
+  chunk. Frames that aren't stitched yet (a chunk still rendering) fall back to
+  the per-chunk live view.
+- The Gallery shows one tile per job when a job clip exists; **chunks** switches
+  back to the per-chunk wall.
+
+### Fixed
+
+- **Graded previews were cropped.** The grading canvas kept its intrinsic size
+  (the video's native resolution) instead of filling its tile. A 1920×1080
+  clip in a smaller tile therefore showed only its top-left corner.
+
 ## [2.1.0] — 2026-07-30
 
 ### Added

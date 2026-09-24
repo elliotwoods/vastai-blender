@@ -410,8 +410,26 @@ export interface AddonInfo {
  */
 export type ClipKind = 'previewSdr' | 'previewHdr' | 'proxy' | 'live'
 
+/** An inclusive run of job frame numbers (honouring the job's frame step). */
+export interface FrameSegment {
+  start: number
+  end: number
+}
+
 export interface ClipAsset {
   kind: ClipKind
+  /**
+   * 'chunk': one chunk's clip. 'job': the chunk clips of a job stitched end to
+   * end (lossless remux, see main/transfer/jobClip.ts), so a job reads as one
+   * clip however finely it was chunked.
+   */
+  scope: 'chunk' | 'job'
+  /**
+   * Job scope only: the job frames the clip holds, in clip order. Chunks not
+   * yet complete are gaps, so clip index ≠ job frame − start in general.
+   */
+  segments?: FrameSegment[]
+  /** '' for a job-scoped clip */
   chunkId: string
   label: string
   absPath: string

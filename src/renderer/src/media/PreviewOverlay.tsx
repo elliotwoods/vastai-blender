@@ -10,6 +10,14 @@
  * Degrades all the way down. With no clip yet it shows the newest thumbnail as
  * a still and disables the transport, so opening a chunk that started
  * rendering ten seconds ago still shows you something.
+ *
+ * Two modes, derived from the target rather than stored:
+ * - JOB mode: the target frame is in the job's stitched clip (see
+ *   main/transfer/jobClip.ts). One transport spans every complete chunk, so
+ *   a job cut into 2-frame chunks still plays as one clip; `[`/`]` and the
+ *   filmstrip seek within it instead of remounting.
+ * - CHUNK mode: anything else — a chunk still rendering (live clip, still),
+ *   or a job with no stitched clip yet. Exactly the per-chunk view.
  */
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
@@ -22,7 +30,7 @@ import { useAssetIndex, useJob, useThumbWindow } from '../lib/queries'
 import { SCALE, TOKENS } from '../lib/theme'
 import { ClipSyncController } from './ClipSyncController'
 import { Filmstrip } from './Filmstrip'
-import { domainOf, frameAt, indexOf } from './frame-domain'
+import { domainOf, frameAt, indexOf, segmentFrameAt, segmentIndexOf } from './frame-domain'
 import { GradePanel } from './GradePanel'
 import { pickClip } from './renditions'
 import { TransportBar } from './TransportBar'
@@ -33,13 +41,40 @@ import { VideoTile } from './VideoTile'
 export function PreviewOverlay(): React.JSX.Element | null {
   const target = usePreview((s) => s.target)
   if (!target) return null
-  // Keyed on the chunk so switching targets rebuilds the transport cleanly
-  // rather than trying to migrate a controller between clips of different
-  // lengths.
-  return <Overlay key={target.chunkId} target={target} />
+  return <ModeSwitch target={target} />
 }
 
-function Overlay({ target }: { target: PreviewTarget }): React.JSX.Element {
+/**
+ * Decide the mode, and key the overlay on it. Chunk mode keys on the chunk so
+ * switching chunks rebuilds the transport cleanly rather than migrating a
+ * controller between clips of different lengths; job mode keys on the job, so
+ * moving around inside the stitched clip never remounts anything.
+ */
+function ModeSwitch({ target }: { target: PreviewTarget }): React.JSX.Element {
+  const { data: job } = useJob(target.jobId)
+  const { data: assets } = useAssetIndex(target.jobId)
+  const chunk = job?.chunks.find((c) => c.id === target.chunkId) ?? null
+  const hasJobClip = (assets?.clips ?? []).some((c) => c.scope === 'job' && c.segments?.length)
+  const focus = target.frame ?? chunk?.frameStart
+  const jobSegments = (assets?.clips ?? []).find((c) => c.scope === 'job')?.segments ?? []
+  const jobMode =
+    hasJobClip && focus != null && segmentIndexOf(jobSegments, job?.frameStep ?? 1, focus) != null
+  return (
+    <Overlay
+      key={jobMode ? `job:${target.jobId}` : `chunk:${target.chunkId}`}
+      target={target}
+      jobMode={jobMode}
+    />
+  )
+}
+
+function Overlay({
+  target,
+  jobMode
+}: {
+  target: PreviewTarget
+  jobMode: boolean
+}): React.JSX.Element {
   const close = usePreview((s) => s.close)
   const retarget = usePreview((s) => s.retarget)
   const opener = usePreview((s) => s.opener)
@@ -59,20 +94,49 @@ function Overlay({ target }: { target: PreviewTarget }): React.JSX.Element {
   const appliedFrame = useRef<number | null>(null)
 
   const clips = useMemo(
-    () => (assets?.clips ?? []).filter((c) => c.chunkId === target.chunkId),
-    [assets, target.chunkId]
+    () =>
+      (assets?.clips ?? []).filter((c) =>
+        jobMode ? c.scope === 'job' : c.scope === 'chunk' && c.chunkId === target.chunkId
+      ),
+    [assets, target.chunkId, jobMode]
   )
+  const step = job?.frameStep ?? 1
   const chunk = job?.chunks.find((c) => c.id === target.chunkId) ?? null
-  const rendering = !!chunk && !['complete', 'failed'].includes(chunk.state)
+  // Job mode only ever holds complete chunks, so nothing in it is "rendering".
+  const rendering = !jobMode && !!chunk && !['complete', 'failed'].includes(chunk.state)
   // Frames the job and this chunk cover. Declared up here because the transport
   // needs `chunkFrames` to convert `target.frame` (a job frame number) into a
   // clip-relative index; the still fallback below uses them too.
   const domain = job ? domainOf(job.frameStart, job.frameEnd, job.frameStep) : domainOf(1, 1, 1)
   const chunkFrames = chunk ? domainOf(chunk.frameStart, chunk.frameEnd, job?.frameStep ?? 1) : null
   const clip = useMemo(
-    () => pickClip(clips, { preferHdr: hdrMode && hdrCapable, preferLive: rendering }),
-    [clips, hdrMode, hdrCapable, rendering]
+    () =>
+      pickClip(clips, {
+        scope: jobMode ? 'job' : 'chunk',
+        preferHdr: hdrMode && hdrCapable,
+        preferLive: rendering
+      }),
+    [clips, hdrMode, hdrCapable, rendering, jobMode]
   )
+  const segments = useMemo(() => (jobMode ? (clip?.segments ?? []) : []), [jobMode, clip])
+
+  /**
+   * Clip index ↔ job frame for whichever clip is showing. A chunk clip starts
+   * at its chunk's first frame; the job clip skips over incomplete chunks, so
+   * it goes through its segments. `toIndex` is null for a frame the clip
+   * doesn't hold.
+   */
+  const toFrame = (index: number): number | undefined =>
+    jobMode
+      ? segmentFrameAt(segments, step, index)
+      : chunkFrames
+        ? frameAt(chunkFrames, index)
+        : undefined
+  const toIndex = (frame: number): number | null => {
+    if (jobMode) return segmentIndexOf(segments, step, frame)
+    if (!chunkFrames || frame < chunkFrames.start || frame > chunkFrames.end) return null
+    return indexOf(chunkFrames, frame)
+  }
   /**
    * Whether an HDR rendition EXISTS — not whether one is currently showing.
    * Gating the toggle on `clip.hdr` made it unreachable in the normal case:
@@ -87,11 +151,6 @@ function Overlay({ target }: { target: PreviewTarget }): React.JSX.Element {
     () => (job?.chunks ?? []).slice().sort((a, b) => a.frameStart - b.frameStart),
     [job]
   )
-  const at = siblings.findIndex((c) => c.id === target.chunkId)
-  const stepChunk = (delta: number): void => {
-    const next = siblings[at + delta]
-    if (next) retarget({ jobId: target.jobId, chunkId: next.id })
-  }
 
   const controller = useMemo(
     () =>
@@ -99,7 +158,8 @@ function Overlay({ target }: { target: PreviewTarget }): React.JSX.Element {
         fps: clip?.fps || 25,
         totalFrames: clip?.frames || 1
       }),
-    // One transport per CHUNK. Neither the clip's length nor its KIND rebuilds
+    // One transport per CHUNK (or per job, in job mode — ModeSwitch keys the
+    // whole overlay on that, so the chunk id doesn't need to be a dep). Neither the clip's length nor its KIND rebuilds
     // it: length goes through setMeta, and nothing in the controller is
     // clip-specific (`videos` holds elements, which a kind change only re-srcs,
     // never remounts). Keying on kind meant a chunk finishing — live clip
@@ -118,6 +178,39 @@ function Overlay({ target }: { target: PreviewTarget }): React.JSX.Element {
     () => controller.lastKnownFrame
   )
 
+  const frameNumber = clip ? toFrame(currentFrame) : undefined
+  // The chunk under the playhead. In job mode that moves as it plays; in chunk
+  // mode it is always the target.
+  const current =
+    jobMode && frameNumber != null
+      ? (siblings.find((c) => frameNumber >= c.frameStart && frameNumber <= c.frameEnd) ?? chunk)
+      : chunk
+  const at = siblings.findIndex((c) => c.id === current?.id)
+
+  /** Go to a job frame: seek if this clip holds it, else retarget to its chunk. */
+  const goToFrame = (frame: number): void => {
+    const index = toIndex(frame)
+    if (index != null && clip) {
+      controller.seekFrame(index)
+      return
+    }
+    const owner = siblings.find((c) => frame >= c.frameStart && frame <= c.frameEnd)
+    // Carrying the frame lets ModeSwitch land in job mode when it is covered.
+    if (owner) retarget({ jobId: target.jobId, chunkId: owner.id, frame })
+  }
+  const stepChunk = (delta: number): void => {
+    const next = siblings[at + delta]
+    if (next) goToFrame(next.frameStart)
+  }
+
+  /**
+   * The job clip is rebuilt as chunks complete, and a filled gap shifts every
+   * index after it. Remember the segments the transport's position was
+   * measured against, so a rebuilt clip can put the playhead back on the same
+   * JOB frame instead of the same (now different) index.
+   */
+  const measuredAgainst = useRef<{ path: string; segments: typeof segments } | null>(null)
+
   /**
    * Retarget the transport at the current clip, then place the playhead.
    *
@@ -134,22 +227,42 @@ function Overlay({ target }: { target: PreviewTarget }): React.JSX.Element {
    */
   useLayoutEffect(() => {
     if (clip) controller.setMeta({ fps: clip.fps || 25, totalFrames: clip.frames || 1 })
-    if (target.frame == null || !chunkFrames) return
+    if (jobMode && clip) {
+      const prev = measuredAgainst.current
+      measuredAgainst.current = { path: clip.absPath, segments }
+      if (prev && prev.path !== clip.absPath && appliedFrame.current != null) {
+        const frame = segmentFrameAt(prev.segments, step, controller.lastKnownFrame)
+        const index = segmentIndexOf(segments, step, frame)
+        if (index != null) {
+          controller.setKnownFrame(index)
+          controller.seekFrame(index)
+        }
+        return
+      }
+    }
+    // Job mode opened from a chunk with no explicit frame: start at the chunk.
+    const requested = target.frame ?? (jobMode ? chunk?.frameStart : undefined)
+    if (requested == null || (!jobMode && !chunkFrames)) return
     // ONE-SHOT per requested frame. This effect also re-runs when the clip
     // changes (a live clip rolling over, or a finished chunk swapping in its
     // definitive rendition), and re-seeking then would yank the viewer back to
     // where they opened from — undoing their own scrubbing.
-    if (appliedFrame.current === target.frame) return
-    appliedFrame.current = target.frame
-    // `target.frame` is a JOB frame number (a filmstrip click carries one); the
-    // clip is per-chunk and starts at that chunk's first frame, so it has to be
-    // converted to a clip-relative index.
-    const index = indexOf(chunkFrames, target.frame)
+    if (appliedFrame.current === requested) return
+    // Job mode can't place anything until the job clip (and so its segments)
+    // is known; leave the one-shot unspent until then.
+    if (jobMode && !clip) return
+    appliedFrame.current = requested
+    // `requested` is a JOB frame number (a filmstrip click carries one); the
+    // clip starts at its chunk's first frame, or skips gaps in job mode, so it
+    // has to be converted to a clip-relative index.
+    const index = toIndex(requested) ?? 0
     controller.setKnownFrame(index)
     // Seed AND seek: seeking covers an element that is already loaded, while the
     // seed is what a not-yet-loaded one picks up when its metadata arrives.
     controller.seekFrame(index)
-  }, [controller, clip, chunkFrames, target.frame])
+    // toIndex/segments/step/chunk derive from clip + job, already deps via clip.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [controller, clip, chunkFrames, target.frame, jobMode])
 
   // Escape closes. Bubble phase, with the same input guard the transport uses:
   // a capture listener would eat the Escape that cancels a frame-number edit.
@@ -200,7 +313,6 @@ function Overlay({ target }: { target: PreviewTarget }): React.JSX.Element {
     return found
   }, [chunkFrames, stillThumbs])
 
-  const frameNumber = clip && chunkFrames ? frameAt(chunkFrames, currentFrame) : undefined
   // Name the rendition: a 960px live clip and a native-resolution previewSdr
   // look very different at full size, and without this the difference reads as
   // "the preview is broken" rather than "this is the in-progress one".
@@ -243,8 +355,16 @@ function Overlay({ target }: { target: PreviewTarget }): React.JSX.Element {
           {job ? job.name || basename(job.blendPath) : target.jobId.slice(0, 8)}
         </button>
         <span style={{ ...mono, fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
-          {target.chunkId}
+          {current?.id ?? target.chunkId}
         </span>
+        {jobMode && clip ? (
+          <span
+            title="The job's finished chunks stitched into one clip. Chunks still rendering are skipped; click one in the strip to watch it live."
+            style={{ ...mono, fontSize: 'var(--text-2xs)', color: TOKENS.textFaint }}
+          >
+            whole job · {clip.frames} frames
+          </span>
+        ) : null}
         {rendering ? (
           <span
             title="This chunk is still rendering — the preview grows as frames land"
@@ -376,16 +496,9 @@ function Overlay({ target }: { target: PreviewTarget }): React.JSX.Element {
           chunks={job.chunks}
           currentFrame={frameNumber}
           onSelect={(frame) => {
-            // Selecting outside this chunk retargets the overlay to the chunk
-            // that owns the frame, so the strip navigates the whole job.
-            const owner = (job.chunks ?? []).find(
-              (c) => frame >= c.frameStart && frame <= c.frameEnd
-            )
-            if (owner && owner.id !== target.chunkId) {
-              retarget({ jobId: target.jobId, chunkId: owner.id, frame })
-              return
-            }
-            if (chunkFrames) controller.seekFrame(indexOf(chunkFrames, frame))
+            // Seek when the showing clip holds the frame; otherwise retarget
+            // to the chunk that owns it, so the strip navigates the whole job.
+            goToFrame(frame)
           }}
           onOpen={(frame) => {
             const asset = assets?.frames.find((f) => f.frame === frame)

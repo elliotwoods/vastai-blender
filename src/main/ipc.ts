@@ -13,6 +13,7 @@ import type {
   ChunkState,
   ClipAsset,
   ClipKind,
+  FrameSegment,
   EngineId,
   JobDetail,
   HistoryRange,
@@ -216,12 +217,25 @@ function mockAssets(jobId: string): AssetIndex {
     fixtureClip('previewHdr', c.id, 'probe_hlg_hevc.mp4', true),
     fixtureClip('proxy', c.id, 'probe_sdr_hevc.mp4', false)
   ])
+  // One stitched job clip, so VR_MOCK exercises the overlay's job mode. The
+  // fixture is 100 frames; claim the first 100 frames of the job for it.
+  if (detail) {
+    const job = fixtureClip('previewSdr', '', 'probe_sdr_hevc.mp4', false)
+    const end = Math.min(detail.frameEnd, detail.frameStart + 99 * detail.frameStep)
+    clips.push({
+      ...job,
+      scope: 'job',
+      label: 'job SDR',
+      segments: [{ start: detail.frameStart, end }]
+    })
+  }
   return { jobId, clips, frames: [] }
 }
 
 function fixtureClip(kind: ClipKind, chunkId: string, file: string, hdr: boolean): ClipAsset {
   return {
     kind,
+    scope: 'chunk',
     chunkId,
     label: `${chunkId} ${kind}`,
     absPath: `fixtures/${file}`,
@@ -609,6 +623,7 @@ export function registerIpc(): void {
   handle('fleet:requestNode', async () => {
     await nodeManager.requestNode()
   })
+  handle('fleet:clearFailed', () => nodeManager.clearFailed())
   handle('node:destroy', (id) => nodeManager.destroyNode(id))
   handle('node:reprovision', () => {})
   handle('node:openVncTunnel', async (nodeId) => {
@@ -623,7 +638,6 @@ export function registerIpc(): void {
       : (nodeManager.get(nodeId)?.snapshot ?? null)
     return snap ? sshTargetFor(snap) : null
   })
-  handle('fleet:clearFailed', () => nodeManager.clearFailed())
   handle('node:openSshTerminal', (nodeId) => {
     const snap = MOCK
       ? (mockNodes().find((n) => n.id === nodeId) ?? null)
@@ -681,6 +695,7 @@ export function registerIpc(): void {
       height: number | null
       codec: string | null
       hdr: number
+      segments: string | null
     }>
     // Allow-list, not `kind !== 'frame'`: a deny-list silently admits every
     // future asset kind into the gallery, mislabelled as SDR.
@@ -688,8 +703,11 @@ export function registerIpc(): void {
       .filter((r) => CLIP_KINDS.includes(r.kind))
       .map((r) => ({
         kind: r.kind as ClipKind,
+        // chunk_id NULL = a stitched job clip (see transfer/jobClip.ts)
+        scope: r.chunk_id == null ? ('job' as const) : ('chunk' as const),
+        segments: r.segments ? (JSON.parse(r.segments) as FrameSegment[]) : undefined,
         chunkId: r.chunk_id ?? '',
-        label: `${r.chunk_id ?? ''} ${r.kind === 'previewHdr' ? 'HDR' : r.kind === 'proxy' ? 'proxy' : 'SDR'}`,
+        label: `${r.chunk_id ?? 'job'} ${r.kind === 'previewHdr' ? 'HDR' : r.kind === 'proxy' ? 'proxy' : 'SDR'}`,
         absPath: r.abs_path,
         mediaUrl: toMediaUrl(r.abs_path),
         fps: r.fps ?? 25,

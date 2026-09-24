@@ -20,6 +20,9 @@ extraResources:
     to: remote
 asarUnpack:
   - resources/**
+  # ffmpeg-static's binary is exec'd for job clip stitching — see
+  # src/main/media/ffmpeg.ts, which rewrites its path to app.asar.unpacked.
+  - node_modules/ffmpeg-static/**
 win:
   executableName: vast-render
 nsis:

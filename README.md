@@ -37,6 +37,10 @@ gauges, ssh access, what it's rendering, and its console.*
 - **Remote preview encodes** — each chunk is encoded on the node to H.265:
   SDR, 10-bit HLG BT.2020 **HDR**, and a small proxy — all All-Intra for
   frame-exact scrubbing.
+- **Whole-job preview** — as chunks finish, the desktop stitches their preview
+  clips end to end (a lossless remux, no re-encode) into one clip per job. However
+  finely a job is chunked across the fleet, it plays and scrubs as one clip;
+  chunks still rendering show as gaps you can click into to watch live.
 - **Gallery** — a video wall of preview clips with a frame-exact transport
   (timecode, frame stepping, draggable playhead), exposure/grade controls,
   HDR passthrough on HDR displays, and click-to-open into Explorer for every
@@ -141,6 +145,11 @@ at boot:
 ```bash
 VR_JOB_SPEC=C:/specs/campaign.json npm run dev
 ```
+
+Each blend entry is **one job**, however many nodes render it. To put more
+machines on a job, raise `maxActiveNodes` (and set `eagerFleet: true` to rent
+ahead of demand) rather than shrinking `chunkSize`. Leaving `chunkSize` null sizes
+chunks for about three per node.
 
 Re-running the same spec **heals** partially complete jobs (revives failed
 chunks) rather than duplicating them. Events and node logs are mirrored to

@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { chunkRange, containsFrame, domainOf, frameAt, indexOf } from './frame-domain'
+import {
+  chunkRange,
+  containsFrame,
+  domainOf,
+  frameAt,
+  indexOf,
+  segmentFrameAt,
+  segmentIndexOf,
+  segmentsCount
+} from './frame-domain'
 
 describe('domainOf', () => {
   it('counts inclusive ranges', () => {
@@ -78,5 +87,49 @@ describe('chunkRange', () => {
     const d = domainOf(10, 20, 1)
     expect(chunkRange(d, 1, 9)).toBeNull()
     expect(chunkRange(d, 21, 30)).toBeNull()
+  })
+})
+
+describe('segmented job clips', () => {
+  // frames 101-110 and 121-125 held; 111-120 still rendering
+  const segs = [
+    { start: 101, end: 110 },
+    { start: 121, end: 125 }
+  ]
+
+  it('maps frames across a gap', () => {
+    expect(segmentIndexOf(segs, 1, 101)).toBe(0)
+    expect(segmentIndexOf(segs, 1, 110)).toBe(9)
+    expect(segmentIndexOf(segs, 1, 121)).toBe(10)
+    expect(segmentIndexOf(segs, 1, 125)).toBe(14)
+  })
+
+  it('reports frames in a gap or outside as not held', () => {
+    expect(segmentIndexOf(segs, 1, 115)).toBeNull()
+    expect(segmentIndexOf(segs, 1, 100)).toBeNull()
+    expect(segmentIndexOf(segs, 1, 126)).toBeNull()
+  })
+
+  it('round-trips index -> frame -> index', () => {
+    for (let i = 0; i < segmentsCount(segs, 1); i++) {
+      expect(segmentIndexOf(segs, 1, segmentFrameAt(segs, 1, i))).toBe(i)
+    }
+  })
+
+  it('clamps out-of-range indices', () => {
+    expect(segmentFrameAt(segs, 1, -3)).toBe(101)
+    expect(segmentFrameAt(segs, 1, 99)).toBe(125)
+    expect(segmentFrameAt([], 1, 0)).toBe(0)
+  })
+
+  it('honours frame step', () => {
+    const stepped = [
+      { start: 1, end: 9 },
+      { start: 21, end: 25 }
+    ] // 1,3,5,7,9 | 21,23,25
+    expect(segmentsCount(stepped, 2)).toBe(8)
+    expect(segmentIndexOf(stepped, 2, 21)).toBe(5)
+    expect(segmentIndexOf(stepped, 2, 4)).toBe(1) // snaps down to 3
+    expect(segmentFrameAt(stepped, 2, 7)).toBe(25)
   })
 })

@@ -28,7 +28,7 @@ export function getDb(): Db {
   return db
 }
 
-const SCHEMA_VERSION = 4
+const SCHEMA_VERSION = 5
 
 /**
  * Column additions, which `CREATE TABLE IF NOT EXISTS` in schema.sql cannot
@@ -57,6 +57,11 @@ function migrate(db: Db): void {
     // and nothing here recorded the offer. Existing rows stay null and their
     // energy is costed at the world-average intensity.
     db.exec('ALTER TABLE nodes ADD COLUMN geolocation TEXT')
+  }
+  if (!hasColumn(db, 'assets', 'segments')) {
+    // v5: stitched job clips (chunk_id NULL) record which job frames they
+    // hold, as a JSON array of {start,end}. Chunk clips leave it null.
+    db.exec('ALTER TABLE assets ADD COLUMN segments TEXT')
   }
   db.prepare('UPDATE schema_meta SET version = ?').run(SCHEMA_VERSION)
 }

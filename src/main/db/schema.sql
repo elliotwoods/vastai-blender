@@ -81,8 +81,8 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE TABLE IF NOT EXISTS assets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id TEXT NOT NULL REFERENCES jobs(id),
-  chunk_id TEXT,
-  kind TEXT NOT NULL,                 -- previewSdr | previewHdr | proxy | frame
+  chunk_id TEXT,                      -- NULL for a stitched job clip
+  kind TEXT NOT NULL,                 -- previewSdr | previewHdr | proxy | live | frame
   abs_path TEXT NOT NULL UNIQUE,
   fps REAL,
   frames INTEGER,
@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS assets (
   height INTEGER,
   codec TEXT,
   hdr INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  segments TEXT                       -- job clips: JSON [{start,end}] of job frames held
 );
 CREATE INDEX IF NOT EXISTS idx_assets_job ON assets(job_id);
 
