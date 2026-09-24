@@ -434,6 +434,32 @@ describe('what Blender saves', () => {
     expect(chunkRow(chunk.id).retries).toBe(0)
     expect(w.alerts('error')).toEqual([])
   })
+
+  it('a stereo chunk the agent fails after rendering every view is not rendered again', async () => {
+    // What the agent does today: encode_preview.py finds no NNNN.ext frames
+    // to encode, so the chunk ends 'failed' with every view listed.
+    const { app, machine } = await oneNode()
+    const specs: AgentSpec[] = []
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      for (let f = spec.frameStart; f <= spec.frameEnd; f += spec.frameStep) {
+        for (const view of ['_L', '_R']) {
+          listSaved(machine, spec.chunkId, `frames/${String(f).padStart(4, '0')}${view}.png`)
+        }
+      }
+      machine.agent.fail(spec.chunkId, 'encode failed (1)')
+    }
+    const jobId = await w.submitJob(app)
+    const chunk = onlyChunk(jobId)
+    app.scheduler.kick()
+
+    await w.until(() => ['complete', 'partial'].includes(jobState(jobId) ?? ''), 'job settled')
+
+    expect(jobState(jobId)).toBe('complete')
+    expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
+    expect(specs).toHaveLength(1)
+    expect(chunkRow(chunk.id).retries).toBe(0)
+  })
 })
 
 describe('frames outside the chunk', () => {
