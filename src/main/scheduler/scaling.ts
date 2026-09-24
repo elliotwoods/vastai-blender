@@ -77,3 +77,39 @@ export function nodesToRequest(i: ScaleInput): number {
   }
   return Math.max(0, Math.min(want, room, burst))
 }
+
+/**
+ * $/hr the fleet may still add under the spend cap.
+ *
+ * The cap used to be tested against the fleet as it stood (`perHour <
+ * cap`), so the offer about to be rented was never counted: with a $2/h cap
+ * and $1.95/h running, the next rental could be any price, a multi-GPU box
+ * at several times the cap included (#5, #16, #35, #65, #94, #144, #158).
+ * requestNodes passes this to findOffers as maxDphTotal, so the search only
+ * returns offers that fit, and re-checks each offer against what is left
+ * before renting it (plan 1.5).
+ *
+ * @param perHourBillingNow $/hr of every node that may hold an instance,
+ *   failed-but-holding and destroying ones included: an instance nobody has
+ *   confirmed gone may still bill, so it still counts against the cap
+ * @param cap the spend cap in $/hr
+ * @param noCap the explicit "no cap" setting. Only that means uncapped: a
+ *   missing, blank or nonsense cap without it rents nothing, so a cleared
+ *   field is never read as "spend without limit" (plan 1.14)
+ *
+ * Rounded down to a millionth of a dollar, so float noise can neither invent
+ * headroom nor turn $0.05 into $0.04999…
+ */
+export function capHeadroom(
+  perHourBillingNow: number,
+  cap: number | null | undefined,
+  noCap = false
+): number {
+  if (noCap === true) return Number.POSITIVE_INFINITY
+  if (cap == null || !Number.isFinite(cap) || cap <= 0) return 0
+  // Unknown billing is not zero billing.
+  if (!Number.isFinite(perHourBillingNow) || perHourBillingNow < 0) return 0
+  const left = cap - perHourBillingNow
+  if (!(left > 0)) return 0
+  return Math.floor(left * 1e6 + 1e-6) / 1e6
+}

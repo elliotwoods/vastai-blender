@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { MAX_REQUESTS_PER_TICK, nodesToRequest, type ScaleInput } from './scaling'
+import { capHeadroom, MAX_REQUESTS_PER_TICK, nodesToRequest, type ScaleInput } from './scaling'
 
 const input = (i: Partial<ScaleInput> = {}): ScaleInput => ({
   pendingShared: 0,
@@ -71,5 +71,45 @@ describe('nodesToRequest', () => {
   it('eager mode fills to the cap while work remains', () => {
     expect(nodesToRequest(input({ eager: true, workRemaining: 1, active: 26 }))).toBe(4)
     expect(nodesToRequest(input({ eager: true, workRemaining: 0 }))).toBe(0)
+  })
+})
+
+describe('capHeadroom (plan 1.5)', () => {
+  it('is what is left under the cap, so the search only returns offers that fit', () => {
+    // The field shape: a $2/h cap with $1.95/h running left the next rental
+    // unbounded. Now the search is told $0.05.
+    expect(capHeadroom(1.95, 2)).toBe(0.05)
+    expect(capHeadroom(0, 2)).toBe(2)
+    expect(capHeadroom(1.9, 2)).toBe(0.1)
+  })
+
+  it('is zero at or over the cap', () => {
+    expect(capHeadroom(2, 2)).toBe(0)
+    expect(capHeadroom(3.4, 2)).toBe(0)
+  })
+
+  it('counts every node that may still bill: the caller passes failed-but-holding ones', () => {
+    // 1.50 live + 0.45 on a node whose destroy failed.
+    expect(capHeadroom(1.5 + 0.45, 2)).toBe(0.05)
+  })
+
+  it('is unbounded only with the explicit no-cap flag', () => {
+    expect(capHeadroom(50, null, true)).toBe(Number.POSITIVE_INFINITY)
+    expect(capHeadroom(50, 2, true)).toBe(Number.POSITIVE_INFINITY)
+    // A cleared field is not "no limit".
+    expect(capHeadroom(0, null)).toBe(0)
+    expect(capHeadroom(0, undefined)).toBe(0)
+    expect(capHeadroom(0, Number.NaN)).toBe(0)
+    expect(capHeadroom(0, -1)).toBe(0)
+  })
+
+  it('treats unknown billing as no headroom', () => {
+    expect(capHeadroom(Number.NaN, 2)).toBe(0)
+    expect(capHeadroom(-1, 2)).toBe(0)
+  })
+
+  it('never rounds headroom up', () => {
+    expect(capHeadroom(0.1 + 0.2, 0.5)).toBe(0.2)
+    expect(capHeadroom(1.9999999, 2)).toBe(0)
   })
 })
