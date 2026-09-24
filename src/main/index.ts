@@ -451,16 +451,25 @@ app.whenReady().then(() => {
             )
             continue
           }
-          const jobId = await createJob({
-            blendPath: blend.path,
-            engine: spec.engine ?? 'eevee',
-            frameStart: blend.frameStart ?? spec.frameStart ?? 1,
-            frameEnd: blend.frameEnd ?? spec.frameEnd ?? 200,
-            frameStep: blend.frameStep ?? spec.frameStep ?? 1,
-            addonIds,
-            chunkSize: spec.chunkSize ?? null,
-            shareNode: blend.shareNode ?? spec.shareNode ?? false
-          })
+          // One blend createJob refuses (missing file, impossible range) must
+          // not cost the rest of the campaign its submission — or skip the
+          // kick() below that starts it.
+          let jobId: string
+          try {
+            jobId = await createJob({
+              blendPath: blend.path,
+              engine: spec.engine ?? 'eevee',
+              frameStart: blend.frameStart ?? spec.frameStart ?? 1,
+              frameEnd: blend.frameEnd ?? spec.frameEnd ?? 200,
+              frameStep: blend.frameStep ?? spec.frameStep ?? 1,
+              addonIds,
+              chunkSize: spec.chunkSize ?? null,
+              shareNode: blend.shareNode ?? spec.shareNode ?? false
+            })
+          } catch (e) {
+            console.error(`[spec] skip (${(e as Error).message}): ${blend.path}`)
+            continue
+          }
           created++
           console.log(`[spec] job ${created}/${blends.length} ${jobId} ${blend.path}`)
         }
