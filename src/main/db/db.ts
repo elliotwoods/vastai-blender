@@ -205,22 +205,29 @@ function resetGpuLearning(db: Db): void {
   })()
 }
 
-/** The app_state keys; schema.sql says what each holds. */
-export type AppStateKey = 'install_id' | 'recovery_hold' | 'account_hold'
+/**
+ * The app_state keys known so far; schema.sql says what each holds. The
+ * functions below take any string too, so a later item can add a key
+ * without editing this file (it should document it in schema.sql).
+ */
+export type AppStateKey = 'install_id' | 'recovery_hold' | 'account_hold' | 'local_sink_hold'
+
+/** An AppStateKey, or a key a later item added (`string & {}` keeps the hints). */
+type AnyAppStateKey = AppStateKey | (string & {})
 
 /**
  * An app_state value, or null when the key was never written or was cleared.
  * Takes the database rather than calling getDb(), so it works on whichever
  * handle the caller has, the test harness's included.
  */
-export function readAppState(db: Db, key: AppStateKey): string | null {
+export function readAppState(db: Db, key: AnyAppStateKey): string | null {
   const row = db.prepare('SELECT value FROM app_state WHERE key = ?').get(key) as
     { value: string } | undefined
   return row?.value ?? null
 }
 
 /** Set an app_state key, stamping updated_at; null deletes it. */
-export function writeAppState(db: Db, key: AppStateKey, value: string | null): void {
+export function writeAppState(db: Db, key: AnyAppStateKey, value: string | null): void {
   if (value == null) {
     db.prepare('DELETE FROM app_state WHERE key = ?').run(key)
     return

@@ -453,4 +453,13 @@ describe('app_state', () => {
     applySchema(db)
     expect(readAppState(db, 'install_id')).toBe('c0ffee00')
   })
+
+  it('takes a key a later item adds without a change to db.ts', () => {
+    // Typechecked: AppStateKey names the keys known now, not every key.
+    const db = freshDb()
+    writeAppState(db, 'local_sink_hold', '{"reason":"ENOSPC"}')
+    writeAppState(db, 'a_later_items_key', '1')
+    expect(readAppState(db, 'local_sink_hold')).toBe('{"reason":"ENOSPC"}')
+    expect(readAppState(db, 'a_later_items_key')).toBe('1')
+  })
 })

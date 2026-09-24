@@ -246,14 +246,17 @@ CREATE INDEX IF NOT EXISTS idx_node_metrics_ts ON node_metrics(ts);
 -- Small state that must outlive a restart and has no better home, one row per
 -- key. Kept here rather than in settings.json because it belongs to this
 -- database's rows: an install id that labels its nodes' instances, holds that
--- stand for its jobs and nodes. Keys (db.ts AppStateKey):
---   install_id     this profile's random id, carried in every instance label
---                  so the orphan sweep can tell this profile's instances from
---                  another's (plan 1.3)
---   recovery_hold  the start-up recovery hold, so a relaunch does not rent a
---                  full fleet past it (plan 1.9)
---   account_hold   renting paused because Vast credit ran low or out, and why
---                  (plan 1.20)
+-- stand for its jobs and nodes. Keys (db.ts AppStateKey; a new key is
+-- listed here, and needs no change to db.ts):
+--   install_id       this profile's random id, carried in every instance
+--                    label so the orphan sweep can tell this profile's
+--                    instances from another's (plan 1.3)
+--   recovery_hold    the start-up recovery hold, so a relaunch does not rent
+--                    a full fleet past it (plan 1.9)
+--   account_hold     renting paused because Vast credit ran low or out, and
+--                    why (plan 1.20)
+--   local_sink_hold  the local output disk is full or refuses writes
+--                    (ENOSPC, EACCES), and why (plan 1.10, B6)
 CREATE TABLE IF NOT EXISTS app_state (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,                -- the key owner's format; JSON where it has fields
