@@ -449,6 +449,23 @@ describe('planScaling: holds and limits', () => {
     expect(p.reason).toMatch(/rentals keep failing/)
   })
 
+  it('a scale backoff lapses at its retryAt, whoever was meant to clear it', () => {
+    const backoff = (retryAt: number | null): FleetHolds => ({
+      scale: { reason: 'rentals keep failing; retrying at 10:42', since: 0, retryAt }
+    })
+    expect(planScaling(plan({ ...big, holds: backoff(2000), now: 1999 })).status).toBe('held')
+    expect(planScaling(plan({ ...big, holds: backoff(2000), now: 2000 })).status).toBe('rent')
+    // No retry time: only its owner releases it.
+    expect(planScaling(plan({ ...big, holds: backoff(null), now: 1e15 })).status).toBe('held')
+    // No clock: in force until cleared, as before.
+    expect(planScaling(plan({ ...big, holds: backoff(2000) })).status).toBe('held')
+    // Other holds have no retry time and stay.
+    const both: FleetHolds = { ...backoff(2000), recovery: 2 }
+    const p = planScaling(plan({ ...big, holds: both, now: 5000 }))
+    expect(p.status).toBe('held')
+    expect(p.reason).not.toMatch(/rentals keep failing/)
+  })
+
   it('$0.05 of headroom is a $0.05 budget, not a yes (plan 1.5)', () => {
     const cap = caps([node(1.95)], { spendCapPerHour: 2, noSpendCap: false })
     const p = planScaling(plan({ ...big, cap }))

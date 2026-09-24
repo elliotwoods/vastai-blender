@@ -190,6 +190,13 @@ export interface PlanScalingInput {
   cap: CapacityBudget
   /** every hold in force (fleet:holds); any one stops scale-up */
   holds: FleetHolds
+  /**
+   * Epoch ms. A scale backoff (holds.scale) whose retryAt is at or before it
+   * has run out and no longer stops scale-up, so a hold its owner (plan
+   * 1.17's rent breaker) failed to clear cannot pause the fleet forever.
+   * Without it, every scale hold stops scale-up until it is cleared.
+   */
+  now?: number
 
   pendingShared: number
   pendingExclusive: number
@@ -247,15 +254,18 @@ function mins(ms: number): string {
 
 const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
 
-/** Each hold's reason, worded for scale status. */
-function holdReasons(h: FleetHolds): string[] {
+/** Each hold in force, its reason worded for scale status. */
+function holdReasons(h: FleetHolds, now: number | undefined): string[] {
   const out: string[] = []
   if (h.account) out.push(h.account.reason)
   if (h.localSink) out.push(h.localSink.reason)
   if (h.recovery != null) {
     out.push(`${plural(h.recovery, 'chunk')} from the last session wait for you to resume`)
   }
-  if (h.scale) out.push(h.scale.reason)
+  if (h.scale) {
+    const over = now != null && h.scale.retryAt != null && h.scale.retryAt <= now
+    if (!over) out.push(h.scale.reason)
+  }
   return out
 }
 
@@ -269,7 +279,7 @@ export function planScaling(i: PlanScalingInput): ScalingPlan {
     nodes: 0
   })
 
-  const held = holdReasons(i.holds)
+  const held = holdReasons(i.holds, i.now)
   if (held.length > 0) return stop('held', `scale-up paused: ${held.join('; ')}`)
 
   // --- Demand, in lanes and slots. ---
