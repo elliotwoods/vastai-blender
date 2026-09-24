@@ -2,9 +2,9 @@
 """Self-check for the parts of noderunner.py that are easy to get wrong.
 
 `remote/` is the one place with no automated coverage — it runs unattended on
-rented hardware, where a mistake costs money and a whole render. The app-side
-suite (`npm test`) cannot reach it, so this stands in: stdlib only, no ffmpeg, no
-node, no network. Run it after touching noderunner.py.
+rented hardware, where a mistake costs money and a whole render. This is its
+suite: stdlib only, no ffmpeg, no node, no network. `npm test` and CI run it
+(`npm run test:remote` on its own); run it after touching anything in remote/.
 
     python3 remote/agent/selfcheck.py
 
@@ -44,6 +44,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import noderunner as nr  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "encode"))
+import encode_preview as ep  # noqa: E402
 
 FAILED = []
 
@@ -515,6 +518,37 @@ def test_plan_launches():
           == [("a", None), ("b", None)])
 
 
+def test_preview_sequence():
+    """encode_preview: one clip frame per Blender frame on the chunk's step grid."""
+    names = lambda ns, fmt="{:04d}.png": [fmt.format(n) for n in ns]  # noqa: E731
+    picked, step, view, ext = ep.plan_sequence(names(range(1, 5)))
+    check("plain frames: every file, step 1", (picked, step, view, ext) == (names(range(1, 5)), 1, "", "png"))
+    picked, step, _, _ = ep.plan_sequence(names(range(1, 10, 2)))
+    check("frame step 2: all five frames, not one", picked == names(range(1, 10, 2)) and step == 2)
+    picked, _, _, _ = ep.plan_sequence(names([1, 2, 4, 5]))
+    check("a gap holds the previous frame so later frames keep their index",
+          picked == ["0001.png", "0002.png", "0002.png", "0004.png", "0005.png"])
+    stereo = names(range(1, 4), "{:04d}_L.png") + names(range(1, 4), "{:04d}_R.png")
+    picked, _, view, _ = ep.plan_sequence(stereo)
+    check("stereo: one clip of the left view", view == "_L" and picked == names(range(1, 4), "{:04d}_L.png"))
+    picked, _, view, ext = ep.plan_sequence(["0001", "0002", "0003"])
+    check("frames saved without an extension are found", picked == ["0001", "0002", "0003"] and ext == "")
+    picked, _, _, ext = ep.plan_sequence(names(range(1, 4), "{:04d}.exr") + ["0002.png", "notes.txt", "live.h265"])
+    check("one format per clip; strays and non-frames ignored", ext == "exr" and len(picked) == 3)
+    check("no frames at all -> empty plan", ep.plan_sequence(["a.txt"])[0] == [])
+    with tempfile.TemporaryDirectory() as tmp:
+        frames = os.path.join(tmp, "frames")
+        os.makedirs(frames)
+        for n in (1, 3):
+            with open(os.path.join(frames, f"{n:04d}"), "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n" + bytes(8))
+        picked, _, _, ext = ep.plan_sequence(os.listdir(frames))
+        pattern, ext = ep.link_sequence(frames, picked, ext, os.path.join(tmp, "seq"))
+        linked = sorted(os.listdir(os.path.join(tmp, "seq")))
+        check("extension-less PNGs are sniffed and linked as a dense sequence",
+              ext == "png" and linked == ["000000.png", "000001.png"] and pattern.endswith("%06d.png"))
+
+
 def main():
     for fn in (
         test_plan_launches,
@@ -523,6 +557,7 @@ def main():
         test_resubscribe_fills_the_gap,
         test_write_state_under_threads,
         test_sweep_filters,
+        test_preview_sequence,
     ):
         fn()
     # Through fake_node, whose `blender` is a `#!/bin/sh` wrapper that Windows
