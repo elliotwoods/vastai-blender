@@ -44,11 +44,17 @@ unset OCTANE_USER OCTANE_PASS
 # contain the words a success line does, and the old check read them as a
 # license (octaneLicense.ts). Only the LAST line that matches either is read,
 # so a sign-in by hand after a failed scripted one does count. These phrases
-# have NOT yet been checked against a real OctaneServer log: add the exact
-# lines when plan 1.18's run with an OTOY account shows them. Until then a
-# server that logs neither reads as serverRunning, never as licensed.
+# have NOT yet been checked against a real OctaneServer log: plan 1.18's run
+# with an OTOY account must replace both with the exact lines it shows. Until
+# then a server that logs neither reads as serverRunning, never as licensed.
+# The two err in opposite directions on purpose. A false needsLogin costs a
+# sign-in over VNC; a false licensed sends paid Octane chunks to a node where
+# every render fails. So any failure-sounding line counts, while every success
+# alternative names the license, a login or sign-in, or the account in the
+# same words: "CUDA device 0 activated successfully" says nothing about a
+# license.
 LOGIN_FAILED_RE='not (activated|licensed|logged in|signed in)|(activation|login|log in|sign-in|sign in|authentication|license check|license request) (has )?(failed|error|denied|refused|unsuccessful)|(failed|unable|could not|couldn.t|cannot|can.t) (to )?(activate|log ?in|sign ?in|authenticate|acquire|obtain|check ?out)|invalid (user ?name|password|credentials|login|e-?mail)|licen[cs]es? (is |are )?(already )?in use|no (free |available |valid )?licen[cs]es?|licen[cs]e (has )?expired|deactivated|logged out|signed out'
-LICENSED_RE='(activation|login|log in|sign-in|sign in|authentication) (was )?(succeeded|successful|complete)|successfully (activated|logged in|signed in|authenticated)|licen[cs]e (acquired|activated|checked out|granted|obtained)|(acquired|obtained|checked out) (a |the )?licen[cs]e|(logged|signed) in as|activated successfully|(is|has been) activated'
+LICENSED_RE='licen[cs]e (was |has been |is )?(acquired|activated|checked out|granted|obtained)|(acquired|obtained|checked out|activated) (a |the |your )?licen[cs]e|licen[cs]e (activation|check|request) (was )?(succeeded|successful|complete)|(login|log in|sign-in|sign in) (was )?(succeeded|successful|complete)|successfully (logged|signed) in|(logged|signed) in (as|to)|account (activated|verified|authenticated)'
 
 OCTANE_PKGS=(
   tightvncserver openbox xterm dbus-x11 x11-xserver-utils

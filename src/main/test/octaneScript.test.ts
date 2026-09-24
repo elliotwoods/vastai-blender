@@ -109,7 +109,7 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
     vnc()
     expect(n.octane(['start-server']).code).toBe(0)
     const pid = serverPid()
-    appendFileSync(serverLog(), 'Activation successful\n')
+    appendFileSync(serverLog(), 'License acquired\n')
 
     const again = n.octane(['start-server', '--credentials-stdin'], { input: `${USER}\n${PASS}\n` })
     expect(again.code).toBe(0)
@@ -181,7 +181,7 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
     expect(state()).toBe('needsLogin')
 
     // A sign-in by hand over VNC after the failure: the latest line wins.
-    appendFileSync(serverLog(), 'Activation successful\n')
+    appendFileSync(serverLog(), 'Successfully logged in as render-farm@example.com\n')
     expect(state()).toBe('licensed')
 
     // Lines that say nothing about the license change nothing.
@@ -192,8 +192,41 @@ describe.skipIf(process.platform === 'win32')('setup_octane.sh', () => {
     expect(state()).toBe('needsLogin')
 
     // A success word inside a failure line is still a failure.
-    appendFileSync(serverLog(), 'Activation successful\nlogin failed: invalid password\n')
+    appendFileSync(serverLog(), 'License acquired\nlogin failed: invalid password\n')
     expect(state()).toBe('needsLogin')
+  })
+
+  it('1.18: a success line that does not name the license never reads as licensed', () => {
+    vnc()
+    expect(n.octane(['start-server']).code).toBe(0)
+    appendFileSync(serverLog(), 'ERROR: Failed to acquire license\n')
+    expect(state()).toBe('needsLogin')
+
+    // Device and module lines a GPU server logs after a failed sign-in. Were
+    // any of them read as the license, Octane chunks would go to a node where
+    // every render fails, and it would bill all the while.
+    appendFileSync(
+      serverLog(),
+      [
+        'CUDA device 0 activated successfully',
+        'OptiX denoiser module has been activated',
+        'Network rendering is activated',
+        'Activation successful',
+        'Authentication successful for render node 127.0.0.1',
+        'Device RTX 4090 successfully activated'
+      ].join('\n') + '\n'
+    )
+    expect(state()).toBe('needsLogin')
+
+    // Nor on a server that has logged nothing about its license yet.
+    expect(n.octane(['stop-server']).code).toBe(0)
+    expect(n.octane(['start-server']).code).toBe(0)
+    appendFileSync(serverLog(), 'CUDA device 0 activated successfully\n')
+    expect(state()).toBe('serverRunning')
+
+    // A line that names the license does count.
+    appendFileSync(serverLog(), 'License activation successful\n')
+    expect(state()).toBe('licensed')
   })
 
   it('1.18: stop-server stops the server cleanly and forgets it', () => {
