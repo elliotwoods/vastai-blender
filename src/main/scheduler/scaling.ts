@@ -15,10 +15,10 @@
  *
  * planScaling() (plan 1.5, 1.21) goes further, and replaces nodesToRequest:
  *
- * - It returns a CapacityBudget (exclusive lanes, shared slots, $/hr, and a
- *   rental count) instead of a node count. requestNodes subtracts each
- *   offer's real contribution as it rents (offerContribution, subtractRental)
- *   and stops once the demand is covered. A node count sized on the
+ * - It returns a CapacityBudget (shared/models.ts: node room, $/hr headroom,
+ *   and the exclusive lanes and shared slots still wanted) instead of a node
+ *   count. requestNodes subtracts each offer's real contribution as it rents
+ *   (offerContribution, subtractRental) and stops once the demand is covered. A node count sized on the
  *   GPU-count filter and placeholder slot counts rented whatever ranked
  *   best, 8-GPU boxes included, for 1-lane demand (#227, #237).
  * - The spend cap is a budget, not a yes/no: capHeadroom() goes to the offer
@@ -30,13 +30,13 @@
  *   would do in less time than it takes to boot, or that the fleet already
  *   has finishes before a new node could arrive, and buy-ahead counts frames,
  *   not chunks.
- * - An account, local-sink or recovery hold stops it with a reason, for
- *   scheduler:scaleStatus.
+ * - Any FleetHolds entry (account, local sink, recovery, scale backoff)
+ *   stops it with the hold's reason, for scheduler:scaleStatus.
  *
  * Pure, so the arithmetic is testable without a fleet.
  */
 
-import type { EngineId, NodeMetrics } from '../../shared/models'
+import type { CapacityBudget, EngineId, FleetHolds, NodeMetrics } from '../../shared/models'
 import { planLanes } from './gpuLanes'
 import { hardCap, seedTarget } from './slotController'
 
@@ -150,45 +150,39 @@ export function capHeadroom(
 /** How long a newly rented node takes to boot and provision before its first frame. */
 export const NEW_NODE_LEAD_MS = 10 * 60_000
 
-/**
- * What one scale-up batch may still rent. requestNodes rents while
- * budgetOpen(), and after each rental takes off what that offer brings
- * (subtractRental).
- */
-export interface CapacityBudget {
-  /** exclusive GPU lanes still wanted */
-  exclusiveLanes: number
-  /** shared-work slots still wanted */
-  sharedSlots: number
-  /** $/hr the batch may still add; Infinity = uncapped. The offer search's maxDphTotal. */
-  maxDphTotal: number
-  /** rentals still allowed: room under maxActiveNodes, and the per-tick burst */
-  maxNodes: number
-}
-
-/** A reason scale-up is paused, for scheduler:scaleStatus. */
-export interface ScaleHold {
-  /** 'account' (plan 1.20), 'local-sink' (1.10), 'recovery' (restart), ... */
-  kind: string
-  /** one line for the user: why, and what releases it */
-  reason: string
-}
-
 export type ScaleStatus = 'rent' | 'held' | 'covered' | 'tail' | 'max-nodes' | 'spend-cap'
 
 export interface ScalingPlan {
   status: ScaleStatus
   /** one line for scheduler:scaleStatus and logs: why the budget is what it is */
   reason: string
-  budget: CapacityBudget
   /**
-   * The budget as a node count at the new-node estimate, bounded by maxNodes,
-   * for a caller that still rents by count. 0 unless status is 'rent'.
+   * The caps it was given, with the demand this batch has to cover filled in
+   * (exclusiveLanes, sharedSlots; 0 unless status is 'rent'). requestNodes
+   * searches with maxDphTotal = headroomPerHour, rents while budgetOpen(),
+   * checks each offer with nodeState.fitsBudget and spends the budget down
+   * with subtractRental.
+   */
+  budget: CapacityBudget
+  /** rentals this batch may make: the node room and the per-tick burst. 0 unless 'rent'. */
+  maxRentals: number
+  /**
+   * The demand as a node count at the new-node estimate, at most maxRentals,
+   * for a caller that still rents by count. 0 unless 'rent'.
    */
   nodes: number
 }
 
 export interface PlanScalingInput {
+  /**
+   * The fleet's caps: nodeState.capacityBudget(nodes, settings), which counts
+   * every node that may still bill and reads the cap only as noSpendCap
+   * allows. Its demand fields are ignored; planScaling fills them in.
+   */
+  cap: CapacityBudget
+  /** every hold in force (fleet:holds); any one stops scale-up */
+  holds: FleetHolds
+
   pendingShared: number
   pendingExclusive: number
   /** free shared slots on usable nodes */
@@ -219,34 +213,31 @@ export interface PlanScalingInput {
   /** boot + provision time of a new node; default NEW_NODE_LEAD_MS */
   newNodeLeadMs?: number
 
-  /** buy-ahead: rent while frames outnumber the fleet's lanes/slots */
+  /** buy-ahead: rent while frames outnumber the fleet's lanes and slots */
   eager: boolean
-  /** nodes counted against maxActiveNodes (booting included) */
-  active: number
-  maxActive: number
-  /** $/hr of every node that may hold an instance, failed-but-holding included */
-  perHourBilling: number
-  spendCap: number | null
-  /** the explicit no-cap setting; see capHeadroom */
-  noCap: boolean
   /** the cheapest offer worth searching for: less headroom than this rents nothing */
   minOfferDph?: number
-  /** every active hold; any one stops scale-up */
-  holds: ScaleHold[]
   maxPerTick?: number
 }
 
-const ZERO_BUDGET: CapacityBudget = {
-  exclusiveLanes: 0,
-  sharedSlots: 0,
-  maxDphTotal: 0,
-  maxNodes: 0
-}
-
-const money = (v: number): string => (Number.isFinite(v) ? `$${v.toFixed(2)}/h` : 'uncapped')
+const money = (v: number | null): string => (v == null ? 'uncapped' : `$${v.toFixed(2)}/h`)
 
 function mins(ms: number): string {
   return `${Math.max(1, Math.round(ms / 60_000))} min`
+}
+
+const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
+
+/** Each hold's reason, worded for scale status. */
+function holdReasons(h: FleetHolds): string[] {
+  const out: string[] = []
+  if (h.account) out.push(h.account.reason)
+  if (h.localSink) out.push(h.localSink.reason)
+  if (h.recovery != null) {
+    out.push(`${plural(h.recovery, 'chunk')} from the last session wait for you to resume`)
+  }
+  if (h.scale) out.push(h.scale.reason)
+  return out
 }
 
 /** Scale-up for this tick: a capacity budget, or the reason there is none. */
@@ -254,13 +245,13 @@ export function planScaling(i: PlanScalingInput): ScalingPlan {
   const stop = (status: ScaleStatus, reason: string): ScalingPlan => ({
     status,
     reason,
-    budget: { ...ZERO_BUDGET },
+    budget: { ...i.cap, exclusiveLanes: 0, sharedSlots: 0 },
+    maxRentals: 0,
     nodes: 0
   })
 
-  if (i.holds.length > 0) {
-    return stop('held', `scale-up paused: ${i.holds.map((h) => h.reason).join('; ')}`)
-  }
+  const held = holdReasons(i.holds)
+  if (held.length > 0) return stop('held', `scale-up paused: ${held.join('; ')}`)
 
   // --- Demand, in lanes and slots. ---
   const bootLanes = i.booting.reduce((a, b) => a + Math.max(1, b.lanes), 0)
@@ -291,69 +282,61 @@ export function planScaling(i: PlanScalingInput): ScalingPlan {
   // needs one rented.
   const lead = i.newNodeLeadMs ?? NEW_NODE_LEAD_MS
   if (i.usableNodes + i.booting.length > 0) {
-    const leadH = lead / 3_600_000
-    // What a new node could be given: pending work, or for buy-ahead, whatever
+    // What a new node could be given: pending work, or for buy-ahead whatever
     // is left (buy-ahead exists for queues the fleet has already prefetched).
+    // Pending frames count whole, even those free lanes will take: an
+    // overestimate, so the rule only ever rents less than before, never more.
     const givable = i.eager ? i.remainingExclusiveFrames + i.remainingSharedFrames : i.pendingFrames
     if (i.newNodeFramesPerHour != null && i.newNodeFramesPerHour > 0) {
       const workMs = (givable / i.newNodeFramesPerHour) * 3_600_000
       if (workMs < lead) {
         return stop(
           'tail',
-          `${givable} frame${givable === 1 ? '' : 's'} left for a new node is ~${mins(workMs)} of its work, less than the ~${mins(lead)} it takes to boot`
+          `${plural(givable, 'frame')} left for a new node is ~${mins(workMs)} of its work, less than the ~${mins(lead)} it takes to boot`
         )
       }
     }
     const remaining = i.remainingExclusiveFrames + i.remainingSharedFrames
     if (i.fleetFramesPerHour != null && i.fleetFramesPerHour > 0) {
-      if (remaining <= i.fleetFramesPerHour * leadH) {
-        const finishMs = (remaining / i.fleetFramesPerHour) * 3_600_000
+      const finishMs = (remaining / i.fleetFramesPerHour) * 3_600_000
+      if (finishMs <= lead) {
         return stop(
           'tail',
-          `the fleet finishes the last ${remaining} frame${remaining === 1 ? '' : 's'} in ~${mins(finishMs)}, before a new node could boot (~${mins(lead)})`
+          `the fleet finishes the last ${plural(remaining, 'frame')} in ~${mins(finishMs)}, before a new node could boot (~${mins(lead)})`
         )
       }
     }
   }
 
   // --- Limits. ---
-  const room = i.maxActive - i.active
-  if (room <= 0) return stop('max-nodes', `at max nodes (${i.active} of ${i.maxActive})`)
-  const headroom = capHeadroom(i.perHourBilling, i.spendCap, i.noCap)
+  if (!(i.cap.nodeRoom >= 1)) {
+    return stop('max-nodes', `at max nodes (${i.cap.nodes} of ${i.cap.maxNodes})`)
+  }
+  const headroom = i.cap.headroomPerHour
   const minOffer = Math.max(0, i.minOfferDph ?? 0)
-  if (!(headroom > 0) || headroom < minOffer) {
-    const cap = i.noCap
-      ? 'no cap'
-      : i.spendCap == null
-        ? 'no cap set'
-        : `a ${money(i.spendCap)} cap`
+  if (headroom != null && (!(headroom > 0) || headroom < minOffer)) {
     return stop(
       'spend-cap',
-      `spend cap: ${money(i.perHourBilling)} billing under ${cap} leaves ${money(headroom)}` +
+      `spend cap: ${money(i.cap.perHour)} of ${money(i.cap.spendCap)} in use leaves ${money(headroom)}` +
         (headroom > 0 ? `, less than the cheapest offer (${money(minOffer)})` : '')
     )
   }
 
-  const maxNodes = Math.max(0, Math.min(room, i.maxPerTick ?? MAX_REQUESTS_PER_TICK))
-  const budget: CapacityBudget = {
-    exclusiveLanes: exclusive,
-    sharedSlots: shared,
-    maxDphTotal: headroom,
-    maxNodes
-  }
+  const maxRentals = Math.max(0, Math.min(i.cap.nodeRoom, i.maxPerTick ?? MAX_REQUESTS_PER_TICK))
   const nodes = Math.min(
-    maxNodes,
+    maxRentals,
     Math.ceil(exclusive / Math.max(1, i.newNodeLanes)) +
       Math.ceil(shared / Math.max(1, i.newNodeSharedSlots))
   )
   const want = [
-    exclusive > 0 ? `${exclusive} exclusive lane${exclusive === 1 ? '' : 's'}` : null,
-    shared > 0 ? `${shared} shared slot${shared === 1 ? '' : 's'}` : null
+    exclusive > 0 ? plural(exclusive, 'exclusive lane') : null,
+    shared > 0 ? plural(shared, 'shared slot') : null
   ].filter((x): x is string => x != null)
   return {
     status: 'rent',
-    reason: `short ${want.join(' and ')}: up to ${maxNodes} rental${maxNodes === 1 ? '' : 's'} within ${money(headroom)}`,
-    budget,
+    reason: `short ${want.join(' and ')}: up to ${plural(maxRentals, 'rental')} within ${money(headroom)}`,
+    budget: { ...i.cap, exclusiveLanes: exclusive, sharedSlots: shared },
+    maxRentals,
     nodes
   }
 }
@@ -425,35 +408,47 @@ export function offerContribution(
 const microDown = (v: number): number => Math.max(0, Math.floor(v * 1e6 + 1e-6) / 1e6)
 
 /**
- * The budget after renting `offer`. A node serves exclusive or shared work,
- * not both at once, so it covers exclusive lanes first and shared slots only
- * once no exclusive demand is left, the way nodesToRequest added the two.
+ * The budget after renting `offer`: one node more, its price spent from the
+ * headroom, and what it brings taken off the demand. A node serves exclusive
+ * or shared work, not both at once, so it covers exclusive lanes first and
+ * shared slots only once no exclusive demand is left, the way nodesToRequest
+ * added the two. Demand that is null (a manual request) stays null.
  */
 export function subtractRental(
   budget: CapacityBudget,
   offer: { dphTotal: number },
   c: RentalContribution
 ): CapacityBudget {
-  const next = { ...budget, maxNodes: Math.max(0, budget.maxNodes - 1) }
-  if (next.exclusiveLanes > 0) next.exclusiveLanes = Math.max(0, next.exclusiveLanes - c.lanes)
-  else next.sharedSlots = Math.max(0, next.sharedSlots - c.sharedSlots)
-  // An unpriced offer spends everything: it should never have been rented.
+  // An unpriced offer spends all the headroom: it should never have been rented.
   const price = Number.isFinite(offer.dphTotal) ? Math.max(0, offer.dphTotal) : Infinity
-  const left = next.maxDphTotal - price
-  next.maxDphTotal = left === Infinity ? Infinity : Number.isFinite(left) ? microDown(left) : 0
+  const next: CapacityBudget = {
+    ...budget,
+    nodes: budget.nodes + 1,
+    nodeRoom: Math.max(0, budget.nodeRoom - 1),
+    perHour: budget.perHour + (Number.isFinite(price) ? price : 0)
+  }
+  if (budget.headroomPerHour != null) {
+    const left = budget.headroomPerHour - price
+    next.headroomPerHour = Number.isFinite(left) ? microDown(left) : 0
+  }
+  if (budget.exclusiveLanes != null && budget.exclusiveLanes > 0) {
+    next.exclusiveLanes = Math.max(0, budget.exclusiveLanes - c.lanes)
+  } else if (budget.sharedSlots != null) {
+    next.sharedSlots = Math.max(0, budget.sharedSlots - c.sharedSlots)
+  }
   return next
 }
 
-/** Is there still demand, a rental and money left in the budget? */
-export function budgetOpen(b: CapacityBudget): boolean {
-  return (b.exclusiveLanes > 0 || b.sharedSlots > 0) && b.maxNodes > 0 && b.maxDphTotal > 0
-}
-
 /**
- * May this offer be rented from the budget? Its price must fit what is left:
- * the re-check before each rent, since the search's limit was set before the
- * batch's earlier rentals spent from it. An offer with no sane price never fits.
+ * Is there still room, money and demand left in the budget? Demand that is
+ * null on both counts means the batch is not limited by it (a manual
+ * request): room and money decide.
  */
-export function offerFits(b: CapacityBudget, offer: { dphTotal: number }): boolean {
-  return Number.isFinite(offer.dphTotal) && offer.dphTotal >= 0 && offer.dphTotal <= b.maxDphTotal
+export function budgetOpen(b: CapacityBudget): boolean {
+  if (!(b.nodeRoom >= 1)) return false
+  if (b.headroomPerHour != null && !(b.headroomPerHour > 0)) return false
+  const ex = b.exclusiveLanes ?? null
+  const sh = b.sharedSlots ?? null
+  if (ex == null && sh == null) return true
+  return (ex ?? 0) > 0 || (sh ?? 0) > 0
 }

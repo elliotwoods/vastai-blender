@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+import type { CapacityBudget, FleetHolds } from '../../shared/models'
+import { capacityBudget, fitsBudget, type NodeCostFacts } from '../../shared/nodeState'
 import {
   budgetOpen,
   capHeadroom,
@@ -6,10 +8,8 @@ import {
   nodesToRequest,
   offerCap,
   offerContribution,
-  offerFits,
   planScaling,
   subtractRental,
-  type CapacityBudget,
   type PlanScalingInput,
   type ScaleInput
 } from './scaling'
@@ -131,8 +131,25 @@ describe('capHeadroom (plan 1.5)', () => {
   })
 })
 
+/** A node that holds an instance, at `dph` $/hr. */
+const node = (dph: number, over: Partial<NodeCostFacts> = {}): NodeCostFacts => ({
+  state: 'rendering',
+  instanceId: 1,
+  dphTotal: dph,
+  ...over
+})
+
+/** The caps as main reads them: nodeState.capacityBudget over the fleet and settings. */
+const caps = (
+  nodes: NodeCostFacts[] = [],
+  s: { maxActiveNodes?: number; spendCapPerHour?: number | null; noSpendCap?: boolean } = {}
+): CapacityBudget =>
+  capacityBudget(nodes, { maxActiveNodes: 30, spendCapPerHour: null, noSpendCap: true, ...s })
+
 /** No nodes, nothing queued, no cap, no holds, nothing learned. */
 const plan = (i: Partial<PlanScalingInput> = {}): PlanScalingInput => ({
+  cap: caps(),
+  holds: {},
   pendingShared: 0,
   pendingExclusive: 0,
   sharedCapacity: 0,
@@ -149,22 +166,15 @@ const plan = (i: Partial<PlanScalingInput> = {}): PlanScalingInput => ({
   fleetFramesPerHour: null,
   newNodeFramesPerHour: null,
   eager: false,
-  active: 0,
-  maxActive: 30,
-  perHourBilling: 0,
-  spendCap: null,
-  noCap: true,
-  holds: [],
   ...i
 })
 
 /** One live 8×4090 node, every lane busy, rendering at 8 × 60 frames/hour. */
 const oneBusy8x4090: Partial<PlanScalingInput> = {
+  cap: caps([node(4)]),
   usableNodes: 1,
   usableLanes: 8,
   exclusiveCapacity: 0,
-  active: 1,
-  perHourBilling: 4,
   fleetFramesPerHour: 480,
   newNodeFramesPerHour: 480,
   newNodeLanes: 8
@@ -185,6 +195,7 @@ describe('planScaling: no work, no rent (plan 1.21, job da68b61b)', () => {
     )
     expect(p.status).not.toBe('rent')
     expect(p.nodes).toBe(0)
+    expect(p.maxRentals).toBe(0)
     expect(budgetOpen(p.budget)).toBe(false)
   })
 
@@ -297,76 +308,82 @@ describe('planScaling: holds and limits', () => {
   }
 
   it('an account hold stops scale-up and says why (plan 1.20)', () => {
-    const p = planScaling(
-      plan({
-        ...big,
-        holds: [{ kind: 'account', reason: 'Vast balance $0.12, fleet paused, top up' }]
-      })
-    )
+    const holds: FleetHolds = {
+      account: { reason: 'Vast balance $0.12, fleet paused, top up', balance: 0.12, since: 0 }
+    }
+    const p = planScaling(plan({ ...big, holds }))
     expect(p.status).toBe('held')
     expect(p.reason).toMatch(/Vast balance \$0\.12/)
-    expect(p.budget).toEqual({ exclusiveLanes: 0, sharedSlots: 0, maxDphTotal: 0, maxNodes: 0 })
+    expect(p.budget.exclusiveLanes).toBe(0)
+    expect(budgetOpen(p.budget)).toBe(false)
   })
 
   it('names every hold at once', () => {
-    const p = planScaling(
-      plan({
-        ...big,
-        holds: [
-          { kind: 'local-sink', reason: 'output disk full' },
-          { kind: 'recovery', reason: 'waiting for you to resume after a restart' }
-        ]
-      })
-    )
-    expect(p.reason).toMatch(/output disk full; waiting for you/)
+    const holds: FleetHolds = {
+      localSink: { reason: 'output disk full', since: 0 },
+      recovery: 3,
+      scale: { reason: 'rentals keep failing; retrying at 10:42', since: 0, retryAt: 1 }
+    }
+    const p = planScaling(plan({ ...big, holds }))
+    expect(p.reason).toMatch(/output disk full; 3 chunks from the last session/)
+    expect(p.reason).toMatch(/rentals keep failing/)
   })
 
   it('$0.05 of headroom is a $0.05 budget, not a yes (plan 1.5)', () => {
-    const p = planScaling(plan({ ...big, perHourBilling: 1.95, spendCap: 2, noCap: false }))
+    const cap = caps([node(1.95)], { spendCapPerHour: 2, noSpendCap: false })
+    const p = planScaling(plan({ ...big, cap }))
     expect(p.status).toBe('rent')
-    expect(p.budget.maxDphTotal).toBe(0.05)
+    expect(p.budget.headroomPerHour).toBe(0.05)
+    // ...the same figure capHeadroom gives main's own checks.
+    expect(capHeadroom(1.95, 2)).toBe(p.budget.headroomPerHour)
   })
 
   it('rents nothing when headroom is below the cheapest offer, rather than search in vain', () => {
-    const p = planScaling(
-      plan({ ...big, perHourBilling: 1.97, spendCap: 2, noCap: false, minOfferDph: 0.05 })
-    )
+    const cap = caps([node(1.97)], { spendCapPerHour: 2, noSpendCap: false })
+    const p = planScaling(plan({ ...big, cap, minOfferDph: 0.05 }))
     expect(p.status).toBe('spend-cap')
     expect(p.reason).toMatch(/cheapest offer/)
   })
 
-  it('counts nodes that may still bill against the cap', () => {
-    const p = planScaling(plan({ ...big, perHourBilling: 2.3, spendCap: 2, noCap: false }))
-    expect(p.status).toBe('spend-cap')
+  it('counts a failed node that still holds its instance against the cap', () => {
+    const failedHolding = node(0.8, { state: 'failed' })
+    const cap = caps([node(1.5), failedHolding], { spendCapPerHour: 2, noSpendCap: false })
+    expect(planScaling(plan({ ...big, cap })).status).toBe('spend-cap')
   })
 
   it('a blank cap without the no-cap flag rents nothing', () => {
-    const p = planScaling(plan({ ...big, spendCap: null, noCap: false }))
-    expect(p.status).toBe('spend-cap')
+    const cap = caps([], { spendCapPerHour: null, noSpendCap: false })
+    expect(planScaling(plan({ ...big, cap })).status).toBe('spend-cap')
   })
 
   it('stops at max nodes and bounds a batch by room and the per-tick burst', () => {
-    expect(planScaling(plan({ ...big, active: 30 })).status).toBe('max-nodes')
-    expect(planScaling(plan({ ...big, active: 27 })).budget.maxNodes).toBe(3)
-    expect(planScaling(plan({ ...big })).budget.maxNodes).toBe(MAX_REQUESTS_PER_TICK)
+    const full = caps(Array.from({ length: 30 }, () => node(0.2)))
+    expect(planScaling(plan({ ...big, cap: full })).status).toBe('max-nodes')
+    const three = caps(Array.from({ length: 27 }, () => node(0.2)))
+    expect(planScaling(plan({ ...big, cap: three })).maxRentals).toBe(3)
+    expect(planScaling(plan({ ...big })).maxRentals).toBe(MAX_REQUESTS_PER_TICK)
   })
 
   it('reports covered demand as covered, not as a limit', () => {
-    const p = planScaling(plan({ pendingExclusive: 4, exclusiveCapacity: 4, active: 30 }))
+    const full = caps(Array.from({ length: 30 }, () => node(0.2)))
+    const p = planScaling(plan({ cap: full, pendingExclusive: 4, exclusiveCapacity: 4 }))
     expect(p.status).toBe('covered')
   })
 
   it('agrees with nodesToRequest on the node count where both apply', () => {
-    const cases: Array<Partial<ScaleInput & PlanScalingInput>> = [
+    const cases: Array<Partial<ScaleInput>> = [
       { pendingExclusive: 90 },
       { pendingExclusive: 9, newNodeLanes: 4 },
       { pendingShared: 5, sharedCapacity: 1 },
       { pendingExclusive: 3, booting: [{ lanes: 1, sharedSlots: 2 }], active: 1 }
     ]
-    for (const c of cases) {
+    for (const { active = 0, ...c } of cases) {
       const frames = (c.pendingExclusive ?? 0) + (c.pendingShared ?? 0)
-      const p = planScaling(plan({ ...c, pendingFrames: frames }))
-      expect(p.nodes).toBe(nodesToRequest(input(c)))
+      const rented = Array.from({ length: active }, () =>
+        node(0, { state: 'requested', instanceId: null })
+      )
+      const p = planScaling(plan({ ...c, cap: caps(rented), pendingFrames: frames }))
+      expect(p.nodes).toBe(nodesToRequest(input({ ...c, active })))
     }
   })
 })
@@ -394,63 +411,64 @@ describe('capacity budgets: rent what the offers bring (#227, #237)', () => {
     ).toBe(12)
     // Nothing learned: 2, floored at one per pinned lane.
     expect(offerContribution(four, { slotsPerGpu: 1, maxNodeSlots: 0 }).sharedSlots).toBe(4)
-    expect(
-      offerContribution(
-        { numGpus: 1, gpuRamGb: 24, cpuCoresEffective: 16 },
-        {
-          slotsPerGpu: 1,
-          maxNodeSlots: 0
-        }
-      ).sharedSlots
-    ).toBe(2)
+    const one = { numGpus: 1, gpuRamGb: 24, cpuCoresEffective: 16 }
+    expect(offerContribution(one, { slotsPerGpu: 1, maxNodeSlots: 0 }).sharedSlots).toBe(2)
   })
 
   it('stops a batch once the demand is covered: one 8-GPU box for 8 lanes, not 8 boxes', () => {
-    let budget: CapacityBudget = planScaling(
-      plan({ pendingExclusive: 8, pendingFrames: 800, remainingExclusiveFrames: 800 })
-    ).budget
-    expect(budget.maxNodes).toBe(8)
+    const p = planScaling(plan({ pendingExclusive: 8, pendingFrames: 800 }))
+    let budget = p.budget
+    expect(p.maxRentals).toBe(8)
     const offer = { numGpus: 8, gpuRamGb: 24, cpuCoresEffective: 128, dphTotal: 3.2 }
+    const brings = offerContribution(offer, { slotsPerGpu: 1, maxNodeSlots: 0 })
     let rented = 0
-    while (budgetOpen(budget) && offerFits(budget, offer)) {
-      budget = subtractRental(
-        budget,
-        offer,
-        offerContribution(offer, { slotsPerGpu: 1, maxNodeSlots: 0 })
-      )
+    while (rented < p.maxRentals && budgetOpen(budget) && fitsBudget(budget, offer.dphTotal)) {
+      budget = subtractRental(budget, offer, brings)
       rented++
     }
     expect(rented).toBe(1)
   })
 
-  it('spends the $/hr budget offer by offer, and refuses an offer that no longer fits', () => {
-    const start: CapacityBudget = {
-      exclusiveLanes: 10,
-      sharedSlots: 0,
-      maxDphTotal: 1,
-      maxNodes: 8
-    }
+  it('spends the $/hr headroom offer by offer, so a later offer must fit what is left', () => {
+    const cap = caps([], { spendCapPerHour: 1, noSpendCap: false })
+    let b: CapacityBudget = { ...cap, exclusiveLanes: 10, sharedSlots: 0 }
     const c = { lanes: 1, sharedSlots: 2 }
-    let b = subtractRental(start, { dphTotal: 0.4 }, c)
-    expect(b.maxDphTotal).toBe(0.6)
     b = subtractRental(b, { dphTotal: 0.4 }, c)
-    expect(b.maxDphTotal).toBe(0.2)
-    expect(offerFits(b, { dphTotal: 0.4 })).toBe(false)
-    expect(offerFits(b, { dphTotal: 0.2 })).toBe(true)
-    expect(offerFits(b, { dphTotal: Number.NaN })).toBe(false)
-    expect(subtractRental(b, { dphTotal: Number.NaN }, c).maxDphTotal).toBe(0)
-    const uncapped = subtractRental({ ...start, maxDphTotal: Infinity }, { dphTotal: 5 }, c)
-    expect(uncapped.maxDphTotal).toBe(Infinity)
+    expect(b.headroomPerHour).toBe(0.6)
+    expect(b.perHour).toBeCloseTo(0.4)
+    expect(b.nodes).toBe(1)
+    b = subtractRental(b, { dphTotal: 0.4 }, c)
+    expect(b.headroomPerHour).toBe(0.2)
+    expect(fitsBudget(b, 0.4)).toBe(false)
+    expect(fitsBudget(b, 0.2)).toBe(true)
+    // An unpriced offer, had it been rented, spends everything.
+    expect(subtractRental(b, { dphTotal: Number.NaN }, c).headroomPerHour).toBe(0)
+    // No cap stays no cap.
+    const uncapped = subtractRental({ ...caps(), exclusiveLanes: 5 }, { dphTotal: 5 }, c)
+    expect(uncapped.headroomPerHour).toBeNull()
+    expect(budgetOpen(uncapped)).toBe(true)
   })
 
   it('covers exclusive lanes first, then shared slots, one rental at a time', () => {
-    const b0: CapacityBudget = { exclusiveLanes: 2, sharedSlots: 6, maxDphTotal: 10, maxNodes: 3 }
+    const b0: CapacityBudget = { ...caps(), nodeRoom: 3, exclusiveLanes: 2, sharedSlots: 6 }
     const c = { lanes: 4, sharedSlots: 4 }
     const b1 = subtractRental(b0, { dphTotal: 1 }, c)
-    expect(b1).toMatchObject({ exclusiveLanes: 0, sharedSlots: 6, maxNodes: 2 })
+    expect(b1).toMatchObject({ exclusiveLanes: 0, sharedSlots: 6, nodeRoom: 2 })
     const b2 = subtractRental(b1, { dphTotal: 1 }, c)
-    expect(b2).toMatchObject({ exclusiveLanes: 0, sharedSlots: 2, maxNodes: 1 })
+    expect(b2).toMatchObject({ exclusiveLanes: 0, sharedSlots: 2, nodeRoom: 1 })
     const b3 = subtractRental(b2, { dphTotal: 1 }, c)
     expect(budgetOpen(b3)).toBe(false)
+  })
+
+  it('leaves a manual request (no demand) to room and money', () => {
+    const manual = caps([], { spendCapPerHour: 2, noSpendCap: false })
+    expect(manual.exclusiveLanes).toBeNull()
+    expect(budgetOpen(manual)).toBe(true)
+    const after = subtractRental(manual, { dphTotal: 1.5 }, { lanes: 4, sharedSlots: 4 })
+    expect(after.exclusiveLanes).toBeNull()
+    expect(after.headroomPerHour).toBe(0.5)
+    expect(budgetOpen(subtractRental(after, { dphTotal: 0.5 }, { lanes: 1, sharedSlots: 2 }))).toBe(
+      false
+    )
   })
 })
