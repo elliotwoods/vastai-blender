@@ -394,9 +394,27 @@ export class NodeManager {
           .filter((n) => !['destroyed', 'failed'].includes(n.state))
           .map((n) => n.snapshot.instanceId)
       )
+      // Labels carry the first 8 chars of OUR node id, and the node row is
+      // written before the instance is created, so every instance this profile
+      // ever rented has a row here. One without is another installation's —
+      // a packaged app and a dev build, or a second profile, on the same
+      // account — and destroying it would kill that app's live render.
+      const ours = new Set(
+        (getDb().prepare('SELECT id FROM nodes').all() as Array<{ id: string }>).map((r) =>
+          r.id.slice(0, 8)
+        )
+      )
       for (const inst of instances) {
         if (!inst.label?.startsWith('vastai-blender')) continue
         if (tracked.has(inst.id)) continue
+        const prefix = inst.label.slice('vastai-blender '.length).trim()
+        if (!ours.has(prefix)) {
+          emit('alert', {
+            level: 'warn',
+            message: `instance ${inst.id} (${inst.label}) was not rented by this profile — left running; destroy it from its own app or the Vast.ai console if it is stray`
+          })
+          continue
+        }
         emit('alert', {
           level: 'warn',
           message: `destroying orphaned instance ${inst.id} (${inst.label})`
