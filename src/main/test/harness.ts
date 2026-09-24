@@ -40,36 +40,51 @@
  *   `w.vast.fail('destroyInstance', { status: 500, message: 'boom' })` (it
  *   never reached Vast), `w.vast.loseReply('createInstance', err)` (Vast did
  *   it; the app never heard), `w.machineFor(id).onExec(/^cat .*state/, HANG)`,
- *   `w.vast.hold(...)` to stop a call mid-flight. See fakeVast.ts and
- *   fakeSsh.ts for the full menu.
+ *   `w.machineFor(id).onSftp('read', HANG)`, `w.vast.hold(...)` to stop a
+ *   call mid-flight. See fakeVast.ts and fakeSsh.ts for the full menu.
+ * - The fakes answer as Vast and ssh2 do, not as the app hopes they will: a
+ *   destroy of an instance that is already gone is a 404, a connection that
+ *   closes takes its SFTP channel's transfers down with it. A test of a fix
+ *   for the app's handling of either must fail without that fix.
  * - Every bus event lands in `w.events` in emit order; `w.eventsOf(channel)`
  *   and `w.alerts()` filter it. `w.openWindow()` adds a renderer window that
  *   records what ipc.ts forwards to it, and `w.invoke(channel, ...args)` calls
  *   an ipcMain handler the way the renderer does.
  *
  * What is mocked, and why (each is a module the money paths reach):
- *   electron            app paths → w.dir; windows, ipcMain, shell, dialog and
- *                       clipboard are recorded, never real
+ *   electron            app paths → w.dir; windows, ipcMain, shell, dialog,
+ *                       clipboard and OS notifications (w.notifications) are
+ *                       recorded, never real
  *   ../db/db            getDb() → an in-memory node:sqlite DB built by db.ts's
  *                       own applySchema (better-sqlite3 is built for Electron's ABI)
  *   ../settings         w.settings / w.secrets: mutate them mid-test. getSettings()
  *                       returns a copy and updateSettings merges, as settings.ts does
- *   ../vast/vastClient  w.vast (the real VastError and sshEndpoints are kept)
+ *   ../vast/vastClient  w.vast is the Vast server, behind a copy of what
+ *                       vastClient.ts does around each request: with no API key
+ *                       every call rejects with VastError and never reaches
+ *                       w.vast, showInstance maps a 404 to null, registerSshKey
+ *                       takes "duplicate" as done. Not its 429 retry: see
+ *                       fakeVast.ts. (The real VastError and sshEndpoints are kept.)
  *   ../ssh/sshConnection  FakeSshConnection on w.network (the real HostKeyMismatchError is kept)
  *   ../ssh/keys         no keypair generation, no key registration
  *   ../media/ffmpeg     "not installed", so job-clip stitching is a no-op
  *   global fetch        throws: any unmocked network call fails loudly
  *
- * The mocks belong to the test that set them up. Work that outlives its test
- * (an un-awaited promise still running after dispose) throws "stale call from
- * a finished test" rather than reaching the next test's database and fakes.
+ * The mocks belong to the test that set them up. dispose() closes every fake
+ * connection and then waits for what that sets off (failing transfers, the
+ * app's handling of them) to go quiet, so a test may end in the middle of
+ * anything. Work that still outlives it throws "stale call from a finished
+ * test", naming the test, rather than reaching the next test's database and
+ * fakes, and the next dispose() fails with it in case the app swallowed it.
  */
 
+import type { NotificationConstructorOptions } from 'electron'
+import { EventEmitter } from 'events'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { fileURLToPath } from 'url'
-import { vi } from 'vitest'
+import { expect, vi } from 'vitest'
 import type { EventChannel, InvokeChannel, IpcEventMap, IpcInvokeMap } from '../../shared/ipc'
 import type {
   AlertEvent,
@@ -81,6 +96,7 @@ import type {
 import type { Db } from '../db/db'
 import type { BusEvent } from '../events'
 import type { RawOffer } from '../vast/types'
+import type { CreateInstanceOptions } from '../vast/vastClient'
 import { FakeMachine, FakeNetwork, FakeSshConnection } from './fakeSsh'
 import { FakeVast } from './fakeVast'
 import { openTestDb } from './sqlite'
@@ -114,7 +130,10 @@ export interface SetupOptions {
   settings?: Partial<Omit<SettingsPublic, 'offerFilters'>> & {
     offerFilters?: Partial<OfferFilters>
   }
-  /** Defaults to a Vast key only; `{ vastApiKey: undefined }` for none. */
+  /**
+   * Defaults to a Vast key only. `{ vastApiKey: undefined }` for none: every
+   * vastClient call then rejects, as it does in production.
+   */
   secrets?: Partial<Record<SecretKey, string>>
   /** Fake-clock start, epoch ms. */
   now?: number
@@ -134,7 +153,10 @@ export interface UntilOptions {
   stepMs?: number
 }
 
-/** A renderer window, as far as main ever touches one: `webContents.send`. */
+/**
+ * A renderer window, as far as main touches one outside index.ts:
+ * `webContents.send`, and whether the user is looking at it.
+ */
 export class FakeWindow {
   /** Everything sent to this window, in order. */
   readonly sent: Array<{ channel: string; payload: unknown }> = []
@@ -142,6 +164,58 @@ export class FakeWindow {
     send: (channel: string, payload: unknown): void => {
       this.sent.push({ channel, payload })
     }
+  }
+  /** What BrowserWindow.getFocusedWindow() goes by. Set it to put the user in front of the app. */
+  focused = false
+  minimized = false
+  visible = true
+
+  isFocused(): boolean {
+    return this.focused
+  }
+
+  focus(): void {
+    this.focused = true
+  }
+
+  isMinimized(): boolean {
+    return this.minimized
+  }
+
+  restore(): void {
+    this.minimized = false
+  }
+
+  show(): void {
+    this.visible = true
+  }
+
+  isDestroyed(): boolean {
+    return false
+  }
+}
+
+/**
+ * An OS notification main raised (electron's `Notification`): recorded in
+ * `w.notifications` as constructed, never shown on the desktop. `emit('click')`
+ * on one is the user clicking it.
+ */
+export class FakeNotification extends EventEmitter {
+  shown = false
+  closed = false
+
+  constructor(readonly options: NotificationConstructorOptions = {}) {
+    super()
+  }
+
+  show(): void {
+    this.shown = true
+    this.emit('show')
+  }
+
+  close(): void {
+    this.closed = true
+    this.emit('close')
   }
 }
 
@@ -158,6 +232,18 @@ type IpcHandler = (event: unknown, ...args: unknown[]) => unknown
 let current: World | null = null
 
 /**
+ * Stale calls not yet reported: the next dispose() fails with them, since the
+ * app may have swallowed the throw (a `.catch(() => {})` around the call).
+ */
+const strays: string[] = []
+
+/** How long dispose() waits for a finished test's work to go quiet (real ms). */
+const SETTLE_BUDGET_MS = 2_000
+
+/** Turns of the real event loop in a row with nothing happening that count as quiet. */
+const QUIET_TURNS = 5
+
+/**
  * What one setup()'s mocks find their world through. The mocks outlive their
  * test — an app module keeps the mock instances it imported — so each set
  * closes over its own scope, never over "whichever test is running now".
@@ -168,16 +254,22 @@ class Scope {
   world: World | null = null
   /** Set by dispose() once in-flight work has had its chance to settle. */
   ended = false
+  /** Calls made into this scope's mocks so far: dispose() waits for it to stop moving. */
+  calls = 0
+  /** The test this scope belongs to, for the stale-call message. */
+  readonly test = expect.getState().currentTestName ?? '(outside a test)'
 
   constructor(readonly dir: string) {}
 
   /** For a mock being called now: throws if its test is over. */
   check(): void {
+    this.calls++
     if (this.ended) {
-      throw new Error(
-        'harness: stale call from a finished test — work it started outlived its dispose(); ' +
-          'await it (or stop it) inside the test'
-      )
+      const message =
+        `harness: stale call from a finished test (${JSON.stringify(this.test)}) — work it ` +
+        'started outlived its dispose(); await it (or stop it) inside the test'
+      strays.push(message)
+      throw new Error(message)
     }
   }
 
@@ -191,6 +283,11 @@ class Scope {
 /** One turn of the REAL event loop: lets real file I/O (downloads) make progress. */
 function realTick(): Promise<void> {
   return new Promise((r) => setImmediate(r))
+}
+
+/** Is real file I/O (a download's writes, a sha256 of a .part) still in flight in this process? */
+function fileIoPending(): boolean {
+  return process.getActiveResourcesInfo().some((r) => r.startsWith('FSReq') || r === 'CloseReq')
 }
 
 export class World {
@@ -211,6 +308,10 @@ export class World {
   readonly ipcHandlers = new Map<string, IpcHandler>()
   /** shell / dialog / clipboard calls, in order. */
   readonly desktop: DesktopCall[] = []
+  /** OS notifications main constructed, in order (shown or not: see FakeNotification). */
+  readonly notifications: FakeNotification[] = []
+  /** What Notification.isSupported() answers. */
+  notificationsSupported = true
 
   private app: App | null = null
   private disposed = false
@@ -422,6 +523,9 @@ export class World {
    * Stop the engine, cut every fake connection and let in-flight work settle
    * while the database is still open — so nothing from this test throws into
    * the next — then close everything and put the real clock back.
+   *
+   * Fails if work from an earlier test called a mock after its own dispose()
+   * (see Scope): the test that leaked is named in the message.
    */
   async dispose(): Promise<void> {
     if (this.disposed) return
@@ -430,7 +534,7 @@ export class World {
     this.app?.nodeManager.shutdown()
     vi.clearAllTimers()
     this.network.shutdown()
-    for (let i = 0; i < 5; i++) await realTick()
+    await this.settle()
     // From here on, anything this test's modules still call throws.
     this.scope.ended = true
     this.unsubscribe()
@@ -439,6 +543,35 @@ export class World {
     vi.unstubAllGlobals()
     rmSync(this.dir, { recursive: true, force: true })
     if (current === this) current = null
+    const leaked = strays.splice(0)
+    if (leaked.length > 0) {
+      throw new Error(
+        `${leaked.length} stale call(s) since the last dispose(); the first: ${leaked[0]}`
+      )
+    }
+  }
+
+  /**
+   * Turn the real event loop until nothing has touched the harness (a mock,
+   * a fake connection, the bus) and no real file I/O is in flight, for
+   * QUIET_TURNS turns in a row. Closing the connections fails every transfer
+   * on them, and each failure runs the app's handling — truncating a .part,
+   * an alert, the settings, the next queued transfer — over as many turns as
+   * its file I/O takes. A fixed few turns was not enough: a test that ended
+   * mid-download left downloads failing into the next test. The fake clock
+   * stands still meanwhile, so work waiting on a timer stays parked for good.
+   */
+  private async settle(): Promise<void> {
+    const activity = (): number => this.scope.calls + this.network.activity + this.events.length
+    const deadline = performance.now() + SETTLE_BUDGET_MS
+    let last = activity()
+    let quiet = 0
+    while (quiet < QUIET_TURNS && performance.now() < deadline) {
+      await realTick()
+      const now = activity()
+      quiet = now === last && !fileIoPending() ? quiet + 1 : 0
+      last = now
+    }
   }
 }
 
@@ -477,7 +610,20 @@ function registerMocks(scope: Scope): void {
       encryptString: (s: string) => Buffer.from(s, 'utf-8'),
       decryptString: (b: Buffer) => b.toString('utf-8')
     },
-    BrowserWindow: { getAllWindows: () => [...world().windows] },
+    BrowserWindow: {
+      getAllWindows: () => [...world().windows],
+      getFocusedWindow: () => world().windows.find((win) => win.isFocused()) ?? null
+    },
+    Notification: class extends FakeNotification {
+      static isSupported(): boolean {
+        return world().notificationsSupported
+      }
+
+      constructor(options?: NotificationConstructorOptions) {
+        super(options)
+        world().notifications.push(this)
+      }
+    },
     ipcMain: {
       handle: (channel: string, handler: IpcHandler) => {
         const handlers = world().ipcHandlers
@@ -533,18 +679,50 @@ function registerMocks(scope: Scope): void {
     }
   }))
 
-  vi.doMock('../vast/vastClient', async (importOriginal) => ({
-    ...(await importOriginal<typeof import('../vast/vastClient')>()),
-    searchOffers: (q: Record<string, unknown>) => world().vast.searchOffers(q),
-    createInstance: (o: Parameters<FakeVast['createInstance']>[0]) =>
-      world().vast.createInstance(o),
-    listInstances: () => world().vast.listInstances(),
-    showInstance: (id: number) => world().vast.showInstance(id),
-    destroyInstance: (id: number) => world().vast.destroyInstance(id),
-    listSshKeys: () => world().vast.listSshKeys(),
-    registerSshKey: (k: string) => world().vast.registerSshKey(k),
-    currentUser: () => world().vast.currentUser()
-  }))
+  vi.doMock('../vast/vastClient', async (importOriginal) => {
+    const real = await importOriginal<typeof import('../vast/vastClient')>()
+    const { VastError } = real
+    // What vastClient.ts does around each request, with w.vast as the server
+    // (fakeVast.ts): the API key comes first, and without one the call
+    // rejects and nothing reaches Vast. request()'s 429 retry is not redone.
+    const request =
+      <A extends unknown[], R>(send: (vast: FakeVast, ...args: A) => Promise<R>) =>
+      (...args: A): Promise<R> => {
+        // Outside the promise: a finished test's leftover work throws at
+        // once, not as a rejection the app might swallow.
+        const w = world()
+        if (!w.secrets.vastApiKey) {
+          return Promise.reject(new VastError('No Vast.ai API key configured'))
+        }
+        return send(w.vast, ...args)
+      }
+    return {
+      ...real,
+      // vastClient sends its own page size ahead of the query.
+      searchOffers: request((vast, q: Record<string, unknown>) =>
+        vast.searchOffers({ limit: 100, ...q })
+      ),
+      createInstance: request((vast, o: CreateInstanceOptions) => vast.createInstance(o)),
+      listInstances: request((vast) => vast.listInstances()),
+      showInstance: request((vast, id: number) =>
+        vast.showInstance(id).catch((e: unknown) => {
+          // Gone (or never was): null, as vastClient.ts answers a 404.
+          if (e instanceof VastError && e.status === 404) return null
+          throw e
+        })
+      ),
+      destroyInstance: request((vast, id: number) => vast.destroyInstance(id)),
+      listSshKeys: request((vast) => vast.listSshKeys()),
+      registerSshKey: request((vast, key: string) =>
+        vast.registerSshKey(key).catch((e: unknown) => {
+          // Already registered: what vastClient.ts wants anyway.
+          if (e instanceof VastError && e.message.includes('duplicate')) return
+          throw e
+        })
+      ),
+      currentUser: request((vast) => vast.currentUser())
+    }
+  })
 
   vi.doMock('../ssh/sshConnection', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../ssh/sshConnection')>()),
@@ -616,5 +794,12 @@ export async function setup(opts: SetupOptions = {}): Promise<World> {
 }
 
 export { HANG } from './fakeSsh'
-export type { AgentSpec, AgentStateFile, FakeMachine } from './fakeSsh'
+export type {
+  AgentSpec,
+  AgentStateFile,
+  FakeMachine,
+  SftpHandler,
+  SftpMethod,
+  SftpReply
+} from './fakeSsh'
 export type { FakeVast } from './fakeVast'

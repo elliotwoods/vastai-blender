@@ -98,3 +98,48 @@ describe('scheduler dispatch', () => {
     expect(w.alerts('warn').join('\n')).toContain('blender exited with code 1')
   })
 })
+
+// A test may stop watching in the middle of anything, a download included.
+// dispose() closes the fake connections, which fails the transfers as ssh2
+// fails them, and waits for what that sets off to finish, so none of it
+// reaches the next test. Each shape runs both before and after the other: a
+// leak would fail the test after it (and dispose() names the test it came from).
+describe('a test that ends mid-download', () => {
+  /** How many of a job's frames have landed locally. */
+  function downloaded(jobId: string): number {
+    return w.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM frames WHERE job_id = ? AND state = 'downloaded'`,
+      jobId
+    )!.n
+  }
+
+  async function endsMidDownload(): Promise<void> {
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    w.machineFor(nodeId).agent.autoFinish()
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 24, chunkSize: 24 })
+    app.scheduler.kick()
+    await w.until(() => downloaded(jobId) > 0, 'the first frame downloaded')
+    // Most of the chunk is still on its way when the test ends.
+    expect(downloaded(jobId)).toBeLessThan(24)
+  }
+
+  async function completesAJob(): Promise<void> {
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    w.machineFor(nodeId).agent.autoFinish()
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(
+      () => w.get('SELECT state FROM jobs WHERE id = ?', jobId)?.state === 'complete',
+      'job complete'
+    )
+    expect(downloaded(jobId)).toBe(4)
+    expect(w.alerts('error')).toEqual([])
+  }
+
+  it('ends with frames still downloading', endsMidDownload)
+  it('the next test runs as if it were first', completesAJob)
+  it('ends with frames still downloading, after a test that did not', endsMidDownload)
+  it('and the test after that runs clean too', completesAJob)
+})

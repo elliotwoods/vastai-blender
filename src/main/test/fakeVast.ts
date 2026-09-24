@@ -21,6 +21,28 @@
  * app does not know it has, so a test of that leak (or of a destroy the app
  * wrongly believes failed) must use loseReply — with fail, there is nothing
  * to leak and the test passes whatever the app does.
+ * gone = an instance that has been destroyed (or never existed) is a 404,
+ * as on Vast: destroying it again rejects with VastError status 404, and so
+ * does showInstance, which the harness's vastClient mock then maps to null
+ * the way vastClient.ts does. A destroy is not idempotent here because it is
+ * not on Vast; treating that 404 as success is the app's job (plan 1.2), and
+ * a fake that did it for the app would pass the test of that fix without it.
+ *
+ * This is the server. The client-side handling vastClient.ts wraps around
+ * each request is the harness's vastClient mock (harness.ts): no API key
+ * rejects before anything reaches Vast, searchOffers sends `limit: 100`,
+ * showInstance turns a 404 into null, registerSshKey takes "duplicate" as
+ * done. What the mock does NOT redo is request()'s retry of a 429, so a
+ * scripted failure is what request() finally throws, after its retries:
+ * `fail(m, { status: 429, message })` is a 429 that outlasted them.
+ *
+ * searchOffers applies the query the way Vast's /bundles/ does: each
+ * `{ field: { op: value } }` with op eq, neq, gt, gte, lt, lte, in or notin
+ * filters the offers, `order` sorts them and `limit` cuts the list. A field
+ * an offer does not carry passes every test on it. Vast's offers carry all
+ * of them (`verified`, `cpu_cores_effective`...); these carry what RawOffer
+ * has, plus what a test sets, so a test that filters on a field sets it on
+ * the offers it adds.
  */
 
 import type { CreateInstanceOptions } from '../vast/vastClient'
@@ -111,7 +133,7 @@ interface InstanceRecord {
 }
 
 export class FakeVast {
-  /** What searchOffers returns. Renting an offer removes it, as on vast. */
+  /** The market: searchOffers filters it by its query. Renting an offer removes it, as on vast. */
   offers: RawOffer[] = []
   /** Every call, in order. */
   readonly calls: VastCall[] = []
@@ -259,7 +281,7 @@ export class FakeVast {
   // -- the vastClient surface ---------------------------------------------------
 
   searchOffers(q: Record<string, unknown>): Promise<RawOffer[]> {
-    return this.call('searchOffers', [q], () => this.offers.map((o) => ({ ...o })))
+    return this.call('searchOffers', [q], () => searchResults(this.offers, q))
   }
 
   createInstance(opts: CreateInstanceOptions): Promise<number> {
@@ -290,15 +312,16 @@ export class FakeVast {
     return this.call('listInstances', [], () => this.live().map((id) => this.view(id)!))
   }
 
-  showInstance(id: number): Promise<RawInstance | null> {
-    // A destroyed or unknown instance is a 404, which vastClient maps to null.
-    return this.call('showInstance', [id], () => this.view(id))
+  showInstance(id: number): Promise<RawInstance> {
+    // A destroyed or unknown instance is a 404, which vastClient (the
+    // harness's mock of it) maps to null.
+    return this.call('showInstance', [id], () => this.view(id) ?? this.gone('GET', id))
   }
 
   destroyInstance(id: number): Promise<void> {
     return this.call('destroyInstance', [id], () => {
       const rec = this.instances.get(id)
-      if (!rec) return // already gone: idempotent, like the app assumes
+      if (!rec) this.gone('DELETE', id)
       this.instances.delete(id)
       this.destroyed.push(id)
       rec.machine.kill()
@@ -330,6 +353,14 @@ export class FakeVast {
     this.instances.set(id, { raw, createdAt: Date.now(), bootMs, machine })
     this.history.set(id, { ...raw })
     this.created.push(id)
+  }
+
+  /** Vast's answer about an instance that is gone or never was, as vastClient's request() throws it. */
+  private gone(method: 'GET' | 'DELETE', id: number): never {
+    throw this.vastError(
+      `vast.ai ${method} /instances/${id}/ → 404: {"success":false,"error":"no_such_instance"}`,
+      404
+    )
   }
 
   /** The instance as /instances/:id reports it now, or null once it is gone. */
@@ -371,4 +402,66 @@ export class FakeVast {
   private toError(failure: VastFailure): Error {
     return failure instanceof Error ? failure : this.vastError(failure.message, failure.status)
   }
+}
+
+/** The search operators the fake applies. */
+const SEARCH_OPS = new Set(['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'in', 'notin'])
+
+/** One `{ op: value }` test of a search query against an offer's value. */
+function passes(value: unknown, op: string, want: unknown): boolean {
+  // Numbers in practice; strings compare the same way at runtime.
+  const v = value as number
+  const w = want as number
+  switch (op) {
+    case 'eq':
+      return value === want
+    case 'neq':
+      return value !== want
+    case 'gt':
+      return v > w
+    case 'gte':
+      return v >= w
+    case 'lt':
+      return v < w
+    case 'lte':
+      return v <= w
+    case 'in':
+      return Array.isArray(want) && want.includes(value)
+    case 'notin':
+      return Array.isArray(want) && !want.includes(value)
+    default:
+      return false
+  }
+}
+
+/** What POST /bundles/ returns for query `q`: filtered, ordered, limited copies. */
+function searchResults(offers: RawOffer[], q: Record<string, unknown>): RawOffer[] {
+  const tests: Array<[field: string, op: string, want: unknown]> = []
+  for (const [field, spec] of Object.entries(q)) {
+    // Filters are `field: { op: value }`; `type`, `order` and `limit` are not.
+    if (typeof spec !== 'object' || spec === null || Array.isArray(spec)) continue
+    for (const [op, want] of Object.entries(spec)) {
+      // Loudly, rather than quietly ignore the filter a test meant to exercise.
+      if (!SEARCH_OPS.has(op)) throw new Error(`fake vast: unsupported search operator ${op}`)
+      tests.push([field, op, want])
+    }
+  }
+  const out = offers.filter((o) =>
+    tests.every(([field, op, want]) => {
+      const value = (o as unknown as Record<string, unknown>)[field]
+      return value === undefined || passes(value, op, want)
+    })
+  )
+  const order = Array.isArray(q.order) ? (q.order as Array<[string, string?]>) : []
+  out.sort((a, b) => {
+    for (const [field, dir] of order) {
+      const x = (a as unknown as Record<string, number | undefined>)[field]
+      const y = (b as unknown as Record<string, number | undefined>)[field]
+      if (x === y || x === undefined || y === undefined) continue
+      return (x < y ? -1 : 1) * (dir === 'desc' ? -1 : 1)
+    }
+    return 0
+  })
+  const limit = typeof q.limit === 'number' ? q.limit : out.length
+  return out.slice(0, limit).map((o) => ({ ...o }))
 }

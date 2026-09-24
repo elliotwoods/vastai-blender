@@ -15,11 +15,26 @@
  * real files under the harness's temp directory.
  *
  * When a connection closes — the app's close(), or the instance destroyed —
- * every command still running on it ends the way ssh2 ends a channel whose
- * connection went: an exec resolves with exit code null and whatever output
- * had arrived (none, here), and an execStream's `done` resolves null. The real
- * client notices a destroyed box only when keepalive gives up (~30 s); the
- * fake notices at once.
+ * every channel on it ends the way ssh2 ends a channel whose connection went:
+ * - an exec resolves with exit code null and whatever output had arrived
+ *   (none, here), and an execStream's `done` resolves null;
+ * - the SFTP channel fails every request still waiting for an answer with
+ *   "No response from server" (ssh2's cleanupRequests) and emits 'end' and
+ *   'close'. A request made on the old wrapper after that is never answered
+ *   at all: ssh2 registers it once its cleanup has run and drops the write
+ *   (the channel is closed, or the dead connection's cipher discards it), so
+ *   only a timeout of the app's own ends it — pipelinedGet's stall watchdog,
+ *   say. The connection opens a fresh channel on the next sftp().
+ * - a command or SFTP channel that had not opened yet fails with "No response
+ *   from server": nothing ever runs on a machine after it is killed.
+ * The real client notices a destroyed box only when keepalive gives up
+ * (~30 s); the fake notices at once.
+ *
+ * resetSftp() ends the SFTP channel on a live connection the same way, as
+ * ssh2's end() does.
+ *
+ * Script SFTP with `machine.onSftp(method, HANG | Error | fn)`, as exec is
+ * scripted with onExec. A HANG'd request waits until its channel closes.
  */
 
 import { createHash } from 'crypto'
@@ -59,15 +74,42 @@ interface Rule {
   times: number
 }
 
+/** The SFTP requests the app makes (sftp.ts, pipelinedGet), each scriptable with onSftp. */
+export type SftpMethod =
+  'open' | 'read' | 'close' | 'readFile' | 'writeFile' | 'rename' | 'unlink' | 'fastPut'
+
+/** A scripted answer to an SFTP request: never answer it, or fail it with this error. */
+export type SftpReply = typeof HANG | Error
+
+/**
+ * `HANG`, an Error, or a function of the request's remote path (for read and
+ * close, the path its handle was opened on) that returns one of those — or
+ * undefined to let the request through to the built-in behaviour.
+ */
+export type SftpHandler =
+  SftpReply | ((path: string, machine: FakeMachine) => SftpReply | undefined)
+
+interface SftpRule {
+  method: SftpMethod
+  handler: SftpHandler
+  /** remaining uses; Infinity = sticky */
+  times: number
+}
+
 export interface Endpoint {
   host: string
   port: number
 }
 
-/** A command in flight on a connection: an exec or an execStream. */
+/** A channel open on a connection: an exec, an execStream or the SFTP channel. */
 interface OpenChannel {
-  /** The connection went under it: end it as ssh2 does, with exit code null. */
+  /** The connection went under it: end it as ssh2 does (see the header). */
   drop(): void
+}
+
+/** What ssh2 fails a request with when its channel or connection goes before the answer. */
+function noResponse(): Error {
+  return new Error('No response from server')
 }
 
 /** The job spec the scheduler writes into the agent's inbox (the fields tests read). */
@@ -197,6 +239,7 @@ export class FakeMachine {
   onSpec: ((spec: AgentSpec) => void) | null = null
 
   private rules: Rule[] = []
+  private sftpRules: SftpRule[] = []
   private openChannels = new Set<OpenChannel>()
 
   constructor(
@@ -215,6 +258,32 @@ export class FakeMachine {
   onExec(pattern: RegExp, handler: ExecHandler, times = Infinity): this {
     this.rules.unshift({ pattern, handler, times })
     return this
+  }
+
+  /**
+   * Answer SFTP `method` requests with `handler` instead of the built-in
+   * behaviour: `HANG` (no answer until the channel closes), an Error (the
+   * request fails with it: `Object.assign(new Error('Failure'), { code: 4 })`
+   * is ssh2's shape for a server-side failure), or a function of the remote
+   * path returning either, or undefined to let that request through. Newest
+   * rule first, as onExec; `times` limits how many requests it answers.
+   */
+  onSftp(method: SftpMethod, handler: SftpHandler, times = Infinity): this {
+    this.sftpRules.unshift({ method, handler, times })
+    return this
+  }
+
+  /** @internal the scripted answer to an SFTP request, or null for the built-in one */
+  sftpReply(method: SftpMethod, path: string): SftpReply | null {
+    for (const rule of this.sftpRules) {
+      if (rule.method !== method || rule.times <= 0) continue
+      const h = rule.handler
+      const reply = typeof h === 'function' ? h(path, this) : h
+      if (reply === undefined) continue
+      rule.times--
+      return reply
+    }
+    return null
   }
 
   /** Commands run so far that match `pattern`. */
@@ -239,8 +308,12 @@ export class FakeMachine {
     return ok()
   }
 
-  /** @internal a command the machine must end when it dies */
+  /** @internal a channel the machine must end when it dies — at once, if it already has */
   track(channel: OpenChannel): void {
+    if (!this.alive) {
+      channel.drop()
+      return
+    }
     this.openChannels.add(channel)
   }
 
@@ -403,6 +476,12 @@ export class FakeAgent {
 export class FakeNetwork {
   readonly machines: FakeMachine[] = []
   readonly connections: FakeSshConnection[] = []
+  /**
+   * Bumped by every connect, command and SFTP request or answer: while it
+   * keeps moving, something is still talking to the fake machines (the
+   * harness's dispose() waits for it to stop).
+   */
+  activity = 0
   private mismatches = new WeakSet<object>()
 
   constructor(
@@ -474,12 +553,23 @@ class FakeStream implements OpenChannel {
  * In-memory SFTP: the SFTPWrapper calls sftp.ts and pipelinedGet make, over
  * the machine's files. Callbacks arrive on a microtask, as errors in ssh2's
  * shape. Like SFTP v3, rename onto an existing file fails.
+ *
+ * It is a channel like any other: it ends with its connection or its machine
+ * (drop) or by end() (resetSftp), as the header describes.
  */
-class FakeSftp extends EventEmitter {
+class FakeSftp extends EventEmitter implements OpenChannel {
   private handles = new Map<string, string>()
   private nextHandle = 1
+  /** Requests not answered yet, each by how it fails: closing the channel fails them all. */
+  private waiting = new Set<{ fail: (err: Error) => void }>()
+  private closed = false
 
-  constructor(private readonly machine: FakeMachine) {
+  constructor(
+    private readonly machine: FakeMachine,
+    private readonly network: FakeNetwork,
+    /** Called once, as the channel closes: the connection forgets it. */
+    private readonly onClosed: (sftp: FakeSftp) => void
+  ) {
     super()
   }
 
@@ -487,51 +577,92 @@ class FakeSftp extends EventEmitter {
     queueMicrotask(fn)
   }
 
+  /**
+   * One request: the scripted answer (onSftp) or `builtin`, which answers
+   * through `answer` — on a microtask, and only if the channel has not closed
+   * in the meantime.
+   */
+  private request(
+    method: SftpMethod,
+    path: string,
+    fail: (err: Error) => void,
+    builtin: (answer: (fn: () => void) => void) => void
+  ): void {
+    this.network.activity++
+    // Made on a channel that has closed: ssh2 never answers it (see the header).
+    if (this.closed) return
+    const req = { fail }
+    this.waiting.add(req)
+    const answer = (fn: () => void): void =>
+      this.later(() => {
+        if (!this.waiting.delete(req)) return
+        this.network.activity++
+        fn()
+      })
+    const scripted = this.machine.sftpReply(method, path)
+    if (scripted === HANG) return
+    if (scripted) return answer(() => fail(scripted))
+    builtin(answer)
+  }
+
   writeFile(path: string, data: Buffer | string, ...rest: unknown[]): void {
     const cb = rest[rest.length - 1] as (err?: Error | null) => void
-    this.machine.files.set(path, Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf-8'))
-    this.later(() => cb(null))
+    this.request('writeFile', path, cb, (answer) => {
+      this.machine.files.set(path, Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf-8'))
+      answer(() => cb(null))
+    })
   }
 
   readFile(path: string, ...rest: unknown[]): void {
     const cb = rest[rest.length - 1] as (err: Error | null, data?: Buffer) => void
-    const data = this.machine.files.get(path)
-    this.later(() => (data ? cb(null, data) : cb(sftpError('No such file', path))))
+    this.request('readFile', path, cb, (answer) => {
+      const data = this.machine.files.get(path)
+      answer(() => (data ? cb(null, data) : cb(sftpError('No such file', path))))
+    })
   }
 
   unlink(path: string, cb: (err?: Error | null) => void): void {
-    const existed = this.machine.files.delete(path)
-    this.later(() => cb(existed ? null : sftpError('No such file', path)))
+    this.request('unlink', path, cb, (answer) => {
+      const existed = this.machine.files.delete(path)
+      answer(() => cb(existed ? null : sftpError('No such file', path)))
+    })
   }
 
   rename(from: string, to: string, cb: (err?: Error | null) => void): void {
-    const data = this.machine.files.get(from)
-    if (!data) return this.later(() => cb(sftpError('No such file', from)))
-    if (this.machine.files.has(to)) return this.later(() => cb(sftpError('Failure', to)))
-    this.machine.files.delete(from)
-    this.machine.files.set(to, data)
-    this.later(() => {
-      cb(null)
-      this.machine.specLanded(to)
+    this.request('rename', from, cb, (answer) => {
+      const data = this.machine.files.get(from)
+      if (!data) return answer(() => cb(sftpError('No such file', from)))
+      if (this.machine.files.has(to)) return answer(() => cb(sftpError('Failure', to)))
+      this.machine.files.delete(from)
+      this.machine.files.set(to, data)
+      answer(() => {
+        cb(null)
+        this.machine.specLanded(to)
+      })
     })
   }
 
   fastPut(local: string, remote: string, ...rest: unknown[]): void {
     const cb = rest[rest.length - 1] as (err?: Error | null) => void
-    readFile(local).then(
-      (data) => {
-        this.machine.files.set(remote, data)
-        cb(null)
-      },
-      (e: Error) => cb(e)
-    )
+    this.request('fastPut', remote, cb, (answer) => {
+      readFile(local).then(
+        (data) =>
+          answer(() => {
+            this.machine.files.set(remote, data)
+            cb(null)
+          }),
+        (e: Error) => answer(() => cb(e))
+      )
+    })
   }
 
   open(path: string, _flags: string, cb: (err: Error | null, handle?: Buffer) => void): void {
-    if (!this.machine.files.has(path)) return this.later(() => cb(sftpError('No such file', path)))
-    const id = String(this.nextHandle++)
-    this.handles.set(id, path)
-    this.later(() => cb(null, Buffer.from(id)))
+    this.request('open', path, cb, (answer) => {
+      if (!this.machine.files.has(path)) return answer(() => cb(sftpError('No such file', path)))
+      const id = String(this.nextHandle++)
+      this.handles.set(id, path)
+      answer(() => cb(null, Buffer.from(id)))
+    })
   }
 
   read(
@@ -543,20 +674,47 @@ class FakeSftp extends EventEmitter {
     cb: (err: Error | null, bytesRead: number) => void
   ): void {
     const path = this.handles.get(handle.toString())
-    const data = path ? this.machine.files.get(path) : undefined
-    if (!data) return this.later(() => cb(sftpError('No such file', path ?? '?'), 0))
-    const n = Math.max(0, Math.min(len, data.length - position))
-    data.copy(buf, off, position, position + n)
-    this.later(() => cb(null, n))
+    this.request(
+      'read',
+      path ?? '?',
+      (e) => cb(e, 0),
+      (answer) => {
+        const data = path ? this.machine.files.get(path) : undefined
+        if (!data) return answer(() => cb(sftpError('No such file', path ?? '?'), 0))
+        const n = Math.max(0, Math.min(len, data.length - position))
+        data.copy(buf, off, position, position + n)
+        answer(() => cb(null, n))
+      }
+    )
   }
 
   close(handle: Buffer, cb: (err?: Error | null) => void): void {
-    this.handles.delete(handle.toString())
-    this.later(() => cb(null))
+    const path = this.handles.get(handle.toString())
+    this.request('close', path ?? '?', cb, (answer) => {
+      this.handles.delete(handle.toString())
+      answer(() => cb(null))
+    })
   }
 
+  /** ssh2's end(): close the channel on a live connection (resetSftp). */
   end(): void {
-    this.emit('close')
+    this.drop()
+  }
+
+  /** The channel closes: its connection or its machine went, or end(). */
+  drop(): void {
+    if (this.closed) return
+    this.closed = true
+    this.onClosed(this)
+    const waiting = [...this.waiting]
+    this.waiting.clear()
+    this.later(() => {
+      // One error for them all, as ssh2's cleanupRequests does.
+      const err = noResponse()
+      for (const req of waiting) req.fail(err)
+      this.emit('end')
+      this.emit('close')
+    })
   }
 }
 
@@ -603,6 +761,7 @@ export class FakeSshConnection extends EventEmitter {
 
   /** The machine this connection is up to, connecting if needed. */
   async acquire(): Promise<FakeMachine> {
+    this.network.activity++
     if (this.closed) throw new Error('connection closed')
     if (this.machine?.alive) return this.machine
     if (this.machine) {
@@ -650,8 +809,20 @@ export class FakeSshConnection extends EventEmitter {
     }
   }
 
-  async exec(command: string, opts: { timeoutMs?: number } = {}): Promise<ExecResult> {
+  /**
+   * The machine a new channel opens on, once acquire() has resolved. If the
+   * connection was closed or the box killed in the meantime, the channel
+   * never opens: ssh2 fails the open with "No response from server" (at
+   * keepalive, where the fake does it at once), and nothing runs.
+   */
+  private async openOn(): Promise<FakeMachine> {
     const m = await this.acquire()
+    if (this.closed || !m.alive) throw noResponse()
+    return m
+  }
+
+  async exec(command: string, opts: { timeoutMs?: number } = {}): Promise<ExecResult> {
+    const m = await this.openOn()
     const reply = m.run(command)
     return new Promise<ExecResult>((resolve, reject) => {
       let settled = false
@@ -667,8 +838,8 @@ export class FakeSshConnection extends EventEmitter {
         this.channels.delete(channel)
         finish()
       }
-      m.track(channel)
       this.channels.add(channel)
+      m.track(channel)
       if (opts.timeoutMs) {
         // The same message the real exec times out with.
         const message = `exec timeout after ${opts.timeoutMs}ms: ${command.slice(0, 80)}`
@@ -690,7 +861,7 @@ export class FakeSshConnection extends EventEmitter {
     command: string,
     onLine: (line: string) => void
   ): Promise<{ stop: () => void; done: Promise<number | null> }> {
-    const m = await this.acquire()
+    const m = await this.openOn()
     const stream = new FakeStream(m, onLine)
     this.channels.add(stream)
     void stream.done.then(() => this.channels.delete(stream))
@@ -706,21 +877,34 @@ export class FakeSshConnection extends EventEmitter {
     return { stop: () => stream.end(null), done: stream.done }
   }
 
+  /** One SFTP channel per connection, cached until it closes, as the real one's is. */
   async sftp(): Promise<FakeSftp> {
-    const m = await this.acquire()
-    this.sftpCache ??= new FakeSftp(m)
-    return this.sftpCache
+    const m = await this.openOn()
+    if (this.sftpCache) return this.sftpCache
+    const sftp = new FakeSftp(m, this.network, (closed) => {
+      // The real one's sftp.on('close') does the same.
+      if (this.sftpCache === closed) this.sftpCache = null
+      this.channels.delete(closed)
+      m.untrack(closed)
+    })
+    this.sftpCache = sftp
+    this.channels.add(sftp)
+    m.track(sftp)
+    return sftp
   }
 
+  /** Like the real one: end the cached channel (see the header) so the next sftp() opens a fresh one. */
   resetSftp(): void {
+    const s = this.sftpCache
     this.sftpCache = null
+    s?.end()
   }
 
   async forwardOut(): Promise<never> {
     throw new Error('harness: forwardOut (the VNC tunnel) is not faked')
   }
 
-  /** Like ending the real client: every command still running on it ends (see the header). */
+  /** Like ending the real client: every channel still open on it ends (see the header). */
   close(): void {
     this.closed = true
     this.sftpCache = null
