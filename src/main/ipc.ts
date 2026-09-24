@@ -25,7 +25,7 @@ import type {
   NodeSnapshot,
   ThumbAsset
 } from '../shared/models'
-import { onEvent, recentAlerts } from './events'
+import { dismissAlerts, onEvent, recentAlerts } from './events'
 import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
 import { currentUser } from './vast/vastClient'
@@ -545,6 +545,7 @@ export function registerIpc(): void {
   // What a window missed: alerts raised before it existed (or while it was
   // closed) went to no one above. events.ts keeps the recent ones.
   handle('alerts:recent', () => recentAlerts())
+  handle('alerts:dismiss', (keys) => dismissAlerts(keys))
 
   // -- settings (real) ------------------------------------------------------
   // VR_MOCK asserts the key too: mock mode exists to drive the UI on a

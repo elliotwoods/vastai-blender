@@ -3,14 +3,14 @@
  * with nothing in the app managing it (a failed destroy, an orphan, "check the
  * Vast.ai console"). Each stays until dismissed. A billing risk also gets a
  * link to the Vast.ai instances page, the one place such an instance can be
- * checked and killed by hand.
+ * checked and killed by hand, and is listed above every plain error.
  *
  * Above the screen and above RecoveryBanner, for the reason that one sits
  * there: it is app-wide, and money leaking outranks paused work.
  */
 
 import { useMemo, useState, type CSSProperties } from 'react'
-import { useAlertStore, type AlertItem } from '../lib/alertStore'
+import { bannerOrder, useAlertStore, type AlertItem } from '../lib/alertStore'
 import { btn, mono } from '../lib/controls'
 import { ipc } from '../lib/ipc'
 import { SCALE, TOKENS } from '../lib/theme'
@@ -19,6 +19,21 @@ import { Icon } from './Icon'
 const VAST_CONSOLE = 'https://cloud.vast.ai/instances/'
 /** Rows shown before "show all": a burst of failures should not eat the screen. */
 const MAX_ROWS = 3
+
+/**
+ * Dismiss here and in main. Main's copy is what a window replays when it
+ * mounts, and without it every error already dealt with would be back each
+ * time a macOS window reopened.
+ */
+function useDismiss(): (keys: string[]) => void {
+  const dismiss = useAlertStore((s) => s.dismiss)
+  return (keys) => {
+    dismiss(keys)
+    ipc
+      .invoke('alerts:dismiss', keys)
+      .catch((e: unknown) => console.error('alerts:dismiss failed', e))
+  }
+}
 
 function clock(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -50,7 +65,7 @@ function tone(item: AlertItem): { row: CSSProperties; meta: string; icon: string
 }
 
 function Row({ item }: { item: AlertItem }): React.JSX.Element {
-  const dismiss = useAlertStore((s) => s.dismiss)
+  const dismiss = useDismiss()
   const t = tone(item)
   const repeated = item.count > 1
   return (
@@ -103,13 +118,9 @@ function Row({ item }: { item: AlertItem }): React.JSX.Element {
 
 export function AlertBanner(): React.JSX.Element | null {
   const items = useAlertStore((s) => s.items)
-  const dismiss = useAlertStore((s) => s.dismiss)
+  const dismiss = useDismiss()
   const [expanded, setExpanded] = useState(false)
-  // Newest first.
-  const open = useMemo(
-    () => items.filter((a) => a.sticky && a.dismissedAt === null).reverse(),
-    [items]
-  )
+  const open = useMemo(() => bannerOrder(items), [items])
   if (open.length === 0) return null
 
   const shown = expanded ? open : open.slice(0, MAX_ROWS)
@@ -139,11 +150,13 @@ export function AlertBanner(): React.JSX.Element | null {
               {expanded ? 'Show fewer' : `${hidden} more`}
             </button>
           ) : null}
+          {/* Only the rows on screen: nothing is dismissed unread. The next
+              ones move up in their place. */}
           <button
             style={btn({ variant: 'ghost', size: 'sm' })}
-            onClick={() => dismiss(open.map((a) => a.key))}
+            onClick={() => dismiss(shown.map((a) => a.key))}
           >
-            Dismiss all
+            {hidden > 0 ? `Dismiss these ${shown.length}` : 'Dismiss all'}
           </button>
         </div>
       ) : null}

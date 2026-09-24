@@ -17,7 +17,9 @@
 import type { AlertEvent } from '../shared/models'
 import {
   alertKey,
+  isBillingRisk,
   isStickyAlert,
+  isStillDismissed,
   type AlertRecord,
   type EventChannel,
   type IpcEventMap
@@ -81,7 +83,8 @@ export function emit<C extends EventChannel>(channel: C, payload: IpcEventMap[C]
 // sweeps orphans before createWindow(), and on macOS the window can be closed
 // while the fleet keeps billing, so "orphan destroy failed ... check the
 // Vast.ai console!" could reach no one. This buffer keeps the recent alerts
-// so a window can replay them when it mounts (the alerts:recent channel).
+// so a window can replay them when it mounts (the alerts:recent channel), and
+// what the user dismissed (alerts:dismiss), so a replay skips those.
 
 /** Distinct alerts kept. Repeats of one alert share an entry, so it is not a line count. */
 export const MAX_RECENT_ALERTS = 100
@@ -100,6 +103,8 @@ function recordAlert(alert: AlertEvent, now: number): void {
   const key = alertKey(alert)
   const i = recent.findIndex((r) => r.key === key)
   if (i >= 0) {
+    // A dismissal is kept: whether this repeat brings it back is
+    // isStillDismissed's call, made against the new lastSeen.
     const [prev] = recent.splice(i, 1)
     recent.push({ ...prev, count: prev.count + 1, lastSeen: now })
     return
@@ -111,19 +116,46 @@ function recordAlert(alert: AlertEvent, now: number): void {
     message: alert.message,
     ts: now,
     lastSeen: now,
-    count: 1
+    count: 1,
+    dismissedAt: null
   })
   if (recent.length > MAX_RECENT_ALERTS) {
-    // Evict the least recently seen alert that is not sticky. A burst of
-    // per-file download warnings must not push out the one message saying an
-    // instance is still billing. Only when every entry is sticky does the
-    // oldest of them go.
-    const j = recent.findIndex((r) => !isStickyAlert(r))
-    recent.splice(j >= 0 ? j : 0, 1)
+    // The least recently seen entry of the lowest tier present goes.
+    let victim = 0
+    for (let j = 1; j < recent.length; j++) {
+      if (evictionTier(recent[j]) < evictionTier(recent[victim])) victim = j
+    }
+    recent.splice(victim, 1)
   }
+}
+
+/**
+ * Which entries go first when the buffer is full, lowest tier first:
+ *   0  nothing a reopened window would put in its banner: a toast-level
+ *      alert, or one the user dismissed that has not come back since.
+ *   1  an error a window would show.
+ *   2  a billing risk. Errors can be distinct by the hundred (a dead node
+ *      fails `dispatch <chunk> failed` for every pending chunk, and each
+ *      requeue is a new chunk id), and they must not push out the one line
+ *      saying an instance may still be billing.
+ */
+function evictionTier(r: AlertRecord): number {
+  if (!isStickyAlert(r) || isStillDismissed(r)) return 0
+  return isBillingRisk(r) ? 2 : 1
 }
 
 /** The buffer, least recently seen first, as copies. */
 export function recentAlerts(): AlertRecord[] {
   return recent.map((r) => ({ ...r }))
+}
+
+/**
+ * The user dismissed these (by alertKey) in a window. Remembered here, so a
+ * window reopened or reloaded later does not replay what was already dealt
+ * with: on macOS the window can close and reopen many times in one run.
+ */
+export function dismissAlerts(keys: string[]): void {
+  const now = Date.now()
+  const drop = new Set(keys)
+  for (const r of recent) if (drop.has(r.key)) r.dismissedAt = now
 }

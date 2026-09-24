@@ -17,8 +17,20 @@
  */
 
 import { create } from 'zustand'
-import { alertKey, isBillingRisk, isStickyAlert, type AlertRecord } from '../../../shared/ipc'
+import {
+  alertKey,
+  isBillingRisk,
+  isStickyAlert,
+  isStillDismissed,
+  RESURFACE_MS,
+  type AlertRecord
+} from '../../../shared/ipc'
 import type { AlertEvent } from '../../../shared/models'
+
+// Shared with main, which applies the same quiet period when a window replays
+// its buffer (isStillDismissed). A toast that times out counts as dismissed
+// here, so a failure repeating every 15 s toasts once per quiet period.
+export { RESURFACE_MS }
 
 /** Entries kept. Repeats share one, so this is distinct alerts, not events. */
 export const MAX_ALERTS = 200
@@ -30,16 +42,11 @@ export function toastMs(level: AlertEvent['level']): number {
   return level === 'warn' ? 9_000 : 5_000
 }
 /**
- * A dismissed alert that fires again comes back, but not within this long of
- * its dismissal. A toast that times out counts as dismissed, so a failure
- * repeating every 15 s toasts once per quiet period, not every 15 s.
- */
-export const RESURFACE_MS = 5 * 60_000
-/**
  * A replayed toast-level alert is shown only if it last fired this recently:
  * the boot-time ones, raised seconds before the window opened. Older ones are
  * history, and a window reopened on macOS should not toast an hour of it.
- * Sticky alerts are always shown until dismissed, however old.
+ * Sticky alerts are shown however old, unless the user dismissed them in an
+ * earlier window (main keeps that; see alerts:dismiss).
  */
 export const REPLAY_TOAST_MS = 60_000
 
@@ -77,18 +84,43 @@ interface AlertState {
 }
 
 /**
- * Hold the list to MAX_ALERTS by dropping the least recently seen entry that
- * is not a sticky alert still on screen. Evicting one of those would take a
- * billing warning off the banner before anyone had dismissed it.
+ * Which entries go first when the list is full, lowest tier first (the same
+ * tiers as main's buffer):
+ *   0  a toast, or anything dismissed: not on the banner.
+ *   1  an error on the banner.
+ *   2  a billing risk on the banner. A dead node can fail dispatch for every
+ *      pending chunk, each a distinct error, and that burst must not take the
+ *      line saying an instance may still be billing off the banner before
+ *      anyone has seen it.
  */
+function evictionTier(a: AlertItem): number {
+  if (!a.sticky || a.dismissedAt !== null) return 0
+  return a.billingRisk ? 2 : 1
+}
+
+/** Hold the list to MAX_ALERTS, dropping the least recently seen entry of the lowest tier. */
 function capped(items: AlertItem[]): AlertItem[] {
   if (items.length <= MAX_ALERTS) return items
   const next = items.slice()
   while (next.length > MAX_ALERTS) {
-    const i = next.findIndex((a) => !(a.sticky && a.dismissedAt === null))
-    next.splice(i >= 0 ? i : 0, 1)
+    let victim = 0
+    for (let i = 1; i < next.length; i++) {
+      if (evictionTier(next[i]) < evictionTier(next[victim])) victim = i
+    }
+    next.splice(victim, 1)
   }
   return next
+}
+
+/**
+ * The banner's rows: sticky alerts still on screen, billing risks first, then
+ * newest first within each group. The banner shows only the first few, so a
+ * burst of ordinary errors must not bury an instance that may still be
+ * billing under "N more".
+ */
+export function bannerOrder(items: AlertItem[]): AlertItem[] {
+  const open = items.filter((a) => a.sticky && a.dismissedAt === null).reverse()
+  return [...open.filter((a) => a.billingRisk), ...open.filter((a) => !a.billingRisk)]
 }
 
 function byLastSeen(a: AlertItem, b: AlertItem): number {
@@ -150,7 +182,11 @@ export const useAlertStore = create<AlertState>((set, get) => ({
           continue
         }
         const sticky = isStickyAlert(r)
-        const show = sticky || now - r.lastSeen < REPLAY_TOAST_MS
+        // Dismissed in an earlier window (a macOS window closed and reopened,
+        // or a reload): stays dismissed, with its own time, so a repeat comes
+        // back after the same quiet period it would have had in that window.
+        const dismissed = isStillDismissed(r)
+        const show = !dismissed && (sticky || now - r.lastSeen < REPLAY_TOAST_MS)
         byKey.set(r.key, {
           key: r.key,
           level: r.level,
@@ -163,7 +199,7 @@ export const useAlertStore = create<AlertState>((set, get) => ({
           surfacedAt: now,
           // Not shown, and never seen: dismissed at 0 means that if it fires
           // again it comes straight back rather than waiting out a quiet period.
-          dismissedAt: show ? null : 0
+          dismissedAt: dismissed ? r.dismissedAt : show ? null : 0
         })
       }
       return { items: capped([...byKey.values()].sort(byLastSeen)) }

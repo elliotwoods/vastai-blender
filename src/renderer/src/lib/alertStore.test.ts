@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AlertRecord, EventChannel } from '../../../shared/ipc'
 import type { AlertEvent } from '../../../shared/models'
 import {
+  bannerOrder,
   MAX_ALERTS,
   REPLAY_TOAST_MS,
   RESURFACE_MS,
@@ -22,6 +23,15 @@ const foreign: AlertEvent = {
   message:
     'instance 9 (vastai-blender x) was not rented by this profile — left running; destroy it from its own app or the Vast.ai console if it is stray'
 }
+const orphan: AlertEvent = {
+  level: 'error',
+  message: 'orphan destroy failed for 42: HTTP 500 — check the Vast.ai console!'
+}
+/** Distinct errors by the hundred: a dead node failing dispatch for every pending chunk. */
+const dispatchFailed = (i: number): AlertEvent => ({
+  level: 'error',
+  message: `dispatch c${i}-r1 failed: ssh: connection lost`
+})
 
 function record(e: AlertEvent, over: Partial<AlertRecord> = {}): AlertRecord {
   return {
@@ -32,6 +42,7 @@ function record(e: AlertEvent, over: Partial<AlertRecord> = {}): AlertRecord {
     ts: T0,
     lastSeen: T0,
     count: 1,
+    dismissedAt: null,
     ...over
   }
 }
@@ -77,15 +88,19 @@ describe('alertStore: append and de-duplicate', () => {
     store().receive(scaleUp, T0)
     store().receive(destroyFailed, T0)
     store().receive(foreign, T0)
-    store().receive({ level: 'warn', message: 'destroying orphaned instance 7 (x)' }, T0)
+    store().receive(orphan, T0)
     store().receive({ level: 'error', message: 'dispatch c1 failed: boom' }, T0)
+    // The sweep announcing a destroy it has not tried yet is not a risk: its
+    // failure has its own alert (orphan, above).
+    store().receive({ level: 'warn', message: 'destroying orphaned instance 7 (x)' }, T0)
 
     expect(items().map((a) => [a.sticky, a.billingRisk])).toEqual([
       [false, false],
       [true, true],
       [true, true],
       [true, true],
-      [true, false]
+      [true, false],
+      [false, false]
     ])
   })
 
@@ -138,6 +153,50 @@ describe('alertStore: append and de-duplicate', () => {
     expect(items()[1].message).toBe('download failed (frames/51.png)')
     expect(items()[MAX_ALERTS - 1].message).toBe(`download failed (frames/${MAX_ALERTS + 49}.png)`)
   })
+
+  it('a billing risk outlasts any number of distinct errors; the oldest errors go first', () => {
+    store().receive(orphan, T0)
+    for (let i = 0; i <= MAX_ALERTS; i++) store().receive(dispatchFailed(i), T0 + 1 + i)
+
+    expect(items()).toHaveLength(MAX_ALERTS)
+    expect(items()[0].message).toBe(orphan.message)
+    expect(items()[1].message).toBe(dispatchFailed(2).message)
+    expect(bannerOrder(items())[0].message).toBe(orphan.message)
+  })
+
+  it('what is off the banner goes before an error still on it', () => {
+    store().receive(dispatchFailed(0), T0)
+    store().receive(destroyFailed, T0 + 1)
+    store().dismiss([items()[1].key], T0 + 2) // dismissed: off the banner
+    for (let i = 1; i < MAX_ALERTS; i++) store().receive(dispatchFailed(i), T0 + 2 + i)
+
+    expect(items()).toHaveLength(MAX_ALERTS)
+    expect(items()[0].message).toBe(dispatchFailed(0).message)
+    expect(items().some((a) => a.message === destroyFailed.message)).toBe(false)
+  })
+})
+
+describe('alertStore: banner order', () => {
+  it('billing risks first, then errors; newest first within each; nothing dismissed or toast', () => {
+    store().receive(orphan, T0)
+    store().receive(dispatchFailed(1), T0 + 1)
+    store().receive(scaleUp, T0 + 2)
+    store().receive(destroyFailed, T0 + 3)
+    store().receive(dispatchFailed(2), T0 + 4)
+    store().receive(dispatchFailed(3), T0 + 5)
+    store().receive(foreign, T0 + 6)
+    store().receive(dispatchFailed(4), T0 + 7)
+    store().dismiss([items().find((a) => a.message === dispatchFailed(4).message)!.key], T0 + 8)
+
+    expect(bannerOrder(items()).map((a) => a.message)).toEqual([
+      foreign.message,
+      destroyFailed.message,
+      orphan.message,
+      dispatchFailed(3).message,
+      dispatchFailed(2).message,
+      dispatchFailed(1).message
+    ])
+  })
 })
 
 describe('alertStore: seed from alerts:recent', () => {
@@ -183,6 +242,27 @@ describe('alertStore: seed from alerts:recent', () => {
     store().dismiss([items()[0].key], T0 + 1)
     store().seed([record(destroyFailed)], T0 + 2)
     expect(onScreen()).toEqual([])
+  })
+
+  it('keeps what the user dismissed in an earlier window, until it comes back', () => {
+    const now = T0 + 3_600_000
+    store().seed(
+      [
+        // Dismissed, and it has not fired since.
+        record(dispatchFailed(1), { dismissedAt: T0 + 10 }),
+        // Fired again within the quiet period: still dismissed.
+        record(dispatchFailed(2), { id: 2, dismissedAt: T0, lastSeen: T0 + RESURFACE_MS - 1 }),
+        // Fired again after it: back, as it would have come back in that window.
+        record(destroyFailed, { id: 3, dismissedAt: T0, lastSeen: T0 + RESURFACE_MS })
+      ],
+      now
+    )
+    expect(onScreen()).toEqual([destroyFailed.message])
+
+    // The dismissal keeps its time, so a repeat now is past the quiet period
+    // and comes straight back.
+    expect(items()[0].dismissedAt).toBe(T0 + 10)
+    expect(store().receive(dispatchFailed(1), now)).toBe(true)
   })
 })
 
@@ -234,6 +314,58 @@ describe('main: recent alerts (events.ts)', () => {
       foreign.message,
       'download failed (frames/32.png)'
     ])
+  })
+
+  it('a billing risk outlasts any number of distinct errors; the oldest errors go first', () => {
+    bus.emit('alert', orphan)
+    for (let i = 0; i <= bus.MAX_RECENT_ALERTS; i++) bus.emit('alert', dispatchFailed(i))
+
+    const recent = bus.recentAlerts()
+    expect(recent).toHaveLength(bus.MAX_RECENT_ALERTS)
+    expect(recent.slice(0, 2).map((r) => r.message)).toEqual([
+      orphan.message,
+      dispatchFailed(2).message
+    ])
+  })
+
+  it('a dismissed error goes before one nobody has seen', () => {
+    bus.emit('alert', dispatchFailed(0))
+    bus.emit('alert', destroyFailed)
+    bus.dismissAlerts([`error:${destroyFailed.message}`])
+    for (let i = 1; i < bus.MAX_RECENT_ALERTS; i++) bus.emit('alert', dispatchFailed(i))
+
+    const recent = bus.recentAlerts()
+    expect(recent).toHaveLength(bus.MAX_RECENT_ALERTS)
+    expect(recent[0].message).toBe(dispatchFailed(0).message)
+    expect(recent.some((r) => r.message === destroyFailed.message)).toBe(false)
+  })
+
+  it('remembers a dismissal, so a reopened window does not show it again', () => {
+    bus.emit('alert', destroyFailed)
+    bus.emit('alert', dispatchFailed(1))
+    vi.setSystemTime(T0 + 1_000)
+    bus.dismissAlerts([`error:${destroyFailed.message}`, 'error:never raised'])
+    expect(bus.recentAlerts().map((r) => r.dismissedAt)).toEqual([T0 + 1_000, null])
+
+    // A window opened now: only what the user has not dealt with.
+    store().seed(bus.recentAlerts(), T0 + 2_000)
+    expect(onScreen()).toEqual([dispatchFailed(1).message])
+
+    // It fires again within the quiet period, and later after it. A window
+    // opened after each shows it only the second time, just as the window
+    // that was open all along would have.
+    vi.setSystemTime(T0 + 60_000)
+    bus.emit('alert', destroyFailed)
+    useAlertStore.setState({ items: [] })
+    store().seed(bus.recentAlerts(), T0 + 61_000)
+    expect(onScreen()).toEqual([dispatchFailed(1).message])
+
+    vi.setSystemTime(T0 + 1_000 + RESURFACE_MS)
+    bus.emit('alert', destroyFailed)
+    useAlertStore.setState({ items: [] })
+    store().seed(bus.recentAlerts(), T0 + 2_000 + RESURFACE_MS)
+    expect(onScreen()).toEqual([dispatchFailed(1).message, destroyFailed.message])
+    expect(bus.recentAlerts()[1]).toMatchObject({ count: 3, dismissedAt: T0 + 1_000 })
   })
 
   it('evicts the oldest sticky alert only once every entry is sticky', () => {
@@ -376,10 +508,6 @@ describe('useIpcEvents', () => {
   it('a boot-time alert, raised before any window existed, shows once the window mounts', async () => {
     // Main, at boot: the orphan sweep fails a destroy before createWindow().
     const bus = await import('../../../main/events')
-    const orphan: AlertEvent = {
-      level: 'error',
-      message: 'orphan destroy failed for 42: HTTP 500 — check the Vast.ai console!'
-    }
     bus.emit('alert', orphan)
     replay = bus.recentAlerts()
 
