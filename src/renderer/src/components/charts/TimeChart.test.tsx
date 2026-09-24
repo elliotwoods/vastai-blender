@@ -30,7 +30,7 @@ describe('TimeChart', () => {
   it('draws each GPU in its own colour, broken at its own gaps', () => {
     const html = render({
       kind: 'line',
-      series: [gpu(0, [90, 95, null, 97]), gpu(1, [10, 12, 14, 16])]
+      series: [gpu(0, [90, 95, null, 97, 98]), gpu(1, [10, 12, 14, 16, 18])]
     })
     // GPU 0 has two runs either side of its gap, GPU 1 one unbroken run.
     expect(count(html, /<polyline[^>]*stroke:light-dark\(#2a78d6, #3987e5\)/g)).toBe(2)

@@ -23,6 +23,7 @@ import { mono } from '../../lib/controls'
 import { SCALE, TOKENS } from '../../lib/theme'
 import {
   barSlot,
+  holdStep,
   mergeIntervals,
   nearestIndex,
   polylinePoints,
@@ -294,7 +295,24 @@ export function TimeChart({
                       />
                     )
                   })
-                : segments(s.points).map((seg, i) => {
+                : (kind === 'step'
+                    ? holdStep(segments(s.points), s.points, toMs)
+                    : segments(s.points)
+                  ).map((seg, i) => {
+                    // A lone reading between gaps is a one-vertex polyline,
+                    // which draws nothing (#117) — show it as a dot.
+                    if (seg.length === 1) {
+                      return (
+                        <circle
+                          key={i}
+                          cx={sx(seg[0].x)}
+                          cy={sy(seg[0].y)}
+                          r={2}
+                          opacity={dimmed(s.id) ? DIM : undefined}
+                          style={{ fill: s.color }}
+                        />
+                      )
+                    }
                     const pts = polylinePoints(seg, kind, sx, sy)
                     return (
                       <Fragment key={i}>

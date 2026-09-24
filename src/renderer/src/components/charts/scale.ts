@@ -83,6 +83,22 @@ export function segments(points: readonly ChartPoint[]): XY[][] {
 }
 
 /**
+ * A step series' runs, with the last held to the end of the window. A step
+ * holds its value until the next reading, and after the last one there is
+ * none: the balance read at 09:00 is still the balance at 17:00 (it is only
+ * logged when it moves). Without this a quiet window, whose only point is
+ * the anchor restamped to its start, drew a single vertex — nothing (#117).
+ * A series that ends in a gap is not held: not sampled is not unchanged.
+ * `points` are in time order, as every caller builds them.
+ */
+export function holdStep(runs: XY[][], points: readonly ChartPoint[], toMs: number): XY[][] {
+  const last = points[points.length - 1]
+  if (!runs.length || last == null || last.y == null || last.x >= toMs) return runs
+  const tail = runs[runs.length - 1]
+  return [...runs.slice(0, -1), [...tail, { x: toMs, y: last.y }]]
+}
+
+/**
  * SVG `points` for one unbroken run. A step series holds its value until the
  * next reading — draw the horizontal run before the vertical jump.
  */

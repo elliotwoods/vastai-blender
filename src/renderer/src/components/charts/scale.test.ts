@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   barSlot,
+  holdStep,
   mergeIntervals,
   nearestIndex,
   niceCeil,
@@ -87,6 +88,58 @@ describe('segments', () => {
 
   it('returns nothing for an all-gap series', () => {
     expect(segments([{ x: 0, y: null }])).toEqual([])
+  })
+})
+
+describe('holdStep (#117)', () => {
+  it('holds the last reading to the end of the window', () => {
+    const pts = [
+      { x: 0, y: 5 },
+      { x: 40, y: 7 }
+    ]
+    expect(holdStep(segments(pts), pts, 100)).toEqual([
+      [
+        { x: 0, y: 5 },
+        { x: 40, y: 7 },
+        { x: 100, y: 7 }
+      ]
+    ])
+  })
+
+  it('turns a lone restamped anchor into a level across the window', () => {
+    const pts = [{ x: 0, y: 42 }]
+    expect(holdStep(segments(pts), pts, 100)).toEqual([
+      [
+        { x: 0, y: 42 },
+        { x: 100, y: 42 }
+      ]
+    ])
+  })
+
+  it('does not hold through a trailing gap, nor past the window', () => {
+    const gap = [
+      { x: 0, y: 5 },
+      { x: 40, y: null }
+    ]
+    expect(holdStep(segments(gap), gap, 100)).toEqual([[{ x: 0, y: 5 }]])
+    const atEnd = [{ x: 100, y: 5 }]
+    expect(holdStep(segments(atEnd), atEnd, 100)).toEqual([[{ x: 100, y: 5 }]])
+    expect(holdStep([], [], 100)).toEqual([])
+  })
+
+  it('leaves earlier runs alone', () => {
+    const pts = [
+      { x: 0, y: 1 },
+      { x: 10, y: null },
+      { x: 20, y: 2 }
+    ]
+    expect(holdStep(segments(pts), pts, 50)).toEqual([
+      [{ x: 0, y: 1 }],
+      [
+        { x: 20, y: 2 },
+        { x: 50, y: 2 }
+      ]
+    ])
   })
 })
 
