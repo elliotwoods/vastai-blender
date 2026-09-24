@@ -43,6 +43,7 @@ export interface IpcInvokeMap {
   // fleet / nodes
   'fleet:setMaxNodes': { args: [number]; result: void }
   'fleet:requestNode': { args: []; result: void }
+  'fleet:clearFailed': { args: []; result: number }
   'node:destroy': { args: [string]; result: void }
   'node:reprovision': { args: [string]; result: void }
   'node:openVncTunnel': { args: [string]; result: { localPort: number; password: string } }

@@ -96,3 +96,24 @@ button:focus-visible {
     opacity: 0.55;
   }
 }
+
+/* Page bar tabs (components/PageBar.tsx). States live here rather than inline
+   because an inline colour would outrank :hover. */
+.vr-pagebar-tab {
+  color: var(--text-muted);
+  background: transparent;
+  transition:
+    color 120ms,
+    background 120ms;
+}
+.vr-pagebar-tab:hover {
+  color: var(--text);
+  background: var(--surface);
+}
+.vr-pagebar-tab[aria-selected='true'] {
+  color: var(--text);
+  box-shadow: inset 0 2px var(--accent);
+}
+.vr-pagebar-tab[aria-selected='true'] .vr-pagebar-icon {
+  color: var(--accent);
+}

@@ -706,6 +706,36 @@ export class NodeManager {
     node.setState('destroyed')
   }
 
+  /**
+   * Retire every 'failed' node. A failed node can still own a billing
+   * instance (a destroy that threw), so re-attempt the destroy rather than
+   * just hiding the row; one that still won't die stays 'failed' and alerts.
+   * Bypasses destroyNode(): its Octane drain would await a dead SSH connection.
+   */
+  async clearFailed(): Promise<number> {
+    const failed = [...this.nodes.values()].filter((n) => n.state === 'failed')
+    const results = await Promise.allSettled(
+      failed.map(async (node) => {
+        forgetNodeProvider?.(node.id)
+        node.closeSsh()
+        const instanceId = node.snapshot.instanceId
+        if (instanceId) {
+          try {
+            await destroyInstance(instanceId)
+          } catch (e) {
+            emit('alert', {
+              level: 'error',
+              message: `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
+            })
+            throw e
+          }
+        }
+        node.setState('destroyed')
+      })
+    )
+    return results.filter((r) => r.status === 'fulfilled').length
+  }
+
   /** Accumulate $ cost from dph × elapsed and push the fleet totals. */
   private async accrueCosts(): Promise<void> {
     const db = getDb()

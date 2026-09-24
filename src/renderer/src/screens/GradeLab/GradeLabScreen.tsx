@@ -1,6 +1,6 @@
 /**
  * Grade parity harness. Reachable only via `?screen=gradelab` — deliberately
- * not in the sidebar; it is a measuring instrument, not a feature.
+ * not in the page bar; it is a measuring instrument, not a feature.
  *
  * Proves (or disproves) that the WebGL grader and the CSS filter produce the
  * same picture for the core tier, which is what lets the Gallery wall and the

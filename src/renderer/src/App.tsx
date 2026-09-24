@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
+import { PageBar } from './components/PageBar'
 import { RecoveryBanner } from './components/RecoveryBanner'
-import { Sidebar } from './components/Sidebar'
 import { useNav } from './lib/nav'
 import { isPreviewOpen, usePreview } from './lib/preview'
 import { useIpcEvents } from './lib/queries'
@@ -62,11 +62,8 @@ function App(): React.JSX.Element {
   }, [back])
 
   return (
-    <div style={{ display: 'flex', height: '100%' }}>
-      <Sidebar />
-      <main
-        style={{ flex: 1, minWidth: 0, height: '100%', display: 'flex', flexDirection: 'column' }}
-      >
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <main style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         {/* Above the screen, not inside it: the hold is app-wide, and every
             screen would otherwise have to remember to show it. */}
         <RecoveryBanner />
@@ -74,7 +71,8 @@ function App(): React.JSX.Element {
           <Screen />
         </div>
       </main>
-      {/* Sibling of <main>, so it covers the sidebar too. */}
+      <PageBar />
+      {/* Sibling of <main>, so it covers the page bar too. */}
       <PreviewOverlay />
     </div>
   )

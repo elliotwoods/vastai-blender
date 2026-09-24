@@ -623,6 +623,7 @@ export function registerIpc(): void {
       : (nodeManager.get(nodeId)?.snapshot ?? null)
     return snap ? sshTargetFor(snap) : null
   })
+  handle('fleet:clearFailed', () => nodeManager.clearFailed())
   handle('node:openSshTerminal', (nodeId) => {
     const snap = MOCK
       ? (mockNodes().find((n) => n.id === nodeId) ?? null)

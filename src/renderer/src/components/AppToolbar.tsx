@@ -4,6 +4,7 @@ import { mono, readout } from '../lib/controls'
 import { compareCo2 } from '../lib/co2'
 import { fmtCo2, fmtEnergy, fmtRate } from '../lib/format'
 import { HINTS } from '../lib/hints'
+import { Icon } from './Icon'
 import { InfoDot, Tooltip } from './Tooltip'
 import { ipc } from '../lib/ipc'
 import { useNav } from '../lib/nav'
@@ -97,7 +98,16 @@ function FleetReadouts(): React.JSX.Element {
           <span style={{ color: TOKENS.textFaint }}>session</span>
           <span style={mono}>${(cost?.sessionTotal ?? 0).toFixed(2)}</span>
           <span style={{ color: TOKENS.border }}>|</span>
-          <span style={{ ...mono, color: TOKENS.textMuted }}>
+          <span
+            style={{
+              ...mono,
+              color: TOKENS.textMuted,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 3
+            }}
+          >
+            <Icon name="power" size={11} />
             {fmtEnergy(cost?.sessionWh ?? 0)}
           </span>
           <InfoDot size={10} />

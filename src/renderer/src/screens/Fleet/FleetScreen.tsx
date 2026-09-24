@@ -284,21 +284,84 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
   )
 }
 
+// Renderer-only view preference, like the grade in media/useGrade.ts.
+const LS_SHOW_FAILED = 'vr:fleet:showFailed'
+
+function readShowFailed(): boolean {
+  try {
+    return localStorage.getItem(LS_SHOW_FAILED) !== '0'
+  } catch {
+    return true
+  }
+}
+
 export function FleetScreen(): React.JSX.Element {
   const { data: nodes, isLoading } = useNodes()
   const { data: settings } = useSettings()
   const { navigate } = useNav()
+  const [showFailed, setShowFailedState] = useState(readShowFailed)
+  const [clearing, setClearing] = useState(false)
 
-  const visible = (nodes ?? []).filter((n) => n.state !== 'destroyed')
+  const setShowFailed = (on: boolean): void => {
+    setShowFailedState(on)
+    try {
+      localStorage.setItem(LS_SHOW_FAILED, on ? '1' : '0')
+    } catch {
+      // best-effort persistence
+    }
+  }
+
+  const clearFailed = async (): Promise<void> => {
+    setClearing(true)
+    try {
+      await ipc.invoke('fleet:clearFailed')
+    } finally {
+      setClearing(false)
+    }
+  }
+
+  const live = (nodes ?? []).filter((n) => n.state !== 'destroyed')
+  const failedCount = live.filter((n) => n.state === 'failed').length
+  const visible = showFailed ? live : live.filter((n) => n.state !== 'failed')
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <AppToolbar
         left={<MaxNodesStepper />}
         right={
-          <button style={btn({ size: 'sm' })} onClick={() => void ipc.invoke('fleet:requestNode')}>
-            + request node
-          </button>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: SCALE.space3 }}>
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+                fontSize: SCALE.textXs,
+                color: TOKENS.textMuted,
+                cursor: 'pointer'
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={showFailed}
+                onChange={(e) => setShowFailed(e.target.checked)}
+              />
+              show failed ({failedCount})
+            </label>
+            <button
+              style={btn({ size: 'sm', disabled: failedCount === 0 || clearing })}
+              disabled={failedCount === 0 || clearing}
+              title="Destroy any instance a failed node still holds, then remove it from the list"
+              onClick={() => void clearFailed()}
+            >
+              {clearing ? 'clearing…' : 'clear failed'}
+            </button>
+            <button
+              style={btn({ size: 'sm' })}
+              onClick={() => void ipc.invoke('fleet:requestNode')}
+            >
+              + request node
+            </button>
+          </span>
         }
       />
       <div style={{ flex: 1, overflow: 'auto', padding: SCALE.space4 }}>
@@ -328,7 +391,9 @@ export function FleetScreen(): React.JSX.Element {
             <span style={{ color: TOKENS.textFaint }}>
               {isLoading
                 ? 'Loading…'
-                : 'No active nodes. Nodes start automatically when jobs are queued.'}
+                : failedCount > 0
+                  ? `${failedCount} failed node${failedCount === 1 ? '' : 's'} hidden.`
+                  : 'No active nodes. Nodes start automatically when jobs are queued.'}
             </span>
           </div>
         ) : (
