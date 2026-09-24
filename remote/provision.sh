@@ -38,8 +38,16 @@ cmd_base() {
   # contract. Fall back to apt ffmpeg only if the download fails.
   if [ ! -x "$VASTAI_HOME/bin/ffmpeg" ]; then
     log "downloading static ffmpeg…"
-    if curl -fsSL --retry 3 -o /tmp/ffmpeg.tar.xz \
-        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"; then
+    # Bounded: this blocks base provisioning (no agent yet, node billing), and
+    # a stalled or trickling server would otherwise hang it forever. Same
+    # guards as the Blender download (20 s connect, abort below 100 kB/s for
+    # 60 s, retry any error), plus a 10 min ceiling per attempt (~130 MB needs
+    # only ~220 kB/s to fit) and no new attempt once 10 min have passed, so
+    # the worst case is ~20 min before the apt fallback below.
+    if curl -fsSL --connect-timeout 20 --speed-limit 100000 --speed-time 60 \
+         --max-time 600 --retry 2 --retry-delay 3 --retry-all-errors --retry-max-time 600 \
+         -o /tmp/ffmpeg.tar.xz \
+         "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"; then
       tar -xJf /tmp/ffmpeg.tar.xz -C /tmp
       cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg "$VASTAI_HOME/bin/"
       cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffprobe "$VASTAI_HOME/bin/"
@@ -62,8 +70,13 @@ cmd_base() {
   # Kill stray render processes from a previous agent (SIGHUP from the tmux
   # kill does not reliably reach detached blender children) — a zombie
   # blender writing into a chunk dir alongside the fresh agent's own render
-  # corrupts progress accounting. Manifested frames survive; the fresh agent
-  # re-renders only what is missing from the manifest… of unfinished chunks.
+  # corrupts progress accounting. Nothing resumes the renders killed here.
+  # Their frames and manifest stay on disk, but the app re-dispatches each
+  # unfinished chunk with its full frame range (to whichever node it picks),
+  # and the agent renders that whole -s/-e range again, overwriting frames
+  # already there while their manifest lines keep the old size and sha256.
+  # So a re-provision mid-render pays again for every frame its in-flight
+  # chunks had already finished.
   pkill -f "$VASTAI_HOME/blender/" 2>/dev/null || true
   # Clear the job inbox: after an app restart every non-complete chunk is
   # re-dispatched with a fresh spec to whichever node the scheduler picks —
@@ -178,8 +191,15 @@ cmd_ensure_optix() {
   local tmp=/tmp/optix-$ver
   rm -rf "$tmp"; mkdir -p "$tmp"
   log "optix: fetching driver $ver libraries"
-  if ! curl -fsSL --retry 3 -o "$tmp/drv.run" \
-      "https://us.download.nvidia.com/XFree86/Linux-x86_64/$ver/NVIDIA-Linux-x86_64-$ver.run"; then
+  # Bounded with the same guards as the other downloads (20 s connect, abort
+  # below 100 kB/s for 60 s, retry any error). This runs in the background and
+  # blocks nothing, so the ceiling is generous: 30 min per attempt (300-400 MB
+  # needs only ~220 kB/s to fit) and no new attempt after 30 min. It exists so
+  # a trickling server can't leave this process hanging for the node's life.
+  if ! curl -fsSL --connect-timeout 20 --speed-limit 100000 --speed-time 60 \
+       --max-time 1800 --retry 2 --retry-delay 3 --retry-all-errors --retry-max-time 1800 \
+       -o "$tmp/drv.run" \
+       "https://us.download.nvidia.com/XFree86/Linux-x86_64/$ver/NVIDIA-Linux-x86_64-$ver.run"; then
     log "optix: driver $ver download failed — staying on CUDA"; rm -rf "$tmp"; return 0
   fi
   if ! sh "$tmp/drv.run" --extract-only --target "$tmp/x" > /dev/null 2>&1; then
