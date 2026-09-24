@@ -135,9 +135,7 @@ export function initialState(
   opts: { numGpus?: number; floor?: number } = {}
 ): SlotState {
   const learned = gpuName ? learnedSlots(gpuName) : null
-  const gpus = Math.max(1, Math.floor(opts.numGpus ?? 1))
-  const seed = learned ? Math.round(learned.bestSlots * gpus) : INITIAL_TARGET
-  const target = Math.max(1, Math.min(cap, Math.max(seed, opts.floor ?? 1)))
+  const target = seedTarget(learned?.bestSlots ?? null, cap, opts)
   return {
     target,
     // A learned value is a starting point, not a verdict — this node's scene
@@ -149,6 +147,22 @@ export function initialState(
     converged: false,
     memBackoffAt: null
   }
+}
+
+/**
+ * The shared-slot target a node starts at: the learned per-GPU optimum times
+ * its GPUs (2 with nothing learned), at least `floor`, at most `cap`. Pure,
+ * so scale-up can size a rental by the slots it will really start with
+ * (scaling.offerContribution) rather than a placeholder (#227).
+ */
+export function seedTarget(
+  learnedSlotsPerGpu: number | null,
+  cap: number,
+  opts: { numGpus?: number; floor?: number } = {}
+): number {
+  const gpus = Math.max(1, Math.floor(opts.numGpus ?? 1))
+  const seed = learnedSlotsPerGpu != null ? Math.round(learnedSlotsPerGpu * gpus) : INITIAL_TARGET
+  return Math.max(1, Math.min(cap, Math.max(seed, opts.floor ?? 1)))
 }
 
 /**

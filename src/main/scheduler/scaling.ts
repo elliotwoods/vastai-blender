@@ -1,5 +1,5 @@
 /**
- * How many nodes to rent this tick.
+ * How much to rent this tick.
  *
  * Scale-up used to be a yes/no question answered once per 15 s tick, renting
  * at most ONE node per tick — so a 30-node fleet spent 7.5 minutes just being
@@ -13,8 +13,32 @@
  * (which the renting loop re-checks per node, since an offer's price is only
  * known once it is picked).
  *
+ * planScaling() (plan 1.5, 1.21) goes further, and replaces nodesToRequest:
+ *
+ * - It returns a CapacityBudget (exclusive lanes, shared slots, $/hr, and a
+ *   rental count) instead of a node count. requestNodes subtracts each
+ *   offer's real contribution as it rents (offerContribution, subtractRental)
+ *   and stops once the demand is covered. A node count sized on the
+ *   GPU-count filter and placeholder slot counts rented whatever ranked
+ *   best, 8-GPU boxes included, for 1-lane demand (#227, #237).
+ * - The spend cap is a budget, not a yes/no: capHeadroom() goes to the offer
+ *   search as maxDphTotal, and every rental spends from it.
+ * - It knows the tail. A new node takes ~10 min to boot and provision
+ *   before its first frame. In job da68b61b every frame had landed except a
+ *   1-frame requeue sub-chunk, sitting on a live node, and buy-ahead rented
+ *   two more 8×4090s (~$8/h) for it. It never rents for work that a new node
+ *   would do in less time than it takes to boot, or that the fleet already
+ *   has finishes before a new node could arrive, and buy-ahead counts frames,
+ *   not chunks.
+ * - An account, local-sink or recovery hold stops it with a reason, for
+ *   scheduler:scaleStatus.
+ *
  * Pure, so the arithmetic is testable without a fleet.
  */
+
+import type { EngineId, NodeMetrics } from '../../shared/models'
+import { planLanes } from './gpuLanes'
+import { hardCap, seedTarget } from './slotController'
 
 /** Rentals per tick. Big enough to ramp 30 nodes in ~1 minute, small enough that
  * one bad offer search cannot buy an entire fleet of the wrong thing at once. */
@@ -56,6 +80,11 @@ export interface ScaleInput {
   maxPerTick?: number
 }
 
+/**
+ * @deprecated Use planScaling(): this sizes by node count and ignores the
+ * price of the node it rents (see capHeadroom) and the tail. Kept until the
+ * scheduler's scalePolicy and requestNodes move to budgets (plan 1.5, 1.21).
+ */
 export function nodesToRequest(i: ScaleInput): number {
   if (i.held) return 0
   const room = i.maxActive - i.active
@@ -112,4 +141,319 @@ export function capHeadroom(
   const left = cap - perHourBillingNow
   if (!(left > 0)) return 0
   return Math.floor(left * 1e6 + 1e-6) / 1e6
+}
+
+// ---------------------------------------------------------------------------
+// Capacity budgets (plan 1.5) and the tail (plan 1.21)
+// ---------------------------------------------------------------------------
+
+/** How long a newly rented node takes to boot and provision before its first frame. */
+export const NEW_NODE_LEAD_MS = 10 * 60_000
+
+/**
+ * What one scale-up batch may still rent. requestNodes rents while
+ * budgetOpen(), and after each rental takes off what that offer brings
+ * (subtractRental).
+ */
+export interface CapacityBudget {
+  /** exclusive GPU lanes still wanted */
+  exclusiveLanes: number
+  /** shared-work slots still wanted */
+  sharedSlots: number
+  /** $/hr the batch may still add; Infinity = uncapped. The offer search's maxDphTotal. */
+  maxDphTotal: number
+  /** rentals still allowed: room under maxActiveNodes, and the per-tick burst */
+  maxNodes: number
+}
+
+/** A reason scale-up is paused, for scheduler:scaleStatus. */
+export interface ScaleHold {
+  /** 'account' (plan 1.20), 'local-sink' (1.10), 'recovery' (restart), ... */
+  kind: string
+  /** one line for the user: why, and what releases it */
+  reason: string
+}
+
+export type ScaleStatus = 'rent' | 'held' | 'covered' | 'tail' | 'max-nodes' | 'spend-cap'
+
+export interface ScalingPlan {
+  status: ScaleStatus
+  /** one line for scheduler:scaleStatus and logs: why the budget is what it is */
+  reason: string
+  budget: CapacityBudget
+  /**
+   * The budget as a node count at the new-node estimate, bounded by maxNodes,
+   * for a caller that still rents by count. 0 unless status is 'rent'.
+   */
+  nodes: number
+}
+
+export interface PlanScalingInput {
+  pendingShared: number
+  pendingExclusive: number
+  /** free shared slots on usable nodes */
+  sharedCapacity: number
+  /** free exclusive lanes on usable nodes */
+  exclusiveCapacity: number
+  /** nodes rented but not yet usable, at what each will bring (offerContribution) */
+  booting: BootingNode[]
+  /** expected exclusive lanes / shared slots on a newly rented node, for `nodes` */
+  newNodeLanes: number
+  newNodeSharedSlots: number
+
+  /** usable (ready/idle/rendering) nodes */
+  usableNodes: number
+  /** all exclusive lanes on usable nodes, busy or free */
+  usableLanes: number
+  /** all shared-slot targets on usable nodes, busy or free */
+  usableSharedSlots: number
+  /** frames in pending chunks: the only work a new node could be given */
+  pendingFrames: number
+  /** frames not yet rendered, pending or in flight, by kind of job */
+  remainingExclusiveFrames: number
+  remainingSharedFrames: number
+  /** frames/hr the usable and booting fleet delivers; null = not learned yet */
+  fleetFramesPerHour: number | null
+  /** frames/hr a newly rented node would deliver (gpu_perf × GPUs); null = not learned */
+  newNodeFramesPerHour: number | null
+  /** boot + provision time of a new node; default NEW_NODE_LEAD_MS */
+  newNodeLeadMs?: number
+
+  /** buy-ahead: rent while frames outnumber the fleet's lanes/slots */
+  eager: boolean
+  /** nodes counted against maxActiveNodes (booting included) */
+  active: number
+  maxActive: number
+  /** $/hr of every node that may hold an instance, failed-but-holding included */
+  perHourBilling: number
+  spendCap: number | null
+  /** the explicit no-cap setting; see capHeadroom */
+  noCap: boolean
+  /** the cheapest offer worth searching for: less headroom than this rents nothing */
+  minOfferDph?: number
+  /** every active hold; any one stops scale-up */
+  holds: ScaleHold[]
+  maxPerTick?: number
+}
+
+const ZERO_BUDGET: CapacityBudget = {
+  exclusiveLanes: 0,
+  sharedSlots: 0,
+  maxDphTotal: 0,
+  maxNodes: 0
+}
+
+const money = (v: number): string => (Number.isFinite(v) ? `$${v.toFixed(2)}/h` : 'uncapped')
+
+function mins(ms: number): string {
+  return `${Math.max(1, Math.round(ms / 60_000))} min`
+}
+
+/** Scale-up for this tick: a capacity budget, or the reason there is none. */
+export function planScaling(i: PlanScalingInput): ScalingPlan {
+  const stop = (status: ScaleStatus, reason: string): ScalingPlan => ({
+    status,
+    reason,
+    budget: { ...ZERO_BUDGET },
+    nodes: 0
+  })
+
+  if (i.holds.length > 0) {
+    return stop('held', `scale-up paused: ${i.holds.map((h) => h.reason).join('; ')}`)
+  }
+
+  // --- Demand, in lanes and slots. ---
+  const bootLanes = i.booting.reduce((a, b) => a + Math.max(1, b.lanes), 0)
+  const bootShared = i.booting.reduce((a, b) => a + Math.max(1, b.sharedSlots), 0)
+  let exclusive: number
+  let shared: number
+  if (i.eager) {
+    // Buy-ahead: frames against every lane and slot the fleet has or has on
+    // the way, busy or not. A chunk cannot use more lanes than it has frames,
+    // so a 1-frame remainder on a live 8-GPU node wants nothing.
+    exclusive = Math.max(0, i.remainingExclusiveFrames - i.usableLanes - bootLanes)
+    shared = Math.max(0, i.remainingSharedFrames - i.usableSharedSlots - bootShared)
+  } else {
+    exclusive = Math.max(0, i.pendingExclusive - i.exclusiveCapacity - bootLanes)
+    shared = Math.max(0, i.pendingShared - i.sharedCapacity - bootShared)
+  }
+  if (exclusive === 0 && shared === 0) {
+    return stop(
+      'covered',
+      i.eager
+        ? 'the fleet has a lane or slot for every frame left'
+        : 'free and booting capacity covers the queue'
+    )
+  }
+
+  // --- The tail: never rent for work a new node could not get to in time. ---
+  // Only with a fleet to do it: with no node at all, a single frame still
+  // needs one rented.
+  const lead = i.newNodeLeadMs ?? NEW_NODE_LEAD_MS
+  if (i.usableNodes + i.booting.length > 0) {
+    const leadH = lead / 3_600_000
+    // What a new node could be given: pending work, or for buy-ahead, whatever
+    // is left (buy-ahead exists for queues the fleet has already prefetched).
+    const givable = i.eager ? i.remainingExclusiveFrames + i.remainingSharedFrames : i.pendingFrames
+    if (i.newNodeFramesPerHour != null && i.newNodeFramesPerHour > 0) {
+      const workMs = (givable / i.newNodeFramesPerHour) * 3_600_000
+      if (workMs < lead) {
+        return stop(
+          'tail',
+          `${givable} frame${givable === 1 ? '' : 's'} left for a new node is ~${mins(workMs)} of its work, less than the ~${mins(lead)} it takes to boot`
+        )
+      }
+    }
+    const remaining = i.remainingExclusiveFrames + i.remainingSharedFrames
+    if (i.fleetFramesPerHour != null && i.fleetFramesPerHour > 0) {
+      if (remaining <= i.fleetFramesPerHour * leadH) {
+        const finishMs = (remaining / i.fleetFramesPerHour) * 3_600_000
+        return stop(
+          'tail',
+          `the fleet finishes the last ${remaining} frame${remaining === 1 ? '' : 's'} in ~${mins(finishMs)}, before a new node could boot (~${mins(lead)})`
+        )
+      }
+    }
+  }
+
+  // --- Limits. ---
+  const room = i.maxActive - i.active
+  if (room <= 0) return stop('max-nodes', `at max nodes (${i.active} of ${i.maxActive})`)
+  const headroom = capHeadroom(i.perHourBilling, i.spendCap, i.noCap)
+  const minOffer = Math.max(0, i.minOfferDph ?? 0)
+  if (!(headroom > 0) || headroom < minOffer) {
+    const cap = i.noCap
+      ? 'no cap'
+      : i.spendCap == null
+        ? 'no cap set'
+        : `a ${money(i.spendCap)} cap`
+    return stop(
+      'spend-cap',
+      `spend cap: ${money(i.perHourBilling)} billing under ${cap} leaves ${money(headroom)}` +
+        (headroom > 0 ? `, less than the cheapest offer (${money(minOffer)})` : '')
+    )
+  }
+
+  const maxNodes = Math.max(0, Math.min(room, i.maxPerTick ?? MAX_REQUESTS_PER_TICK))
+  const budget: CapacityBudget = {
+    exclusiveLanes: exclusive,
+    sharedSlots: shared,
+    maxDphTotal: headroom,
+    maxNodes
+  }
+  const nodes = Math.min(
+    maxNodes,
+    Math.ceil(exclusive / Math.max(1, i.newNodeLanes)) +
+      Math.ceil(shared / Math.max(1, i.newNodeSharedSlots))
+  )
+  const want = [
+    exclusive > 0 ? `${exclusive} exclusive lane${exclusive === 1 ? '' : 's'}` : null,
+    shared > 0 ? `${shared} shared slot${shared === 1 ? '' : 's'}` : null
+  ].filter((x): x is string => x != null)
+  return {
+    status: 'rent',
+    reason: `short ${want.join(' and ')}: up to ${maxNodes} rental${maxNodes === 1 ? '' : 's'} within ${money(headroom)}`,
+    budget,
+    nodes
+  }
+}
+
+/** What one rented node adds to the fleet. */
+export interface RentalContribution {
+  lanes: number
+  sharedSlots: number
+}
+
+/** The offer fields capacity is estimated from (shared Offer, or a booting node's row). */
+export interface OfferShape {
+  numGpus: number
+  gpuRamGb?: number | null
+  cpuCoresEffective?: number | null
+}
+
+/**
+ * The hardware ceiling an offer will have, from what the offer lists: the
+ * same hardCap the node gets once metrics arrive, fed its CPUs and total
+ * VRAM. RAM is not listed, so it does not bound the estimate.
+ */
+export function offerCap(offer: OfferShape, maxNodeSlots: number): number {
+  const gpus = Math.max(1, Math.floor(offer.numGpus || 1))
+  const listed: NodeMetrics = {
+    gpuUtil: 0,
+    vramUsedGb: 0,
+    vramTotalGb: Math.max(0, (offer.gpuRamGb ?? 0) * gpus),
+    gpuTemp: 0,
+    powerW: 0,
+    powerLimitW: 0,
+    cpuUtil: 0,
+    cpuLoad1: 0,
+    cpuCores: Math.max(0, offer.cpuCoresEffective ?? 0),
+    ramUsedGb: 0,
+    ramTotalGb: 0,
+    updatedAt: 0
+  }
+  return hardCap(listed, Math.max(0, maxNodeSlots))
+}
+
+/**
+ * What renting this offer brings: its GPU lanes (planLanes on the offer's own
+ * GPU count, not the filter's floor) and the shared slots it will start at
+ * (the learned per-GPU optimum × its GPUs, as initialState seeds it). Use the
+ * same estimate for booting nodes.
+ */
+export function offerContribution(
+  offer: OfferShape,
+  o: {
+    slotsPerGpu: number
+    maxNodeSlots: number
+    /** gpu_slots.best_slots for the offer's model; null = nothing learned */
+    learnedSlotsPerGpu?: number | null
+    /** the engine of the work it is rented for; EEVEE and Octane get one lane */
+    engine?: EngineId | null
+  }
+): RentalContribution {
+  const cap = offerCap(offer, o.maxNodeSlots)
+  const plan = planLanes(offer.numGpus, o.slotsPerGpu, cap, o.engine)
+  const sharedSlots = seedTarget(o.learnedSlotsPerGpu ?? null, cap, {
+    numGpus: offer.numGpus,
+    floor: plan.pin ? plan.lanes : 1
+  })
+  return { lanes: plan.lanes, sharedSlots }
+}
+
+/** Rounded down to a millionth of a dollar, never below zero (as capHeadroom). */
+const microDown = (v: number): number => Math.max(0, Math.floor(v * 1e6 + 1e-6) / 1e6)
+
+/**
+ * The budget after renting `offer`. A node serves exclusive or shared work,
+ * not both at once, so it covers exclusive lanes first and shared slots only
+ * once no exclusive demand is left, the way nodesToRequest added the two.
+ */
+export function subtractRental(
+  budget: CapacityBudget,
+  offer: { dphTotal: number },
+  c: RentalContribution
+): CapacityBudget {
+  const next = { ...budget, maxNodes: Math.max(0, budget.maxNodes - 1) }
+  if (next.exclusiveLanes > 0) next.exclusiveLanes = Math.max(0, next.exclusiveLanes - c.lanes)
+  else next.sharedSlots = Math.max(0, next.sharedSlots - c.sharedSlots)
+  // An unpriced offer spends everything: it should never have been rented.
+  const price = Number.isFinite(offer.dphTotal) ? Math.max(0, offer.dphTotal) : Infinity
+  const left = next.maxDphTotal - price
+  next.maxDphTotal = left === Infinity ? Infinity : Number.isFinite(left) ? microDown(left) : 0
+  return next
+}
+
+/** Is there still demand, a rental and money left in the budget? */
+export function budgetOpen(b: CapacityBudget): boolean {
+  return (b.exclusiveLanes > 0 || b.sharedSlots > 0) && b.maxNodes > 0 && b.maxDphTotal > 0
+}
+
+/**
+ * May this offer be rented from the budget? Its price must fit what is left:
+ * the re-check before each rent, since the search's limit was set before the
+ * batch's earlier rentals spent from it. An offer with no sane price never fits.
+ */
+export function offerFits(b: CapacityBudget, offer: { dphTotal: number }): boolean {
+  return Number.isFinite(offer.dphTotal) && offer.dphTotal >= 0 && offer.dphTotal <= b.maxDphTotal
 }
