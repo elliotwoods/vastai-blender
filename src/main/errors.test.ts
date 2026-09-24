@@ -290,6 +290,52 @@ describe('classify: what the agent reports', () => {
   })
 })
 
+describe('classify: what nothing recognises', () => {
+  it('is charged to the job, so the render retries bound it and the user sees why', () => {
+    // Called transient, a bug of ours could be retried until the
+    // infrastructure budget ran out, never reaching the job breaker.
+    const ours = new TypeError("Cannot read properties of undefined (reading 'numGpus')")
+    const c = classify(ours, { via: 'ssh' })
+    expect(c).toMatchObject({ kind: 'job', retryable: true, rule: 'unclassified' })
+    expect(c.reason).toMatch(/numGpus/)
+    expect(classify(new Error('path escapes the job folder: ../../etc')).kind).toBe('job')
+    expect(classify('something odd').kind).toBe('job')
+    expect(classify(undefined).kind).toBe('job')
+  })
+
+  it('from Vast stays transient, with its outcome unknown: there is no job to charge', () => {
+    const c = classify(new VastError('vast.ai said something new'), { via: 'vast' })
+    expect(c).toMatchObject({ kind: 'transient', outcomeUnknown: true })
+    expect(classify('odd', { via: 'vast' }).kind).toBe('transient')
+  })
+
+  it("knows this app's own SSH and transfer failures, so none is charged to the job", () => {
+    const infra: Array<[Error, string]> = [
+      [new Error('execStream timeout after 600000ms: provision.sh base'), 'transient'],
+      [new Error('SFTP readFile /work/state/c1.json: no answer for 30s'), 'transient'],
+      [new Error('SFTP channel open timed out after 20000ms'), 'transient'],
+      [new Error('unexpected EOF at 1048576 of 4194304 (/work/renders/c1/0001.exr)'), 'transient'],
+      [new Error('size mismatch downloading /work/renders/c1/0001.exr: 10 != 20'), 'transient'],
+      [new Error('hash mismatch downloading /work/renders/c1/0001.exr'), 'transient'],
+      [new Error('upload verify failed for scene.blend'), 'transient'],
+      [new Error('transfer aborted (/work/renders/c1/0001.exr)'), 'transient'],
+      [new Error('node vanished'), 'machine'],
+      [new Error('no SSH endpoint yet'), 'machine'],
+      // sshConnection's own words, even when the caller gave no source.
+      [new Error('connection closed'), 'machine'],
+      [new Error('reconnect budget exhausted: connect ECONNREFUSED 1.2.3.4:22'), 'machine'],
+      [new Error('provision.sh base failed: No space left on device'), 'machine']
+    ]
+    for (const [e, kind] of infra) {
+      const c = classify(e)
+      expect(c.kind, `${e.message} → ${c.rule}`).toBe(kind)
+      expect(c.rule).not.toBe('unclassified')
+    }
+    const sftpTimeout = classify(new Error('SFTP writeFile /work/inbox/c1.json: no answer for 30s'))
+    expect(sftpTimeout.outcomeUnknown).toBe(true)
+  })
+})
+
 describe('describeError: never empty, always names the code', () => {
   it('names the code, errno and syscall of an error with no message', () => {
     const e = Object.assign(new Error(''), { code: 'ECONNREFUSED', errno: -61, syscall: 'connect' })

@@ -17,7 +17,9 @@
  *              1d59516c made 12 rent attempts, each refused with 400
  *              insufficient_credit.
  *   job        The job itself: a scene check or startup script failed, or
- *              Blender exited with an error.
+ *              Blender exited with an error. Also any error nothing here
+ *              recognises, so that it is bounded by the render retries and
+ *              shown to the user (see the end of classify).
  *   localFs    This computer: disk full, permission denied, an output folder
  *              gone. Nothing remote is wrong, and failing chunks for it throws
  *              away renders already paid for.
@@ -186,14 +188,18 @@ function looksLikeVast(e: ErrorLike): boolean {
   )
 }
 
-/** ssh2 marks its own errors with `level` (client-socket, client-timeout, ...). */
+/**
+ * ssh2 marks its own errors with `level` (client-socket, client-timeout, ...);
+ * sshConnection.ts words its own as "connection closed" and so on.
+ */
 function looksLikeSsh(e: ErrorLike): boolean {
   return (
     typeof e.level === 'string' ||
     str(e.name) === 'HostKeyMismatchError' ||
     /\(SSH\)|\bssh\b|handshake|No response from server|authentication methods failed|host key/i.test(
       str(e.message)
-    )
+    ) ||
+    /^(connection closed|reconnect budget exhausted|Not connected)\b/i.test(str(e.message))
   )
 }
 
@@ -287,6 +293,7 @@ const OUTCOME_UNKNOWN = new Set([
   'timeout',
   'net-dropped',
   'ssh-exec-timeout',
+  'sftp-timeout',
   'ssh-lost',
   'unclassified'
 ])
@@ -351,9 +358,7 @@ function classifyAgent(f: AgentFailure): Classification {
  */
 export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classification {
   if (isAgentFailure(e)) return classifyAgent(e)
-  if (!isObject(e)) {
-    return result('transient', 'unclassified', 'unrecognised failure', e, true)
-  }
+  if (!isObject(e)) return unrecognised(e, opts.via === 'vast', 'unrecognised failure')
   const message = str(e.message)
   const name = str(e.name)
   // An HTTP status or Vast's own wording says Vast whatever `via` says; `via`
@@ -392,6 +397,11 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
     // An offer rented by someone else, or no longer on the market: another
     // offer can succeed where this one cannot. A create answered 200 with no
     // contract says why in the same words, and is as definite a no.
+    // An unrecognised 4xx can equally be our own request (an image, a disk
+    // size or a field Vast rejects), which fails on every offer the same
+    // way. So the rent path must bound these per batch (requestNodes stops
+    // after 3) and count them toward plan 1.17's scale backoff, not only
+    // blacklist one machine after another.
     return result('machine', 'vast-refused', 'Vast refused the request', e, true)
   }
 
@@ -427,8 +437,11 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
   if (/channel open failure/i.test(message)) {
     return result('transient', 'ssh-channels', 'SSH channel limit on the node', e, true)
   }
-  if (/^exec timeout/i.test(message)) {
+  if (/^exec(Stream)? timeout/i.test(message)) {
     return result('transient', 'ssh-exec-timeout', 'a command on the node timed out', e, true)
+  }
+  if (/^SFTP\b.*\bno answer for\b|^SFTP channel open timed out/i.test(message)) {
+    return result('transient', 'sftp-timeout', 'the node did not answer a file transfer', e, true)
   }
   if (
     ssh &&
@@ -455,9 +468,31 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
     return result('localFs', `local-${code}`, label, e, false)
   }
 
+  // --- The node's disk, quoted back in its stderr (not a local code above). ---
+  if (/No space left on device|Disk quota exceeded|\bENOSPC\b/i.test(message)) {
+    return result('machine', 'node-disk', "the node's disk is full", e, true)
+  }
+
   // --- ssh2 SFTP statuses (numeric codes): the node's side of a transfer. ---
   if (typeof e.code === 'number' && e.code >= 2 && e.code <= 8) {
     return result('machine', 'sftp-status', 'the node refused a file transfer', e, true)
+  }
+
+  // --- Transfers this app checks itself (sftp.ts, pipelinedGet.ts). ---
+  if (/^transfer aborted\b/i.test(message)) {
+    return result('transient', 'transfer-aborted', 'the transfer was stopped', e, true)
+  }
+  if (
+    /^unexpected EOF at\b|^(size|hash) mismatch downloading\b|^upload verify failed\b/i.test(
+      message
+    )
+  ) {
+    return result('transient', 'transfer-damaged', 'a transfer arrived short or damaged', e, true)
+  }
+
+  // --- The node left the fleet under the caller (scheduler, nodeManager). ---
+  if (/^node vanished\b|^no SSH endpoints?\b/i.test(message)) {
+    return result('machine', 'node-gone', 'the node is no longer usable', e, true)
   }
 
   // --- Vast replies with no status. ---
@@ -465,5 +500,20 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
     return result('transient', 'vast-network', 'could not reach Vast.ai', e, true)
   }
 
-  return result('transient', 'unclassified', 'unrecognised error', e, true)
+  return unrecognised(e, vast, 'unrecognised error')
+}
+
+/**
+ * Nothing above recognised it. Called transient, an error nobody knows (a
+ * TypeError in our own code, a path resolveInside refused) could be retried
+ * until the infrastructure budget ran out, never reaching the job breaker,
+ * while the fleet it ran on billed. So it is charged to the job: bounded by
+ * the render retries, and on a second node the breaker puts its reason in
+ * front of the user. From Vast it stays transient, with its outcome unknown:
+ * there is no job to charge, and the rent batch's failure count and the scale
+ * backoff bound it. Give an error its own rule before relying on its class.
+ */
+function unrecognised(e: unknown, vast: boolean, label: string): Classification {
+  if (vast) return result('transient', 'unclassified', `${label} from Vast.ai`, e, true)
+  return result('job', 'unclassified', label, e, true)
 }
