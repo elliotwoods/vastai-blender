@@ -123,7 +123,11 @@ GitHub Releases with the notes from this file.
   blacklisted, or it came back as `provisioning`. The instance is now destroyed
   whichever step the destroy lands in. If that destroy fails, the node is left
   `failed` with a "check the Vast.ai console" alert, for Fleet's *clear
-  failed* or the launch sweep to retry.
+  failed* or the launch sweep to retry. One case remains: a destroy while the
+  rent request is in flight, when that request then fails without a clear
+  refusal (a timeout, a 5xx), may have created an instance whose id never
+  came back. The node is left `failed` with a billing-risk alert, and only the
+  launch sweep finds that instance (plan 1.4 resolves it by label).
 - **Chunks were rendered twice.** Destroying a node while a chunk was being
   prepared on it (a Blender download, a scene upload) requeued the chunk, which
   was dispatched again at once. The abandoned preparation then failed on the

@@ -75,7 +75,7 @@ From source:
 npm install
 npm run dev          # development (Vite + Electron, hot reload)
 npm run build:win    # packaged Windows build (electron-builder)
-npm test             # node agent self-check (needs python3), then unit tests
+npm test             # node agent self-check (skipped with a note if no python3), then unit tests
 npm run typecheck    # main + renderer type checks
 ```
 
@@ -187,9 +187,10 @@ does about that, and what it doesn't:
   never touched. The sweep runs only at launch.
 - **One app per profile.** A second launch on the same profile writes one
   line to stderr and quits with status 0, and the app already running brings
-  its window forward. A headless one (`VR_JOB_SPEC`, `VR_E2E_BLEND`) submits
-  nothing and exits with status 1. A `VR_USERDATA` profile is a separate
-  profile, so it runs alongside.
+  its window forward. A scripted one — headless (`VR_JOB_SPEC`,
+  `VR_E2E_BLEND`) or a window capture (`VR_SHOT`) — submits or captures
+  nothing, exits with status 1, and leaves the running app's window alone. A
+  `VR_USERDATA` profile is a separate profile, so it runs alongside.
 - **Billing-risk alerts stay up.** A destroy that failed, or an instance left
   running, stays in a banner above every screen until you dismiss it, with a
   link to the Vast.ai console.
