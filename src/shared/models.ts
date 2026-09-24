@@ -35,6 +35,14 @@ export interface OfferFilters {
    * ~cores × clock, so a floor forces the fleet onto machines with real CPUs.
    */
   minCpuCores?: number | null
+  /**
+   * Minimum GPUs per offer (optional; null/absent = any). Multi-GPU nodes run
+   * one render per GPU (see SettingsPublic.slotsPerGpu), so a 4-GPU box is
+   * four render lanes on one rental: fewer machines to boot and babysit for
+   * the same throughput. Offer ranking is per GPU, so this is a preference
+   * the user expresses, not something ranking forces.
+   */
+  minNumGpus?: number | null
 }
 
 export interface Offer {
@@ -95,12 +103,30 @@ export interface NodeMetrics {
   ramTotalGb: number
   /** epoch ms of the sample */
   updatedAt: number
+  /** per-GPU breakdown; absent on samples from before it was recorded */
+  gpus?: GpuSample[]
+}
+
+/** One GPU's share of a node's usage sample (nvidia-smi index order). */
+export interface GpuSample {
+  index: number
+  util: number
+  vramUsedGb: number
+  vramTotalGb: number
+  temp: number
+  /** 0 = not reported */
+  powerW: number
 }
 
 /** One chunk the scheduler currently has in flight on a node. */
 export interface NodeWorkRef {
   chunkId: string
   jobId: string
+  /**
+   * The GPU this chunk's Blender is pinned to (nvidia-smi index), or null when
+   * it is not pinned — a single-GPU node, per-GPU slots off, or not started yet.
+   */
+  gpu?: number | null
 }
 
 export interface NodeSnapshot {
@@ -374,6 +400,8 @@ export interface NodeChunkView {
   live: boolean
   /** epoch ms the chunk was dispatched; null for rows that predate the column */
   assignedAt: number | null
+  /** GPU the live run is pinned to (nvidia-smi index); null = unpinned / unknown */
+  gpu: number | null
   /** newest downloaded frame thumbnail for this chunk; null until one lands */
   thumbUrl: string | null
 }
@@ -512,6 +540,24 @@ export interface SettingsPublic {
    * chunk holds its node alone regardless of this number.
    */
   maxNodeSlots: number
+  /**
+   * Render slots per GPU on a node (optional; absent = 1).
+   *
+   * 1 (default): a node with N GPUs runs N chunks at once, each Blender pinned
+   * to one GPU with CUDA_VISIBLE_DEVICES — including jobs that do NOT share
+   * nodes, for which the GPU rather than the whole node becomes the unit of
+   * exclusivity. A single Blender spread over every GPU scales badly whenever
+   * a frame carries serial CPU work (scene sync, BVH build, geometry nodes),
+   * because every GPU idles while that one process does it.
+   *
+   * 2: two chunks per GPU, so one process's CPU sync overlaps the other's GPU
+   * sampling. Worth it when sync is a large fraction of the frame; costs VRAM
+   * and RAM for the second copy of the scene. Applies to single-GPU nodes too.
+   *
+   * 0: off — one Blender process uses every GPU on the node (the behaviour
+   * before per-GPU slots).
+   */
+  slotsPerGpu?: number
   /**
    * Buy-ahead fleet mode (optional; default off = historical demand-driven
    * scaling). When true, scale-up keeps renting to maxActiveNodes while ANY

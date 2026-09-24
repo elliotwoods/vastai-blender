@@ -47,6 +47,7 @@ export function buildQuery(f: OfferFilters): Record<string, unknown> {
   // campaign's throughput target (measured 2026-07-27: a fleet of i7/Xeon
   // leftovers delivered ~4 frames/min across 80 slots).
   if (f.minCpuCores != null) q.cpu_cores_effective = { gte: f.minCpuCores }
+  if (f.minNumGpus != null) q.num_gpus = { gte: f.minNumGpus }
   return q
 }
 
@@ -71,6 +72,7 @@ function toOffer(r: RawOffer): Offer {
   }
 }
 
+/** Measured frames/hour for ONE GPU of this model (see recordThroughput). */
 function measuredFramesPerHour(gpuName: string): number | null {
   try {
     const row = getDb()
@@ -86,8 +88,18 @@ function measuredFramesPerHour(gpuName: string): number | null {
  * Record a completed chunk's throughput for this GPU model (EWMA 30% new).
  * Called by the scheduler; includes per-chunk overheads (upload/encode) on
  * purpose — that's the throughput we actually experience.
+ *
+ * `nodeFramesPerHour` is what the whole node delivered; it is stored PER GPU.
+ * The table is keyed by GPU model alone, and before this a 4×4090 node and a
+ * 1×4090 node wrote their node totals under the same "RTX 4090" key, so the
+ * figure swung ~4x with whichever size happened to finish a chunk last — and
+ * scoring then divided it by each offer's whole-node price, so every 1-GPU
+ * offer was ranked on a 4-GPU node's output (or the reverse). Per GPU, the
+ * figure means the same thing whatever size of node measured it, and
+ * scoreOffer multiplies it back up by the offer's GPU count.
  */
-export function recordThroughput(gpuName: string, framesPerHour: number): void {
+export function recordThroughput(gpuName: string, nodeFramesPerHour: number, numGpus = 1): void {
+  const framesPerHour = nodeFramesPerHour / Math.max(1, Math.floor(numGpus || 1))
   if (!Number.isFinite(framesPerHour) || framesPerHour <= 0) return
   const db = getDb()
   const row = db
@@ -129,9 +141,14 @@ export function scoreOffer(o: Offer, cpuBound = false): number {
   const measured = measuredFramesPerHour(o.gpuName)
   let perfPerDollar: number
   if (measured != null) {
-    // frames/hour per dollar/hour = frames per dollar. Scale to roughly the
-    // magnitude of dlperf_per_dphtotal so mixed fleets rank sanely.
-    perfPerDollar = (measured / o.dphTotal) * 0.5
+    // frames/hour per dollar/hour = frames per dollar. `measured` is per GPU
+    // and dphTotal is the whole node's price, so scale by the GPU count — each
+    // GPU runs its own render lane (see scheduler/gpuLanes). Scale to roughly
+    // the magnitude of dlperf_per_dphtotal so mixed fleets rank sanely.
+    // (dlperf_per_dphtotal needs no such correction: vast's DLPerf already
+    // scores the whole machine.)
+    const gpus = Math.max(1, o.numGpus || 1)
+    perfPerDollar = ((measured * gpus) / o.dphTotal) * 0.5
   } else if (cpuBound) {
     // CPU-bound: rank unmeasured machines by CPU per dollar; the DL benchmark
     // only tie-breaks (capped) so premium datacenter GPUs stop auto-winning.
