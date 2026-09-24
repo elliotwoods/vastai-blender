@@ -626,8 +626,10 @@ def test_failed_state_says_why():
         check("no Blender on the node: machine, and no exit code because none ran",
               state.get("errorKind") == "machine" and state.get("exitCode") is None
               and isinstance(state.get("logTail"), list))
-    check("a disk errno is the machine's", nr.failure_kind(OSError(28, "full")) == ("machine", None))
-    check("an unexplained exception is transient", nr.failure_kind(ValueError("x")) == ("transient", None))
+    check("a disk errno is the machine's",
+          nr.failure_kind(OSError(28, "full")) == ("machine", None))
+    check("an unexplained exception is transient",
+          nr.failure_kind(ValueError("x")) == ("transient", None))
 
 
 def test_full_disk_still_retires_the_spec():
@@ -644,11 +646,14 @@ def test_full_disk_still_retires_the_spec():
 
         nr.write_state = full  # fake_node restores it
         raised = None
+        out = io.StringIO()
         try:
-            nr.process(spec_path)
+            with contextlib.redirect_stdout(out):
+                nr.process(spec_path)
         except Exception as e:  # noqa: BLE001
             raised = e
-        check("full disk: process() does not raise", raised is None)
+        check("full disk: process() does not raise, and says what it could not write",
+              raised is None and "could not write the failed state of c1" in out.getvalue())
         check("full disk: the spec leaves the inbox for failed/",
               not os.path.exists(spec_path) and os.path.exists(os.path.join(nr.FAILED, "c1.json")))
 
@@ -905,6 +910,12 @@ def cloth(name="Flag", pc=None, **kw):
     return NS(**fields)
 
 
+def layer(name, children=(), exclude=False, hide_render=False):
+    """A view layer's LayerCollection over a collection called `name`."""
+    return NS(collection=NS(name=name, hide_render=hide_render), exclude=exclude,
+              children=list(children))
+
+
 def preflight(tmp, bpy, **args):
     """(raised, report) for preflight.py over `bpy`, with VR_PREFLIGHT `args`."""
     base = {"jobChunks": None, "first": 1, "last": 50, "contiguous": True, "mode": "enforce"}
@@ -1008,6 +1019,21 @@ def test_preflight_simulations():
             ("baked to disk, one chunk", scene(cloth(pc=cache(is_baked=True, use_disk_cache=True))),
              {"jobChunks": 1}, False),
             ("hidden from the render", scene(cloth(hide_render=True)), {"jobChunks": 3}, True),
+            ("in a collection disabled for renders", scene(
+                cloth(users_collection=[NS(name="WIP")]),
+                view_layers=[NS(use=True, layer_collection=layer("Scene Collection", [
+                    layer("Set"), layer("WIP", hide_render=True)]))]),
+             {"jobChunks": 3}, True),
+            ("in a collection the view layer excludes", scene(
+                cloth(users_collection=[NS(name="WIP")]),
+                view_layers=[NS(use=True, layer_collection=layer("Scene Collection", [
+                    layer("WIP", exclude=True)]))]),
+             {"jobChunks": 3}, True),
+            ("in a collection that renders", scene(
+                cloth(users_collection=[NS(name="Set")]),
+                view_layers=[NS(use=True, layer_collection=layer("Scene Collection", [
+                    layer("Set"), layer("WIP", hide_render=True)]))]),
+             {"jobChunks": 3}, False),
             ("hair without dynamics", scene(NS(name="Fur", hide_render=False, modifiers=[
                 NS(type="PARTICLE_SYSTEM", show_render=True, particle_system=NS(
                     settings=NS(type="HAIR", physics_type="NEWTON"), use_hair_dynamics=False,
@@ -1058,7 +1084,8 @@ def test_agent_runs_the_preflight():
         check("preflight: the third script, after the startup blocks and the GPU setup",
               scripts == ["run_startup_scripts.py", "enable_gpu.py", "preflight.py"])
         check("-x 1: every frame gets its file extension, set before the render",
-              "-x" in argv and argv[argv.index("-x") + 1] == "1" and argv.index("-x") < argv.index("-a"))
+              "-x" in argv and argv[argv.index("-x") + 1] == "1"
+              and argv.index("-x") < argv.index("-a"))
         check("preflight: told the first frame that will really render, and the chunking",
               json.loads(env.get("VR_PREFLIGHT") or "{}")
               == {"jobChunks": 4, "first": 2, "last": 5, "contiguous": True, "mode": "enforce"})
@@ -1079,7 +1106,8 @@ def test_agent_runs_the_preflight():
     with fake_node() as tmp:
         make_chunk(tmp)
         state, _ = run_chunk(tmp, {"default": {
-            "print": ['VR_STARTUP_FAILED {"script": "startup_guard.py", "error": "ValueError: no"}'],
+            "print": ['VR_STARTUP_FAILED {"script": "startup_guard.py",'
+                      ' "error": "ValueError: no"}'],
             "exit": nr.GUARD_EXIT}})
         check("startup refusal: errorKind scene, naming the block",
               state.get("errorKind") == "scene" and "'startup_guard.py'" in state.get("error", "")
@@ -1223,7 +1251,10 @@ def test_out_of_memory():
               "retrying" not in render_log() and state.get("oom") is True)
     st = {}
     nr.scan_line("Fra:3 Mem:10M | Sample 12/128", st, {}, 1.0)
-    check("oom: an ordinary line is not an OOM", "oom" not in st)
+    nr.scan_line('VR_PREFLIGHT {"ok": true, "warnings": ["not on the node: //out of memory.png"]}',
+                 st, {}, 1.0)
+    check("oom: an ordinary line, or a script's report quoting a file name, is not an OOM",
+          "oom" not in st)
 
 
 def test_log_tail():
@@ -1281,7 +1312,9 @@ def test_plan_launches():
 def test_pinning_is_cycles_only():
     """1.11 / #229 #235: EEVEE and Octane pick their own GPU, so their "pinned"
     lanes piled onto one card while the Fleet screen showed one per GPU."""
-    ex = lambda engine, pin=True: {"exclusive": True, "lanes": 4, "pinGpus": pin, "engine": engine}  # noqa: E731
+    def ex(engine, pin=True):
+        return {"exclusive": True, "lanes": 4, "pinGpus": pin, "engine": engine}
+
     got = nr.plan_launches([(f"e{i}", ex("eevee")) for i in range(4)], [], 4, 1)
     check("eevee: never pinned, and its pinned lanes run one at a time", got == [("e0", None)])
     got = nr.plan_launches([(f"o{i}", ex("octane")) for i in range(4)], [], 4, 1)

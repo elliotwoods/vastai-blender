@@ -17,9 +17,10 @@ Contract with the app (all under ~/vastai/):
 The manifest is the ONLY thing the app trusts for downloads — a file is listed
 only after it is size-stable, so partially-written frames are never pulled.
 Size-stable is not enough on its own (a file whose writer was killed is stable
-too), so a frame is listed only once Blender announced it with "Saved:", or
-when the end-of-render sweep finds it after a CLEAN run: exit 0 and no write
-errors — see run_render.
+too), so a frame is listed only once Blender announced it with "Saved:" (and
+not after it reported running out of memory), or when the end-of-render sweep
+finds it after a CLEAN run: exit 0, no write error, no out-of-memory — see
+run_render.
 
 Job spec:
   { "chunkId": str, "blendFile": str (under work/scenes/),
@@ -994,9 +995,9 @@ def unannounced_frames(frames_dir, spec, since, recorded):
       * only files modified since this attempt started, so nothing an earlier,
         killed attempt left behind (if discard_unmanifested could not delete
         it) passes as this attempt's output.
-    Only ever call it after a CLEAN run (exit 0, no "cannot save" line): the
-    frame a crashed Blender died writing, or one it failed to write, passes
-    every one of these tests.
+    Only ever call it after a CLEAN run (exit 0, no "cannot save" line, no
+    out-of-memory): the frame a crashed Blender died writing, or one it failed
+    to write, passes every one of these tests.
     """
     wanted = set(render_frames(spec))
     chunk_dir = os.path.dirname(frames_dir)
@@ -1050,7 +1051,8 @@ def scan_line(line, state, seen, now=None):
     m = SAVE_FAILED_RE.search(line)
     if m:
         save_failed = m.group(1)
-    if not seen.get("oom") and OOM_RE.search(line):
+    # Not in the scripts' own reports: a preflight line quotes file names.
+    if not seen.get("oom") and not line.startswith("VR_") and OOM_RE.search(line):
         # With "gpu", the card it ran out on: the app can put fewer renders on
         # each GPU before it sends the chunk again (#228).
         state["oom"] = True
@@ -1373,13 +1375,14 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
     # initialise (no ICD for the driver) even when EGL/OpenGL works fine — the
     # process dies before frame 1. If the first attempt produced no frame,
     # didn't fail via the script guard and hit no write error or OOM (a full
-    # disk or card is not a backend problem), retry once on the OpenGL backend. "No frame" is
-    # measured against the manifest as it stood before: a chunk re-dispatched
-    # to this node after a restart starts with frames recorded, and its Vulkan
-    # failure is just as retryable. "EEVEE" is the engine the scene reported
-    # (enable_gpu.py's VR_ENGINE), not the job's label for it: an EEVEE scene
-    # submitted as Cycles was never retried, and failed on every node (#248).
-    # The label decides only when Blender died before saying.
+    # disk or card is not a backend problem), retry once on the OpenGL
+    # backend. "No frame" is measured against the manifest as it stood before:
+    # a chunk re-dispatched to this node after a restart starts with frames
+    # recorded, and its Vulkan failure is just as retryable. "EEVEE" is the
+    # engine the scene reported (enable_gpu.py's VR_ENGINE), not the job's
+    # label for it: an EEVEE scene submitted as Cycles was never retried, and
+    # failed on every node (#248). The label decides only when Blender died
+    # before saying.
     if (
         code not in (0, GUARD_EXIT)
         and (state.get("engine") or spec.get("engine")) == "eevee"

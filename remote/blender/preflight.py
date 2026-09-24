@@ -9,7 +9,8 @@ whole job wrong, and every chunk completes, downloads and is billed across the
 fleet (#246 #247 #249 #252).
 
 Checks, over what the scene can use (datablocks with real users; a fake user
-alone does not count, and objects hidden from the render are skipped):
+alone does not count, and objects that do not render, hidden or in a
+collection disabled for renders or excluded from the view layer, are skipped):
   * files it refers to by path and did not pack: images (every UDIM tile),
     movie clips, volumes, Alembic/USD caches, fonts, mesh-cache modifiers and
     linked libraries, and any linked datablock Blender could not find
@@ -121,10 +122,45 @@ def need_file(kind, idb, path):
         missing.append({"kind": kind, "name": getattr(idb, "name", "?"), "path": path})
 
 
+def rendering_collections():
+    """Names of the collections that render in some view layer, or None when
+    bpy cannot say (then every collection counts).
+
+    A collection renders unless it, or one above it, is disabled for renders
+    or excluded from the layer: where artists park work in progress, an
+    unbaked simulation included, that must not fail the job.
+    """
+    layers = [vl for vl in getattr(scene, "view_layers", None) or () if getattr(vl, "use", True)]
+    if not layers:
+        return None
+    names = set()
+
+    def walk(layer_collection, hidden):
+        coll = layer_collection.collection
+        hidden = hidden or layer_collection.exclude or getattr(coll, "hide_render", False)
+        if not hidden:
+            names.add(coll.name)
+        for child in layer_collection.children:
+            walk(child, hidden)
+
+    for layer in layers:
+        walk(layer.layer_collection, False)
+    return names
+
+
 def rendered_objects():
+    try:
+        rendering = rendering_collections()
+    except Exception:  # noqa: BLE001 — then every collection counts
+        rendering = None
     for obj in getattr(scene, "objects", None) or ():
-        if not getattr(obj, "hide_render", False):
-            yield obj
+        if getattr(obj, "hide_render", False):
+            continue
+        if rendering is not None and not any(
+            c.name in rendering for c in getattr(obj, "users_collection", None) or ()
+        ):
+            continue
+        yield obj
 
 
 def check_libraries():

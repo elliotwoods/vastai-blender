@@ -22,8 +22,8 @@ def _vr_run_startup_block(name, source):
     try:
         exec(source, globals())
     except Exception as e:
-        print("VR_STARTUP_FAILED " + json.dumps({"script": name, "error": f"{type(e).__name__}: {e}"}),
-              flush=True)
+        report = {"script": name, "error": f"{type(e).__name__}: {e}"}
+        print("VR_STARTUP_FAILED " + json.dumps(report), flush=True)
         raise
 
 
