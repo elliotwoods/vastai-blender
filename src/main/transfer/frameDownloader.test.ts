@@ -1,6 +1,6 @@
 import { createHash } from 'crypto'
-import { existsSync } from 'fs'
-import { join } from 'path'
+import { existsSync, mkdirSync, writeFileSync } from 'fs'
+import { dirname, join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SshConnection } from '../ssh/sshConnection'
 import { REMOTE_ROOT } from '../test/fakeSsh'
@@ -318,5 +318,32 @@ describe('frames saved one file per view', () => {
 
     expect(result).toEqual({ manifestRead: true, lost: [] })
     expect(downloaded(r.jobId)).toEqual([1, 2, 3, 4])
+  })
+})
+
+describe('unlinkLater', () => {
+  it("deletes only inside the project's renders folder", async () => {
+    // Its paths come from assets rows, built from node-supplied names, and a
+    // row written before those were checked can point anywhere.
+    await w.boot({ start: false })
+    const { unlinkLater } = await import('./frameDownloader')
+    const root = w.settings.projectRoot
+    const inside = join(root, 'renders', 'job', 'previews', 'a.mp4')
+    const outside = [
+      join(w.dir, 'Library', 'LaunchAgents', 'x.plist'),
+      // Shares the prefix, not the folder.
+      join(root, 'renders-old', 'b.mp4'),
+      join(root, 'settings.json')
+    ]
+    for (const p of [inside, ...outside]) {
+      mkdirSync(dirname(p), { recursive: true })
+      writeFileSync(p, 'x')
+    }
+
+    unlinkLater([inside, ...outside, join(root, 'renders', '..', 'settings.json')], 0)
+    await w.until(() => !existsSync(inside), 'the file inside deleted')
+    await w.advance(1_000)
+
+    for (const p of outside) expect(existsSync(p)).toBe(true)
   })
 })
