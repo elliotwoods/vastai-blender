@@ -9,8 +9,8 @@
  * there: it is app-wide, and money leaking outranks paused work.
  */
 
-import { useMemo, useState, type CSSProperties } from 'react'
-import { bannerOrder, useAlertStore, type AlertItem } from '../lib/alertStore'
+import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { bannerOrder, OnScreen, useAlertStore, type AlertItem } from '../lib/alertStore'
 import { btn, mono } from '../lib/controls'
 import { ipc } from '../lib/ipc'
 import { SCALE, TOKENS } from '../lib/theme'
@@ -64,8 +64,7 @@ function tone(item: AlertItem): { row: CSSProperties; meta: string; icon: string
   }
 }
 
-function Row({ item }: { item: AlertItem }): React.JSX.Element {
-  const dismiss = useDismiss()
+function Row({ item, onDismiss }: { item: AlertItem; onDismiss: () => void }): React.JSX.Element {
   const t = tone(item)
   const repeated = item.count > 1
   return (
@@ -104,12 +103,7 @@ function Row({ item }: { item: AlertItem }): React.JSX.Element {
           <Icon name="external" size={11} />
         </button>
       ) : null}
-      <button
-        className="vr-alert-close"
-        aria-label="Dismiss"
-        title="Dismiss"
-        onClick={() => dismiss([item.key])}
-      >
+      <button className="vr-alert-close" aria-label="Dismiss" title="Dismiss" onClick={onDismiss}>
         <Icon name="cross" size={12} />
       </button>
     </div>
@@ -121,14 +115,25 @@ export function AlertBanner(): React.JSX.Element | null {
   const dismiss = useDismiss()
   const [expanded, setExpanded] = useState(false)
   const open = useMemo(() => bannerOrder(items), [items])
+  const shown = expanded ? open : open.slice(0, MAX_ROWS)
+  const onScreen = useRef(new OnScreen())
+  // After every render, once the rows are drawn: which ones, and since when.
+  useLayoutEffect(() => {
+    onScreen.current.drawn(shown.map((a) => a.key))
+  })
+  // Only rows on screen long enough to have been read (SETTLE_MS). A row
+  // that has just slid under the pointer stays, for the next click.
+  const dismissRead = (keys: string[]): void => {
+    const read = onScreen.current.settled(keys)
+    if (read.length > 0) dismiss(read)
+  }
   if (open.length === 0) return null
 
-  const shown = expanded ? open : open.slice(0, MAX_ROWS)
   const hidden = open.length - shown.length
   return (
     <div role="alert" style={{ flexShrink: 0, maxHeight: '40vh', overflowY: 'auto' }}>
       {shown.map((a) => (
-        <Row key={a.key} item={a} />
+        <Row key={a.key} item={a} onDismiss={() => dismissRead([a.key])} />
       ))}
       {open.length > 1 ? (
         <div
@@ -150,11 +155,12 @@ export function AlertBanner(): React.JSX.Element | null {
               {expanded ? 'Show fewer' : `${hidden} more`}
             </button>
           ) : null}
-          {/* Only the rows on screen: nothing is dismissed unread. The next
-              ones move up in their place. */}
+          {/* Only the rows on screen, and only those that have been there a
+              moment: nothing is dismissed unread. The next ones move up in
+              their place. */}
           <button
             style={btn({ variant: 'ghost', size: 'sm' })}
-            onClick={() => dismiss(shown.map((a) => a.key))}
+            onClick={() => dismissRead(shown.map((a) => a.key))}
           >
             {hidden > 0 ? `Dismiss these ${shown.length}` : 'Dismiss all'}
           </button>

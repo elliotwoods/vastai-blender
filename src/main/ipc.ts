@@ -6,9 +6,10 @@
  * development).
  */
 
-import { BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
-import type { InvokeChannel, IpcInvokeMap } from '../shared/ipc'
+import { BrowserWindow, Notification, clipboard, dialog, ipcMain, shell } from 'electron'
+import { isStickyAlert, type InvokeChannel, type IpcInvokeMap } from '../shared/ipc'
 import type {
+  AlertEvent,
   AssetIndex,
   ChunkSnapshot,
   ChunkState,
@@ -26,7 +27,7 @@ import type {
   ThumbAsset
 } from '../shared/models'
 import { externalUrl, openPathVerdict } from './app/windowPolicy'
-import { dismissAlerts, onEvent, recentAlerts } from './events'
+import { dismissAlerts, onAlertSurfaced, onEvent, recentAlerts } from './events'
 import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
 import { currentUser } from './vast/vastClient'
@@ -545,7 +546,70 @@ const mockHistory = (range: HistoryRange, now = Date.now()): HistorySummary => {
   }
 }
 
-export function registerIpc(): void {
+/**
+ * Bring the app's window to the front, or open one when there is none: on
+ * macOS the app keeps running, and the fleet billing, with its window closed.
+ * As index.ts does for a second launch.
+ */
+function showWindow(createWindow: (() => void) | undefined): void {
+  const win = BrowserWindow.getAllWindows()[0]
+  if (!win) {
+    createWindow?.()
+    return
+  }
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+/**
+ * Notifications not yet clicked or closed. An Electron Notification that
+ * nothing references any more can be garbage-collected, and its click handler
+ * with it, so each is held here until then. Only the newest few: an older one
+ * let go stays on the desktop, and a click on it just does nothing.
+ */
+const heldNotifications = new Set<Notification>()
+const MAX_HELD_NOTIFICATIONS = 20
+
+/**
+ * An OS notification for an error or billing risk that has just surfaced
+ * (events.ts's onAlertSurfaced) while no window of the app is in front: it is
+ * behind another app, minimised, or closed altogether. The banner is where it
+ * is dealt with; clicking this goes there. Raised here in main rather than in
+ * the window, which cannot notify while closed, and whose own window.focus()
+ * may not bring a backgrounded app forward on macOS. A repeat that only
+ * counts up does not surface, so a failure every 15 s notifies once per quiet
+ * period; a billing risk has none (RESURFACE_MS).
+ */
+function notifyUnattended(alert: AlertEvent, createWindow: (() => void) | undefined): void {
+  if (!isStickyAlert(alert) || BrowserWindow.getFocusedWindow()) return
+  if (!Notification.isSupported()) return
+  const n = new Notification({ title: 'Vast Render', body: alert.message })
+  const release = (): void => {
+    heldNotifications.delete(n)
+  }
+  n.on('click', () => {
+    release()
+    showWindow(createWindow)
+  })
+  n.on('close', release)
+  heldNotifications.add(n)
+  if (heldNotifications.size > MAX_HELD_NOTIFICATIONS) {
+    const [oldest] = heldNotifications
+    heldNotifications.delete(oldest)
+  }
+  n.show()
+}
+
+export interface RegisterIpcOptions {
+  /**
+   * index.ts's createWindow, for a notification clicked while no window is
+   * open. Without it such a click does nothing.
+   */
+  createWindow?: () => void
+}
+
+export function registerIpc(opts: RegisterIpcOptions = {}): void {
   // -- events ---------------------------------------------------------------
   // Every bus event goes to every window. Subscribed here, once, before
   // index.ts starts the node manager and scheduler (the first emitters) and
@@ -553,6 +617,17 @@ export function registerIpc(): void {
   onEvent(({ channel, payload }) => {
     for (const win of BrowserWindow.getAllWindows()) {
       win.webContents.send(channel, payload)
+    }
+  })
+  // An error or billing risk nobody is looking at: an OS notification too.
+  // This runs inside emit, before the windows hear the alert, so a failure
+  // here is logged and goes no further. It must never cost the user the
+  // alert itself, or throw into the destroy path that raised it.
+  onAlertSurfaced((alert) => {
+    try {
+      notifyUnattended(alert, opts.createWindow)
+    } catch (e) {
+      console.warn('[alerts] OS notification failed:', e)
     }
   })
   // What a window missed: alerts raised before it existed (or while it was

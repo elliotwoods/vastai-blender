@@ -276,7 +276,9 @@ app.whenReady().then(() => {
   })
 
   registerMediaProtocol()
-  registerIpc()
+  // createWindow: an alert's OS notification, clicked with the window closed
+  // (macOS, still billing), opens one.
+  registerIpc({ createWindow })
   // Provisioning pipeline: base setup, default Blender release, EEVEE probe.
   // Job-specific Blender versions are installed on demand at dispatch time.
   // 5.1 (not 4.5): campaign blends are saved by Blender 5.1, so probing EEVEE

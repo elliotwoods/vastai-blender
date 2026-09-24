@@ -28,7 +28,7 @@ import type {
   SettingsPublic
 } from '../../../shared/models'
 import type { EventChannel, IpcEventMap } from '../../../shared/ipc'
-import { notifyIfUnfocused, useAlertStore } from './alertStore'
+import { useAlertStore } from './alertStore'
 import { ipc } from './ipc'
 import { useLogStore } from './logStore'
 import { useProgressStore } from './progressStore'
@@ -304,9 +304,11 @@ export function useIpcEvents(): void {
         useLogStore.getState().append(e)
       },
       // An append stream with UI state of its own (dismissed, toast timers),
-      // so a zustand store like the log's rather than the Query cache.
+      // so a zustand store like the log's rather than the Query cache. No OS
+      // notification from here: main raises it (ipc.ts), even with no window
+      // open, so a second one from the window would tell the user twice.
       alert: (a) => {
-        if (useAlertStore.getState().receive(a) && a.level === 'error') notifyIfUnfocused(a)
+        useAlertStore.getState().receive(a)
       }
     }
 

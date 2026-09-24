@@ -157,17 +157,28 @@ export interface AlertRecord extends AlertEvent {
  * A dismissed alert that fires again comes back, but not within this long of
  * its dismissal. So a failure repeating every 15 s is put in front of the user
  * once per quiet period, not every 15 s.
+ *
+ * Not for a billing risk (isBillingRisk): any repeat after its dismissal
+ * brings it straight back. None of them repeats on a timer. Each is a new
+ * destroy that failed on an instance still billing, such as Fleet's "clear
+ * failed" retried during a Vast outage right after the user dismissed the
+ * first failure. Kept quiet, that retry's failure would reach no one, and a
+ * Fleet row that did not clear would be the only sign. A billing risk that
+ * did repeat on a timer would need a throttle of its own, not this one.
  */
 export const RESURFACE_MS = 5 * 60_000
 
 /**
  * Whether a window should keep this record out of sight: dismissed, and not
- * fired again at least RESURFACE_MS after that. A window that was open all
- * along brings an alert back by the same rule when its push arrives
+ * fired again since. For anything but a billing risk, a repeat within
+ * RESURFACE_MS of the dismissal does not count either. A window that was open
+ * all along brings an alert back by the same rule when its push arrives
  * (alertStore's receive), so one replaying the buffer reaches the same answer.
  */
 export function isStillDismissed(r: AlertRecord): boolean {
-  return r.dismissedAt !== null && r.lastSeen - r.dismissedAt < RESURFACE_MS
+  if (r.dismissedAt === null) return false
+  if (isBillingRisk(r)) return r.lastSeen <= r.dismissedAt
+  return r.lastSeen - r.dismissedAt < RESURFACE_MS
 }
 
 /**

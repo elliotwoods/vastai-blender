@@ -11,7 +11,9 @@
  * test harness is another.
  *
  * It also keeps the recent alerts, so a window that was not listening when
- * one fired can still show it (recentAlerts, at the end of this file).
+ * one fired can still show it, and says which ones were put in front of the
+ * user, for the OS notification (recentAlerts and onAlertSurfaced, at the end
+ * of this file).
  */
 
 import type { AlertEvent } from '../shared/models'
@@ -69,7 +71,11 @@ export function emit<C extends EventChannel>(channel: C, payload: IpcEventMap[C]
     console.log(`[log:${l.nodeId.slice(0, 8)}] ${l.line}`)
   }
   // Before the listeners, so an alert is kept even when one of them throws.
-  if (channel === 'alert') recordAlert(payload as AlertEvent, Date.now())
+  if (channel === 'alert' && recordAlert(payload as AlertEvent, Date.now())) {
+    // Before them too, so a window whose webContents.send throws does not
+    // also cost the user the OS notification.
+    for (const listener of [...surfacedListeners]) listener(payload as AlertEvent)
+  }
   const event = { channel, payload } as BusEvent
   // A copy, so a listener that unsubscribes (or subscribes) mid-emit cannot
   // change who hears this event. A throwing listener propagates to the
@@ -93,21 +99,48 @@ export const MAX_RECENT_ALERTS = 100
 const recent: AlertRecord[] = []
 let nextAlertId = 1
 
+type AlertListener = (alert: AlertEvent) => void
+
+const surfacedListeners = new Set<AlertListener>()
+
+/**
+ * Subscribe to the alerts put in front of the user: one not in the buffer
+ * yet, or a repeat that brings back one the user dismissed (isStillDismissed
+ * turns false). A repeat of one still showing, or still quiet after its
+ * dismissal, is not among them. ipc.ts raises the OS notification from this,
+ * so scale-up failing every 15 s notifies once, while a failed destroy that
+ * fails again after its dismissal notifies again. Only a banner's dismissals
+ * reach main (alerts:dismiss), so a toast-level alert surfaces here only the
+ * first time.
+ *
+ * Called from inside `emit`, once the alert is recorded and before the bus
+ * listeners hear it. Returns the unsubscribe function.
+ */
+export function onAlertSurfaced(listener: AlertListener): () => void {
+  surfacedListeners.add(listener)
+  return () => {
+    surfacedListeners.delete(listener)
+  }
+}
+
 /**
  * Add one alert. An identical alert already in the buffer (alertKey) is not
  * added again: its count goes up, lastSeen moves to now, and it moves to the
  * newest end. So scale-up failing every 15 s is one entry that counts, and
  * cannot push everything else out.
+ *
+ * Returns whether the alert surfaced (onAlertSurfaced).
  */
-function recordAlert(alert: AlertEvent, now: number): void {
+function recordAlert(alert: AlertEvent, now: number): boolean {
   const key = alertKey(alert)
   const i = recent.findIndex((r) => r.key === key)
   if (i >= 0) {
     // A dismissal is kept: whether this repeat brings it back is
     // isStillDismissed's call, made against the new lastSeen.
     const [prev] = recent.splice(i, 1)
-    recent.push({ ...prev, count: prev.count + 1, lastSeen: now })
-    return
+    const next = { ...prev, count: prev.count + 1, lastSeen: now }
+    recent.push(next)
+    return isStillDismissed(prev) && !isStillDismissed(next)
   }
   recent.push({
     id: nextAlertId++,
@@ -127,6 +160,7 @@ function recordAlert(alert: AlertEvent, now: number): void {
     }
     recent.splice(victim, 1)
   }
+  return true
 }
 
 /**

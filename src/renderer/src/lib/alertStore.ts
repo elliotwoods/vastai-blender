@@ -13,7 +13,9 @@
  *
  * Two surfaces read this. AlertBanner shows the sticky ones (errors, and
  * anything that means an instance may be billing unmanaged) until the user
- * dismisses them. AlertToasts shows the rest briefly.
+ * dismisses them. AlertToasts shows the rest briefly. The OS notification for
+ * a sticky alert nobody is looking at is main's (ipc.ts), not this window's:
+ * main can raise one with no window open, and bring the window forward.
  */
 
 import { create } from 'zustand'
@@ -29,7 +31,8 @@ import type { AlertEvent } from '../../../shared/models'
 
 // Shared with main, which applies the same quiet period when a window replays
 // its buffer (isStillDismissed). A toast that times out counts as dismissed
-// here, so a failure repeating every 15 s toasts once per quiet period.
+// here, so a failure repeating every 15 s toasts once per quiet period. A
+// billing risk has no quiet period: any repeat after a dismissal is back.
 export { RESURFACE_MS }
 
 /** Entries kept. Repeats share one, so this is distinct alerts, not events. */
@@ -72,8 +75,9 @@ interface AlertState {
   items: AlertItem[]
   /**
    * One pushed alert. Returns true when it was put in front of the user: new,
-   * or back after a quiet period. False when it only counted up on an entry
-   * that is already showing, or is still quiet after a dismissal.
+   * or back after a dismissal (after the quiet period, or at once for a
+   * billing risk). False when it only counted up on an entry that is already
+   * showing, or is still quiet after a dismissal.
    */
   receive: (e: AlertEvent, now?: number) => boolean
   /** Main's buffer (alerts:recent). Idempotent, and safe after pushes that raced it. */
@@ -123,6 +127,42 @@ export function bannerOrder(items: AlertItem[]): AlertItem[] {
   return [...open.filter((a) => a.billingRisk), ...open.filter((a) => !a.billingRisk)]
 }
 
+/**
+ * How long a banner row must have been on screen before a click dismisses it.
+ * A billing risk that arrives goes to the top and pushes the other rows down,
+ * but the buttons under the pointer stay where they are. Without this, a
+ * click meant for a row the user had read could dismiss the new row unread.
+ * The same goes for the rows that move up after "Dismiss these 3", which a
+ * second click would otherwise take.
+ */
+export const SETTLE_MS = 1_500
+
+/**
+ * When each banner row came on screen. AlertBanner reports the rows it has
+ * drawn after every render, and dismisses only the rows `settled` returns.
+ */
+export class OnScreen {
+  private readonly since = new Map<string, number>()
+
+  /**
+   * The rows on screen now. A new one is stamped `now`. One no longer drawn
+   * is forgotten, so if it comes back it has to settle again.
+   */
+  drawn(keys: string[], now = Date.now()): void {
+    const drawn = new Set(keys)
+    for (const key of this.since.keys()) if (!drawn.has(key)) this.since.delete(key)
+    for (const key of keys) if (!this.since.has(key)) this.since.set(key, now)
+  }
+
+  /** Of these rows, the ones on screen for at least SETTLE_MS. */
+  settled(keys: string[], now = Date.now()): string[] {
+    return keys.filter((key) => {
+      const since = this.since.get(key)
+      return since !== undefined && now - since >= SETTLE_MS
+    })
+  }
+}
+
 function byLastSeen(a: AlertItem, b: AlertItem): number {
   return a.lastSeen - b.lastSeen
 }
@@ -151,7 +191,9 @@ export const useAlertStore = create<AlertState>((set, get) => ({
       return true
     }
     const prev = items[i]
-    const back = prev.dismissedAt !== null && now - prev.dismissedAt >= RESURFACE_MS
+    // isStillDismissed's rule, for a window that was open all along.
+    const back =
+      prev.dismissedAt !== null && (prev.billingRisk || now - prev.dismissedAt >= RESURFACE_MS)
     const next: AlertItem = {
       ...prev,
       count: prev.count + 1,
@@ -172,19 +214,23 @@ export const useAlertStore = create<AlertState>((set, get) => ({
           // Already here: a push that arrived before this reply, which main's
           // buffer counted too, or a second seed (StrictMode mounts twice).
           // Taking the larger count, rather than adding, counts it once
-          // either way. What the user has seen and dismissed is kept.
+          // either way. What the user has seen and dismissed is kept, and so
+          // is a dismissal from an earlier window: the push showed it only
+          // because this window had not heard of that dismissal yet.
+          const dismissedEarlier = have.dismissedAt === null && isStillDismissed(r)
           byKey.set(r.key, {
             ...have,
             count: Math.max(have.count, r.count),
             firstSeen: Math.min(have.firstSeen, r.ts),
-            lastSeen: Math.max(have.lastSeen, r.lastSeen)
+            lastSeen: Math.max(have.lastSeen, r.lastSeen),
+            ...(dismissedEarlier ? { dismissedAt: r.dismissedAt } : {})
           })
           continue
         }
         const sticky = isStickyAlert(r)
         // Dismissed in an earlier window (a macOS window closed and reopened,
         // or a reload): stays dismissed, with its own time, so a repeat comes
-        // back after the same quiet period it would have had in that window.
+        // back when it would have in that window (at once, for a billing risk).
         const dismissed = isStillDismissed(r)
         const show = !dismissed && (sticky || now - r.lastSeen < REPLAY_TOAST_MS)
         byKey.set(r.key, {
@@ -228,17 +274,3 @@ export const useAlertStore = create<AlertState>((set, get) => ({
       return changed ? { items } : s
     })
 }))
-
-/**
- * An OS notification for an error while the window is not in front: behind
- * another app, or minimised. The banner is where it is dealt with; this says
- * to go and look. Only for alerts `receive` put in front of the user, so a
- * repeating error notifies once per quiet period, and not for the replay at
- * mount, when the window has just opened.
- */
-export function notifyIfUnfocused(e: AlertEvent): void {
-  if (document.hasFocus()) return
-  if (typeof Notification === 'undefined' || Notification.permission === 'denied') return
-  const n = new Notification('Vast Render', { body: e.message })
-  n.onclick = () => window.focus()
-}

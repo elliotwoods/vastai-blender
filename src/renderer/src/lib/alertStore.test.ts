@@ -4,8 +4,10 @@ import type { AlertEvent } from '../../../shared/models'
 import {
   bannerOrder,
   MAX_ALERTS,
+  OnScreen,
   REPLAY_TOAST_MS,
   RESURFACE_MS,
+  SETTLE_MS,
   toastMs,
   useAlertStore,
   type AlertItem
@@ -117,17 +119,30 @@ describe('alertStore: append and de-duplicate', () => {
   })
 
   it('a dismissed alert that fires again comes back, but not within the quiet period', () => {
+    const failed = dispatchFailed(1)
+    store().receive(failed, T0)
+    store().dismiss([items()[0].key], T0 + 1_000)
+    expect(onScreen()).toEqual([])
+
+    expect(store().receive(failed, T0 + 1_000 + RESURFACE_MS - 1)).toBe(false)
+    expect(onScreen()).toEqual([])
+    expect(items()[0].count).toBe(2)
+
+    expect(store().receive(failed, T0 + 1_000 + RESURFACE_MS)).toBe(true)
+    expect(onScreen()).toEqual([failed.message])
+    expect(items()[0]).toMatchObject({ count: 3, surfacedAt: T0 + 1_000 + RESURFACE_MS })
+  })
+
+  it('a billing risk that fires again after its dismissal is back at once: no quiet period', () => {
+    // A Vast outage: the destroy failed, the user dismissed the row, and
+    // pressed Fleet's "clear failed". The retry failed a minute later.
     store().receive(destroyFailed, T0)
     store().dismiss([items()[0].key], T0 + 1_000)
     expect(onScreen()).toEqual([])
 
-    expect(store().receive(destroyFailed, T0 + 1_000 + RESURFACE_MS - 1)).toBe(false)
-    expect(onScreen()).toEqual([])
-    expect(items()[0].count).toBe(2)
-
-    expect(store().receive(destroyFailed, T0 + 1_000 + RESURFACE_MS)).toBe(true)
-    expect(onScreen()).toEqual([destroyFailed.message])
-    expect(items()[0]).toMatchObject({ count: 3, surfacedAt: T0 + 1_000 + RESURFACE_MS })
+    expect(store().receive(destroyFailed, T0 + 61_000)).toBe(true)
+    expect(bannerOrder(items()).map((a) => a.message)).toEqual([destroyFailed.message])
+    expect(items()[0]).toMatchObject({ count: 2, surfacedAt: T0 + 61_000, dismissedAt: null })
   })
 
   it('scale-up failing every 15 s toasts once per quiet period, not every 15 s', () => {
@@ -244,6 +259,24 @@ describe('alertStore: seed from alerts:recent', () => {
     expect(onScreen()).toEqual([])
   })
 
+  it('keeps a dismissal from an earlier window when a push raced the replay', () => {
+    // Dismissed in the window before this one. It fires again just as this
+    // one mounts, and the push lands before the alerts:recent reply, whose
+    // record (counting that push) says it is still quiet.
+    const failed = dispatchFailed(1)
+    expect(store().receive(failed, T0 + 60_000)).toBe(true)
+    store().seed(
+      [record(failed, { count: 2, dismissedAt: T0, lastSeen: T0 + 60_000 })],
+      T0 + 60_010
+    )
+    expect(onScreen()).toEqual([])
+    expect(items()[0]).toMatchObject({ count: 2, dismissedAt: T0 })
+
+    // And it comes back when it would have in that window.
+    expect(store().receive(failed, T0 + RESURFACE_MS)).toBe(true)
+    expect(onScreen()).toEqual([failed.message])
+  })
+
   it('keeps what the user dismissed in an earlier window, until it comes back', () => {
     const now = T0 + 3_600_000
     store().seed(
@@ -264,140 +297,58 @@ describe('alertStore: seed from alerts:recent', () => {
     expect(items()[0].dismissedAt).toBe(T0 + 10)
     expect(store().receive(dispatchFailed(1), now)).toBe(true)
   })
+
+  it('shows a billing risk that failed again after its dismissal in an earlier window, however soon', () => {
+    // Main's record for "dismissed, then 'clear failed' failed again a minute
+    // later" (events.test.ts checks main hands out exactly this).
+    store().seed(
+      [record(destroyFailed, { count: 2, dismissedAt: T0 + 1_000, lastSeen: T0 + 61_000 })],
+      T0 + 62_000
+    )
+    expect(bannerOrder(items()).map((a) => a.message)).toEqual([destroyFailed.message])
+  })
 })
 
-describe('main: recent alerts (events.ts)', () => {
-  // Fresh module per test: the buffer is module state.
-  let bus: typeof import('../../../main/events')
-  beforeEach(async () => {
-    vi.resetModules()
-    vi.useFakeTimers({ toFake: ['Date'] })
-    vi.setSystemTime(T0)
-    bus = await import('../../../main/events')
-  })
-  afterEach(() => vi.useRealTimers())
+describe('alertStore: a banner row dismissed only once it could have been read', () => {
+  const keys = (...alerts: AlertEvent[]): string[] => alerts.map((a) => `${a.level}:${a.message}`)
 
-  it('collapses identical repeats into one entry with a count and lastSeen', () => {
-    bus.emit('alert', scaleUp)
-    vi.setSystemTime(T0 + 1_000)
-    bus.emit('alert', destroyFailed)
-    for (let i = 1; i <= 40; i++) {
-      vi.setSystemTime(T0 + 1_000 + i * 15_000)
-      bus.emit('alert', scaleUp)
-    }
+  it('leaves out a billing risk that arrived at the top just before the click', () => {
+    const rows = new OnScreen()
+    rows.drawn(keys(dispatchFailed(1), dispatchFailed(2), dispatchFailed(3)), T0)
+    // The user reads them, and moves to "Dismiss all". A billing risk lands
+    // on top just before the click and pushes the last one off the banner.
+    rows.drawn(keys(orphan, dispatchFailed(1), dispatchFailed(2)), T0 + 5_000)
+    const onClick = keys(orphan, dispatchFailed(1), dispatchFailed(2))
+    expect(rows.settled(onClick, T0 + 5_200)).toEqual(keys(dispatchFailed(1), dispatchFailed(2)))
 
-    const recent = bus.recentAlerts()
-    expect(recent).toHaveLength(2)
-    // Least recently seen first: the repeat moved to the newest end.
-    expect(recent.map((r) => r.message)).toEqual([destroyFailed.message, scaleUp.message])
-    expect(recent[1]).toMatchObject({
-      id: 1,
-      level: 'warn',
-      key: `warn:${scaleUp.message}`,
-      ts: T0,
-      lastSeen: T0 + 1_000 + 40 * 15_000,
-      count: 41
-    })
-    expect(recent[0]).toMatchObject({ id: 2, ts: T0 + 1_000, count: 1 })
+    // Once it has been on screen a moment, it goes like the rest.
+    expect(rows.settled(onClick, T0 + 5_000 + SETTLE_MS)).toEqual(onClick)
   })
 
-  it('is bounded, evicting the least recently seen alert that is not sticky', () => {
-    bus.emit('alert', destroyFailed)
-    bus.emit('alert', foreign)
-    for (let i = 0; i < bus.MAX_RECENT_ALERTS + 30; i++) {
-      bus.emit('alert', { level: 'warn', message: `download failed (frames/${i}.png)` })
-    }
-    const recent = bus.recentAlerts()
-    expect(recent).toHaveLength(bus.MAX_RECENT_ALERTS)
-    expect(recent.slice(0, 3).map((r) => r.message)).toEqual([
-      destroyFailed.message,
-      foreign.message,
-      'download failed (frames/32.png)'
-    ])
+  it('leaves out the rows that moved up after a dismissal, from a second quick click', () => {
+    const rows = new OnScreen()
+    rows.drawn(keys(dispatchFailed(1), dispatchFailed(2), dispatchFailed(3)), T0)
+    // "Dismiss these 3" at T0 + 4 s: the next three move up in their place.
+    rows.drawn(keys(dispatchFailed(4), dispatchFailed(5), dispatchFailed(6)), T0 + 4_000)
+    expect(rows.settled(keys(dispatchFailed(4), dispatchFailed(5)), T0 + 4_300)).toEqual([])
   })
 
-  it('a billing risk outlasts any number of distinct errors; the oldest errors go first', () => {
-    bus.emit('alert', orphan)
-    for (let i = 0; i <= bus.MAX_RECENT_ALERTS; i++) bus.emit('alert', dispatchFailed(i))
-
-    const recent = bus.recentAlerts()
-    expect(recent).toHaveLength(bus.MAX_RECENT_ALERTS)
-    expect(recent.slice(0, 2).map((r) => r.message)).toEqual([
-      orphan.message,
-      dispatchFailed(2).message
-    ])
-  })
-
-  it('a dismissed error goes before one nobody has seen', () => {
-    bus.emit('alert', dispatchFailed(0))
-    bus.emit('alert', destroyFailed)
-    bus.dismissAlerts([`error:${destroyFailed.message}`])
-    for (let i = 1; i < bus.MAX_RECENT_ALERTS; i++) bus.emit('alert', dispatchFailed(i))
-
-    const recent = bus.recentAlerts()
-    expect(recent).toHaveLength(bus.MAX_RECENT_ALERTS)
-    expect(recent[0].message).toBe(dispatchFailed(0).message)
-    expect(recent.some((r) => r.message === destroyFailed.message)).toBe(false)
-  })
-
-  it('remembers a dismissal, so a reopened window does not show it again', () => {
-    bus.emit('alert', destroyFailed)
-    bus.emit('alert', dispatchFailed(1))
-    vi.setSystemTime(T0 + 1_000)
-    bus.dismissAlerts([`error:${destroyFailed.message}`, 'error:never raised'])
-    expect(bus.recentAlerts().map((r) => r.dismissedAt)).toEqual([T0 + 1_000, null])
-
-    // A window opened now: only what the user has not dealt with.
-    store().seed(bus.recentAlerts(), T0 + 2_000)
-    expect(onScreen()).toEqual([dispatchFailed(1).message])
-
-    // It fires again within the quiet period, and later after it. A window
-    // opened after each shows it only the second time, just as the window
-    // that was open all along would have.
-    vi.setSystemTime(T0 + 60_000)
-    bus.emit('alert', destroyFailed)
-    useAlertStore.setState({ items: [] })
-    store().seed(bus.recentAlerts(), T0 + 61_000)
-    expect(onScreen()).toEqual([dispatchFailed(1).message])
-
-    vi.setSystemTime(T0 + 1_000 + RESURFACE_MS)
-    bus.emit('alert', destroyFailed)
-    useAlertStore.setState({ items: [] })
-    store().seed(bus.recentAlerts(), T0 + 2_000 + RESURFACE_MS)
-    expect(onScreen()).toEqual([dispatchFailed(1).message, destroyFailed.message])
-    expect(bus.recentAlerts()[1]).toMatchObject({ count: 3, dismissedAt: T0 + 1_000 })
-  })
-
-  it('evicts the oldest sticky alert only once every entry is sticky', () => {
-    for (let i = 0; i <= bus.MAX_RECENT_ALERTS; i++) {
-      bus.emit('alert', { level: 'error', message: `Destroy failed for instance ${i}` })
-    }
-    const recent = bus.recentAlerts()
-    expect(recent).toHaveLength(bus.MAX_RECENT_ALERTS)
-    expect(recent[0].message).toBe('Destroy failed for instance 1')
-  })
-
-  it('keeps alerts nobody was listening for, and hands out copies', () => {
-    // Before any window, as nodeManager.init()'s orphan sweep is.
-    bus.emit('alert', destroyFailed)
-    const a = bus.recentAlerts()
-    a[0].count = 99
-    expect(bus.recentAlerts()[0].count).toBe(1)
-  })
-
-  it('listeners still get the emitted object itself', () => {
-    const heard: unknown[] = []
-    const off = bus.on('alert', (p) => heard.push(p))
-    bus.emit('alert', scaleUp)
-    off()
-    expect(heard[0]).toBe(scaleUp)
+  it('a row that left the screen and came back has to settle again', () => {
+    const rows = new OnScreen()
+    rows.drawn(keys(orphan), T0)
+    rows.drawn([], T0 + 5_000)
+    rows.drawn(keys(orphan), T0 + 6_000)
+    expect(rows.settled(keys(orphan), T0 + 6_000 + SETTLE_MS - 1)).toEqual([])
+    expect(rows.settled(keys(orphan), T0 + 6_000 + SETTLE_MS)).toEqual(keys(orphan))
+    // A key never drawn is never dismissed.
+    expect(rows.settled(keys(foreign), T0 + 60_000)).toEqual([])
   })
 })
 
 describe('useIpcEvents', () => {
   // Driven without a DOM: useEffect runs its body at once, and window.api is
-  // a fake that records subscriptions and answers alerts:recent from the
-  // real main-side buffer.
+  // a fake that records subscriptions and answers alerts:recent with `replay`.
+  // Notification is stubbed only to show the window never raises one.
   type Listener = (payload: unknown) => void
   const listeners = new Map<string, Listener>()
   const notifications: string[] = []
@@ -482,7 +433,7 @@ describe('useIpcEvents', () => {
     expect([...listeners.keys()].sort()).toEqual([...channels].sort())
   })
 
-  it('a pushed alert reaches the store; an error raises an OS notification only while unfocused', async () => {
+  it("a pushed alert reaches the store; the OS notification is main's, never the window's", async () => {
     const { useAlertStore } = await mount()
     const push = (a: AlertEvent): void => listeners.get('alert')?.(a)
 
@@ -492,24 +443,19 @@ describe('useIpcEvents', () => {
       scaleUp.message,
       destroyFailed.message
     ])
-    expect(notifications).toEqual([])
 
+    // Main notifies for this one (ipc.ts), so a second from here would tell
+    // the user twice.
     focused = false
-    const other = {
-      level: 'error' as const,
-      message: 'Could not destroy instance 5 — check the Vast.ai console!'
-    }
-    push(other)
-    push(other) // a repeat of one already on screen: no second notification
-    push({ level: 'warn', message: 'chunk c1 failed: exit 1' })
-    expect(notifications).toEqual([other.message])
+    push(orphan)
+    expect(useAlertStore.getState().items.map((a) => a.message)).toContain(orphan.message)
+    expect(notifications).toEqual([])
   })
 
   it('a boot-time alert, raised before any window existed, shows once the window mounts', async () => {
-    // Main, at boot: the orphan sweep fails a destroy before createWindow().
-    const bus = await import('../../../main/events')
-    bus.emit('alert', orphan)
-    replay = bus.recentAlerts()
+    // Main, at boot: the orphan sweep failed a destroy before createWindow(),
+    // and main's buffer kept it for this replay (events.test.ts).
+    replay = [record(orphan)]
 
     const { useAlertStore } = await mount()
     const banner = useAlertStore
