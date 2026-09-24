@@ -284,6 +284,13 @@ describe('fieldEvent (plan 1.14)', () => {
     expect(r.commits).toEqual([])
   })
 
+  it('keeps an Escape that reverted a draft from also closing the dialog around it', () => {
+    expect(fieldEvent({ draft: '', base: 2 }, { type: 'escape' }).stop).toBe(true)
+    // Nothing to revert: that Escape is the dialog's to handle.
+    expect(fieldEvent({ draft: '2', base: 2 }, { type: 'escape' }).stop).toBeUndefined()
+    expect(fieldEvent({ draft: null, base: 2 }, { type: 'escape' }).stop).toBeUndefined()
+  })
+
   it('steps the draft on arrows without committing', () => {
     const r = play(2, [focus(2), { type: 'step', dir: 1, step: 0.5 }], noCap)
     expect(r).toEqual({ state: { draft: '2.5', base: 2 }, commits: [] })

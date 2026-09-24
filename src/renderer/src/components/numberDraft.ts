@@ -172,6 +172,11 @@ export interface FieldResult {
   commit?: { value: number | null }
   /** a fresh edit: select the text so typing replaces it */
   select?: boolean
+  /**
+   * The key did something here (Escape reverted a draft): keep it from a
+   * parent's shortcut, so the same Escape doesn't also close a dialog.
+   */
+  stop?: boolean
 }
 
 /**
@@ -226,9 +231,11 @@ export function fieldEvent(state: FieldState, ev: FieldEvent, rules: FieldRules 
         ? { state: { draft: r.text, base: r.value }, commit: { value: r.value } }
         : { state: { draft: r.text, base: state.base } }
     }
-    case 'escape':
+    case 'escape': {
       if (state.draft == null) return { state }
-      return { state: { draft: formatValue(state.base), base: state.base } }
+      const back = formatValue(state.base)
+      return { state: { draft: back, base: state.base }, stop: state.draft !== back || undefined }
+    }
     case 'step':
       if (state.draft == null) return { state }
       return {

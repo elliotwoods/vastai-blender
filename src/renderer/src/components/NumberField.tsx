@@ -137,7 +137,7 @@ export function NumberField({
         const ev = fieldKey(e.key, step)
         if (ev == null || live.current.draft == null) return
         e.preventDefault()
-        dispatch(ev)
+        if (dispatch(ev).stop) e.stopPropagation()
       }}
       style={{
         ...input({ size, invalid: problem != null }),
