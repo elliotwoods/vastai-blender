@@ -54,6 +54,17 @@ export interface Classification {
    * fixed.
    */
   retryable: boolean
+  /**
+   * The far end may have done what was asked before the error came back: a
+   * Vast 5xx, timeout, network error or non-JSON reply, an SSH command that
+   * timed out or lost its connection, or an error nothing here recognises.
+   * For a call that is not safe to repeat, above all a create (PUT /asks),
+   * this means "find out", never "retry": the instance may exist and bill
+   * under its label, so plan 1.4 looks it up by label and adopts it or
+   * confirms it absent before anything is rented again. `retryable` only
+   * says a later attempt might succeed, not that this one did nothing.
+   */
+  outcomeUnknown: boolean
   /** The rule that matched, for tests and logs. */
   rule: string
 }
@@ -261,6 +272,25 @@ function describeAgent(f: AgentFailure): string {
   return tags.length ? `${msg} (${tags.join(', ')})` : msg
 }
 
+/**
+ * The rules after which the request may have been carried out. Everything
+ * else is a definite answer (a 4xx, the agent's own report, an SSH
+ * connection or channel refused) or never left this computer. A Vast
+ * connection failure counts as unknown whatever its code: a lookup by label
+ * costs far less than an instance billing unseen.
+ */
+const OUTCOME_UNKNOWN = new Set([
+  'vast-5xx',
+  'vast-timeout',
+  'vast-network',
+  'vast-unreachable',
+  'timeout',
+  'net-dropped',
+  'ssh-exec-timeout',
+  'ssh-lost',
+  'unclassified'
+])
+
 function result(
   kind: ErrorClass,
   rule: string,
@@ -268,7 +298,13 @@ function result(
   e: unknown,
   retryable: boolean
 ): Classification {
-  return { kind, rule, retryable, reason: clip(`${label}: ${describe(e, 0)}`) }
+  return {
+    kind,
+    rule,
+    retryable,
+    outcomeUnknown: OUTCOME_UNKNOWN.has(rule),
+    reason: clip(`${label}: ${describe(e, 0)}`)
+  }
 }
 
 function classifyAgent(f: AgentFailure): Classification {
@@ -352,9 +388,10 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
   if (status === 404 || status === 410) {
     return result('machine', 'vast-gone', 'Vast says the instance or offer is gone', e, true)
   }
-  if (status != null && status >= 400) {
+  if ((status != null && status >= 400) || (vast && /^create instance failed:/i.test(message))) {
     // An offer rented by someone else, or no longer on the market: another
-    // offer can succeed where this one cannot.
+    // offer can succeed where this one cannot. A create answered 200 with no
+    // contract says why in the same words, and is as definite a no.
     return result('machine', 'vast-refused', 'Vast refused the request', e, true)
   }
 

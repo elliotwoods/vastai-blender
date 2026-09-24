@@ -89,6 +89,65 @@ describe('classify: Vast replies', () => {
   })
 })
 
+describe('classify: did the far end act? (plan 1.4)', () => {
+  it('a create that failed with a 5xx, a timeout, a network error or a non-JSON reply may exist', () => {
+    const maybeCreated = [
+      vastReply('PUT', '/asks/1/', 502, '<html>bad gateway'),
+      vastReply('PUT', '/asks/1/', 504, 'gateway timeout'),
+      vastReply('PUT', '/asks/1/', 408, 'request timeout'),
+      new VastError('network error: fetch failed'),
+      new VastError('vast.ai PUT /asks/1/: non-JSON response: <html>'),
+      Object.assign(new Error('The operation was aborted due to timeout'), {
+        name: 'TimeoutError'
+      }),
+      sysErr('read ECONNRESET', 'ECONNRESET', -54, 'read'),
+      sysErr('connect ETIMEDOUT 104.18.1.1:443', 'ETIMEDOUT', -60, 'connect')
+    ]
+    for (const e of maybeCreated) {
+      const c = classify(e, { via: 'vast' })
+      // Retryable, and still no leave to send the create again.
+      expect(c, c.reason).toMatchObject({ kind: 'transient', outcomeUnknown: true })
+    }
+  })
+
+  it('an explicit refusal made nothing', () => {
+    const refused = [
+      vastReply('PUT', '/asks/1/', 400, '{"error": "insufficient_credit"}'),
+      vastReply('PUT', '/asks/1/', 400, '{"error": "no_such_ask"}'),
+      vastReply('PUT', '/asks/1/', 401, 'bad key'),
+      vastReply('PUT', '/asks/1/', 404, 'not found'),
+      vastReply('PUT', '/asks/1/', 429, 'slow down'),
+      new VastError('No Vast.ai API key configured')
+    ]
+    for (const e of refused) {
+      const c = classify(e, { via: 'vast' })
+      expect(c.outcomeUnknown, c.reason).toBe(false)
+    }
+  })
+
+  it('a create answered 200 without a contract is a refusal from Vast, not a mystery', () => {
+    const c = classify(new VastError('create instance failed: no_such_ask'), { via: 'vast' })
+    expect(c).toMatchObject({ kind: 'machine', outcomeUnknown: false, retryable: true })
+  })
+
+  it('an SSH command that timed out or lost its link may have run; one never sent did not', () => {
+    const ran = [
+      new Error('exec timeout after 30000ms: mv /work/inbox/c1.json.tmp /work/inbox/c1.json'),
+      new Error('No response from server'),
+      sysErr('read ECONNRESET', 'ECONNRESET', -54, 'read')
+    ]
+    for (const e of ran) expect(classify(e, { via: 'ssh' }).outcomeUnknown).toBe(true)
+    const notSent = [
+      sysErr('connect ECONNREFUSED 1.2.3.4:22', 'ECONNREFUSED', -61, 'connect'),
+      Object.assign(new Error('SSH host key mismatch'), { name: 'HostKeyMismatchError' }),
+      new Error('(SSH) Channel open failure: open failed'),
+      sysErr("ENOSPC: no space left on device, write '/x'", 'ENOSPC', -28, 'write')
+    ]
+    for (const e of notSent) expect(classify(e, { via: 'ssh' }).outcomeUnknown).toBe(false)
+    expect(classify({ exitCode: 1, error: 'blender exited 1' }).outcomeUnknown).toBe(false)
+  })
+})
+
 describe('classify: SSH to a node', () => {
   it('an empty-message refusal names its code (field incident 1d59516c)', () => {
     // Node's connect to a multi-address host fails as an AggregateError with
