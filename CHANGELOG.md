@@ -69,11 +69,20 @@ GitHub Releases with the notes from this file.
   linked libraries and simulations, not only textures. Claims corrected there
   and in tooltips: `VR_MOCK` mocks only reads, and its actions reach the real
   fleet; the spend cap limits only automatic scale-up, and checks the fleet's
-  current rate, not the next machine's price; the node panel's *actual* $/hr
-  is at most about the quote (it can read slightly over in a node's first few
-  minutes, since the meter charges whole minutes); the toolbar's energy counts
-  since launch, while its spend is all-time; and an app restart re-renders
-  each in-flight chunk's whole range rather than re-attaching to it.
+  current rate, not the next machine's price; the node panel's *actual* $/hr,
+  now labelled *metered ÷ uptime*, settles at about the quote but reads up to
+  about a third over when it first shows, since the meter charges whole
+  minutes; the toolbar's spend is all-time, so its pill now reads *total*
+  rather than *session*, while its energy counts since launch; and an app
+  restart re-renders each in-flight chunk's whole range rather than
+  re-attaching to it. `docs/OCTANE.md` no longer points to a VNC tunnel button
+  the node panel does not have, and says that saved OTOY credentials can be
+  read by the machine's host.
+- **Two earlier entries overclaimed.** 2.1.0's fix for "a node that went
+  unreachable mid-render kept billing" covers only a node found unreachable
+  when the app starts: nothing checks a node's reachability during a session
+  yet. 2.0.0's "realised $/hr" is the node panel's metered spend ÷ uptime, an
+  estimate from the quoted rate, not a rate vast.ai billed.
 - **Faster fleet ramp.** Scale-up rents several nodes per 15 s tick (up to 8,
   from one offer search) instead of one, still bounded by *Max active nodes*
   and the spend cap. A 30-node fleet is now requested in about a minute rather
@@ -112,7 +121,9 @@ GitHub Releases with the notes from this file.
   next launch. A destroy during the first SSH connection or provisioning could
   be overwritten: the node was marked `failed` and its healthy machine
   blacklisted, or it came back as `provisioning`. The instance is now destroyed
-  and the node stays destroyed whichever step the destroy lands in.
+  whichever step the destroy lands in. If that destroy fails, the node is left
+  `failed` with a "check the Vast.ai console" alert, for Fleet's *clear
+  failed* or the launch sweep to retry.
 - **Chunks were rendered twice.** Destroying a node while a chunk was being
   prepared on it (a Blender download, a scene upload) requeued the chunk, which
   was dispatched again at once. The abandoned preparation then failed on the

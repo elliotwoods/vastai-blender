@@ -426,7 +426,7 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
           {fmtEnergy(node.energyWh)}
         </Fact>
         {burn != null ? (
-          <Fact icon="activity" label="actual" hint={HINTS.actual}>
+          <Fact icon="activity" label="metered ÷ uptime" hint={HINTS.actual}>
             {fmtRate(burn)}
           </Fact>
         ) : null}

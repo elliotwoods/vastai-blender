@@ -131,8 +131,11 @@ CREATE TABLE IF NOT EXISTS cost_log (
 -- Per-minute usage series behind the History screen — the same accrual tick as
 -- cost_log, but split by what the node was actually doing. One row per
 -- (node, job) share, plus a job_id = NULL row for minutes the node billed
--- without rendering, so SUM over a node's rows is its true spend and the NULL
--- rows are exactly the idle/provisioning overhead.
+-- without rendering, so SUM over a node's rows is its metered spend and the
+-- NULL rows are the idle/provisioning overhead within it. Metered, not billed:
+-- a minute of the quoted rate per tick while the app runs. Time the app was
+-- closed or asleep is missing, and so is a 'failed' node whose instance still
+-- runs; nothing here is read back from vast.ai.
 CREATE TABLE IF NOT EXISTS usage_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,                -- epoch ms

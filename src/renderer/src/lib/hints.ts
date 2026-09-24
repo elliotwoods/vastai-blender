@@ -16,14 +16,14 @@ export const HINTS = {
   energy:
     'GPU energy this node has drawn since the app was opened, from its power readings. It is not kept across a restart.',
   actual:
-    'Metered spend ÷ how long the node has been up. The app meters at the quoted rate, provisioning and idle time included, so this is at most about that rate (the meter charges whole minutes, so it can read slightly over for the first few minutes). It reads lower only for time the app did not meter, such as while it was closed or asleep. Estimated, not billed.',
+    'Metered spend ÷ how long the node has been up. The app meters at the quoted rate, provisioning and idle time included, so this settles at about that rate. It reads high at first, because the meter charges whole minutes: up to about a third over the rate when it first shows, at 3 minutes. It reads lower only for time the app did not meter, such as while it was closed or asleep. Estimated, not billed.',
   uptime: 'Time since vast.ai started billing this instance.',
   power: 'Current GPU power draw against the card’s limit, and energy used this session.',
 
   fleetRate:
     'Combined $/hr of every live node — what the fleet costs while it stays up. Click for spend history.',
   fleetSession:
-    'Estimated spend and GPU energy. The spend covers every run (the cost log is never cleared); the energy counts only since the app was opened. Click for spend history.',
+    'Estimated total spend across every run (the cost log is never cleared), and GPU energy since the app was opened. Click for spend history.',
   balance: 'Your vast.ai credit. Click for balance history, or “+” to add funds.',
 
   co2: 'A rough estimate, not a measurement: metered GPU energy × the grid intensity of the country the node ran in × an overhead factor for the host machine and cooling. Nodes rented before the app recorded their location fall back to a world average, and country averages hide a lot — treat it as an order of magnitude.',

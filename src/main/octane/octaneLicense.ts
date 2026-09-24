@@ -1,11 +1,15 @@
 /**
  * Octane on a node: X11/VNC desktop + OctaneServer with best-effort scripted
- * license sign-in. Credentials are injected via the exec environment only —
- * never written to node disk. Falls back to a one-click VNC tunnel for
- * manual sign-in when scripted flags aren't supported by the installed
- * OctaneServer build. Teardown SIGTERMs the server and waits for a clean
- * exit (which releases the floating license) BEFORE the instance is
- * destroyed — see docs/OCTANE.md for the manual recovery path.
+ * license sign-in. Credentials travel as env assignments in the exec command
+ * text and, when the build takes them, as OctaneServer's argv. No file on the
+ * node holds them, but root on the host can read both, so they are disclosed
+ * to the host (plan 1.18 moves them to stdin and makes manual sign-in the
+ * default). The manual path is meant to be openVncTunnel below, but nothing
+ * in the renderer calls node:openVncTunnel yet (plan 1.18 adds the button).
+ * destroyNode SIGTERMs the server and waits for a clean exit (which releases
+ * the floating license) BEFORE destroying the instance, but only for a node
+ * whose license was confirmed; no other destroy path does — see
+ * docs/OCTANE.md for the manual recovery path.
  */
 
 import { randomBytes } from 'crypto'
@@ -30,14 +34,18 @@ export async function setupOctane(ssh: SshConnection, nodeId: string): Promise<v
   })
   if (install.code !== 0) throw new Error(`octane install failed: ${install.stderr.slice(0, 300)}`)
 
-  // Per-node generated VNC password (stored app-side only, in the node row).
+  // Per-node generated VNC password, held app-side only: in vncPasswords
+  // below (memory, not the node row), so an app restart loses it.
   const password = randomBytes(9).toString('base64url')
   getDb().prepare('UPDATE nodes SET octane_ready = 0 WHERE id = ?').run(nodeId)
   const vnc = await ssh.exec(`bash ${script} start-vnc ${sq(password)}`, { timeoutMs: 60_000 })
   if (vnc.code !== 0) throw new Error(`vnc start failed: ${vnc.stderr.slice(0, 300)}`)
   vncPasswords.set(nodeId, password)
 
-  // Launch OctaneServer, injecting credentials via env on the exec channel.
+  // Launch OctaneServer, with credentials as env assignments at the front of
+  // the command text. exec's timeout error quotes the first 80 characters of
+  // that text, so a timeout here can put them in the dispatch-failed alert
+  // (plans 1.8 and 1.18).
   const user = getSecret('otoyUsername')
   const pass = getSecret('otoyPassword')
   const env = user && pass ? `OCTANE_USER=${sq(user)} OCTANE_PASS=${sq(pass)} ` : ''
@@ -63,6 +71,10 @@ export async function setupOctane(ssh: SshConnection, nodeId: string): Promise<v
     .prepare('UPDATE nodes SET octane_ready = ? WHERE id = ?')
     .run(licensed ? 1 : 0, nodeId)
   if (!licensed) {
+    // The fleet view has no VNC tunnel button yet (nothing calls
+    // node:openVncTunnel), so this advice cannot be followed until plan 1.18
+    // adds it. octane_ready = 0 also re-runs this setup on the next Octane
+    // dispatch to the node.
     emit('alert', {
       level: 'warn',
       message:

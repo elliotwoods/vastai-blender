@@ -4,7 +4,9 @@ A desktop app (Electron) that renders Blender projects on [Vast.ai](https://vast
 GPU fleets. Point it at a `.blend`, and it rents the best-value machines,
 provisions them (matching Blender version, ffmpeg, render agent), splits the
 animation into frame chunks across the fleet, streams frames and HDR preview
-clips back to your disk as they finish, and destroys the machines when done.
+clips back to your disk as they finish, and destroys the machines once they go
+idle, as long as the app is running: quitting leaves them billing (see
+[Safety model](#safety-model)).
 
 Vast.ai rents time on other people's GPU machines — typically far cheaper than
 dedicated cloud render farms. This app automates the whole lifecycle from an
@@ -37,7 +39,8 @@ gauges, ssh access, what it's rendering, and its console.*
   (side-by-side per version; override in Settings).
 - **Direct, verified transfers** — scenes go up and frames come down over the
   instance's own SSH (SFTP, SHA-256 verified, resumable). No Dropbox, no
-  cloud bucket, no credentials on untrusted machines.
+  cloud bucket, no credentials on untrusted machines, except the optional
+  OTOY sign-in for Octane (see `docs/OCTANE.md`).
 - **Remote preview encodes** — each chunk is encoded on the node to H.265:
   SDR, 10-bit HLG BT.2020 **HDR**, and a small proxy — all All-Intra for
   frame-exact scrubbing.
@@ -116,7 +119,8 @@ reaches the node. Before submitting:
   is above 1. A chunk size covering the whole range renders it in one go, but a
   retry after a failure restarts part-way through, cold.
 - Image sequences, movie clips, Alembic/USD caches and files over 2 GB cannot
-  be packed, so scenes that need them are not supported yet.
+  be packed, and neither can fluid (Mantaflow) bakes, which Blender writes only
+  to a disk cache. Scenes that need any of them are not supported yet.
 
 Nothing checks for any of this before the fleet starts. A missing texture
 renders magenta, and those frames complete and are billed like any other.
@@ -157,9 +161,13 @@ does about that, and what it doesn't:
   until you destroy them. Before you quit, set **Fleet → max nodes** to 0 (or
   cancel every unfinished job), then destroy each node. Otherwise their chunks
   go back to the queue and, within seconds, the scheduler rents replacements
-  to render them. Check the
-  [Vast.ai console](https://cloud.vast.ai/instances/) afterwards. Sleep is the
-  same: nodes keep billing and nothing is metered until the computer wakes.
+  to render them. A scale-up already under way (up to 8 rentals) can keep
+  renting after max nodes reaches 0, so wait until no new rows appear and
+  destroy those too. Check the
+  [Vast.ai console](https://cloud.vast.ai/instances/) afterwards. The 0 is
+  saved, so the next launch rents nothing and shows no *Resume rendering*
+  prompt; renting starts when you raise max nodes again. Sleep is the same as
+  quitting: nodes keep billing and nothing is metered until the computer wakes.
 - **A restart re-renders in-flight work.** On launch the app re-provisions
   every node it can reach, which kills the renders running there. Each chunk
   that was in flight goes back to the queue and renders its whole frame range
@@ -177,9 +185,11 @@ does about that, and what it doesn't:
   such as one whose destroy failed. An instance another profile or install
   rented is left running, with a warning, and instances without the label are
   never touched. The sweep runs only at launch.
-- **One app per profile.** A second launch on the same profile focuses the
-  window that is already open; a headless one (`VR_JOB_SPEC`, `VR_E2E_BLEND`)
-  exits with status 1 and submits nothing.
+- **One app per profile.** A second launch on the same profile writes one
+  line to stderr and quits with status 0, and the app already running brings
+  its window forward. A headless one (`VR_JOB_SPEC`, `VR_E2E_BLEND`) submits
+  nothing and exits with status 1. A `VR_USERDATA` profile is a separate
+  profile, so it runs alongside.
 - **Billing-risk alerts stay up.** A destroy that failed, or an instance left
   running, stays in a banner above every screen until you dismiss it, with a
   link to the Vast.ai console.
@@ -213,6 +223,12 @@ at boot:
 VR_JOB_SPEC=C:/specs/campaign.json npm run dev
 ```
 
+The spec must run on a profile no other instance has open: close the app
+first, or give the campaign its own profile with `VR_USERDATA`. On a profile
+that is already open, the run submits nothing, prints one line to stderr
+naming the profile, and exits with status 1 (see
+[Safety model](#safety-model)).
+
 Each blend entry is **one job**, however many nodes render it. To put more
 machines on a job, raise `maxActiveNodes` (and set `eagerFleet: true` to rent
 ahead of demand) rather than shrinking `chunkSize`. Leaving `chunkSize` null sizes
@@ -235,7 +251,7 @@ Other environment switches (development aids):
 | `VR_SCREEN=jobs` | Open on a given screen (`fleet`, `jobs`, `job`, `gallery`, `history`, `settings`, `gradelab`) |
 | `VR_SHOT=out.png` | Capture the window after load (`VR_SHOT_DELAY` ms, default 6000) |
 | `VR_USERDATA=dir` | Use a throwaway profile (own settings, own SQLite state, no API key) |
-| `VR_E2E_BLEND=x.blend` | Single-blend end-to-end test run (rents real machines) |
+| `VR_E2E_BLEND=x.blend` | Single-blend end-to-end test run (rents real machines). Like `VR_JOB_SPEC`, it exits with status 1 if the profile is already open |
 
 `VR_SCREEN` is appended to the dev-server URL verbatim, so it can carry the
 screens' own parameters: `history&metric=power&range=7d`,
