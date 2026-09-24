@@ -146,8 +146,16 @@ const caps = (
 ): CapacityBudget =>
   capacityBudget(nodes, { maxActiveNodes: 30, spendCapPerHour: null, noSpendCap: true, ...s })
 
+/**
+ * planScaling once took a new node's rate (gpu_perf × GPUs) as
+ * newNodeFramesPerHour and stopped whenever the queue was under a boot's
+ * worth of it. It reads no such rate now. Fixtures may still carry the figure
+ * gpu_perf would give, so that rule coming back fails here.
+ */
+type Fixture = Partial<PlanScalingInput> & { newNodeFramesPerHour?: number | null }
+
 /** No nodes, nothing queued, no cap, no holds, nothing learned. */
-const plan = (i: Partial<PlanScalingInput> = {}): PlanScalingInput => ({
+const plan = (i: Fixture = {}): PlanScalingInput => ({
   cap: caps(),
   holds: {},
   pendingShared: 0,
@@ -164,19 +172,19 @@ const plan = (i: Partial<PlanScalingInput> = {}): PlanScalingInput => ({
   remainingExclusiveFrames: 0,
   remainingSharedFrames: 0,
   fleetFramesPerHour: null,
-  newNodeFramesPerHour: null,
+  ratedRuns: 0,
   eager: false,
   ...i
 })
 
 /** One live 8×4090 node, every lane busy, rendering at 8 × 60 frames/hour. */
-const oneBusy8x4090: Partial<PlanScalingInput> = {
+const oneBusy8x4090: Fixture = {
   cap: caps([node(4)]),
   usableNodes: 1,
   usableLanes: 8,
   exclusiveCapacity: 0,
   fleetFramesPerHour: 480,
-  newNodeFramesPerHour: 480,
+  ratedRuns: 8,
   newNodeLanes: 8
 }
 
@@ -204,7 +212,6 @@ describe('planScaling: no work, no rent (plan 1.21, job da68b61b)', () => {
       plan({
         ...oneBusy8x4090,
         fleetFramesPerHour: null,
-        newNodeFramesPerHour: null,
         eager: true,
         remainingExclusiveFrames: 1
       })
@@ -215,7 +222,7 @@ describe('planScaling: no work, no rent (plan 1.21, job da68b61b)', () => {
   describe('a fully downloaded retry chunk → no rent', () => {
     // The leftover requeue sub-chunk: pending, but every frame of it is
     // already on this computer.
-    const downloaded: Partial<PlanScalingInput> = {
+    const downloaded: Fixture = {
       pendingExclusive: 1,
       pendingFrames: 0,
       remainingExclusiveFrames: 0
@@ -248,14 +255,13 @@ describe('planScaling: no work, no rent (plan 1.21, job da68b61b)', () => {
   })
 
   it('1 frame left with 1 live node → no rent, even when it waits for a lane', () => {
+    // One frame is a minute of one run's work; the busy lanes have hours left.
     const p = planScaling(
       plan({
         ...oneBusy8x4090,
-        fleetFramesPerHour: 60,
-        newNodeFramesPerHour: 60,
         pendingExclusive: 1,
         pendingFrames: 1,
-        remainingExclusiveFrames: 2000 // the busy lanes have hours left
+        remainingExclusiveFrames: 2000
       })
     )
     expect(p.status).toBe('tail')
@@ -268,7 +274,6 @@ describe('planScaling: no work, no rent (plan 1.21, job da68b61b)', () => {
     const p = planScaling(
       plan({
         ...oneBusy8x4090,
-        newNodeFramesPerHour: 30, // a slow new node would still have 50 frames of work
         pendingExclusive: 6,
         pendingFrames: 50,
         remainingExclusiveFrames: 50
@@ -298,7 +303,6 @@ describe('planScaling: no work, no rent (plan 1.21, job da68b61b)', () => {
         pendingExclusive: 1,
         pendingFrames: 1,
         remainingExclusiveFrames: 1,
-        newNodeFramesPerHour: 480,
         fleetFramesPerHour: 0
       })
     )
@@ -311,7 +315,6 @@ describe('planScaling: no work, no rent (plan 1.21, job da68b61b)', () => {
       plan({
         ...oneBusy8x4090,
         fleetFramesPerHour: null,
-        newNodeFramesPerHour: null,
         pendingExclusive: 1,
         pendingFrames: 1,
         remainingExclusiveFrames: 2000
@@ -332,6 +335,87 @@ describe('planScaling: no work, no rent (plan 1.21, job da68b61b)', () => {
     )
     expect(p.status).toBe('rent')
     expect(p.budget.exclusiveLanes).toBe(3000 - 8)
+  })
+})
+
+describe("planScaling: the tail is the fleet's, at the rate it renders these jobs (plan 1.21)", () => {
+  it('a heavy scene on a slow fleet rents, whatever gpu_perf learned on a light one', () => {
+    // One live 4×4090 measured at 80 frames/h on this scene. gpu_perf, learned
+    // on a light scene, says a new 4×4090 does 4800: the old rule read 460
+    // frames as ~6 min of a new node's work and left the job ~5.75 h on one node.
+    const p = planScaling(
+      plan({
+        cap: caps([node(1.6)]),
+        usableNodes: 1,
+        usableLanes: 4,
+        fleetFramesPerHour: 80,
+        ratedRuns: 4,
+        newNodeFramesPerHour: 4800,
+        newNodeLanes: 4,
+        pendingExclusive: 10,
+        pendingFrames: 460,
+        remainingExclusiveFrames: 500
+      })
+    )
+    expect(p.status).toBe('rent')
+    expect(p.budget.exclusiveLanes).toBe(10)
+  })
+
+  it('a slow live node and a fast new one: the queue is judged on the live node', () => {
+    // A 1×3060 at 30 frames/h; an 8×4090 would truly do 480.
+    const p = planScaling(
+      plan({
+        cap: caps([node(0.2)]),
+        usableNodes: 1,
+        usableLanes: 1,
+        fleetFramesPerHour: 30,
+        ratedRuns: 1,
+        newNodeFramesPerHour: 480,
+        newNodeLanes: 8,
+        pendingExclusive: 2,
+        pendingFrames: 70,
+        remainingExclusiveFrames: 80
+      })
+    )
+    expect(p.status).toBe('rent')
+  })
+
+  it('one chunk renders on one lane, not at the whole fleet rate', () => {
+    // 8 runs at 60 frames/h each. The one 70-frame chunk queued behind them
+    // takes a lane 70 min, not 70/480 h ≈ 9 min.
+    const p = planScaling(
+      plan({
+        ...oneBusy8x4090,
+        newNodeFramesPerHour: 480,
+        pendingExclusive: 1,
+        pendingFrames: 70,
+        remainingExclusiveFrames: 470
+      })
+    )
+    expect(p.status).toBe('rent')
+  })
+
+  it('still stops for a short queue on a big fleet', () => {
+    // 30 × 8 runs at 60 frames/h: 2000 queued frames in 250 chunks are gone
+    // in ~8 min, before a new node could start on any.
+    const p = planScaling(
+      plan({
+        cap: caps(
+          Array.from({ length: 30 }, () => node(4)),
+          { maxActiveNodes: 40 }
+        ),
+        usableNodes: 30,
+        usableLanes: 240,
+        fleetFramesPerHour: 240 * 60,
+        ratedRuns: 240,
+        newNodeLanes: 8,
+        pendingExclusive: 250,
+        pendingFrames: 2000,
+        remainingExclusiveFrames: 2000 + 240 * 10
+      })
+    )
+    expect(p.status).toBe('tail')
+    expect(p.reason).toMatch(/2000 frames left in the queue take the fleet ~8 min/)
   })
 })
 
