@@ -7,7 +7,7 @@
  */
 
 import { BrowserWindow, Notification, clipboard, dialog, ipcMain, shell } from 'electron'
-import { isStickyAlert, type InvokeChannel, type IpcInvokeMap } from '../shared/ipc'
+import { isStickyAlert, type InvokeChannel, type IpcInvokeMap, isBillingRisk } from '../shared/ipc'
 import type {
   AlertEvent,
   AssetIndex,
@@ -602,7 +602,41 @@ const MAX_HELD_NOTIFICATIONS = 20
 function notifyUnattended(alert: AlertEvent, createWindow: (() => void) | undefined): void {
   if (!isStickyAlert(alert) || BrowserWindow.getFocusedWindow()) return
   if (!Notification.isSupported()) return
-  const n = new Notification({ title: 'Vast Render', body: alert.message })
+  // Billing risks always notify at once: they are rare, and each one is an
+  // instance that may be costing money. Plain errors come in storms — a dead
+  // node fails dispatch for every pending chunk, each with its own message —
+  // so they are paced, and whatever is held back becomes one summary.
+  if (!isBillingRisk(alert)) {
+    const now = Date.now()
+    const wait = lastErrorNotifyAt + ERROR_NOTIFY_GAP_MS - now
+    if (wait > 0) {
+      heldBackErrors++
+      trailingNotify ??= setTimeout(() => {
+        trailingNotify = null
+        const n = heldBackErrors
+        heldBackErrors = 0
+        if (n === 0 || BrowserWindow.getFocusedWindow() || !Notification.isSupported()) return
+        lastErrorNotifyAt = Date.now()
+        showNotification(
+          `${n} more error${n === 1 ? '' : 's'} — open Vast Render to see them`,
+          createWindow
+        )
+      }, wait)
+      return
+    }
+    lastErrorNotifyAt = now
+  }
+  showNotification(alert.message, createWindow)
+}
+
+/** Errors (not billing risks) notify at most this often; see notifyUnattended. */
+const ERROR_NOTIFY_GAP_MS = 20_000
+let lastErrorNotifyAt = -Infinity
+let heldBackErrors = 0
+let trailingNotify: ReturnType<typeof setTimeout> | null = null
+
+function showNotification(body: string, createWindow: (() => void) | undefined): void {
+  const n = new Notification({ title: 'Vast Render', body })
   const release = (): void => {
     heldNotifications.delete(n)
   }

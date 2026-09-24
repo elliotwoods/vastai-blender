@@ -57,31 +57,55 @@ export function on<C extends EventChannel>(
   })
 }
 
-/** Publish an event to every subscriber (and so to every window). */
+/**
+ * Report a subscriber that threw, without throwing. emit() runs inside the
+ * money paths — nodeManager's destroy and recovery catch blocks raise alerts —
+ * so nothing a listener or stdout does may unwind into them: a window whose
+ * webContents was destroyed, or a full disk under the headless stdout mirror
+ * (observed: ENOSPC from console.log surfaced as a modal "JavaScript error in
+ * the main process" while nodes were billing), must cost at most a log line.
+ */
+function contained(what: string, fn: () => void): void {
+  try {
+    fn()
+  } catch (e) {
+    try {
+      console.error(`[events] ${what} threw:`, e)
+    } catch {
+      // stderr is gone too (full disk, closed pipe): nowhere left to say it.
+    }
+  }
+}
+
+/** Publish an event to every subscriber (and so to every window). Never throws. */
 export function emit<C extends EventChannel>(channel: C, payload: IpcEventMap[C]): void {
   // E2E observability: mirror events to stdout when driving headless tests. Both headless
   // drivers need this — without it a scripted run has no way to see why a chunk failed,
   // because the node's render log otherwise only ever reaches the renderer window.
   const headless = process.env.VR_E2E_BLEND || process.env.VR_JOB_SPEC
-  if (headless && channel !== 'render:logLine') {
-    console.log(`[event] ${channel} ${JSON.stringify(payload).slice(0, 240)}`)
-  }
-  if (headless && channel === 'render:logLine') {
-    const l = payload as IpcEventMap['render:logLine']
-    console.log(`[log:${l.nodeId.slice(0, 8)}] ${l.line}`)
+  if (headless) {
+    contained('stdout mirror', () => {
+      if (channel !== 'render:logLine') {
+        console.log(`[event] ${channel} ${JSON.stringify(payload).slice(0, 240)}`)
+      } else {
+        const l = payload as IpcEventMap['render:logLine']
+        console.log(`[log:${l.nodeId.slice(0, 8)}] ${l.line}`)
+      }
+    })
   }
   // Before the listeners, so an alert is kept even when one of them throws.
   if (channel === 'alert' && recordAlert(payload as AlertEvent, Date.now())) {
     // Before them too, so a window whose webContents.send throws does not
     // also cost the user the OS notification.
-    for (const listener of [...surfacedListeners]) listener(payload as AlertEvent)
+    for (const listener of [...surfacedListeners]) {
+      contained('alert listener', () => listener(payload as AlertEvent))
+    }
   }
   const event = { channel, payload } as BusEvent
   // A copy, so a listener that unsubscribes (or subscribes) mid-emit cannot
-  // change who hears this event. A throwing listener propagates to the
-  // emitter, exactly as a throwing webContents.send did when this loop lived
-  // in ipc.ts.
-  for (const listener of [...listeners]) listener(event)
+  // change who hears this event; each one contained, so one that throws
+  // neither silences the rest nor reaches the emitter.
+  for (const listener of [...listeners]) contained(`${channel} listener`, () => listener(event))
 }
 
 // -- recent alerts -------------------------------------------------------------

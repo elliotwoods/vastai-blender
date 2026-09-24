@@ -66,13 +66,21 @@ describe('event bus', () => {
     expect(heard).toEqual(['a', 'b', 'a'])
   })
 
-  it('a throwing listener reaches the emitter, as a throwing webContents.send did', () => {
+  // emit() runs inside nodeManager's destroy and recovery catch blocks: a
+  // window whose webContents was destroyed must not unwind into them.
+  it('a throwing listener neither reaches the emitter nor silences the others', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const heard: BusEvent[] = []
     unsubscribes.push(
       onEvent(() => {
         throw new Error('listener failed')
-      })
+      }),
+      onEvent((e) => heard.push(e))
     )
-    expect(() => emit('alert', alert)).toThrow('listener failed')
+    expect(() => emit('alert', alert)).not.toThrow()
+    expect(heard).toHaveLength(1)
+    expect(String(err.mock.calls[0]?.[1])).toContain('listener failed')
+    err.mockRestore()
   })
 })
 
@@ -92,6 +100,24 @@ describe('headless stdout mirror', () => {
     emit('alert', alert)
     emit('render:logLine', logLine)
     expect(log).not.toHaveBeenCalled()
+  })
+
+  // Observed on a full disk: console.log threw ENOSPC out of emit() and main
+  // showed a modal error while the fleet billed.
+  it('a stdout that throws (full disk) costs the mirror, not the event', () => {
+    vi.stubEnv('VR_JOB_SPEC', '/tmp/spec.json')
+    log.mockImplementation(() => {
+      throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' })
+    })
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('EPIPE')
+    })
+    const heard: BusEvent[] = []
+    const off = onEvent((e) => heard.push(e))
+    expect(() => emit('alert', alert)).not.toThrow()
+    expect(heard).toHaveLength(1)
+    off()
+    err.mockRestore()
   })
 
   it.each(['VR_JOB_SPEC', 'VR_E2E_BLEND'])('mirrors every event under %s', (env) => {
@@ -365,6 +391,24 @@ describe('OS notification (ipc.ts)', () => {
     expect(w.notifications.every((n) => n.shown && n.options.title === 'Vast Render')).toBe(true)
     // The window heard every one of them either way.
     expect(win.sent.map((e) => e.payload)).toEqual([scaleUp, dispatchFailed(1), foreign, orphan])
+  })
+
+  // A dead node fails dispatch for every pending chunk, each alert distinct.
+  it('an error storm is paced to one now and one summary; billing risks are never held', async () => {
+    const bus = await boot()
+    for (let i = 0; i < 12; i++) bus.emit('alert', dispatchFailed(i))
+    bus.emit('alert', destroyFailed) // a billing risk mid-storm
+    expect(bodies()).toEqual([dispatchFailed(0).message, destroyFailed.message])
+
+    await w.advance(20_000)
+    expect(bodies()).toEqual([
+      dispatchFailed(0).message,
+      destroyFailed.message,
+      '11 more errors — open Vast Render to see them'
+    ])
+    await w.advance(60_000)
+    bus.emit('alert', dispatchFailed(99)) // the pace has passed: notifies at once
+    expect(bodies()).toHaveLength(4)
   })
 
   it('with no window at all: on macOS the window can close while the fleet bills', async () => {
