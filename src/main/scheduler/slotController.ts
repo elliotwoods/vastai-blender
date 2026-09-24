@@ -312,12 +312,36 @@ export function learnedSlots(gpuName: string): LearnedSlots | null {
 }
 
 /**
+ * How much of the stored best slot count survives one lower observation.
+ * See decayedBestSlots.
+ */
+export const BEST_SLOTS_DECAY = 0.8
+
+/**
+ * The stored best slot count after a node settles at `observed`.
+ *
+ * A pure max never came down. When gpu_slots switched to per-GPU units
+ * (93cbad4) with no migration, a row holding a 4-GPU node's total (12)
+ * became a per-GPU figure, seeded 48 on the next 4-GPU node, clamped to the
+ * hardware ceiling, and no later measurement could lower it (#226, #238).
+ * A decaying max still favours the best observation, so a light scene's
+ * packing is not averaged away by one heavy job, but a value nothing
+ * confirms fades: 12 against repeated 3s reads 9.6, 7.7, 6.1, ... and is
+ * back to 3 after seven settles.
+ */
+export function decayedBestSlots(stored: number, observed: number): number {
+  if (!Number.isFinite(stored) || stored <= 0) return observed
+  return Math.max(observed, stored * BEST_SLOTS_DECAY)
+}
+
+/**
  * Remember where a node settled. Throughput is EWMA'd (30% new) like
- * gpu_perf, but the slot count tracks the *best* observation rather than an
- * average: a node that measured 8 slots on a light scene and 3 on a heavy one
- * should start at 8 and ramp down — starting at the mean would leave the
- * light case permanently under-packed, and ramping down is cheap while
- * ramping up costs a settle period per step.
+ * gpu_perf, but the slot count tracks a decaying *best* observation rather
+ * than an average: a node that measured 8 slots on a light scene and 3 on a
+ * heavy one should start near 8 and ramp down — starting at the mean would
+ * leave the light case under-packed, and ramping down is cheap while ramping
+ * up costs a settle period per step. See decayedBestSlots for why the best
+ * decays.
  */
 export function recordNodeSlots(
   gpuName: string,
@@ -345,7 +369,7 @@ export function recordNodeSlots(
     db.prepare(
       'UPDATE gpu_slots SET best_slots = ?, frames_per_hour = ?, samples = samples + 1, updated_at = ? WHERE gpu_name = ?'
     ).run(
-      Math.max(row.best_slots, slots),
+      decayedBestSlots(row.best_slots, slots),
       row.frames_per_hour * 0.7 + framesPerHour * 0.3,
       Date.now(),
       gpuName

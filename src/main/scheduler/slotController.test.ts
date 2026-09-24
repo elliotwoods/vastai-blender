@@ -3,17 +3,24 @@ import type { NodeMetrics } from '../../shared/models'
 
 // slotController reaches SQLite for the learned-per-GPU cache, and db.ts pulls
 // in electron. Stub the whole module: these tests are about the control law.
-const learned = { row: undefined as { best_slots: number } | undefined }
+const learned = {
+  row: undefined as { best_slots: number; frames_per_hour?: number } | undefined,
+  /** every statement run, with its SQL and arguments */
+  runs: [] as Array<{ sql: string; args: unknown[] }>
+}
 vi.mock('../db/db', () => ({
   getDb: () => ({
-    prepare: () => ({
+    prepare: (sql: string) => ({
       get: () => learned.row,
-      run: () => undefined
+      run: (...args: unknown[]) => {
+        learned.runs.push({ sql, args })
+      }
     })
   })
 }))
 
-const { decide, hardCap, initialState, SETTLE_MS } = await import('./slotController')
+const { decide, decayedBestSlots, hardCap, initialState, recordNodeSlots, SETTLE_MS } =
+  await import('./slotController')
 type SlotState = import('./slotController').SlotState
 type Decision = import('./slotController').Decision
 
@@ -35,6 +42,7 @@ const metrics = (m: Partial<NodeMetrics> = {}): NodeMetrics => ({
 
 beforeEach(() => {
   learned.row = undefined
+  learned.runs = []
 })
 
 describe('hardCap', () => {
@@ -298,5 +306,35 @@ describe('decide — memory backoff', () => {
     expect(r.state.target).toBe(5)
     expect(r.state.bestTarget).toBe(5)
     expect(r.state.bestThroughput).toBe(0)
+  })
+})
+
+describe('recordNodeSlots — the learned best decays instead of ratcheting (#226)', () => {
+  it('lets an over-seed fade toward what nodes now measure', () => {
+    // A row written before 93cbad4 holds a 4-GPU node's TOTAL (12), now read
+    // per GPU: every 4-GPU node seeded 48, clamped to its ceiling, and a pure
+    // max kept it there for good, whatever later nodes measured.
+    learned.row = { best_slots: 12, frames_per_hour: 100 }
+    recordNodeSlots('RTX 4090', 12, 1, 4) // settled at 12 on 4 GPUs = 3 per GPU
+    const update = learned.runs.find((r) => r.sql.startsWith('UPDATE gpu_slots'))
+    expect(update?.args[0]).toBeCloseTo(9.6)
+  })
+
+  it('reaches the measured value after enough settles, and never goes below it', () => {
+    let best = 12
+    for (let i = 0; i < 7; i++) best = decayedBestSlots(best, 3)
+    expect(best).toBe(3)
+    expect(decayedBestSlots(3, 3)).toBe(3)
+  })
+
+  it('still takes a better observation at once', () => {
+    expect(decayedBestSlots(4, 6)).toBe(6)
+    expect(decayedBestSlots(0, 2.5)).toBe(2.5)
+  })
+
+  it('is what a first sample inserts', () => {
+    recordNodeSlots('RTX 4090', 5, 1, 4)
+    const insert = learned.runs.find((r) => r.sql.startsWith('INSERT INTO gpu_slots'))
+    expect(insert?.args[1]).toBe(1.25)
   })
 })
