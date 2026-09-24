@@ -382,12 +382,20 @@ export function partPathFor(
   return `${localPath}.${key}.part`
 }
 
-/** Remove what a download given up on left behind: the job folder is the user's delivery folder. */
-export async function discardPartial(
+/**
+ * Remove what a download given up on, or stopped, left behind: the job folder
+ * is the user's delivery folder, and with content-keyed names nothing else
+ * ever touches the partial again. In turn with any download of the same file
+ * (oneWriterAt), so it never pulls a .part from under one that is writing it:
+ * called as a transfer is aborted, it runs once that transfer has let go.
+ */
+export function discardPartial(
   localPath: string,
   expected: { size: number; sha256?: string }
 ): Promise<void> {
-  await fsp.rm(partPathFor(localPath, expected), { force: true }).catch(() => {})
+  return oneWriterAt(localPath, localPath, undefined, () =>
+    fsp.rm(partPathFor(localPath, expected), { force: true })
+  ).catch(() => {})
 }
 
 export interface DownloadOptions {
@@ -413,7 +421,8 @@ export interface DownloadOptions {
  * TransferStalledError instead of hanging forever (ssh2's fastGet never calls
  * back on a wedged channel), and the SFTP channel it used is reset so the
  * retry gets a fresh one. A partial `.part` is kept and the next attempt at
- * the same content resumes from it.
+ * the same content resumes from it; one already whole, whose rename failed,
+ * is only checked and renamed.
  *
  * Every local step that fails because the disk cannot take the file (full,
  * read-only, not ours, the drive gone) rejects with LocalSinkError, never as
@@ -525,7 +534,6 @@ async function fetchVerified(
   expected: { size: number; sha256?: string },
   opts: DownloadOptions
 ): Promise<'downloaded' | 'skipped'> {
-  const { signal } = opts
   try {
     const st = await fsp.stat(localPath)
     if (
@@ -542,16 +550,46 @@ async function fetchVerified(
   // says EACCES): the local disk, not the node.
   await local(fsp.mkdir(dir, { recursive: true }), ['ENOENT', 'ENOTDIR'])
   const part = partPathFor(localPath, expected)
-  // Resume from a previous attempt's prefix of this same content. A .part at
-  // or past the expected size cannot be one (it is corrupt) — start over.
+  // Resume from a previous attempt's prefix of this same content. One that is
+  // already whole (its download finished, then the rename failed: a file
+  // another program held open, say) needs only its check, not the whole file
+  // again. Past the expected size, or whole but wrong, it is corrupt: start
+  // over.
   let start = 0
+  let whole = false
   try {
     const prev = await fsp.stat(part)
     if (prev.size < expected.size) start = prev.size
+    else if (prev.size === expected.size && (await isWhole(part, expected))) whole = true
     else await fsp.rm(part, { force: true })
   } catch {
     // no partial — start from zero
   }
+  if (!whole) await fetchInto(ssh, remotePath, part, dir, start, expected, opts)
+  await local(fsp.rename(part, localPath))
+  return 'downloaded'
+}
+
+/** Does a .part of the expected size hold the expected content? Unreadable is no. */
+async function isWhole(
+  part: string,
+  expected: { size: number; sha256?: string }
+): Promise<boolean> {
+  if (!expected.sha256) return true // size-only (legacy entry): as the check after a fetch
+  return (await sha256File(part).catch(() => null)) === expected.sha256
+}
+
+/** Fetch `remotePath` into `part` from `start`, then check its size and hash. */
+async function fetchInto(
+  ssh: SshConnection,
+  remotePath: string,
+  part: string,
+  dir: string,
+  start: number,
+  expected: { size: number; sha256?: string },
+  opts: DownloadOptions
+): Promise<void> {
+  const { signal } = opts
   await ensureRoom(dir, expected.size - start)
   const stallMs = opts.stallMs ?? DOWNLOAD_STALL_MS
   // The channel open is inside the stall budget too: sftp() on a wedged
@@ -583,6 +621,4 @@ async function fetchVerified(
       throw new Error(`hash mismatch downloading ${remotePath}`)
     }
   }
-  await local(fsp.rename(part, localPath))
-  return 'downloaded'
 }

@@ -1,6 +1,6 @@
 import { createHash } from 'crypto'
 import { existsSync, promises as fsp, readFileSync, type StatsFs } from 'fs'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { REMOTE_ROOT } from '../test/fakeSsh'
 import { HANG, setup, type FakeMachine, type World } from '../test/harness'
@@ -321,6 +321,75 @@ describe('downloadFileVerified', () => {
     expect(reads.n).toBe(Math.ceil((200_000 - kept) / 32_768))
     expect(readFileSync(localFrame()).equals(a.data)).toBe(true)
     expect(existsSync(sftp.partPathFor(localFrame(), a.entry))).toBe(false)
+  })
+
+  it('a whole partial whose rename failed is checked and renamed, not fetched again', async () => {
+    // A frame file another program held (Windows antivirus, a viewer, a
+    // Finder lock) refused the rename after the whole file had landed, and
+    // every retry deleted the .part and fetched it all again.
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 200_000)
+    const rename = fsp.rename.bind(fsp)
+    const refuse = vi.spyOn(fsp, 'rename').mockImplementationOnce(async (from) => {
+      throw Object.assign(new Error(`EPERM: operation not permitted, rename '${String(from)}'`), {
+        code: 'EPERM',
+        syscall: 'rename',
+        path: String(from)
+      })
+    })
+    const first = await sftp
+      .downloadFileVerified(conn, FRAME, localFrame(), a.entry)
+      .catch((e: unknown) => e)
+    expect(first).toBeInstanceOf(sftp.LocalSinkError)
+    expect(readFileSync(sftp.partPathFor(localFrame(), a.entry)).length).toBe(200_000)
+    refuse.mockImplementation(rename)
+
+    const reads = countReads(machine)
+    await expect(sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry)).resolves.toBe(
+      'downloaded'
+    )
+
+    expect(reads.n).toBe(0)
+    expect(readFileSync(localFrame()).equals(a.data)).toBe(true)
+    expect(existsSync(sftp.partPathFor(localFrame(), a.entry))).toBe(false)
+  })
+
+  it('a partial of the whole size but the wrong bytes is fetched again, in the same attempt', async () => {
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 200_000)
+    const part = sftp.partPathFor(localFrame(), a.entry)
+    await fsp.mkdir(dirname(part), { recursive: true })
+    await fsp.writeFile(part, Buffer.alloc(200_000, 7))
+
+    await expect(sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry)).resolves.toBe(
+      'downloaded'
+    )
+    expect(readFileSync(localFrame()).equals(a.data)).toBe(true)
+  })
+
+  it('discardPartial waits for the download writing that file to let go', async () => {
+    // Called as a transfer is stopped: removing the .part while it was still
+    // open for writing pulled the file from under that writer (and on
+    // Windows fails outright).
+    const { machine, conn, sftp } = await node()
+    const a = frameOn(machine, 200_000)
+    wedgeAfterReads(machine, 2)
+    const ctl = new AbortController()
+    const got = watch(
+      sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry, { signal: ctl.signal })
+    )
+    const part = sftp.partPathFor(localFrame(), a.entry)
+    await w.until(() => existsSync(part), 'transfer under way')
+
+    const discard = watch(sftp.discardPartial(localFrame(), a.entry))
+    await w.advance(2_000)
+    expect(discard.done).toBe(false)
+    expect(existsSync(part)).toBe(true)
+
+    ctl.abort()
+    await w.until(() => discard.done, 'the discard runs')
+    expect(got.error).toBeInstanceOf(sftp.TransferAbortedError)
+    expect(existsSync(part)).toBe(false)
   })
 
   it('#245: a stall resets the channel it stalled on, by name', async () => {
