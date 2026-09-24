@@ -45,7 +45,14 @@ added, so an older app reads a newer agent's state):
                               in a failed state null only if it never ran,
     "gpu": int|null           the GPU the render is pinned to,
     "updatedAt": float        epoch s of the last write; the 60 s heartbeat
-                              refreshes it while Blender lives }
+                              refreshes it while Blender lives, so it says
+                              the process is alive, not that it is working,
+    "lastProgressAt": float   epoch s of the last progress: when this
+                              attempt's Blender started, then each saved
+                              frame and each "Fra:" naming a new frame. The
+                              heartbeat never moves it, so a hung Blender
+                              shows it falling behind updatedAt. Rendering
+                              only: encoding makes no frame progress }
   A failed state keeps every field it had and adds:
     "error": str              one readable line,
     "errorKind": "scene"|"job"|"machine"|"transient"   see ERROR_KINDS,
@@ -875,20 +882,30 @@ def unannounced_frames(frames_dir, spec, since, recorded):
     return found
 
 
-def scan_line(line, state, seen):
+def scan_line(line, state, seen, now=None):
     """Fold one line of Blender's output into the chunk's state.
 
     `state` is what the app reads; `seen` collects what only the failure
     classification needs. Returns (saved, save_failed): the path of a frame
     Blender announced with "Saved:" or reported it could not write, or None.
+
+    lastProgressAt moves only on real progress: a saved frame, or a "Fra:"
+    line naming a frame other than the last one. Blender repeats "Fra:" for
+    every sample of the same frame, so counting those, like the updatedAt
+    the heartbeat refreshes, would make a hung render look busy (#77).
     """
+    now = time.time() if now is None else now
     saved = save_failed = None
     m = FRA_RE.search(line)
     if m:
-        state["currentFrame"] = int(m.group(1))
+        frame = int(m.group(1))
+        if frame != state.get("currentFrame"):
+            state["lastProgressAt"] = now
+        state["currentFrame"] = frame
     m = SAVED_RE.search(line)
     if m:
         saved = m.group(1)
+        state["lastProgressAt"] = now
     m = SAVE_FAILED_RE.search(line)
     if m:
         save_failed = m.group(1)
@@ -975,6 +992,8 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         # The GPU this render is pinned to (nvidia-smi index), or None. The app
         # shows it per slot on the Fleet screen.
         "gpu": gpu,
+        # Reset again as each attempt's Blender starts; see scan_line.
+        "lastProgressAt": time.time(),
     })
     write_state(chunk_id, state)
 
@@ -1009,6 +1028,9 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         tracker.forget_pending()
         discard_unmanifested(chunk_id, chunk_dir, tracker.recorded)
         attempt_started = time.time()
+        # A new Blender has made no progress yet, and the app's watchdog times
+        # its scene load and first frame from here.
+        state["lastProgressAt"] = attempt_started
         with open(log_path, "a") as log:
             log.write(f"=== {time.strftime('%F %T')} render start: {' '.join(cmd)}\n")
             log.flush()
@@ -1022,7 +1044,9 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
             # legitimately silent for 15+ minutes per frame — long enough for
             # the app's stall watchdog to kill a healthy render. Refresh
             # updatedAt every 60s while the process lives, so "stale state"
-            # reliably means "process dead", never just "quiet".
+            # reliably means "process dead", never just "quiet". It leaves
+            # lastProgressAt alone: that is what tells a hung Blender, alive
+            # but making no frames, from a slow one.
             # Never let this thread die: it is a daemon, so an escaping
             # exception would end it silently and take the anti-stall refresh
             # with it — leaving exactly the symptom it was added to prevent.

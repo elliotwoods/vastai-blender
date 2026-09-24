@@ -32,6 +32,8 @@ Covers the failure modes that actually bit:
     the app retried a scene error on every node exactly like a flaky one; and a
     state write that failed (a full disk) left the spec in the inbox, where the
     next scan launched it again.
+  * the 60 s heartbeat keeps updatedAt fresh for a Blender that is alive but
+    hung, so the state had no way to say "no frame for an hour".
     These cases drive the real run_render and process() against a scripted
     fake `blender`, and are skipped on Windows, where its `#!/bin/sh` wrapper
     cannot run.
@@ -584,6 +586,46 @@ def test_full_disk_still_retires_the_spec():
               not os.path.exists(spec_path) and os.path.exists(os.path.join(nr.FAILED, "c1.json")))
 
 
+def test_last_progress_at():
+    """1.7 / #77: a hung Blender keeps updatedAt fresh through the heartbeat, so
+    progress needs its own clock that only frames move."""
+    st, seen = {}, {}
+    stamps = []
+    for line, now in (
+        ("Fra:1 Mem:12.00M | Syncing Cube", 100.0),
+        ("Fra:1 Mem:12.00M | Sample 64/128", 160.0),  # same frame: not progress
+        ("Saved: '/x/frames/0001.exr'", 170.0),
+        ("Fra:2 Mem:12.00M | Syncing Cube", 200.0),
+        ("Warning: something unrelated", 250.0),
+    ):
+        nr.scan_line(line, st, seen, now)
+        stamps.append(st.get("lastProgressAt"))
+    check("lastProgressAt moves on a new frame or a saved one, never on samples or chatter",
+          stamps == [100.0, 100.0, 170.0, 200.0, 200.0])
+    with tempfile.TemporaryDirectory() as tmp:
+        original = nr.STATE
+        nr.STATE = tmp
+        try:
+            nr.write_state("c1", {"status": "rendering", "lastProgressAt": 5.0})
+            with open(os.path.join(tmp, "c1.json")) as f:
+                written = json.load(f)
+        finally:
+            nr.STATE = original
+        check("the heartbeat's write refreshes updatedAt and leaves lastProgressAt alone",
+              written["lastProgressAt"] == 5.0 and written["updatedAt"] > 5.0)
+
+
+def test_render_publishes_last_progress():
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        started = time.time()
+        state, _ = run_chunk(tmp, {"default": {"write": [["0001.exr", "a", True]], "exit": 0}},
+                             frames=(1, 1, 1))
+        stamp = state.get("lastProgressAt")
+        check("a render publishes lastProgressAt",
+              isinstance(stamp, float) and started <= stamp <= state["updatedAt"])
+
+
 def test_log_tail():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "c1.log")
@@ -685,6 +727,7 @@ def main():
         test_sweep_filters,
         test_preview_sequence,
         test_log_tail,
+        test_last_progress_at,
     ):
         run(fn)
     # Through fake_node, whose `blender` is a `#!/bin/sh` wrapper that Windows
@@ -700,6 +743,7 @@ def main():
         test_eevee_retry_on_a_redispatched_chunk,
         test_failed_state_says_why,
         test_full_disk_still_retires_the_spec,
+        test_render_publishes_last_progress,
     ):
         if os.name == "nt":
             print(f"SKIP  {fn.__name__}: the fake blender needs a POSIX shell")
