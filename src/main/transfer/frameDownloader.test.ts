@@ -1,11 +1,12 @@
 import { createHash } from 'crypto'
 import { existsSync } from 'fs'
 import { join } from 'path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SshConnection } from '../ssh/sshConnection'
 import { REMOTE_ROOT } from '../test/fakeSsh'
 import { setup, type FakeMachine, type World } from '../test/harness'
 import type { ChunkDownloader, DrainResult } from './frameDownloader'
+import type { ParsedManifest } from './manifest'
 
 // The final download pass on its own: a real ChunkDownloader against a fake
 // node's manifest, with the manifest read broken in the ways a busy or dying
@@ -151,7 +152,7 @@ describe('ChunkDownloader.drain', () => {
     expect(Date.now()).toBe(started)
   })
 
-  it('returns at once when stopped mid-drain, without waiting out the retries', async () => {
+  it('reads the manifest no more once stopped mid-drain', async () => {
     const r = await rig()
     r.machine.onExec(manifest, () => Promise.reject(new Error('(SSH) Channel open failure')))
     let out: DrainResult | null = null
@@ -161,8 +162,37 @@ describe('ChunkDownloader.drain', () => {
     r.downloader.stop()
     await w.until(() => out !== null, 'drain returns')
 
-    // Only the backoff already under way; no read after the stop.
+    // It waits out the backoff already under way, but reads nothing after the stop.
     expect(r.machine.ran(manifest)).toHaveLength(1)
+  })
+})
+
+describe('a line the parser should have refused', () => {
+  afterEach(() => {
+    vi.doUnmock('./manifest')
+  })
+
+  it('is refused by the download itself, its name made as safe to show as a parser refusal', async () => {
+    // Climbs out of the job folder, and carries a bidi override that makes the
+    // alert read backwards, in a name far too long for an alert.
+    const file = `../\u202e${'x'.repeat(200)}.png`
+    vi.doMock('./manifest', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('./manifest')>()),
+      parseManifest: (): ParsedManifest => ({
+        entries: [{ kind: 'frame', file, size: 10, sha256: 'a'.repeat(64), mtime: 1 }],
+        rejected: []
+      })
+    }))
+    const r = await rig()
+
+    const result = await drain(r)
+
+    expect(result.lost).toHaveLength(1)
+    const refusals = w.alerts('error').filter((m) => m.includes('refused'))
+    expect(refusals).toHaveLength(1)
+    expect(refusals[0]).toContain('"../\\u202exxx')
+    expect(refusals[0]).not.toMatch(/[^\x20-\x7e]/)
+    expect(refusals[0]).not.toContain('x'.repeat(81))
   })
 })
 

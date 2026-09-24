@@ -175,6 +175,18 @@ function printable(v: unknown): string {
 }
 
 /**
+ * A refusal of the node's `file`, made safe to put in an alert. For every
+ * refusal, the parser's and any later check's alike.
+ */
+export function manifestReject(
+  kind: ManifestEntry['kind'],
+  file: unknown,
+  reason: string
+): ManifestReject {
+  return { kind, file: printable(file), reason }
+}
+
+/**
  * The entry rebuilt from its validated fields, or the reason it can't be.
  * Rebuilt rather than cast, so nothing the node adds beyond these fields
  * travels any further.
@@ -253,7 +265,7 @@ export function parseManifest(text: string, chunkId: string): ParsedManifest {
     if (!isObject(e) || !isKind(e.kind)) continue
     const out = validate(e, e.kind, chunkId)
     if (typeof out === 'string') {
-      rejected.push({ kind: e.kind, file: printable(e.file), reason: out })
+      rejected.push(manifestReject(e.kind, e.file, out))
     } else {
       entries.push(out)
     }

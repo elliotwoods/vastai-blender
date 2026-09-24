@@ -15,7 +15,13 @@ import { isInside, resolveInside } from '../paths'
 import { getSettings } from '../settings'
 import { downloadFileVerified } from '../ssh/sftp'
 import type { SshConnection } from '../ssh/sshConnection'
-import { parseFrameName, parseManifest, type ManifestEntry, type ManifestReject } from './manifest'
+import {
+  manifestReject,
+  parseFrameName,
+  parseManifest,
+  type ManifestEntry,
+  type ManifestReject
+} from './manifest'
 
 const POLL_MS = 5_000
 
@@ -135,8 +141,10 @@ export class ChunkDownloader {
    * per view whose views have all landed (settleViewFrames).
    *
    * A downloader stopped mid-drain (its run was cancelled or its node went
-   * away) returns at once, and the result is meaningless: the caller no longer
-   * owns the chunk and must not act on it.
+   * away) starts no further read, but returns only once what it is waiting on
+   * ends: a manifest read in flight (30 s at most) or a retry backoff (20 s at
+   * most). The result is then meaningless: the caller no longer owns the chunk
+   * and must not act on it.
    */
   async drain(budgetMs = DRAIN_BUDGET_MS): Promise<DrainResult> {
     const deadline = Date.now() + budgetMs
@@ -421,9 +429,7 @@ export class ChunkDownloader {
     // the backstop that still holds if those patterns are ever loosened.
     const localPath = resolveInside(jobLocalDir(jobId), entry.file)
     if (!localPath) {
-      this.noteRejected([
-        { kind: entry.kind, file: JSON.stringify(entry.file), reason: 'outside the job folder' }
-      ])
+      this.noteRejected([manifestReject(entry.kind, entry.file, 'outside the job folder')])
       return
     }
     await downloadFileVerified(ssh, remotePath, localPath, entry)
