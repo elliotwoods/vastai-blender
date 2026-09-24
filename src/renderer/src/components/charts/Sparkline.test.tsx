@@ -49,6 +49,17 @@ describe('Sparkline', () => {
     expect(ys(html, 'polyline')).toEqual([[1.5, 18.5]])
   })
 
+  it('is a tab stop once it has readings, so the readout is not pointer-only', () => {
+    expect(
+      render([
+        { x: 0, mean: 50 },
+        { x: 100, mean: 60 }
+      ])
+    ).toMatch(/<svg[^>]*tabindex="0"/)
+    // Nothing to read out yet: not a stop, as with TimeChart.
+    expect(render([])).not.toContain('tabindex')
+  })
+
   it('never draws outside its box, even when handed readings from before the window', () => {
     // The 60-minute metrics ring passed straight to a 30-minute sparkline:
     // the older half must not spill over the next column of the fleet row.

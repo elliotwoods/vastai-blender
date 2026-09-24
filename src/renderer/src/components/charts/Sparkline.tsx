@@ -10,14 +10,16 @@
  * 30-minute sparkline would otherwise run over the next column), and values
  * outside the y range pin to its edge.
  *
- * Hovering (or focusing) reads out the snapped reading through the shared
- * Tooltip, which is portalled so a scrolling fleet list can't clip it.
+ * Hovering reads out the snapped reading through the shared Tooltip, which
+ * is portalled so a scrolling fleet list can't clip it. The keyboard gets
+ * the same, as in TimeChart: a sparkline with readings is a tab stop, focus
+ * shows the latest reading, and the arrows (Home/End) step through the rest.
  */
 
 import { useState } from 'react'
 import { TOKENS } from '../../lib/theme'
 import { Tooltip } from '../Tooltip'
-import { nearestIndex, summarize } from './scale'
+import { nearestIndex, stepHover, summarize } from './scale'
 
 export interface SparkPoint {
   /** epoch ms */
@@ -125,6 +127,13 @@ export function Sparkline({
     )
   }
 
+  const onKey = (e: React.KeyboardEvent<SVGSVGElement>): void => {
+    const next = stepHover(e.key, hover, points.length)
+    if (next === undefined) return
+    e.preventDefault()
+    setHover(next)
+  }
+
   return (
     <Tooltip text={readout}>
       <svg
@@ -134,6 +143,11 @@ export function Sparkline({
         aria-label={summary}
         onMouseMove={onMove}
         onMouseLeave={() => setHover(null)}
+        tabIndex={points.length ? 0 : undefined}
+        onKeyDown={onKey}
+        // A click focuses too, after the mousemove already snapped — keep that.
+        onFocus={() => setHover((h) => h ?? (points.length ? points.length - 1 : null))}
+        onBlur={() => setHover(null)}
         style={{ display: 'block', flex: 'none' }}
       >
         {runs(points).map((run, i) => {
