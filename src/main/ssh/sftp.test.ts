@@ -289,12 +289,12 @@ describe('downloadFileVerified', () => {
     expect(first.error).toBeInstanceOf(sftp.TransferStalledError)
     expect(readFileSync(sftp.partPathFor(localFrame(), a.entry)).length).toBeGreaterThan(0)
 
-    // The re-render's frame, same name and size, different bytes.
+    // The re-render's frame, same name and size, different bytes. Its own
+    // download on the default stall budget: the watchdog counts reads, and
+    // the real disk writes behind them can lag several fake-clock steps.
     wedge.release()
     const b = frameOn(machine, 200_000, 2)
-    const second = watch(
-      sftp.downloadFileVerified(conn, FRAME, localFrame(), b.entry, { stallMs: 5_000 })
-    )
+    const second = watch(sftp.downloadFileVerified(conn, FRAME, localFrame(), b.entry))
     await w.until(() => second.done, 'second download settles')
 
     expect(second.error).toBeUndefined()
@@ -314,9 +314,7 @@ describe('downloadFileVerified', () => {
     expect(kept).toBe(3 * 32_768)
 
     const reads = countReads(machine)
-    const second = watch(
-      sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry, { stallMs: 5_000 })
-    )
+    const second = watch(sftp.downloadFileVerified(conn, FRAME, localFrame(), a.entry))
     await w.until(() => second.done, 'second download settles')
 
     expect(second.value).toBe('downloaded')
