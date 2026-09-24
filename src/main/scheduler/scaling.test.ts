@@ -10,6 +10,7 @@ import {
   offerContribution,
   planScaling,
   subtractRental,
+  withDemand,
   type PlanScalingInput,
   type ScaleInput
 } from './scaling'
@@ -591,5 +592,71 @@ describe('capacity budgets: rent what the offers bring (#227, #237)', () => {
     expect(budgetOpen(subtractRental(after, { dphTotal: 0.5 }, { lanes: 1, sharedSlots: 2 }))).toBe(
       false
     )
+  })
+})
+
+describe('withDemand: each rental is checked against the live fleet (plan 1.5)', () => {
+  type CapSettings = Parameters<typeof capacityBudget>[1]
+  const fourDollars: CapSettings = { maxActiveNodes: 30, spendCapPerHour: 4, noSpendCap: false }
+  const oneLane = { lanes: 1, sharedSlots: 2 }
+
+  /** One step of requestNodes' loop: may an offer at `dph` be rented now? */
+  const mayRent = (
+    fleet: NodeCostFacts[],
+    settings: CapSettings,
+    carried: CapacityBudget,
+    dph: number
+  ): boolean => {
+    const b = withDemand(capacityBudget(fleet, settings), carried)
+    return budgetOpen(b) && fitsBudget(b, dph)
+  }
+
+  it('a rental made elsewhere between two of the batch refuses the second', () => {
+    const fleet: NodeCostFacts[] = []
+    const p = planScaling(
+      plan({
+        cap: capacityBudget(fleet, fourDollars),
+        pendingExclusive: 10,
+        pendingFrames: 1000,
+        remainingExclusiveFrames: 1000
+      })
+    )
+    expect(p.status).toBe('rent')
+    let carried = p.budget
+    // The batch rents $1.50/h. Its row goes in before the create is sent.
+    expect(mayRent(fleet, fourDollars, carried, 1.5)).toBe(true)
+    fleet.push(node(1.5, { state: 'requested', instanceId: null }))
+    carried = subtractRental(carried, { dphTotal: 1.5 }, oneLane)
+    // While that create was out, the user rented $2/h by hand: $3.50 of $4.
+    fleet.push(node(2))
+    // The batch's own copy still has $2.50 left and would rent a $2.50 offer,
+    // taking the fleet to $6/h...
+    expect(fitsBudget(carried, 2.5)).toBe(true)
+    // ...the live fleet leaves $0.50.
+    expect(mayRent(fleet, fourDollars, carried, 2.5)).toBe(false)
+    expect(mayRent(fleet, fourDollars, carried, 0.5)).toBe(true)
+  })
+
+  it('a lower cap or max nodes saved mid-batch holds from the next rental', () => {
+    const fleet = [node(1)]
+    const carried: CapacityBudget = {
+      ...capacityBudget(fleet, fourDollars),
+      exclusiveLanes: 5,
+      sharedSlots: 0
+    }
+    expect(mayRent(fleet, fourDollars, carried, 2)).toBe(true)
+    expect(mayRent(fleet, { ...fourDollars, spendCapPerHour: 2 }, carried, 2)).toBe(false)
+    expect(mayRent(fleet, { ...fourDollars, maxActiveNodes: 1 }, carried, 0.1)).toBe(false)
+  })
+
+  it('takes only the demand from what the batch carries', () => {
+    const live = capacityBudget([node(1)], fourDollars)
+    const stale: CapacityBudget = { ...capacityBudget([], fourDollars), exclusiveLanes: 3 }
+    expect(withDemand(live, stale)).toEqual({ ...live, exclusiveLanes: 3, sharedSlots: null })
+    // Covered demand stops the batch; a manual request (no demand) does not.
+    expect(budgetOpen(withDemand(live, { ...stale, exclusiveLanes: 0, sharedSlots: 0 }))).toBe(
+      false
+    )
+    expect(budgetOpen(withDemand(live, live))).toBe(true)
   })
 })

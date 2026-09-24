@@ -23,8 +23,9 @@
  *   counts rented whatever ranked best, 8-GPU boxes included, for 1-lane
  *   demand (#227, #237).
  * - The spend cap is a budget, not a yes/no: the headroom goes to the offer
- *   search as maxDphTotal, and every rental spends from it. capHeadroom()
- *   and nodeState.capacityBudget() read the cap and round it the same way.
+ *   search as maxDphTotal, and each offer must fit what the live fleet
+ *   leaves of it before it is rented (withDemand). capHeadroom() and
+ *   nodeState.capacityBudget() read the cap and round it the same way.
  * - It knows the tail. A new node takes ~10 min to boot and provision
  *   before its first frame. In job da68b61b every frame had landed except a
  *   1-frame requeue sub-chunk, sitting on a live node, and buy-ahead rented
@@ -161,8 +162,13 @@ export interface ScalingPlan {
   /**
    * The caps it was given, with the demand this batch has to cover filled in
    * (exclusiveLanes, sharedSlots; 0 unless status is 'rent'). requestNodes
-   * searches with maxDphTotal = headroomPerHour, rents while budgetOpen(),
-   * checks each offer with nodeState.fitsBudget and spends the budget down
+   * searches with maxDphTotal = min(filter, headroomPerHour). The caps here
+   * are a snapshot, for that search and for scale status only: the batch
+   * carries just the demand across its rentals. Before each rental it
+   * rebuilds the caps from the live nodes and settings, and rents only if
+   * budgetOpen and nodeState.fitsBudget hold on
+   * withDemand(nodeState.capacityBudget(live nodes, getSettings()), carried).
+   * After each rental it takes what the offer brings off the carried demand
    * with subtractRental.
    */
   budget: CapacityBudget
@@ -452,6 +458,9 @@ const microDown = (v: number): number => Math.max(0, Math.floor(v * 1e6 + 1e-6) 
  * or shared work, not both at once, so it covers exclusive lanes first and
  * shared slots only once no exclusive demand is left, the way nodesToRequest
  * added the two. Demand that is null (a manual request) stays null.
+ *
+ * The room and money it spends are a projection. A batch that has awaited a
+ * rental must not rent on them: see withDemand.
  */
 export function subtractRental(
   budget: CapacityBudget,
@@ -476,6 +485,30 @@ export function subtractRental(
     next.sharedSlots = Math.max(0, budget.sharedSlots - c.sharedSlots)
   }
   return next
+}
+
+/**
+ * The budget one rental of a batch is checked against: the caps from the
+ * live fleet, the demand from what the batch carries.
+ *
+ * A batch must not carry its caps across the awaits of its rentals. Each
+ * create awaits Vast, and meanwhile a manual fleet:requestNode can rent (the
+ * scheduler's requestingNode flag serialises only scale-up batches), the
+ * user can save a lower cap or maxActiveNodes, and another path can rent or
+ * destroy. Under a $4/h cap: the batch rents $1.50 and its copy has $2.50
+ * left; the user rents $2 by hand, which the live check allows ($3.50 of
+ * $4); the batch's copy would then let a $2.50 offer through, and the fleet
+ * would run at $6/h. So the node count, room, rate, cap and headroom come
+ * from `live` (nodeState.capacityBudget over the nodes and settings as they
+ * are now, a rented row included from before its create), and only
+ * exclusiveLanes and sharedSlots come from `carried`.
+ */
+export function withDemand(live: CapacityBudget, carried: CapacityBudget): CapacityBudget {
+  return {
+    ...live,
+    exclusiveLanes: carried.exclusiveLanes ?? null,
+    sharedSlots: carried.sharedSlots ?? null
+  }
 }
 
 /**
