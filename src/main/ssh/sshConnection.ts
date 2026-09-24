@@ -6,9 +6,10 @@
  * instance, stored by the caller).
  */
 
-import { Client, type ConnectConfig, type SFTPWrapper } from 'ssh2'
+import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from 'ssh2'
 import { createHash } from 'crypto'
 import { EventEmitter } from 'events'
+import { posix } from 'path'
 
 export interface SshTarget {
   host: string
@@ -25,6 +26,23 @@ export interface ExecResult {
   stderr: string
 }
 
+export interface ExecOptions {
+  /**
+   * A deadline for the whole call: connecting, opening the channel (on a
+   * wedged connection the open itself can go unanswered for good) and
+   * running the command. When it passes, the channel is closed and the call
+   * fails with ExecTimeoutError — for execStream, `done` rejects with it.
+   */
+  timeoutMs?: number
+  /**
+   * What errors call the command. They never quote the command line, which
+   * can carry credentials: Octane's sign-in did, and a timed-out server start
+   * put them in the dispatch-failed alert. Without a label, an error names
+   * only the program the command runs (see describeCommand).
+   */
+  label?: string
+}
+
 export class HostKeyMismatchError extends Error {
   constructor(
     public readonly actual: string,
@@ -34,8 +52,30 @@ export class HostKeyMismatchError extends Error {
   }
 }
 
+/** An exec or execStream still running (or still opening) at its deadline. */
+export class ExecTimeoutError extends Error {
+  constructor(
+    kind: 'exec' | 'execStream',
+    readonly label: string,
+    readonly timeoutMs: number
+  ) {
+    super(`${kind} timeout after ${timeoutMs}ms: ${label}`)
+  }
+}
+
 function hashKey(key: Buffer): string {
   return createHash('sha256').update(key).digest('base64')
+}
+
+/**
+ * How an error may name a command: its label, or else the program it runs
+ * (`cat`, `bash`, `blender`) when it starts with a plain word or path.
+ * Anything else — an environment assignment, a quoted word — is "command".
+ */
+export function describeCommand(command: string, label?: string): string {
+  if (label) return label
+  const first = command.trimStart().split(/\s+/, 1)[0] ?? ''
+  return /^[\w./-]+$/.test(first) ? posix.basename(first) : 'command'
 }
 
 /**
@@ -160,12 +200,20 @@ export class SshConnection extends EventEmitter {
   private execChannel(
     c: Client,
     command: string,
-    cb: (err: Error | undefined, stream: import('ssh2').ClientChannel) => void,
+    cb: (err: Error | undefined, stream: ClientChannel) => void,
+    /** The caller has given up (its deadline passed): stop retrying. */
+    abandoned: () => boolean,
     attempt = 0
   ): void {
     c.exec(command, (err, stream) => {
-      if (err && /channel open failure/i.test(err.message) && attempt < 4) {
-        setTimeout(() => this.execChannel(c, command, cb, attempt + 1), 1500 * (attempt + 1))
+      if (err && /channel open failure/i.test(err.message) && attempt < 4 && !abandoned()) {
+        setTimeout(
+          () =>
+            abandoned()
+              ? cb(err, stream)
+              : this.execChannel(c, command, cb, abandoned, attempt + 1),
+          1500 * (attempt + 1)
+        )
         return
       }
       cb(err ?? undefined, stream)
@@ -173,71 +221,137 @@ export class SshConnection extends EventEmitter {
   }
 
   /** Run a command to completion, capturing output. */
-  async exec(command: string, opts: { timeoutMs?: number } = {}): Promise<ExecResult> {
-    const c = await this.acquire()
+  async exec(command: string, opts: ExecOptions = {}): Promise<ExecResult> {
+    const label = describeCommand(command, opts.label)
     return new Promise<ExecResult>((resolve, reject) => {
-      this.execChannel(c, command, (err, stream) => {
-        if (err) return reject(err)
-        let stdout = ''
-        let stderr = ''
-        let settled = false
-        const timer = opts.timeoutMs
-          ? setTimeout(() => {
-              if (!settled) {
-                settled = true
-                stream.close()
-                reject(new Error(`exec timeout after ${opts.timeoutMs}ms: ${command.slice(0, 80)}`))
-              }
-            }, opts.timeoutMs)
-          : null
-        stream.on('data', (d: Buffer) => {
-          stdout += d.toString()
-        })
-        stream.stderr.on('data', (d: Buffer) => {
-          stderr += d.toString()
-        })
-        stream.on('close', (code: number | null) => {
-          if (timer) clearTimeout(timer)
-          if (!settled) {
-            settled = true
-            resolve({ code, stdout, stderr })
-          }
-        })
-      })
+      let settled = false
+      let timer: NodeJS.Timeout | null = null
+      let stream: ClientChannel | null = null
+      const settle = (finish: () => void): void => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        finish()
+      }
+      if (opts.timeoutMs) {
+        const ms = opts.timeoutMs
+        // From the call, not from the channel opening: an open that is never
+        // answered used to leave this waiting with no deadline at all.
+        timer = setTimeout(
+          () =>
+            settle(() => {
+              stream?.close()
+              reject(new ExecTimeoutError('exec', label, ms))
+            }),
+          ms
+        )
+      }
+      this.acquire().then(
+        (c) => {
+          if (settled) return
+          this.execChannel(
+            c,
+            command,
+            (err, s) => {
+              if (err) return settle(() => reject(err))
+              // Opened after the deadline: nobody is waiting for it.
+              if (settled) return s.close()
+              stream = s
+              let stdout = ''
+              let stderr = ''
+              s.on('data', (d: Buffer) => {
+                stdout += d.toString()
+              })
+              s.stderr.on('data', (d: Buffer) => {
+                stderr += d.toString()
+              })
+              s.on('close', (code: number | null) =>
+                settle(() => resolve({ code, stdout, stderr }))
+              )
+            },
+            () => settled
+          )
+        },
+        (e: Error) => settle(() => reject(e))
+      )
     })
   }
 
   /**
    * Run a long-lived command, invoking `onLine` per stdout line. Returns a
-   * stop() function; the promise resolves with the exit code when the stream
-   * ends (or stop() is called).
+   * stop() function; `done` resolves with the exit code when the stream ends
+   * (or stop() is called).
+   *
+   * With `timeoutMs`, a command still running at the deadline is closed and
+   * `done` rejects with ExecTimeoutError (the call itself rejects if the
+   * channel never opened). Provisioning had no deadline at all: a stalled
+   * download on the node left it 'provisioning', and billing, for good.
    */
   async execStream(
     command: string,
-    onLine: (line: string) => void
+    onLine: (line: string) => void,
+    opts: ExecOptions = {}
   ): Promise<{ stop: () => void; done: Promise<number | null> }> {
-    const c = await this.acquire()
+    const label = describeCommand(command, opts.label)
     return new Promise((resolve, reject) => {
-      this.execChannel(c, command, (err, stream) => {
-        if (err) return reject(err)
-        let buf = ''
-        stream.on('data', (d: Buffer) => {
-          buf += d.toString()
-          for (;;) {
-            const i = buf.indexOf('\n')
-            if (i < 0) break
-            onLine(buf.slice(0, i).replace(/\r$/, ''))
-            buf = buf.slice(i + 1)
-          }
-        })
-        const done = new Promise<number | null>((res) => {
-          stream.on('close', (code: number | null) => {
-            if (buf) onLine(buf)
-            res(code)
-          })
-        })
-        resolve({ stop: () => stream.close(), done })
-      })
+      let expired = false
+      let timer: NodeJS.Timeout | null = null
+      /** Set once the channel is open: fails `done` at the deadline. */
+      let expire: ((e: Error) => void) | null = null
+      if (opts.timeoutMs) {
+        const ms = opts.timeoutMs
+        timer = setTimeout(() => {
+          expired = true
+          const err = new ExecTimeoutError('execStream', label, ms)
+          if (expire) expire(err)
+          else reject(err)
+        }, ms)
+      }
+      const fail = (e: Error): void => {
+        if (timer) clearTimeout(timer)
+        reject(e)
+      }
+      this.acquire().then((c) => {
+        if (expired) return
+        this.execChannel(
+          c,
+          command,
+          (err, stream) => {
+            if (expired) {
+              if (!err) stream.close()
+              return
+            }
+            if (err) return fail(err)
+            let buf = ''
+            stream.on('data', (d: Buffer) => {
+              buf += d.toString()
+              for (;;) {
+                const i = buf.indexOf('\n')
+                if (i < 0) break
+                onLine(buf.slice(0, i).replace(/\r$/, ''))
+                buf = buf.slice(i + 1)
+              }
+            })
+            const done = new Promise<number | null>((res, rej) => {
+              expire = (e) => {
+                rej(e)
+                stream.close()
+              }
+              stream.on('close', (code: number | null) => {
+                if (timer) clearTimeout(timer)
+                if (buf) onLine(buf)
+                res(code)
+              })
+            })
+            // A caller that never awaits `done` (the log tail) must not turn
+            // a deadline into an unhandled rejection; one that does still
+            // sees it.
+            done.catch(() => {})
+            resolve({ stop: () => stream.close(), done })
+          },
+          () => expired
+        )
+      }, fail)
     })
   }
 
