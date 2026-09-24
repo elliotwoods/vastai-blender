@@ -85,11 +85,34 @@ cmd_install_blender() {
   fi
   local major_minor
   major_minor="$(echo "$version" | cut -d. -f1-2)"
-  local url="https://download.blender.org/release/Blender${major_minor}/blender-${version}-linux-x64.tar.xz"
-  log "downloading $url"
+  local file="blender-${version}-linux-x64.tar.xz"
+  local rel="release/Blender${major_minor}/$file"
+  # download.blender.org answers some hosts with 4xx (seen: "exit 22" on a Vast
+  # node), and curl --retry doesn't retry those, so fall back through mirrors.
+  local urls=(
+    "https://download.blender.org/$rel"
+    "https://mirrors.ocf.berkeley.edu/blender/$rel"
+    "https://ftp.halifax.rwth-aachen.de/blender/$rel"
+    "https://mirror.clarkson.edu/blender/$rel"
+  )
   mkdir -p "$BLENDER_ROOT"
   local tmp="$BLENDER_ROOT/.dl-$version.tar.xz"
-  curl -fsSL --retry 3 -o "$tmp" "$url"
+  local ok=0 url attempt
+  for attempt in 1 2; do
+    for url in "${urls[@]}"; do
+      log "downloading $url (attempt $attempt)"
+      rm -f "$tmp"
+      # stall guard: abort if <100 kB/s for 60 s; retry transient failures on the same URL
+      if curl -fsSL --connect-timeout 20 --speed-limit 100000 --speed-time 60 \
+           --retry 2 --retry-delay 3 --retry-all-errors -o "$tmp" "$url" \
+         && xz -t "$tmp" 2>/dev/null; then
+        ok=1; break 2
+      fi
+      log "download failed or archive corrupt from $url"
+    done
+    sleep 5
+  done
+  [ "$ok" = 1 ] || { log "all Blender mirrors failed for $version"; exit 22; }
   log "extracting…"
   local extract_dir="$BLENDER_ROOT/.extract-$version"
   rm -rf "$extract_dir"
