@@ -106,6 +106,28 @@ describe('nodeManager lifecycle', () => {
     expect(w.vast.live()).toEqual([w.vast.created[0]])
   })
 
+  it('a create whose reply is lost has still rented the instance (finding #151)', async () => {
+    const app = await w.boot()
+    w.vast.addOffer()
+    // Vast creates the instance, then the connection drops before the reply.
+    w.vast.loseReply('createInstance', new Error('read ECONNRESET'))
+
+    await expect(app.nodeManager.requestNodes(1)).rejects.toThrow('ECONNRESET')
+
+    // The instance is billing under this node's label, which is all the app
+    // has to find it by: it never learned the instance id. This pins today's
+    // behaviour — the node is written off and the instance left running until
+    // the next start's orphan sweep — so plan 1.4 flips these expectations;
+    // the scenario is the part to keep.
+    const [row] = w.all<{ id: string; state: string; instance_id: number | null }>(
+      'SELECT id, state, instance_id FROM nodes'
+    )
+    expect(row).toMatchObject({ state: 'failed', instance_id: null })
+    const live = w.vast.live()
+    expect(live).toHaveLength(1)
+    expect(w.vast.instance(live[0])?.label).toBe(`vastai-blender ${row.id.slice(0, 8)}`)
+  })
+
   it('onReady receives the same connection the node keeps', async () => {
     const app = await w.boot()
     let seen: SshConnection | null = null

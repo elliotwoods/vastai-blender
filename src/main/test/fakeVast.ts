@@ -8,9 +8,19 @@
  * Every call is recorded (`calls`, `count`) before any scripted behaviour
  * runs, so a call that was made to fail still shows up. Script with:
  *   vast.fail('destroyInstance', { status: 500, message: 'boom' })  // next call throws
+ *   vast.loseReply('createInstance', new Error('ECONNRESET'))        // next call happens, then throws
  *   vast.delay('createInstance', 30_000)                             // next call takes 30s (fake clock)
  *   const gate = vast.hold('createInstance')                          // next call waits for the test
- *   await h.until(() => gate.reached); ...; gate.release()
+ *   await w.until(() => gate.reached, 'create in flight'); ...; gate.release()
+ *                                             // or gate.fail(e) / gate.loseReply(e)
+ *
+ * fail = the request never reached Vast: nothing was created or destroyed.
+ * loseReply = Vast did it, the app never heard: the instance was created (or
+ * destroyed) and THEN the call threw, as when the connection drops after the
+ * request went out. Only a lost reply can leave an instance billing that the
+ * app does not know it has, so a test of that leak (or of a destroy the app
+ * wrongly believes failed) must use loseReply — with fail, there is nothing
+ * to leak and the test passes whatever the app does.
  */
 
 import type { CreateInstanceOptions } from '../vast/vastClient'
@@ -43,36 +53,52 @@ export interface Gate {
   readonly reached: boolean
   /** let the call proceed to its normal result */
   release(): void
-  /** make the call throw instead */
+  /** make the call throw instead, without taking effect (it never reached Vast) */
   fail(error: VastFailure): void
+  /** let the call take effect on Vast, then throw (the reply was lost) */
+  loseReply(error: VastFailure): void
 }
 
-interface Behaviour {
-  delayMs?: number
+/** How a call ends, if not normally. */
+interface Outcome {
+  /** thrown before the call takes effect: the request never reached Vast */
   error?: VastFailure
+  /** thrown after the call took effect: Vast did it, the reply was lost */
+  errorAfter?: VastFailure
+}
+
+interface Behaviour extends Outcome {
+  delayMs?: number
   gate?: GateImpl
 }
 
 class GateImpl implements Gate {
   reached = false
-  private settle: ((error: VastFailure | null) => void) | null = null
-  private early: { error: VastFailure | null } | null = null
+  private settle: ((outcome: Outcome) => void) | null = null
+  private early: Outcome | null = null
 
-  /** @internal resolves null to proceed, or with the failure to throw */
-  wait(): Promise<VastFailure | null> {
+  /** @internal resolves with how the held call is to end ({} = normally) */
+  wait(): Promise<Outcome> {
     this.reached = true
-    if (this.early) return Promise.resolve(this.early.error)
+    if (this.early) return Promise.resolve(this.early)
     return new Promise((r) => (this.settle = r))
   }
 
+  private end(outcome: Outcome): void {
+    if (this.settle) this.settle(outcome)
+    else this.early = outcome
+  }
+
   release(): void {
-    if (this.settle) this.settle(null)
-    else this.early = { error: null }
+    this.end({})
   }
 
   fail(error: VastFailure): void {
-    if (this.settle) this.settle(error)
-    else this.early = { error }
+    this.end({ error })
+  }
+
+  loseReply(error: VastFailure): void {
+    this.end({ errorAfter: error })
   }
 }
 
@@ -98,6 +124,8 @@ export class FakeVast {
   bootMs = 0
 
   private instances = new Map<number, InstanceRecord>()
+  /** Every instance ever created, as created: kept after it is destroyed. */
+  private history = new Map<number, RawInstance>()
   private scripts = new Map<VastMethod, Behaviour[]>()
   private nextOfferId = 5001
   private nextMachineId = 301
@@ -161,6 +189,15 @@ export class FakeVast {
     return m
   }
 
+  /**
+   * An instance as it was created — its label, machine, price — whether or
+   * not it is still live (see live()). Undefined if it never existed.
+   */
+  instance(id: number): RawInstance | undefined {
+    const raw = this.history.get(id)
+    return raw && { ...raw }
+  }
+
   /** Ids of instances that exist right now, i.e. are still billing. */
   live(): number[] {
     return [...this.instances.keys()]
@@ -183,9 +220,18 @@ export class FakeVast {
     return this
   }
 
-  /** The next `times` calls of `method` throw. */
+  /** The next `times` calls of `method` throw without taking effect. */
   fail(method: VastMethod, error: VastFailure, times = 1): this {
     return this.script(method, { error }, times)
+  }
+
+  /**
+   * The next `times` calls of `method` take effect on Vast and then throw.
+   * Only a create or destroy has an effect to lose; for a read it is the
+   * same as fail().
+   */
+  loseReply(method: VastMethod, error: VastFailure, times = 1): this {
+    return this.script(method, { errorAfter: error }, times)
   }
 
   /** The next `times` calls of `method` take `ms` of fake time. */
@@ -282,6 +328,7 @@ export class FakeVast {
     const machine = this.network.addMachine(`instance-${id}`, [direct, proxy])
     machine.numGpus = raw.num_gpus ?? 1
     this.instances.set(id, { raw, createdAt: Date.now(), bootMs, machine })
+    this.history.set(id, { ...raw })
     this.created.push(id)
   }
 
@@ -312,11 +359,16 @@ export class FakeVast {
     this.calls.push({ method, args, at: Date.now() })
     const b = this.scripts.get(method)?.shift()
     if (b?.delayMs) await new Promise((r) => setTimeout(r, b.delayMs))
-    const gated = b?.gate ? await b.gate.wait() : null
-    const failure = b?.error ?? gated
-    if (failure) {
-      throw failure instanceof Error ? failure : this.vastError(failure.message, failure.status)
-    }
-    return impl()
+    const gated = b?.gate ? await b.gate.wait() : {}
+    const before = b?.error ?? gated.error
+    if (before) throw this.toError(before)
+    const result = impl()
+    const after = b?.errorAfter ?? gated.errorAfter
+    if (after) throw this.toError(after)
+    return result
+  }
+
+  private toError(failure: VastFailure): Error {
+    return failure instanceof Error ? failure : this.vastError(failure.message, failure.status)
   }
 }

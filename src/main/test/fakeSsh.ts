@@ -13,6 +13,13 @@
  * lands on the next `await` whatever the fake clock is doing. The one real
  * asynchrony left is the local disk: SFTP uploads read, and downloads write,
  * real files under the harness's temp directory.
+ *
+ * When a connection closes — the app's close(), or the instance destroyed —
+ * every command still running on it ends the way ssh2 ends a channel whose
+ * connection went: an exec resolves with exit code null and whatever output
+ * had arrived (none, here), and an execStream's `done` resolves null. The real
+ * client notices a destroyed box only when keepalive gives up (~30 s); the
+ * fake notices at once.
  */
 
 import { createHash } from 'crypto'
@@ -28,7 +35,10 @@ import type { ExecResult, SshTarget } from '../ssh/sshConnection'
  */
 export const REMOTE_ROOT = '/root/vastai'
 
-/** Reply that never arrives — a wedged channel. Only an exec timeout ends it. */
+/**
+ * Reply that never arrives — a wedged channel. Only an exec timeout, or the
+ * connection closing under it, ends it.
+ */
 export const HANG: unique symbol = Symbol('hang')
 
 /** Plain string = stdout with exit code 0. */
@@ -52,6 +62,12 @@ interface Rule {
 export interface Endpoint {
   host: string
   port: number
+}
+
+/** A command in flight on a connection: an exec or an execStream. */
+interface OpenChannel {
+  /** The connection went under it: end it as ssh2 does, with exit code null. */
+  drop(): void
 }
 
 /** The job spec the scheduler writes into the agent's inbox (the fields tests read). */
@@ -181,7 +197,7 @@ export class FakeMachine {
   onSpec: ((spec: AgentSpec) => void) | null = null
 
   private rules: Rule[] = []
-  private openStreams = new Set<FakeStream>()
+  private openChannels = new Set<OpenChannel>()
 
   constructor(
     readonly name: string,
@@ -223,20 +239,20 @@ export class FakeMachine {
     return ok()
   }
 
-  /** @internal a stream the machine must end when it dies */
-  track(stream: FakeStream): void {
-    this.openStreams.add(stream)
+  /** @internal a command the machine must end when it dies */
+  track(channel: OpenChannel): void {
+    this.openChannels.add(channel)
   }
 
   /** @internal */
-  untrack(stream: FakeStream): void {
-    this.openStreams.delete(stream)
+  untrack(channel: OpenChannel): void {
+    this.openChannels.delete(channel)
   }
 
-  /** The instance is gone: refuse new connections, cut the open streams. */
+  /** The instance is gone: refuse new connections, end every command running on it. */
   kill(): void {
     this.alive = false
-    for (const s of [...this.openStreams]) s.end(null)
+    for (const c of [...this.openChannels]) c.drop()
   }
 
   /** `nvidia-smi` + loadavg + meminfo + /proc/stat, in pollMetrics' layout. */
@@ -387,12 +403,25 @@ export class FakeAgent {
 export class FakeNetwork {
   readonly machines: FakeMachine[] = []
   readonly connections: FakeSshConnection[] = []
+  private mismatches = new WeakSet<object>()
 
   constructor(
     /** Builds the real HostKeyMismatchError, so `instanceof` in the app holds. */
-    readonly hostKeyMismatch: (actual: string, pinned: string) => Error = () =>
+    private readonly makeHostKeyMismatch: (actual: string, pinned: string) => Error = () =>
       new Error('SSH host key mismatch — possible machine change or MITM')
   ) {}
+
+  /** @internal the error a connect fails with when the machine's key isn't the pinned one */
+  hostKeyMismatch(actual: string, pinned: string): Error {
+    const e = this.makeHostKeyMismatch(actual, pinned)
+    this.mismatches.add(e)
+    return e
+  }
+
+  /** The fake's `instanceof HostKeyMismatchError`: was `e` raised by hostKeyMismatch()? */
+  isHostKeyMismatch(e: unknown): boolean {
+    return typeof e === 'object' && e !== null && this.mismatches.has(e)
+  }
 
   addMachine(name: string, endpoints: Endpoint[]): FakeMachine {
     const m = new FakeMachine(name, endpoints)
@@ -412,7 +441,7 @@ export class FakeNetwork {
 }
 
 /** An execStream in flight. */
-class FakeStream {
+class FakeStream implements OpenChannel {
   private finished = false
   private resolveDone!: (code: number | null) => void
   readonly done = new Promise<number | null>((r) => (this.resolveDone = r))
@@ -434,6 +463,10 @@ class FakeStream {
     this.finished = true
     this.machine.untrack(this)
     this.resolveDone(code)
+  }
+
+  drop(): void {
+    this.end(null)
   }
 }
 
@@ -542,7 +575,7 @@ export class FakeSshConnection extends EventEmitter {
   private closed = false
   private sftpCache: FakeSftp | null = null
   private seenHostKey: string | null = null
-  private streams = new Set<FakeStream>()
+  private channels = new Set<OpenChannel>()
 
   constructor(
     private target: SshTarget,
@@ -605,6 +638,9 @@ export class FakeSshConnection extends EventEmitter {
         await this.acquire()
         return
       } catch (e) {
+        // A different box behind the endpoint won't turn into the pinned one
+        // by waiting: the real one gives up at once, and so does this.
+        if (this.network.isHostKeyMismatch(e)) throw e
         if (Date.now() - start + delay > budgetMs) {
           throw new Error(`reconnect budget exhausted: ${(e as Error).message}`)
         }
@@ -619,27 +655,33 @@ export class FakeSshConnection extends EventEmitter {
     const reply = m.run(command)
     return new Promise<ExecResult>((resolve, reject) => {
       let settled = false
-      // The same message the real exec times out with.
-      const timer = opts.timeoutMs
-        ? setTimeout(() => {
-            if (settled) return
-            settled = true
-            reject(new Error(`exec timeout after ${opts.timeoutMs}ms: ${command.slice(0, 80)}`))
-          }, opts.timeoutMs)
-        : null
+      let timer: ReturnType<typeof setTimeout> | null = null
+      const channel: OpenChannel = {
+        drop: () => settle(() => resolve({ code: null, stdout: '', stderr: '' }))
+      }
+      const settle = (finish: () => void): void => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        m.untrack(channel)
+        this.channels.delete(channel)
+        finish()
+      }
+      m.track(channel)
+      this.channels.add(channel)
+      if (opts.timeoutMs) {
+        // The same message the real exec times out with.
+        const message = `exec timeout after ${opts.timeoutMs}ms: ${command.slice(0, 80)}`
+        timer = setTimeout(() => settle(() => reject(new Error(message))), opts.timeoutMs)
+      }
       reply.then(
         (r) => {
-          if (r === HANG || settled) return
-          settled = true
-          if (timer) clearTimeout(timer)
-          resolve(typeof r === 'string' ? ok(r) : { code: 0, stdout: '', stderr: '', ...r })
+          if (r === HANG) return
+          settle(() =>
+            resolve(typeof r === 'string' ? ok(r) : { code: 0, stdout: '', stderr: '', ...r })
+          )
         },
-        (e: Error) => {
-          if (settled) return
-          settled = true
-          if (timer) clearTimeout(timer)
-          reject(e)
-        }
+        (e: Error) => settle(() => reject(e))
       )
     })
   }
@@ -650,8 +692,8 @@ export class FakeSshConnection extends EventEmitter {
   ): Promise<{ stop: () => void; done: Promise<number | null> }> {
     const m = await this.acquire()
     const stream = new FakeStream(m, onLine)
-    this.streams.add(stream)
-    void stream.done.then(() => this.streams.delete(stream))
+    this.channels.add(stream)
+    void stream.done.then(() => this.channels.delete(stream))
     m.run(command).then(
       (r) => {
         if (r === HANG) return // held open until stop()
@@ -678,11 +720,11 @@ export class FakeSshConnection extends EventEmitter {
     throw new Error('harness: forwardOut (the VNC tunnel) is not faked')
   }
 
-  /** Like ending the real client: its open streams end too. */
+  /** Like ending the real client: every command still running on it ends (see the header). */
   close(): void {
     this.closed = true
     this.sftpCache = null
     this.machine = null
-    for (const s of [...this.streams]) s.end(null)
+    for (const c of [...this.channels]) c.drop()
   }
 }

@@ -37,9 +37,11 @@
  *   clock until a condition holds) or `w.advance(ms)`. A step also yields to
  *   the real event loop, because downloads write real files under `w.dir`.
  * - Script failures on the fakes BEFORE the call you want to fail happens:
- *   `w.vast.fail('destroyInstance', { status: 500, message: 'boom' })`,
- *   `w.machineFor(id).onExec(/^cat .*state/, HANG)`, `w.vast.hold(...)` to
- *   stop a call mid-flight. See fakeVast.ts and fakeSsh.ts for the full menu.
+ *   `w.vast.fail('destroyInstance', { status: 500, message: 'boom' })` (it
+ *   never reached Vast), `w.vast.loseReply('createInstance', err)` (Vast did
+ *   it; the app never heard), `w.machineFor(id).onExec(/^cat .*state/, HANG)`,
+ *   `w.vast.hold(...)` to stop a call mid-flight. See fakeVast.ts and
+ *   fakeSsh.ts for the full menu.
  * - Every bus event lands in `w.events` in emit order; `w.eventsOf(channel)`
  *   and `w.alerts()` filter it. `w.openWindow()` adds a renderer window that
  *   records what ipc.ts forwards to it, and `w.invoke(channel, ...args)` calls
@@ -50,12 +52,17 @@
  *                       clipboard are recorded, never real
  *   ../db/db            getDb() → an in-memory node:sqlite DB built by db.ts's
  *                       own applySchema (better-sqlite3 is built for Electron's ABI)
- *   ../settings         w.settings / w.secrets, live: mutate them mid-test
+ *   ../settings         w.settings / w.secrets: mutate them mid-test. getSettings()
+ *                       returns a copy and updateSettings merges, as settings.ts does
  *   ../vast/vastClient  w.vast (the real VastError and sshEndpoints are kept)
  *   ../ssh/sshConnection  FakeSshConnection on w.network (the real HostKeyMismatchError is kept)
  *   ../ssh/keys         no keypair generation, no key registration
  *   ../media/ffmpeg     "not installed", so job-clip stitching is a no-op
  *   global fetch        throws: any unmocked network call fails loudly
+ *
+ * The mocks belong to the test that set them up. Work that outlives its test
+ * (an un-awaited promise still running after dispose) throws "stale call from
+ * a finished test" rather than reaching the next test's database and fakes.
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
@@ -64,7 +71,13 @@ import { join } from 'path'
 import { fileURLToPath } from 'url'
 import { vi } from 'vitest'
 import type { EventChannel, InvokeChannel, IpcEventMap, IpcInvokeMap } from '../../shared/ipc'
-import type { AlertEvent, JobSubmission, SecretKey, SettingsPublic } from '../../shared/models'
+import type {
+  AlertEvent,
+  JobSubmission,
+  OfferFilters,
+  SecretKey,
+  SettingsPublic
+} from '../../shared/models'
 import type { Db } from '../db/db'
 import type { BusEvent } from '../events'
 import type { RawOffer } from '../vast/types'
@@ -85,46 +98,23 @@ export const HARNESS_BLENDER = '4.2.3'
 /** The repo root, which provisioner's localRemoteDir() finds remote/ under. */
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url))
 
-/**
- * Production defaults (settings.ts `defaults()`), except where a test needs
- * otherwise: a Vast key is present, the project root is the world's temp dir,
- * and the Blender version is pinned. Typed as the full SettingsPublic so a new
- * setting that is not given a default here fails the typecheck.
- */
-function defaultSettings(dir: string): SettingsPublic {
-  return {
-    hasVastApiKey: true,
-    hasOtoyCredentials: false,
-    projectRoot: join(dir, 'project'),
-    maxActiveNodes: 2,
-    spendCapPerHour: 2,
-    idleTimeoutMinutes: 5,
-    proxyCodec: 'hevc',
-    blenderVersionOverride: HARNESS_BLENDER,
-    offerFilters: {
-      gpuNames: [],
-      maxDphTotal: null,
-      minGpuRamGb: 10,
-      minInetDownMbps: 100,
-      minReliability: 0.95,
-      minDiskGb: 40
-    },
-    sshKeyPath: '',
-    concurrentTransfersPerNode: 3,
-    thumbnails: true,
-    livePreview: 'onDemand',
-    livePreviewWidth: 960,
-    maxNodeSlots: 0,
-    slotsPerGpu: 1,
-    eagerFleet: false,
-    co2OverheadFactor: 1.6
-  }
+/** What getSettings() hands out: a copy, down to offerFilters, as settings.ts's is. */
+function copySettings(s: SettingsPublic): SettingsPublic {
+  return { ...s, offerFilters: { ...s.offerFilters } }
 }
 
 export interface SetupOptions {
-  /** Merged over the defaults above. */
-  settings?: Partial<SettingsPublic>
-  /** Defaults to a Vast key only. */
+  /**
+   * Merged over production's defaults, read from the real settings.ts, less
+   * two things a test needs: the project root is under the world's temp dir
+   * and the Blender version is pinned. offerFilters merges too, so
+   * `{ offerFilters: { maxDphTotal: 1 } }` keeps the other filters.
+   * hasVastApiKey / hasOtoyCredentials follow `secrets`, as in settings.ts.
+   */
+  settings?: Partial<Omit<SettingsPublic, 'offerFilters'>> & {
+    offerFilters?: Partial<OfferFilters>
+  }
+  /** Defaults to a Vast key only; `{ vastApiKey: undefined }` for none. */
   secrets?: Partial<Record<SecretKey, string>>
   /** Fake-clock start, epoch ms. */
   now?: number
@@ -164,16 +154,38 @@ export interface DesktopCall {
 
 type IpcHandler = (event: unknown, ...args: unknown[]) => unknown
 
-/** The world the current test runs in. The mocks read it at call time. */
+/** The world of the test running now, so setup() can clean up after one that threw. */
 let current: World | null = null
 
-function world(): World {
-  if (!current) {
-    throw new Error(
-      'harness: no world — call setup() in beforeEach, and dispose() only in afterEach'
-    )
+/**
+ * What one setup()'s mocks find their world through. The mocks outlive their
+ * test — an app module keeps the mock instances it imported — so each set
+ * closes over its own scope, never over "whichever test is running now".
+ * Leftover work from a finished test then fails loudly instead of quietly
+ * writing into the next test's database and fakes.
+ */
+class Scope {
+  world: World | null = null
+  /** Set by dispose() once in-flight work has had its chance to settle. */
+  ended = false
+
+  constructor(readonly dir: string) {}
+
+  /** For a mock being called now: throws if its test is over. */
+  check(): void {
+    if (this.ended) {
+      throw new Error(
+        'harness: stale call from a finished test — work it started outlived its dispose(); ' +
+          'await it (or stop it) inside the test'
+      )
+    }
   }
-  return current
+
+  get(): World {
+    this.check()
+    if (!this.world) throw new Error('harness: a mock was called before setup() built the world')
+    return this.world
+  }
 }
 
 /** One turn of the REAL event loop: lets real file I/O (downloads) make progress. */
@@ -184,7 +196,11 @@ function realTick(): Promise<void> {
 export class World {
   /** Every event emitted on the bus, in order. */
   readonly events: BusEvent[] = []
-  /** Live settings: getSettings() returns this very object, as the real one returns its cache. */
+  /**
+   * The settings the app reads: the real settings.ts's cache, in effect. Edit
+   * it mid-test and the next getSettings() sees the change; one the app
+   * already holds does not, since getSettings() returns a copy.
+   */
   settings: SettingsPublic
   readonly secrets: Partial<Record<SecretKey, string>>
   /** Real directory for everything local: the project root, userData, scene files. */
@@ -202,15 +218,27 @@ export class World {
 
   /** @internal use setup() */
   constructor(
-    dir: string,
+    private readonly scope: Scope,
     opts: SetupOptions,
+    /** getSettings() of the real settings.ts with nothing saved: production's defaults */
+    defaults: SettingsPublic,
     readonly db: Db,
     readonly network: FakeNetwork,
     readonly vast: FakeVast
   ) {
-    this.dir = dir
-    this.settings = { ...defaultSettings(dir), ...opts.settings }
+    this.dir = scope.dir
+    const base: SettingsPublic = {
+      ...defaults,
+      projectRoot: join(this.dir, 'project'),
+      blenderVersionOverride: HARNESS_BLENDER
+    }
+    this.settings = {
+      ...base,
+      ...opts.settings,
+      offerFilters: { ...base.offerFilters, ...opts.settings?.offerFilters }
+    }
     this.secrets = { vastApiKey: 'harness-vast-key', ...opts.secrets }
+    deriveFlags(this)
     mkdirSync(this.settings.projectRoot, { recursive: true })
   }
 
@@ -403,6 +431,8 @@ export class World {
     vi.clearAllTimers()
     this.network.shutdown()
     for (let i = 0; i < 5; i++) await realTick()
+    // From here on, anything this test's modules still call throws.
+    this.scope.ended = true
     this.unsubscribe()
     this.db.close()
     vi.useRealTimers()
@@ -412,12 +442,19 @@ export class World {
   }
 }
 
-// -- module mocks ---------------------------------------------------------------------
-// Each delegates to world() at call time, never at import: the modules are
-// imported once per setup() (after vi.resetModules), and whatever they close
-// over must be the current test's fakes.
+/** The has* flags, derived from the secrets exactly as settings.ts derives them. */
+function deriveFlags(w: World): void {
+  w.settings.hasVastApiKey = !!w.secrets.vastApiKey
+  w.settings.hasOtoyCredentials = !!w.secrets.otoyUsername && !!w.secrets.otoyPassword
+}
 
-function registerMocks(): void {
+// -- module mocks ---------------------------------------------------------------------
+// Each resolves its world through `scope` at call time, never at import: the
+// modules are imported once per setup() (after vi.resetModules), and whatever
+// they close over must be that test's fakes — and only while it runs.
+
+function registerMocks(scope: Scope): void {
+  const world = (): World => scope.get()
   const desktop =
     (api: DesktopCall['api'], method: string, result?: unknown) =>
     (...args: unknown[]) => {
@@ -426,7 +463,12 @@ function registerMocks(): void {
     }
   vi.doMock('electron', () => ({
     app: {
-      getPath: (name: string) => join(world().dir, 'electron', name),
+      // Straight from the scope: setup() reads the real settings.ts's
+      // defaults, which need a documents path, before the world exists.
+      getPath: (name: string) => {
+        scope.check()
+        return join(scope.dir, 'electron', name)
+      },
       getAppPath: () => REPO_ROOT,
       isPackaged: false
     },
@@ -470,15 +512,24 @@ function registerMocks(): void {
   }))
 
   vi.doMock('../settings', () => ({
-    getSettings: () => world().settings,
-    updateSettings: (patch: Partial<SettingsPublic>) => Object.assign(world().settings, patch),
+    getSettings: () => copySettings(world().settings),
+    // As settings.ts: the derived has* flags are stripped from the patch, and
+    // a partial offerFilters merges over the current filters.
+    updateSettings: (patch: Partial<SettingsPublic>) => {
+      const s = world().settings
+      const rest = { ...patch }
+      delete rest.hasVastApiKey
+      delete rest.hasOtoyCredentials
+      delete rest.offerFilters
+      Object.assign(s, rest)
+      if (patch.offerFilters) Object.assign(s.offerFilters, patch.offerFilters)
+      return copySettings(s)
+    },
     getSecret: (key: SecretKey) => world().secrets[key] ?? null,
     setSecret: (key: SecretKey, value: string) => {
       const w = world()
       w.secrets[key] = value
-      // Derived exactly as settings.ts derives them.
-      w.settings.hasVastApiKey = !!w.secrets.vastApiKey
-      w.settings.hasOtoyCredentials = !!w.secrets.otoyUsername && !!w.secrets.otoyPassword
+      deriveFlags(w)
     }
   }))
 
@@ -532,7 +583,8 @@ export async function setup(opts: SetupOptions = {}): Promise<World> {
   if (current) await current.dispose()
 
   vi.resetModules()
-  registerMocks()
+  const scope = new Scope(mkdtempSync(join(tmpdir(), 'vr-harness-')))
+  registerMocks(scope)
   // setImmediate, nextTick and queueMicrotask stay real: the fakes answer on
   // microtasks, and until() needs real macrotask turns for real file I/O.
   vi.useFakeTimers({
@@ -549,11 +601,15 @@ export async function setup(opts: SetupOptions = {}): Promise<World> {
   const { HostKeyMismatchError } = await import('../ssh/sshConnection')
   const { VastError } = await import('../vast/vastClient')
   const bus = await import('../events')
+  // Production's defaults, from the real settings.ts rather than a copy that
+  // could drift. It runs on the mocked electron, so it looks for a saved file
+  // under the world's empty temp dir — never the user's real settings.
+  const real = await vi.importActual<typeof import('../settings')>('../settings')
 
   const network = new FakeNetwork((actual, pinned) => new HostKeyMismatchError(actual, pinned))
   const vast = new FakeVast(network, (message, status) => new VastError(message, status))
-  const dir = mkdtempSync(join(tmpdir(), 'vr-harness-'))
-  const w = new World(dir, opts, openTestDb(applySchema), network, vast)
+  const w = new World(scope, opts, real.getSettings(), openTestDb(applySchema), network, vast)
+  scope.world = w
   w.listen(bus)
   current = w
   return w
