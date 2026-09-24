@@ -32,6 +32,8 @@ Job spec:
     "nodeSlots": int, "exclusive": bool,
     "lanes": int (exclusive chunks that may run side by side; absent = 1),
     "pinGpus": bool (pin each render to one GPU; absent = false),
+    "cpuRender": bool (Cycles on the CPU by design; absent = a Cycles render
+                      with no GPU to enable fails, errorKind machine),
     "jobChunks": int (chunks the whole job is split into; the preflight
                       refuses an unbaked simulation when > 1),
     "preflight": "enforce"|"warn"|"off" (the scene preflight; absent =
@@ -49,11 +51,12 @@ chunk sent again after a restart or a failure renders only what it lacks.
 
 Each render runs three scripts from blender/ before its first frame, in this
 order: run_startup_scripts.py (the scene's own "startup*" blocks),
-enable_gpu.py and preflight.py (files the scene needs and did not pack,
-simulations it cannot step, movie output). Each reports on a line of its own
-("VR_STARTUP_FAILED {...}", "VR_PREFLIGHT {...}") before it raises, and
-Blender then exits GUARD_EXIT; the agent turns the report into the error and
-its errorKind.
+enable_gpu.py (Cycles on the GPU, or no render at all) and preflight.py
+(files the scene needs and did not pack, simulations it cannot step, movie
+output). Each reports on a line of its own ("VR_STARTUP_FAILED {...}",
+"VR_ENGINE <id>", "VR_GPU {...}", "VR_PREFLIGHT {...}") before it raises,
+and Blender then exits GUARD_EXIT; the agent turns the report into the error
+and its errorKind.
 
 Chunk state (state/<chunkId>.json, rewritten atomically; fields are only ever
 added, so an older app reads a newer agent's state):
@@ -72,6 +75,10 @@ added, so an older app reads a newer agent's state):
                               heartbeat never moves it, so a hung Blender
                               shows it falling behind updatedAt. Rendering
                               only: encoding makes no frame progress,
+    "engine": str             the engine the scene really renders with, once
+                              Blender loaded it: cycles|eevee|octane|workbench
+                              or another engine's id in lower case. The
+                              spec's engine is only the app's label for it,
     "preflight": {...}        preflight.py's report once Blender ran it:
                               {ok, summary, missing, problems, warnings} }
   A failed state keeps every field it had and adds:
@@ -134,9 +141,20 @@ GUARD_EXIT = 32
 # --python-exit-code: "Error: script failed, file: '<path>', exiting." or
 # "Error: script failed, expr: '<code>', exiting."
 SCRIPT_FAILED_RE = re.compile(r"script failed, (file|expr): '")
-# One-line JSON reports from the scripts in remote/blender/; see each script.
+# One-line reports from the scripts in remote/blender/; see each script.
+ENGINE_RE = re.compile(r"\bVR_ENGINE (\S+)")
+GPU_RE = re.compile(r"\bVR_GPU (\{.*\})")
 PREFLIGHT_RE = re.compile(r"\bVR_PREFLIGHT (\{.*\})")
 STARTUP_FAILED_RE = re.compile(r"\bVR_STARTUP_FAILED (\{.*\})")
+# scene.render.engine ids in the app's words (the spec's "engine"). EEVEE's id
+# was BLENDER_EEVEE_NEXT from 4.2 until 5.0 renamed it back.
+ENGINE_NAMES = {
+    "CYCLES": "cycles",
+    "BLENDER_EEVEE": "eevee",
+    "BLENDER_EEVEE_NEXT": "eevee",
+    "BLENDER_WORKBENCH": "workbench",
+    "OCTANE": "octane",
+}
 # The frame number a file in frames/ starts with, stereo views included.
 FRAME_PREFIX_RE = re.compile(r"^(\d+)")
 
@@ -149,8 +167,9 @@ FRAME_PREFIX_RE = re.compile(r"^(\d+)")
 #   "job"        the job asks for something no node can give it: Octane without
 #                OctaneBlender, a frame list off the chunk's grid, one of the
 #                job's own python expressions raised.
-#   "machine"    this node cannot render it: its disk is full or failing, it
-#                lacks the Blender version asked for. Another node may.
+#   "machine"    this node cannot render it: Cycles found no GPU to enable, its
+#                disk is full or failing, it lacks the Blender version asked
+#                for. Another node may.
 #   "transient"  anything else: a crash, a kill, an exit nothing explains.
 #                Retrying may work, which is how the app treated every failure
 #                before errorKind existed.
@@ -1017,6 +1036,13 @@ def scan_line(line, state, seen, now=None):
     m = SCRIPT_FAILED_RE.search(line)
     if m:
         seen["scriptFailed"] = m.group(1)
+    m = ENGINE_RE.search(line)
+    if m:
+        raw = m.group(1)
+        state["engine"] = ENGINE_NAMES.get(raw.upper(), raw.lower())
+    m = GPU_RE.search(line)
+    if m:
+        seen["gpu"] = parse_marker(m.group(1))
     m = PREFLIGHT_RE.search(line)
     if m:
         # For the app to show, pass or fail: the report is the scene's.
@@ -1041,6 +1067,14 @@ def classify_exit(code, save_failed, seen, state):
     """(errorKind, message) for a render that ended unclean. See ERROR_KINDS."""
     if code == GUARD_EXIT:
         # The scripts' own markers first: they say which one refused, and why.
+        # The GPU before the scene: enable_gpu.py runs first, and a node with
+        # no usable GPU is no verdict on the scene.
+        gpu = seen.get("gpu") or {}
+        if gpu.get("ok") is False:
+            return "machine", (
+                f"no Cycles GPU device on this node: {gpu.get('reason') or 'see log'}"
+                f" (exit {code}); not rendering on the CPU"
+            )
         preflight = state.get("preflight") or {}
         if preflight.get("ok") is False:
             return "scene", f"scene preflight failed: {preflight.get('summary') or 'see log'}"
@@ -1203,6 +1237,9 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
     if gpu is not None:
         env.update(gpu_env(gpu))
         log_line(chunk_id, f"pinned to GPU {gpu} ({env.get('VR_GPU_BUS') or 'bus id unknown'})")
+    if spec.get("cpuRender") is True:
+        # enable_gpu.py otherwise refuses a Cycles render it cannot put on a GPU.
+        env["VR_CPU_RENDER"] = "1"
 
     # When the current attempt launched Blender; the end-of-render sweep only
     # adopts files modified since. Set by run_once.
@@ -1303,10 +1340,13 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
     # not a backend problem), retry once on the OpenGL backend. "No frame" is
     # measured against the manifest as it stood before: a chunk re-dispatched
     # to this node after a restart starts with frames recorded, and its Vulkan
-    # failure is just as retryable.
+    # failure is just as retryable. "EEVEE" is the engine the scene reported
+    # (enable_gpu.py's VR_ENGINE), not the job's label for it: an EEVEE scene
+    # submitted as Cycles was never retried, and failed on every node (#248).
+    # The label decides only when Blender died before saying.
     if (
         code not in (0, GUARD_EXIT)
-        and spec.get("engine") == "eevee"
+        and (state.get("engine") or spec.get("engine")) == "eevee"
         and len(tracker.recorded) == recorded_before
         and not save_failed
     ):

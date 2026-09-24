@@ -42,6 +42,8 @@ Covers the failure modes that actually bit:
     unbaked simulation split across chunks, or a movie output rendered wrong
     on every node, completed and was billed. preflight.py and the other
     remote/blender/ scripts run here against a stand-in `bpy`.
+  * Cycles with no GPU to enable rendered on the CPU at GPU prices, and the
+    EEVEE OpenGL retry keyed on the job's engine label, not the scene's.
     These cases drive the real run_render and process() against a scripted
     fake `blender`, and are skipped on Windows, where its `#!/bin/sh` wrapper
     cannot run.
@@ -1060,6 +1062,103 @@ def test_agent_runs_the_preflight():
               and state.get("status") == "done")
 
 
+def gpu_bpy(engine="CYCLES", devices=(), addons=None):
+    """A stand-in bpy for enable_gpu.py: one scene, Cycles' device list."""
+    cprefs = NS(devices=[NS(type=t, id=i, name=n, use=False) for t, i, n in devices],
+                compute_device_type="NONE", refresh_devices=lambda: None)
+    cycles = NS(device="CPU", use_auto_tile=False, use_persistent_data=False)
+    bpy = types.ModuleType("bpy")
+    bpy.context = NS(scene=NS(render=NS(engine=engine), cycles=cycles),
+                     preferences=NS(addons={"cycles": NS(preferences=cprefs)}
+                                    if addons is None else addons))
+    bpy.app = NS(version=(4, 2, 0))
+    return bpy, cprefs, cycles
+
+
+def test_enable_gpu():
+    """1.16 / #83: Cycles with no GPU to enable printed a warning and rendered on
+    the CPU at GPU prices, and its slow frames were scored against the GPU."""
+    gpus = [("CUDA", "CUDA_NVIDIA GeForce RTX 4090_0000:01:00", "RTX 4090"),
+            ("OPTIX", "OPTIX_NVIDIA GeForce RTX 4090_0000:01:00", "RTX 4090"),
+            ("OPTIX", "OPTIX_NVIDIA GeForce RTX 4090_0000:41:00", "RTX 4090 #2"),
+            ("CPU", "CPU", "AMD EPYC")]
+    bpy, cprefs, cycles = gpu_bpy(devices=gpus)
+    err, printed = blender_script("enable_gpu.py", bpy)
+    check("gpu: OptiX preferred, every OptiX card on, CUDA and the CPU off",
+          err is None and cycles.device == "GPU" and cprefs.compute_device_type == "OPTIX"
+          and [d.use for d in cprefs.devices] == [False, True, True, False]
+          and marker(printed, "VR_GPU") == {"ok": True, "backend": "OPTIX",
+                                            "devices": ["RTX 4090", "RTX 4090 #2"]})
+    bpy, cprefs, _ = gpu_bpy(devices=gpus)
+    err, _ = blender_script("enable_gpu.py", bpy,
+                            {"VR_GPU_INDEX": "1", "VR_GPU_BUS": "00000000:41:00.0"})
+    check("gpu: pinned, only the card on the named bus when both are listed",
+          err is None and [d.use for d in cprefs.devices] == [False, False, True, False])
+
+    bpy, cprefs, cycles = gpu_bpy(devices=[("CPU", "CPU", "AMD EPYC")])
+    err, printed = blender_script("enable_gpu.py", bpy)
+    check("gpu: none to enable refuses the render instead of using the CPU",
+          isinstance(err, RuntimeError) and str(err).startswith("no Cycles GPU device: ")
+          and (marker(printed, "VR_GPU") or {}).get("ok") is False
+          and "VR_ENGINE CYCLES" in printed)
+    bpy, _, _ = gpu_bpy(addons={})
+    err, printed = blender_script("enable_gpu.py", bpy)
+    check("gpu: a device setup that breaks is refused and reported the same way",
+          isinstance(err, RuntimeError)
+          and "KeyError" in (marker(printed, "VR_GPU") or {}).get("reason", ""))
+    bpy, _, cycles = gpu_bpy(devices=[("CPU", "CPU", "AMD EPYC")])
+    err, printed = blender_script("enable_gpu.py", bpy, {"VR_CPU_RENDER": "1"})
+    check("gpu: a job that renders on the CPU by design is left on the CPU",
+          err is None and cycles.device == "CPU"
+          and (marker(printed, "VR_GPU") or {}).get("backend") == "CPU")
+    bpy, _, cycles = gpu_bpy(engine="BLENDER_EEVEE_NEXT")
+    err, printed = blender_script("enable_gpu.py", bpy)
+    check("gpu: EEVEE is left alone, and its engine reported",
+          err is None and printed.startswith("VR_ENGINE BLENDER_EEVEE_NEXT\n")
+          and marker(printed, "VR_GPU") is None and cycles.device == "CPU")
+
+
+def test_agent_gpu_and_engine():
+    """1.16: the machine, not the scene, is blamed for a missing GPU, and the
+    scene's real engine is reported and decides the EEVEE OpenGL retry."""
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, _ = run_chunk(tmp, {"default": {"print": [
+            "VR_ENGINE CYCLES",
+            'VR_GPU {"ok": false, "backend": null, "devices": [], "reason": "no OptiX/CUDA'
+            ' device could be enabled (none listed)"}',
+            "Error: script failed, file: '/root/vastai/blender/enable_gpu.py', exiting.",
+        ], "exit": nr.GUARD_EXIT}})
+        check("no GPU: errorKind machine, saying so, although the exit is the guard's",
+              state.get("errorKind") == "machine" and state.get("engine") == "cycles"
+              and state.get("error", "").startswith("no Cycles GPU device on this node: "))
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        # An EEVEE scene the job labelled Cycles; Vulkan dies before frame 1.
+        state, entries = run_chunk(tmp, {
+            "default": {"print": ["VR_ENGINE BLENDER_EEVEE_NEXT"], "exit": 1},
+            "opengl": {"print": ["VR_ENGINE BLENDER_EEVEE_NEXT"], "render": "gl"},
+        }, grid=(1, 2, 1), engine="cycles")
+        check("engine: an EEVEE scene labelled Cycles is still retried on OpenGL (#248)",
+              "retrying with --gpu-backend opengl" in render_log()
+              and state.get("status") == "done" and len(entries) == 2
+              and state.get("engine") == "eevee")
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, _ = run_chunk(tmp, {"default": {"print": ["VR_ENGINE CYCLES"], "exit": 1}},
+                             engine="eevee")
+        check("engine: a Cycles scene labelled EEVEE is not retried on OpenGL",
+              "retrying" not in render_log() and state.get("errorKind") == "transient")
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        rec = os.path.join(tmp, "runs.jsonl")
+        run_chunk(tmp, {"record": rec, "default": {"render": "f"}}, cpuRender=True)
+        with open(rec) as f:
+            env = json.loads(f.readline())["env"]
+        check("cpuRender: enable_gpu.py is told the CPU is by design",
+              env.get("VR_CPU_RENDER") == "1")
+
+
 def test_log_tail():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "c1.log")
@@ -1165,6 +1264,7 @@ def main():
         test_preflight_files,
         test_preflight_simulations,
         test_startup_script_marker,
+        test_enable_gpu,
     ):
         run(fn)
     # Through fake_node, whose `blender` is a `#!/bin/sh` wrapper that Windows
@@ -1185,6 +1285,7 @@ def main():
         test_explicit_frame_list,
         test_never_a_stand_in_blender,
         test_agent_runs_the_preflight,
+        test_agent_gpu_and_engine,
     ):
         if os.name == "nt":
             print(f"SKIP  {fn.__name__}: the fake blender needs a POSIX shell")

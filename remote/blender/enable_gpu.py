@@ -3,6 +3,21 @@
 Engines other than Cycles are left untouched: EEVEE uses the GPU implicitly,
 Octane is handled by the OctaneBlender build itself.
 
+It reports, one line each:
+    VR_ENGINE <scene.render.engine>   always, first
+    VR_GPU {"ok": bool, "backend": str, "devices": [str], "reason": str}
+                                      Cycles only
+VR_ENGINE is the engine the scene really renders with, after its startup
+blocks: the app's Engine picker is only a label, and the EEVEE OpenGL retry
+used to key on that label (#248).
+
+A Cycles render with no GPU enabled raises (after its VR_GPU line), unless
+the job renders on the CPU by design (VR_CPU_RENDER=1, the spec's cpuRender).
+It used to print a warning and render on the CPU at GPU prices, and that
+throughput was recorded against the GPU model, which then ranked lower for
+every later rental (#83). The agent fails such a chunk as the machine's
+fault: another node's GPU will do.
+
 WHY THIS IS DEFENSIVE
 This runs under `--python-exit-code 32`, which makes any exception FATAL — the
 chunk fails, retries four times, fails again, and the render never happens. But
@@ -16,9 +31,12 @@ properties keep moving between releases:
 Both of the first two were observed failing every Cycles render on Blender
 5.1.2. So: probe for each property, never assume, and treat tuning as
 best-effort. Getting the GPU enabled is what matters; a tiling hint is not
-worth failing a paid render over.
+worth failing a paid render over. The one deliberate raise is a GPU that
+could not be enabled, and anything that breaks the device setup counts as
+that: it is reported as the machine's, never left to render on the CPU.
 """
 
+import json
 import os
 
 import bpy
@@ -37,10 +55,8 @@ def try_set(owner, name, value, label=None):
         return False
 
 
-scene = bpy.context.scene
-cycles = getattr(scene, "cycles", None)
-
-if scene.render.engine == "CYCLES" and cycles is not None:
+def enable_gpus(cycles):
+    """Point Cycles at the GPUs. Returns (backend, names of the devices enabled)."""
     cycles.device = "GPU"
 
     cprefs = bpy.context.preferences.addons["cycles"].preferences
@@ -89,7 +105,7 @@ if scene.render.engine == "CYCLES" and cycles is not None:
             print(f"WARNING pinned to GPU {pinned} ({bus}) but no device id matches; using all")
 
     chosen = {(d.type, d.id) for d in candidates}
-    enabled = 0
+    enabled = []
     for device in cprefs.devices:
         # CPU devices are listed too; enabling them alongside the GPU splits the
         # scene and is usually slower than the GPU alone. Devices of the other
@@ -98,12 +114,38 @@ if scene.render.engine == "CYCLES" and cycles is not None:
         use = (device.type, device.id) in chosen
         device.use = use
         if use:
-            enabled += 1
+            enabled.append(device.name)
             print(f"Enabled GPU: {device.name} ({device.type}) id={device.id}")
     if pinned is not None:
-        print(f"Pinned to GPU {pinned} ({bus or 'bus unknown'}): {enabled} {backend} device(s)")
-    if enabled == 0:
-        print("WARNING no GPU devices enabled — Cycles will fall back to CPU")
+        print(f"Pinned to GPU {pinned} ({bus or 'bus unknown'}): {len(enabled)} {backend} device(s)")
+    return backend, enabled
+
+
+scene = bpy.context.scene
+cycles = getattr(scene, "cycles", None)
+print(f"VR_ENGINE {scene.render.engine}", flush=True)
+
+if scene.render.engine == "CYCLES" and cycles is not None:
+    if os.environ.get("VR_CPU_RENDER") == "1":
+        cycles.device = "CPU"
+        print("CPU render by design (the job's cpuRender): not enabling GPUs")
+        gpu = {"ok": True, "backend": "CPU", "devices": []}
+    else:
+        try:
+            backend, enabled = enable_gpus(cycles)
+            reason = None if enabled else (
+                f"no {backend or 'OptiX/CUDA'} device could be enabled"
+                + ("" if backend else " (none listed)")
+            )
+        except Exception as e:  # noqa: BLE001 — reported, then raised below
+            backend, enabled = None, []
+            reason = f"GPU setup raised {type(e).__name__}: {e}"
+        gpu = {"ok": reason is None, "backend": backend, "devices": enabled}
+        if reason:
+            gpu["reason"] = reason
+    print("VR_GPU " + json.dumps(gpu), flush=True)
+    if not gpu["ok"]:
+        raise RuntimeError(f"no Cycles GPU device: {gpu['reason']}; not rendering on the CPU")
 
     if bpy.app.version < (3, 0, 0):  # pre Cycles-X
         try_set(cycles, "tile_size", 512)
