@@ -34,6 +34,8 @@ Covers the failure modes that actually bit:
     next scan launched it again.
   * the 60 s heartbeat keeps updatedAt fresh for a Blender that is alive but
     hung, so the state had no way to say "no frame for an hour".
+  * a chunk sent again after an app restart rendered its whole range again,
+    rewriting frames under manifest lines whose hashes no longer matched.
     These cases drive the real run_render and process() against a scripted
     fake `blender`, and are skipped on Windows, where its `#!/bin/sh` wrapper
     cannot run.
@@ -221,13 +223,44 @@ import json, os, sys
 argv = sys.argv[1:]
 with open(argv[argv.index("-b") + 1]) as f:
     script = json.load(f)
+if script.get("record"):
+    with open(script["record"], "a") as f:
+        env = {k: v for k, v in os.environ.items() if k.startswith("VR_")}
+        f.write(json.dumps({"argv": argv, "env": env}) + "\n")
 attempt = script["opengl" if "--gpu-backend" in argv else "default"]
 out = os.path.dirname(argv[argv.index("-o") + 1])
+exprs = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--python-expr"]
+# Overwrite off: unchecked in the .blend, or turned off by an expression.
+no_overwrite = script.get("noOverwrite") or any("use_overwrite" in e for e in exprs)
+
+
+def frames():
+    if "-f" in argv:
+        found = []
+        for part in argv[argv.index("-f") + 1].split(","):
+            a, _, b = part.partition("..")
+            found += range(int(a), int(b or a) + 1)
+        return found
+    step = int(argv[argv.index("-j") + 1]) if "-j" in argv else 1
+    return range(int(argv[argv.index("-s") + 1]), int(argv[argv.index("-e") + 1]) + 1, step)
+
+
 for line in attempt.get("print", []):
     print(line, flush=True)
+if "render" in attempt:
+    # The frames argv asks for, as -a or -f renders them.
+    for n in frames():
+        path = os.path.join(out, "%04d.exr" % n)
+        if no_overwrite and os.path.exists(path):
+            print('skipping existing frame "%s"' % path, flush=True)
+            continue
+        print("Fra:%d Mem:1.00M | Rendering" % n, flush=True)
+        with open(path, "w") as f:
+            f.write("%s%d" % (attempt["render"], n))
+        print("Saved: '%s'" % path, flush=True)
 for name, body, announce in attempt.get("write", []):
     path = os.path.join(out, name)
-    if script.get("noOverwrite") and os.path.exists(path):
+    if no_overwrite and os.path.exists(path):
         print("skipping existing frame '%s'" % path, flush=True)
         continue
     with open(path, "w") as f:
@@ -248,13 +281,17 @@ sys.exit(attempt.get("exit", 0))
 def fake_node():
     """A throwaway ~/vastai whose `blender` is FAKE_BLENDER. Yields its root.
 
-    Script shape: {"default": attempt, "opengl": attempt, "noOverwrite": bool},
-    where "opengl" is the attempt run with `--gpu-backend opengl` and an attempt
-    is {"print": [line], "write": [[name, body, announce]], "exit": code}.
-    "print" lines come first. `announce` True prints Blender's "Saved:" line,
-    and "error" its "cannot save" line, after which the fake stops writing, as
-    Blender does. `noOverwrite` mimics a .blend with Overwrite unchecked, which
-    skips any frame already on disk.
+    Script shape: {"default": attempt, "opengl": attempt, "noOverwrite": bool,
+    "record": path}, where "opengl" is the attempt run with `--gpu-backend
+    opengl` and an attempt is {"print": [line], "render": body,
+    "write": [[name, body, announce]], "exit": code}, acted out in that order.
+    "render" renders the frames argv asks for (-s/-e/-j, or -f) as NNNN.exr
+    holding body + the frame number, with "Fra:" and "Saved:" lines. In
+    "write", `announce` True prints Blender's "Saved:" line, and "error" its
+    "cannot save" line, after which the fake stops writing, as Blender does.
+    Overwrite is off, skipping any frame already on disk, when `noOverwrite`
+    says the .blend has it unchecked or a --python-expr sets use_overwrite.
+    "record" appends each run's argv and VR_* environment to a JSON-lines file.
     """
     names = ("ROOT", "RENDERS", "STATE", "LOGS", "BLENDER_ROOT", "INBOX", "DONE", "FAILED",
              "CONTROL", "size_stable", "SETTLE_PAUSE", "write_state")
@@ -294,13 +331,13 @@ def fake_node():
                 setattr(nr, k, v)
 
 
-def chunk_spec(tmp, script, frames=(1, 3, 1), engine="cycles", **extra):
+def chunk_spec(tmp, script, grid=(1, 3, 1), engine="cycles", **extra):
     """Chunk c1's spec, with `script` saved as its "blend file"."""
     with open(os.path.join(tmp, "work", "scenes", "s.blend"), "w") as f:
         json.dump(script, f)
     spec = {
         "chunkId": "c1", "blendFile": "s.blend", "blenderVersion": "fake", "engine": engine,
-        "frameStart": frames[0], "frameEnd": frames[1], "frameStep": frames[2],
+        "frameStart": grid[0], "frameEnd": grid[1], "frameStep": grid[2],
     }
     spec.update(extra)
     return spec
@@ -315,9 +352,9 @@ def frame_entries():
     return [e for e in entries if e.get("kind", "frame") == "frame"]
 
 
-def render(tmp, script, frames=(1, 3, 1), engine="cycles", **extra):
+def render(tmp, script, grid=(1, 3, 1), engine="cycles", **extra):
     """run_render chunk c1 against `script`. Returns (error or None, frame manifest lines)."""
-    spec = chunk_spec(tmp, script, frames, engine, **extra)
+    spec = chunk_spec(tmp, script, grid, engine, **extra)
     err = None
     try:
         nr.run_render(spec, os.path.join(nr.LOGS, "c1.log"),
@@ -327,12 +364,12 @@ def render(tmp, script, frames=(1, 3, 1), engine="cycles", **extra):
     return err, frame_entries()
 
 
-def run_chunk(tmp, script, frames=(1, 3, 1), engine="cycles", gpu=None, **extra):
+def run_chunk(tmp, script, grid=(1, 3, 1), engine="cycles", gpu=None, **extra):
     """Chunk c1 through process(), from the inbox, as the agent's main loop runs
     it. Returns (the state the app would read, frame manifest lines)."""
     spec_path = os.path.join(nr.INBOX, "c1.json")
     with open(spec_path, "w") as f:
-        json.dump(chunk_spec(tmp, script, frames, engine, **extra), f)
+        json.dump(chunk_spec(tmp, script, grid, engine, **extra), f)
     nr.process(spec_path, gpu)
     with open(os.path.join(nr.STATE, "c1.json")) as f:
         state = json.load(f)
@@ -436,7 +473,7 @@ def test_clean_render_is_manifested():
                       ["0005.exr", "c", False], ["0002.exr", "d", False],
                       ["0009.exr", "e", False], ["notes.txt", "f", False]],
             "exit": 0,
-        }}, frames=(1, 5, 2))
+        }}, grid=(1, 5, 2))
         check("clean: the render succeeds", err is None)
         check("clean: every frame on the grid is manifested, announced or swept, and nothing else",
               sorted(e["file"] for e in entries)
@@ -452,7 +489,7 @@ def test_eevee_opengl_retry():
             "noOverwrite": True,
             "default": {"write": [["0001.exr", "vk", False]], "exit": 1},
             "opengl": {"write": [["0001.exr", "gl1", True], ["0002.exr", "gl2", False]], "exit": 0},
-        }, frames=(1, 2, 1), engine="eevee")
+        }, grid=(1, 2, 1), engine="eevee")
         by_file = {e["file"]: e for e in entries}
         check("eevee: a failed first attempt is retried on OpenGL and succeeds", err is None)
         check("eevee: the retry's frames are manifested", sorted(by_file) == ["frames/0001.exr", "frames/0002.exr"])
@@ -473,7 +510,7 @@ def test_eevee_retry_keeps_finished_frames():
             "default": {"print": ["Fra:1 Mem:12.00M | Syncing Cube"],
                         "write": [["0001.exr", "vk1", True]], "exit": 1},
             "opengl": {"exit": 1},
-        }, frames=(1, 2, 1), engine="eevee")
+        }, grid=(1, 2, 1), engine="eevee")
         by_file = {e["file"]: e for e in entries}
         check("eevee: a frame the failed attempt finished is manifested and kept",
               by_file.get("frames/0001.exr", {}).get("sha256") == sha("vk1")
@@ -493,7 +530,7 @@ def test_eevee_retry_forgets_unrecorded_announcements():
         err, entries = render(tmp, {
             "default": {"write": [["0001.exr", "", True]], "exit": 1},
             "opengl": {"write": [["0001.exr", "trun", False]], "exit": 1},
-        }, frames=(1, 2, 1), engine="eevee")
+        }, grid=(1, 2, 1), engine="eevee")
         check("retry: runs when the first attempt recorded nothing",
               "retrying with --gpu-backend opengl" in render_log() and err == "blender exited 1")
         check("retry: a stale announcement cannot manifest the retry's partial frame",
@@ -511,7 +548,7 @@ def test_eevee_retry_on_a_redispatched_chunk():
             "default": {"exit": 1},
             "opengl": {"write": [["0001.exr", "gl1", True], ["0002.exr", "gl2", True]],
                        "exit": 0},
-        }, frames=(1, 3, 1), engine="eevee")
+        }, grid=(1, 3, 1), engine="eevee")
         check("eevee: a re-dispatched chunk with frames recorded is still retried",
               err is None
               and sorted(e["file"] for e in entries)
@@ -620,10 +657,83 @@ def test_render_publishes_last_progress():
         make_chunk(tmp)
         started = time.time()
         state, _ = run_chunk(tmp, {"default": {"write": [["0001.exr", "a", True]], "exit": 0}},
-                             frames=(1, 1, 1))
+                             grid=(1, 1, 1))
         stamp = state.get("lastProgressAt")
         check("a render publishes lastProgressAt",
               isinstance(stamp, float) and started <= stamp <= state["updatedAt"])
+
+
+def finished_frame(cdir, name, body):
+    """A frame an earlier attempt finished: on disk, manifested with its hash."""
+    with open(os.path.join(cdir, "frames", name), "w") as f:
+        f.write(body)
+    with open(os.path.join(cdir, "manifest.jsonl"), "a") as f:
+        f.write(json.dumps({"kind": "frame", "file": "frames/" + name,
+                            "size": len(body), "sha256": sha(body)}) + "\n")
+
+
+def disk(cdir):
+    out = {}
+    for name in sorted(os.listdir(os.path.join(cdir, "frames"))):
+        with open(os.path.join(cdir, "frames", name)) as f:
+            out[name] = f.read()
+    return out
+
+
+def test_restart_renders_only_missing_frames():
+    """1.9 / #79 #145 #183: a chunk sent again after an app restart (provision.sh
+    killed its Blender) re-rendered its whole range. A frame rewritten before
+    the app downloaded it no longer matched its manifest line, and failed
+    verification until the chunk ran out of retries."""
+    with fake_node() as tmp:
+        cdir = make_chunk(tmp)
+        finished_frame(cdir, "0001.exr", "old1")
+        finished_frame(cdir, "0002.exr", "old2")
+        state, entries = run_chunk(tmp, {"default": {"render": "new"}}, grid=(1, 3, 1))
+        on_disk = disk(cdir)
+        check("restart: the frames already rendered are not rendered again",
+              on_disk.get("0001.exr") == "old1" and on_disk.get("0002.exr") == "old2"
+              and "skipping existing frame" in render_log())
+        check("restart: the missing frame is rendered and the chunk is done",
+              on_disk.get("0003.exr") == "new3" and state.get("status") == "done")
+        check("restart: every manifest line matches the bytes on disk",
+              sorted(e["file"] for e in entries)
+              == ["frames/0001.exr", "frames/0002.exr", "frames/0003.exr"]
+              and all(e.get("sha256") == sha(on_disk[e["file"][7:]]) for e in entries))
+
+
+def test_explicit_frame_list():
+    """1.9: the app may name the frames to render; only those are rendered."""
+    with fake_node() as tmp:
+        cdir = make_chunk(tmp)
+        rec = os.path.join(tmp, "runs.jsonl")
+        state, entries = run_chunk(tmp, {"record": rec, "default": {"render": "f"}},
+                                   grid=(1, 9, 1), frames=[9, 1, 2, 3, 7])
+        with open(rec) as f:
+            argv = json.loads(f.readline())["argv"]
+        check("frame list: -f with its runs, and no -a",
+              "-f" in argv and argv[argv.index("-f") + 1] == "1..3,7,9" and "-a" not in argv)
+        check("frame list: exactly those frames are rendered and counted",
+              sorted(disk(cdir)) == ["0001.exr", "0002.exr", "0003.exr", "0007.exr", "0009.exr"]
+              and len(entries) == 5 and state.get("framesTotal") == 5)
+        scripts = [i for i, a in enumerate(argv) if a in ("-P", "--python-expr")]
+        overwrite = [i for i in scripts if "use_overwrite" in argv[i + 1]]
+        check("Overwrite goes off after every other script, and before the render",
+              len(overwrite) == 1 and overwrite[0] == max(scripts)
+              and overwrite[0] < argv.index("-o"))
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, _ = run_chunk(tmp, {"default": {"render": "f"}}, grid=(1, 9, 2), frames=[1, 4])
+        check("frame list: a frame off the chunk's grid fails the job before anything renders",
+              state.get("errorKind") == "job" and state.get("exitCode") is None
+              and os.listdir(os.path.join(nr.RENDERS, "c1", "frames")) == [])
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        rec = os.path.join(tmp, "runs.jsonl")
+        state, _ = run_chunk(tmp, {"record": rec, "default": {"render": "f"}}, frames=[])
+        check("frame list: an empty list is done without starting Blender",
+              state.get("status") == "done" and state.get("framesTotal") == 0
+              and not os.path.exists(rec))
 
 
 def test_log_tail():
@@ -744,6 +854,8 @@ def main():
         test_failed_state_says_why,
         test_full_disk_still_retires_the_spec,
         test_render_publishes_last_progress,
+        test_restart_renders_only_missing_frames,
+        test_explicit_frame_list,
     ):
         if os.name == "nt":
             print(f"SKIP  {fn.__name__}: the fake blender needs a POSIX shell")

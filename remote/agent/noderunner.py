@@ -25,6 +25,8 @@ Job spec:
   { "chunkId": str, "blendFile": str (under work/scenes/),
     "blenderVersion": "4.5.3", "engine": "cycles"|"eevee"|"octane",
     "frameStart": int, "frameEnd": int, "frameStep": int,
+    "frames": [int] (render exactly these, each on the start..end/step grid;
+                     absent = the whole grid),
     "extraArgs": [str], "pythonExprs": [str],
     "nodeSlots": int, "exclusive": bool,
     "lanes": int (exclusive chunks that may run side by side; absent = 1),
@@ -35,6 +37,10 @@ Job spec:
 
 Every `encode` sub-key is optional and absent means off, so an old app talking
 to a new agent (and vice versa) both degrade to the behaviour they knew.
+
+Blender never renders a frame whose file is already in frames/ (Overwrite is
+off; see NO_OVERWRITE_EXPR), and only manifested frames are left there, so a
+chunk sent again after a restart or a failure renders only what it lacks.
 
 Chunk state (state/<chunkId>.json, rewritten atomically; fields are only ever
 added, so an older app reads a newer agent's state):
@@ -136,6 +142,21 @@ LOG_TAIL_LINES = 40
 # Pause between run_render's end-of-render settle passes, taken only while an
 # announced frame is still not size-stable. selfcheck shortens it.
 SETTLE_PAUSE = 0.5
+
+# Every render runs with Overwrite off (and Placeholders off, so a killed
+# Blender leaves no empty file behind): Blender then skips each frame whose
+# file is already in frames/. discard_unmanifested leaves only manifested
+# frames there, so a chunk re-dispatched after a restart or a failure renders
+# just what it is missing, and every manifested hash still matches the bytes
+# on disk. With Overwrite on, a re-dispatch rendered the whole range again,
+# and a frame rewritten before the app had downloaded it no longer matched
+# its manifest line, which failed verification until the chunk ran out of
+# retries (#79, #145, #183). hasattr: never fail a render over a renamed
+# property.
+NO_OVERWRITE_EXPR = (
+    "import bpy; r = bpy.context.scene.render; "
+    "[setattr(r, k, False) for k in ('use_overwrite', 'use_placeholder') if hasattr(r, k)]"
+)
 
 
 class ChunkFailed(RuntimeError):
@@ -802,10 +823,10 @@ def discard_unmanifested(chunk_id, chunk_dir, recorded):
     unlisted file is untrusted by definition: the frame a killed Blender was
     mid-write on (provision.sh's `pkill` on every app restart, a cancel, an OOM
     kill), or one a failed attempt left behind. Left in place it is a hazard
-    twice over: a .blend with Overwrite unchecked makes Blender skip any frame
-    already on disk, so it is never replaced, and the end-of-render sweep then
-    finds it and manifests it with a hash over the truncated bytes, which the
-    app verifies against and accepts.
+    twice over: every render runs with Overwrite off (NO_OVERWRITE_EXPR), so
+    Blender skips any frame already on disk and it is never replaced, and the
+    end-of-render sweep then finds it and manifests it with a hash over the
+    truncated bytes, which the app verifies against and accepts.
 
     Manifested frames are kept: the app may not have downloaded them yet, and
     their size and hash are already promised to it. This is the one place the
@@ -840,13 +861,50 @@ def discard_unmanifested(chunk_id, chunk_dir, recorded):
     return removed
 
 
+def render_frames(spec):
+    """The frames this chunk renders, ascending.
+
+    The spec's `frames` list when the app sends one, else frameStart..frameEnd
+    by frameStep. A listed frame must lie on that grid: the app accepts only
+    frames on it, so any other would be rendered, paid for and thrown away.
+    A bad list is the app's to fix, the same on every node: errorKind "job".
+    """
+    start, end = int(spec["frameStart"]), int(spec["frameEnd"])
+    step = int(spec.get("frameStep") or 1)
+    listed = spec.get("frames")
+    if listed is None:
+        return list(range(start, end + 1, step))
+    if not isinstance(listed, list) or not all(
+        isinstance(f, int) and not isinstance(f, bool) for f in listed
+    ):
+        raise ChunkFailed("the spec's frames must be a list of frame numbers", "job")
+    off = [f for f in listed if f < start or f > end or (f - start) % step]
+    if off:
+        raise ChunkFailed(
+            f"the spec lists frames off the chunk's {start}-{end} step {step} grid: {off[:5]}",
+            "job",
+        )
+    return sorted(set(listed))
+
+
+def frame_arg(frames):
+    """Blender's `-f` argument for ascending `frames`: "1..3,7,9"."""
+    runs = []
+    for f in frames:
+        if runs and f == runs[-1][1] + 1:
+            runs[-1][1] = f
+        else:
+            runs.append([f, f])
+    return ",".join(str(a) if a == b else f"{a}..{b}" for a, b in runs)
+
+
 def unannounced_frames(frames_dir, spec, since, recorded):
     """Files this attempt wrote to frames/ whose "Saved:" line the parser missed.
 
     The end-of-render safety net. Deliberately narrow, because whatever it
     returns goes into the manifest with a hash over the bytes on disk:
       * only `NNNN.ext` names, which is what `-o frames/####` produces;
-      * only frame numbers on the spec's start..end/step grid, so a leftover
+      * only the frames this chunk renders (render_frames), so a leftover
         from the wider chunk this one was split from cannot ride along;
       * only files modified since this attempt started, so nothing an earlier,
         killed attempt left behind (if discard_unmanifested could not delete
@@ -855,8 +913,7 @@ def unannounced_frames(frames_dir, spec, since, recorded):
     frame a crashed Blender died writing, or one it failed to write, passes
     every one of these tests.
     """
-    start, end = int(spec["frameStart"]), int(spec["frameEnd"])
-    step = int(spec.get("frameStep") or 1)
+    wanted = set(render_frames(spec))
     chunk_dir = os.path.dirname(frames_dir)
     try:
         names = sorted(os.listdir(frames_dir))
@@ -867,8 +924,7 @@ def unannounced_frames(frames_dir, spec, since, recorded):
         m = FRAME_NAME_RE.match(name)
         if not m:
             continue
-        n = int(m.group(1))
-        if n < start or n > end or (n - start) % step:
+        if int(m.group(1)) not in wanted:
             continue
         path = os.path.join(frames_dir, name)
         if os.path.relpath(path, chunk_dir) in recorded:
@@ -939,6 +995,23 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
     chunk_dir = os.path.join(RENDERS, chunk_id)
     frames_dir = os.path.join(chunk_dir, "frames")
     os.makedirs(frames_dir, exist_ok=True)
+    # Filled in place: process() owns the dict, and adds a failure to it
+    # rather than replacing it (record_failure).
+    if state is None:
+        state = {}
+
+    frames = render_frames(spec)
+    listed = spec.get("frames") is not None
+    if not frames:
+        # "Render exactly these frames", and there are none. Blender given an
+        # empty -f would render nothing either, after paying for a scene load.
+        log_line(chunk_id, "the spec lists no frames; nothing to render")
+        state.update({
+            "status": "rendering", "currentFrame": None,
+            "framesDone": len(tracker.recorded), "framesTotal": 0,
+            "lastLine": "", "exitCode": None, "gpu": gpu,
+        })
+        return state
 
     blender = pick_blender(spec)
     blend = os.path.join(ROOT, "work", "scenes", spec["blendFile"])
@@ -962,8 +1035,18 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         ]
         for expr in spec.get("pythonExprs") or []:
             cmd += ["--python-expr", expr]
+        # Last of the scripts, so no startup block or job expression can turn
+        # Overwrite back on. Blender runs these in argv order, the render
+        # (-a or -f) after all of them.
+        cmd += ["--python-expr", NO_OVERWRITE_EXPR]
+        cmd += ["-o", os.path.join(frames_dir, "####")]
+        if listed:
+            # An explicit list from the app: exactly those frames, which -f
+            # renders in order. -s/-e/-j only shape -a.
+            cmd += list(spec.get("extraArgs") or [])
+            cmd += ["-f", frame_arg(frames)]
+            return cmd
         cmd += [
-            "-o", os.path.join(frames_dir, "####"),
             "-s", str(spec["frameStart"]),
             "-e", str(spec["frameEnd"]),
         ]
@@ -976,16 +1059,11 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
     step = int(spec.get("frameStep") or 1)
     cmd = build_cmd()
 
-    frames_total = (spec["frameEnd"] - spec["frameStart"]) // step + 1
-    # Filled in place: process() owns the dict, and adds a failure to it
-    # rather than replacing it (record_failure).
-    if state is None:
-        state = {}
     state.update({
         "status": "rendering",
         "currentFrame": None,
         "framesDone": len(tracker.recorded),
-        "framesTotal": frames_total,
+        "framesTotal": len(frames),
         "lastLine": "",
         "exitCode": None,
         "command": " ".join(cmd),
