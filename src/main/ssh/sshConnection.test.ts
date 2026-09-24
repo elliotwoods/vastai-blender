@@ -200,3 +200,112 @@ describe('execStream', () => {
     expect(ssh2.execs[0].closeCalls).toBe(1)
   })
 })
+
+describe('the SFTP channel', () => {
+  it('#245: resetSftp(stale) ends only the channel that stalled, not the fresh one after it', async () => {
+    // A wedge stalls every transfer on channel A; their watchdogs fire seconds
+    // apart. The first reset makes room for channel B, which the next queued
+    // transfer opens at once — and the second watchdog used to end B.
+    const conn = connection()
+    const a = await conn.sftp()
+    conn.resetSftp(a)
+    const b = await conn.sftp()
+    expect(b).not.toBe(a)
+    const onB = watch(
+      new Promise((res, rej) =>
+        b.stat('/root/vastai/renders/c1/frames/0001.png', (e) => (e ? rej(e) : res(null)))
+      )
+    )
+
+    conn.resetSftp(a)
+    await flush()
+
+    expect(ssh2.sftps[1].state).toBe('open')
+    expect(ssh2.sftps[1].endCalls).toBe(0)
+    expect(await conn.sftp()).toBe(b)
+    ssh2.sftps[1].answerAll()
+    await flush()
+    expect(onB.error).toBeUndefined()
+    expect(onB.done).toBe(true)
+  })
+
+  it('#245: an open that times out is given up on, for every caller waiting on it', async () => {
+    const conn = connection()
+    await conn.acquire()
+    ssh2.holdOpens = true
+    const timed = watch(conn.sftp({ timeoutMs: 60_000 }))
+    // The spec write: no timeout of its own, waiting on the same open.
+    const untimed = watch(conn.sftp())
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect((timed.error as Error).message).toBe('SFTP channel open timed out after 60000ms')
+    expect(untimed.done).toBe(true)
+    expect(untimed.error).toBeInstanceOf(Error)
+
+    // The retry opens a fresh channel instead of waiting on the hung one again.
+    ssh2.holdOpens = false
+    const fresh = await conn.sftp({ timeoutMs: 60_000 })
+    // The hung open is answered late: ended, never cached over the fresh one.
+    ssh2.releaseOpens()
+    await flush()
+    const late = ssh2.sftps.find((s) => (s as unknown) !== fresh)!
+    expect(late.endCalls).toBe(1)
+    expect(await conn.sftp()).toBe(fresh)
+  })
+
+  it('an open answered in time is cached as before', async () => {
+    const conn = connection()
+    const s = await conn.sftp({ timeoutMs: 60_000 })
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(await conn.sftp()).toBe(s)
+    expect(ssh2.sftps).toHaveLength(1)
+  })
+
+  it("a channel the node's sftp-server breaks is dropped, without crashing main", async () => {
+    const conn = connection()
+    const s = await conn.sftp()
+    // With no 'error' listener, EventEmitter throws this out of ssh2's socket callback.
+    expect(() => ssh2.sftps[0].fatal()).not.toThrow()
+    expect(ssh2.sftps[0].endCalls).toBe(1)
+    const next = await conn.sftp()
+    expect(next).not.toBe(s)
+  })
+
+  it('a channel that closes is forgotten; the next sftp() opens another', async () => {
+    const conn = connection()
+    const s = await conn.sftp()
+    ssh2.sftps[0].serverClose()
+    expect(await conn.sftp()).not.toBe(s)
+  })
+
+  it('resetSftp() with no channel ends the cached one and gives up on an open in flight', async () => {
+    const conn = connection()
+    await conn.sftp()
+    conn.resetSftp()
+    expect(ssh2.sftps[0].endCalls).toBe(1)
+
+    ssh2.holdOpens = true
+    const opening = watch(conn.sftp())
+    await flush()
+    conn.resetSftp()
+    await flush()
+    expect(opening.error).toBeInstanceOf(Error)
+    ssh2.releaseOpens()
+    await flush()
+    expect(ssh2.sftps[1].endCalls).toBe(1)
+  })
+
+  it('close() fails an open in flight, and the late channel is ended', async () => {
+    const conn = connection()
+    await conn.acquire()
+    ssh2.holdOpens = true
+    const opening = watch(conn.sftp())
+    await flush()
+    conn.close()
+    await flush()
+    expect((opening.error as Error).message).toBe('connection closed')
+    ssh2.releaseOpens()
+    await flush()
+    expect(ssh2.sftps[0].endCalls).toBe(1)
+  })
+})

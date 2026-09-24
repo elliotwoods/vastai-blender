@@ -63,8 +63,30 @@ export class ExecTimeoutError extends Error {
   }
 }
 
+/** An SFTP channel open that was not answered within the caller's timeout. */
+export class SftpOpenTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`SFTP channel open timed out after ${timeoutMs}ms`)
+  }
+}
+
+/** An SFTP channel open in flight, and how to fail everyone waiting on it. */
+interface SftpOpening {
+  promise: Promise<SFTPWrapper>
+  abandon: (e: Error) => void
+}
+
 function hashKey(key: Buffer): string {
   return createHash('sha256').update(key).digest('base64')
+}
+
+/** End a channel that may already be closing (ssh2's end() is a no-op then). */
+function endQuietly(s: { end(): void } | null | undefined): void {
+  try {
+    s?.end()
+  } catch {
+    // already closed
+  }
 }
 
 /**
@@ -87,7 +109,14 @@ export class SshConnection extends EventEmitter {
   private closed = false
   private seenHostKey: string | null = null
   private sftpCache: SFTPWrapper | null = null
-  private sftpOpening: Promise<SFTPWrapper> | null = null
+  /** The SFTP channel open in flight, if any (see sftp()). */
+  private sftpOpening: SftpOpening | null = null
+  /**
+   * Bumped whenever the channel cached or being opened is given up on (a
+   * reset, a timed-out open, close()). An open that completes under an older
+   * generation is wanted by no one: it is ended, never cached.
+   */
+  private sftpGeneration = 0
 
   constructor(private target: SshTarget) {
     super()
@@ -359,43 +388,123 @@ export class SshConnection extends EventEmitter {
    * One cached SFTP channel per connection — SFTP multiplexes transfers over
    * a single channel, and SSH servers cap concurrent channels (opening one
    * per transfer exhausts the cap and gets "Channel open failure").
+   *
+   * Fetch it right before each request and never hold on to it across an
+   * await: once it is reset, ssh2 silently drops every request made on it
+   * (see withSftp in sftp.ts).
+   *
+   * With `timeoutMs`, an open that is not answered in time is given up on:
+   * this call rejects with SftpOpenTimeoutError, and so does every other
+   * caller waiting on the same open, and the next sftp() tries a fresh one.
+   * Without that, every retry waited on the same hung open, and a caller
+   * with no timeout of its own waited for good.
    */
-  async sftp(): Promise<SFTPWrapper> {
+  async sftp(opts: { timeoutMs?: number } = {}): Promise<SFTPWrapper> {
     if (this.sftpCache) return this.sftpCache
-    if (this.sftpOpening) return this.sftpOpening
-    this.sftpOpening = (async () => {
-      const c = await this.acquire()
-      const sftp = await new Promise<SFTPWrapper>((resolve, reject) => {
-        c.sftp((err, s) => (err ? reject(err) : resolve(s)))
-      })
-      sftp.on('close', () => {
-        if (this.sftpCache === sftp) this.sftpCache = null
-      })
-      this.sftpCache = sftp
-      return sftp
-    })().finally(() => {
-      this.sftpOpening = null
+    const opening = this.sftpOpening ?? this.openSftp()
+    const ms = opts.timeoutMs
+    if (!ms) return opening.promise
+    return new Promise<SFTPWrapper>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const err = new SftpOpenTimeoutError(ms)
+        this.abandonSftpOpen(opening, err)
+        reject(err)
+      }, ms)
+      opening.promise.then(
+        (s) => {
+          clearTimeout(timer)
+          resolve(s)
+        },
+        (e: unknown) => {
+          clearTimeout(timer)
+          reject(e)
+        }
+      )
     })
-    return this.sftpOpening
+  }
+
+  private openSftp(): SftpOpening {
+    const generation = this.sftpGeneration
+    let abandon!: (e: Error) => void
+    const promise = new Promise<SFTPWrapper>((resolve, reject) => {
+      abandon = reject
+      void (async () => {
+        const c = await this.acquire()
+        const sftp = await new Promise<SFTPWrapper>((res, rej) => {
+          c.sftp((err, s) => (err ? rej(err) : res(s)))
+        })
+        if (generation !== this.sftpGeneration || this.closed) {
+          // Given up on while it opened (a reset, a timed-out open, close()):
+          // everyone who wanted it has moved on, and a channel nobody tracks
+          // would only hold one of the server's few session slots.
+          endQuietly(sftp)
+          throw new Error('SFTP channel given up on while it opened')
+        }
+        const forget = (): void => {
+          if (this.sftpCache === sftp) this.sftpCache = null
+        }
+        sftp.on('close', forget)
+        // ssh2 emits 'error' on the wrapper when the node's sftp-server
+        // breaks the protocol (doFatalSFTPError). With no listener that throws
+        // out of a socket callback, which takes the main process down mid-render.
+        sftp.on('error', () => {
+          forget()
+          endQuietly(sftp)
+        })
+        this.sftpCache = sftp
+        return sftp
+      })().then(resolve, reject)
+    })
+    const opening: SftpOpening = { promise, abandon }
+    this.sftpOpening = opening
+    const settled = (): void => {
+      if (this.sftpOpening === opening) this.sftpOpening = null
+    }
+    promise.then(settled, settled)
+    return opening
+  }
+
+  /** Fail everyone waiting on this open, and make sure it is never cached. */
+  private abandonSftpOpen(opening: SftpOpening, err: Error): void {
+    if (this.sftpOpening !== opening) return // already answered, or already given up on
+    this.sftpGeneration++
+    this.sftpOpening = null
+    opening.abandon(err)
   }
 
   /**
-   * Drop the cached SFTP channel so the next sftp() opens a fresh one.
+   * Give up on an SFTP channel so the next sftp() opens a fresh one.
    *
    * For a transfer that stalled: a wedged SFTP channel never answers again,
    * and every later transfer queued on it would hang behind it. Ending it also
    * errors out whatever else was in flight on it, which is what we want — they
    * are retried on the new channel. If the whole TCP connection is dead, the
    * keepalive closes it and acquire() reconnects.
+   *
+   * Pass the channel that failed: only that one is ended. A wedge stalls every
+   * transfer on the channel at once, and their watchdogs fire seconds apart;
+   * by the second, the cache already held the fresh channel the first reset
+   * made room for. Ending whatever was cached then ended that one too, failing
+   * every transfer, upload and spec write on it, and the next watchdog the
+   * one after (#245). With no argument, whatever is cached is ended and an
+   * open in flight is given up on.
    */
-  resetSftp(): void {
+  resetSftp(stale?: SFTPWrapper): void {
+    if (stale) {
+      if (this.sftpCache === stale) {
+        this.sftpGeneration++
+        this.sftpCache = null
+      }
+      endQuietly(stale)
+      return
+    }
+    this.sftpGeneration++
     const s = this.sftpCache
     this.sftpCache = null
-    try {
-      s?.end()
-    } catch {
-      // already closed
+    if (this.sftpOpening) {
+      this.abandonSftpOpen(this.sftpOpening, new Error('SFTP channel reset while it opened'))
     }
+    endQuietly(s)
   }
 
   /** Open a forwarded TCP channel (for the VNC tunnel). */
@@ -410,7 +519,9 @@ export class SshConnection extends EventEmitter {
 
   close(): void {
     this.closed = true
+    this.sftpGeneration++
     this.sftpCache = null
+    if (this.sftpOpening) this.abandonSftpOpen(this.sftpOpening, new Error('connection closed'))
     this.client?.end()
     this.client = null
   }
