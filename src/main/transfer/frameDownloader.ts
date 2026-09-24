@@ -232,7 +232,7 @@ export class ChunkDownloader {
     } catch {
       return { ok: false } // connection down — reconnect logic lives with the node
     }
-    const { entries, rejected } = parseManifest(text)
+    const { entries, rejected } = parseManifest(text, this.target.chunkId)
     this.noteRejected(rejected)
 
     // Of all the live-clip versions in this read, only the newest is worth

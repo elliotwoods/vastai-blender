@@ -117,12 +117,30 @@ const MAX_BYTES: Record<ManifestEntry['kind'], number> = {
 
 const SHA256 = /^[0-9a-f]{64}$/
 
-/** Exhaustive over ClipKind: a new rendition won't compile until it's listed here. */
-const CLIP_KINDS: Record<ClipKind, true> = {
-  previewSdr: true,
-  previewHdr: true,
-  proxy: true,
-  live: true
+/**
+ * What follows `previews/<chunkId>_` in each clip the agent writes, by
+ * kindKey (encode_preview.py; PreviewWorker's live remux, whose run token is
+ * the render's start in epoch seconds). Exhaustive over ClipKind: a new
+ * rendition won't compile until it's listed here.
+ *
+ * FILE_PATTERNS.clip only says what a clip name may look like. This pins it
+ * to the chunk being downloaded and to what the clip says it is. A clip named
+ * for another chunk, or for the stitched job clip (job_previewSdr.v1.mp4),
+ * would overwrite that file and take over its assets row (abs_path is UNIQUE
+ * and clips are written INSERT OR REPLACE), and as 'live' the next prune of
+ * superseded live clips would then delete it.
+ */
+const CLIP_NAMES: Record<ClipKind, RegExp> = {
+  previewSdr: /^sdr\.mp4$/,
+  previewHdr: /^hdr\.mp4$/,
+  proxy: /^proxy\.mp4$/,
+  live: /^live_\d{1,20}_\d{4,9}\.mp4$/
+}
+
+/** Is `file` the name the agent gives this chunk's clip of this kind? */
+function isClipName(file: string, kindKey: ClipKind, chunkId: string): boolean {
+  const prefix = `previews/${chunkId}_`
+  return file.startsWith(prefix) && CLIP_NAMES[kindKey].test(file.slice(prefix.length))
 }
 
 const CODECS = new Set(['hevc', 'av1'])
@@ -161,7 +179,7 @@ function printable(v: unknown): string {
  * Rebuilt rather than cast, so nothing the node adds beyond these fields
  * travels any further.
  */
-function validate(e: Json, kind: ManifestEntry['kind']): ManifestEntry | string {
+function validate(e: Json, kind: ManifestEntry['kind'], chunkId: string): ManifestEntry | string {
   const { file, size, sha256, mtime } = e
   if (typeof file !== 'string' || !FILE_PATTERNS[kind].test(file)) {
     return 'not a file name the agent writes'
@@ -190,10 +208,13 @@ function validate(e: Json, kind: ManifestEntry['kind']): ManifestEntry | string 
   }
 
   const { kindKey, fps, frames, width, height, codec, hdr } = meta
-  if (typeof kindKey !== 'string' || !Object.hasOwn(CLIP_KINDS, kindKey)) {
+  if (typeof kindKey !== 'string' || !Object.hasOwn(CLIP_NAMES, kindKey)) {
     return 'unknown meta.kindKey'
   }
   if (meta.file !== file) return 'meta.file does not match file'
+  if (!isClipName(file, kindKey as ClipKind, chunkId)) {
+    return `not the name of this chunk's ${kindKey} clip`
+  }
   if (!isCount(fps) || !isCount(frames) || !isCount(width) || !isCount(height)) {
     return 'bad clip dimensions'
   }
@@ -215,7 +236,8 @@ function validate(e: Json, kind: ManifestEntry['kind']): ManifestEntry | string 
   }
 }
 
-export function parseManifest(text: string): ParsedManifest {
+/** Parse the manifest of chunk `chunkId`: its clips must be named for it. */
+export function parseManifest(text: string, chunkId: string): ParsedManifest {
   const entries: ManifestEntry[] = []
   const rejected: ManifestReject[] = []
   for (const line of text.split('\n')) {
@@ -229,7 +251,7 @@ export function parseManifest(text: string): ParsedManifest {
     }
     // A kind this app doesn't know is skipped, not rejected, as it always was.
     if (!isObject(e) || !isKind(e.kind)) continue
-    const out = validate(e, e.kind)
+    const out = validate(e, e.kind, chunkId)
     if (typeof out === 'string') {
       rejected.push({ kind: e.kind, file: printable(e.file), reason: out })
     } else {

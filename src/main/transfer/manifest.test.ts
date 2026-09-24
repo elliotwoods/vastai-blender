@@ -8,6 +8,9 @@ import { parseFrameName, parseManifest, type ParsedManifest } from './manifest'
 
 const HASH = 'a'.repeat(64)
 
+/** The chunk whose manifest the parser is reading. */
+const CHUNK = '0b1c2d3e-1-40'
+
 const frame = { kind: 'frame', file: 'frames/0042.exr', size: 100, sha256: HASH, mtime: 1 }
 const thumb = {
   kind: 'thumb',
@@ -37,11 +40,11 @@ const live = {
 }
 const sdr = {
   ...live,
-  file: 'previews/0b1c2d3e-41-80-r1_sdr.mp4',
+  file: 'previews/0b1c2d3e-1-40_sdr.mp4',
   meta: {
     ...live.meta,
     kindKey: 'previewSdr',
-    file: 'previews/0b1c2d3e-41-80-r1_sdr.mp4',
+    file: 'previews/0b1c2d3e-1-40_sdr.mp4',
     fps: 23.976,
     codec: 'av1',
     hdr: false
@@ -52,7 +55,7 @@ const lines = (...objs: unknown[]): string => objs.map((o) => JSON.stringify(o))
 
 /** Parse one line; expect it refused, and return why. */
 function refused(obj: unknown): ParsedManifest['rejected'][number] {
-  const out = parseManifest(lines(obj))
+  const out = parseManifest(lines(obj), CHUNK)
   expect(out.entries).toEqual([])
   expect(out.rejected).toHaveLength(1)
   return out.rejected[0]
@@ -60,7 +63,7 @@ function refused(obj: unknown): ParsedManifest['rejected'][number] {
 
 describe('parseManifest', () => {
   it('accepts frames, thumbs and clips as the agent writes them', () => {
-    const out = parseManifest(lines(frame, thumb, live, sdr))
+    const out = parseManifest(lines(frame, thumb, live, sdr), CHUNK)
     expect(out.entries.map((e) => e.kind)).toEqual(['frame', 'thumb', 'clip', 'clip'])
     expect(out.entries).toEqual([frame, thumb, live, sdr])
     expect(out.rejected).toEqual([])
@@ -71,7 +74,7 @@ describe('parseManifest', () => {
     // fragment. It must not discard the complete lines before it, nor count
     // as a refusal: it will be whole on the next poll.
     const text = lines(frame, thumb) + '\n' + '{"kind":"clip","fi'
-    const out = parseManifest(text)
+    const out = parseManifest(text, CHUNK)
     expect(out.entries).toHaveLength(2)
     expect(out.rejected).toEqual([])
   })
@@ -79,7 +82,7 @@ describe('parseManifest', () => {
   it('skips blank lines, non-objects and unknown kinds without refusing them', () => {
     const text =
       lines(frame) + '\n\n' + lines({ kind: 'mystery', file: '../x', size: 1 }, null, 42, [frame])
-    expect(parseManifest(text)).toEqual({ entries: [frame], rejected: [] })
+    expect(parseManifest(text, CHUNK)).toEqual({ entries: [frame], rejected: [] })
   })
 
   it('refuses entries with no file or a bad size', () => {
@@ -91,21 +94,21 @@ describe('parseManifest', () => {
   })
 
   it('carries only the validated fields', () => {
-    const out = parseManifest(lines({ ...frame, extra: 'x', meta: { a: 1 } }))
+    const out = parseManifest(lines({ ...frame, extra: 'x', meta: { a: 1 } }), CHUNK)
     expect(out.entries).toEqual([frame])
   })
 
   it('keeps live clips distinguishable from definitive ones', () => {
     // The downloader's supersede filter and its class-priority ordering both
     // key on meta.kindKey, so it has to survive parsing intact.
-    const out = parseManifest(lines(live)).entries
+    const out = parseManifest(lines(live), CHUNK).entries
     expect(out[0].kind).toBe('clip')
     expect(out[0].kind === 'clip' && out[0].meta.kindKey).toBe('live')
   })
 
   it('carries the frame number on a thumb', () => {
     // frames.thumb_path is keyed by frame, so losing this would orphan it.
-    const out = parseManifest(lines(thumb)).entries
+    const out = parseManifest(lines(thumb), CHUNK).entries
     expect(out[0].kind === 'thumb' && out[0].meta.frame).toBe(42)
   })
 
@@ -125,7 +128,7 @@ describe('parseManifest', () => {
     // Past frame 9999, `####` just grows.
     ['frames/1048574.exr']
   ])('accepts a frame Blender saved as %j', (file) => {
-    expect(parseManifest(lines({ ...frame, file }))).toEqual({
+    expect(parseManifest(lines({ ...frame, file }), CHUNK)).toEqual({
       entries: [{ ...frame, file }],
       rejected: []
     })
@@ -134,7 +137,7 @@ describe('parseManifest', () => {
   it("accepts a view's thumbnail, which the agent cannot number", () => {
     // PreviewWorker names it after the frame's stem, and int('0042_L') fails.
     const t = { ...thumb, file: 'thumbs/0042_L.jpg', meta: { frame: null, width: 320 } }
-    expect(parseManifest(lines(t)).entries).toEqual([t])
+    expect(parseManifest(lines(t), CHUNK).entries).toEqual([t])
     expect(refused({ ...t, meta: { frame: 7, width: 320 } }).reason).toMatch(/meta.frame/)
   })
 
@@ -225,7 +228,7 @@ describe('parseManifest', () => {
   })
 
   it('caps the declared size', () => {
-    expect(parseManifest(lines({ ...frame, size: 8 * 1024 ** 3 })).entries).toHaveLength(1)
+    expect(parseManifest(lines({ ...frame, size: 8 * 1024 ** 3 }), CHUNK).entries).toHaveLength(1)
     expect(refused({ ...frame, size: 8 * 1024 ** 3 + 1 }).reason).toMatch(/size cap/)
     expect(refused({ ...thumb, size: 65 * 1024 ** 2 }).reason).toMatch(/size cap/)
   })
@@ -249,17 +252,54 @@ describe('parseManifest', () => {
     expect(refused({ ...live, meta: undefined }).reason).toBe('missing meta')
   })
 
+  it("accepts only this chunk's clips, named for what they are", () => {
+    const clip = (file: string, kindKey: string): unknown => ({
+      ...live,
+      file,
+      meta: { ...live.meta, file, kindKey }
+    })
+    const ok = (file: string, kindKey: string, chunkId = CHUNK): void => {
+      expect(parseManifest(lines(clip(file, kindKey)), chunkId).rejected).toEqual([])
+    }
+    const no = (file: string, kindKey: string, chunkId = CHUNK): void => {
+      const out = parseManifest(lines(clip(file, kindKey)), chunkId)
+      expect(out.entries).toEqual([])
+      expect(out.rejected[0].reason).toBe(`not the name of this chunk's ${kindKey} clip`)
+    }
+    ok('previews/0b1c2d3e-1-40_sdr.mp4', 'previewSdr')
+    ok('previews/0b1c2d3e-1-40_hdr.mp4', 'previewHdr')
+    ok('previews/0b1c2d3e-1-40_proxy.mp4', 'proxy')
+    ok('previews/0b1c2d3e-1-40_live_1700000000_0040.mp4', 'live')
+    ok('previews/0b1c2d3e-41-80-r1_proxy.mp4', 'proxy', '0b1c2d3e-41-80-r1')
+
+    // Another chunk's clip: downloading it would overwrite that chunk's file
+    // and take over its assets row. So would one that only starts the same.
+    no('previews/0b1c2d3e-41-80-r1_sdr.mp4', 'previewSdr')
+    no('previews/0b1c2d3e-1-40_sdr.mp4', 'previewSdr', '0b1c2d3e-1-4')
+    // The stitched job clip (jobClipPlan's nextVersionName). As 'live', the
+    // next prune of superseded live clips would have deleted it.
+    no('previews/job_previewSdr.v1.mp4', 'live')
+    no('previews/job_previewSdr.v1.mp4', 'previewSdr')
+    // Named for another rendition than it claims to be.
+    no('previews/0b1c2d3e-1-40_sdr.mp4', 'proxy')
+    no('previews/0b1c2d3e-1-40_live_1700000000_0040.mp4', 'previewSdr')
+    no('previews/0b1c2d3e-1-40_sdr.mp4', 'live')
+    no('previews/0b1c2d3e-1-40_live_x_0040.mp4', 'live')
+    no('previews/0b1c2d3e-1-40_live_1700000000_40.mp4', 'live')
+    no('previews/0b1c2d3e-1-40_sdr.v2.mp4', 'previewSdr')
+  })
+
   it('refuses a thumb that names some other frame', () => {
     expect(refused({ ...thumb, meta: { frame: 7, width: 320 } }).reason).toMatch(/meta.frame/)
     expect(refused({ ...thumb, meta: { width: 320 } }).reason).toMatch(/meta.frame/)
     expect(refused({ ...thumb, meta: { frame: 42, width: 'x' } }).reason).toBe('bad meta.width')
     expect(
-      parseManifest(lines({ ...thumb, meta: { frame: null, width: 320 } })).entries
+      parseManifest(lines({ ...thumb, meta: { frame: null, width: 320 } }), CHUNK).entries
     ).toHaveLength(1)
   })
 
   it('keeps the good lines around a bad one', () => {
-    const out = parseManifest(lines(frame, { ...frame, file: '../../x/0001.exr' }, thumb))
+    const out = parseManifest(lines(frame, { ...frame, file: '../../x/0001.exr' }, thumb), CHUNK)
     expect(out.entries).toEqual([frame, thumb])
     expect(out.rejected).toEqual([
       { kind: 'frame', file: '"../../x/0001.exr"', reason: 'not a file name the agent writes' }
