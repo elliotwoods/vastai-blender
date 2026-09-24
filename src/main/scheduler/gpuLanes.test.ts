@@ -14,7 +14,8 @@ const {
   normaliseSlotsPerGpu,
   cardVramFraction,
   perGpuFramesPerHour,
-  runsOnGpu
+  runsOnGpu,
+  dispatchLanePlan
 } = await import('./gpuLanes')
 type LaneGuard = import('./gpuLanes').LaneGuard
 type LaneGuardContext = import('./gpuLanes').LaneGuardContext
@@ -332,5 +333,56 @@ describe('perGpuFramesPerHour (#225)', () => {
     const work = [{ gpu: 0 }, { gpu: 1 }, { gpu: 1 }, { gpu: null }]
     expect(runsOnGpu(work, 1)).toBe(2)
     expect(runsOnGpu(work, 3)).toBe(1)
+  })
+})
+
+describe('dispatchLanePlan (#224)', () => {
+  const pinned4 = { lanes: 4, pin: true }
+
+  it("sends a job's last chunk to an empty node as one process on every card", () => {
+    expect(
+      dispatchLanePlan({ plan: pinned4, nodeInFlight: 0, freeLanes: 4, pendingExclusive: 1 })
+    ).toEqual({ lanes: 1, pin: false })
+  })
+
+  it('pins when there is work for every lane', () => {
+    expect(
+      dispatchLanePlan({ plan: pinned4, nodeInFlight: 0, freeLanes: 4, pendingExclusive: 4 })
+    ).toEqual(pinned4)
+    expect(
+      dispatchLanePlan({ plan: pinned4, nodeInFlight: 0, freeLanes: 4, pendingExclusive: 9 })
+    ).toEqual(pinned4)
+  })
+
+  it('keeps pinning beside pinned lanes already running', () => {
+    expect(
+      dispatchLanePlan({ plan: pinned4, nodeInFlight: 2, freeLanes: 2, pendingExclusive: 1 })
+    ).toEqual(pinned4)
+  })
+
+  it('counts the free lanes the whole queue can reach', () => {
+    // Five chunks, two empty 4-GPU nodes: the first node takes one chunk
+    // across all its cards; the second then has exactly enough to pin.
+    const first = dispatchLanePlan({
+      plan: pinned4,
+      nodeInFlight: 0,
+      freeLanes: 8,
+      pendingExclusive: 5
+    })
+    expect(first).toEqual({ lanes: 1, pin: false })
+    const second = dispatchLanePlan({
+      plan: pinned4,
+      nodeInFlight: 0,
+      freeLanes: 4,
+      pendingExclusive: 4
+    })
+    expect(second).toEqual(pinned4)
+  })
+
+  it('leaves an unpinned plan alone', () => {
+    const one = { lanes: 1, pin: false }
+    expect(
+      dispatchLanePlan({ plan: one, nodeInFlight: 0, freeLanes: 1, pendingExclusive: 0 })
+    ).toBe(one)
   })
 })

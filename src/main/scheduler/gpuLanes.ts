@@ -349,3 +349,38 @@ export function perGpuFramesPerHour(i: {
 export function runsOnGpu(work: ReadonlyArray<{ gpu?: number | null }>, gpu: number): number {
   return Math.max(1, work.filter((w) => w.gpu === gpu).length)
 }
+
+/**
+ * Lanes and pinning for ONE exclusive chunk at dispatch.
+ *
+ * Pinning was decided per node, never per dispatch, so whenever a job had
+ * fewer chunks left than a node has lanes (small jobs, and the end of every
+ * job) the remaining chunks rendered one card each while the other cards
+ * idled, where one unpinned process used to use them all (#224). On the
+ * commit's own figures (62 s sampling + 4.5 s sync per frame on one 4090, ~20
+ * s on four) a lone tail chunk took about three times as long.
+ *
+ * So: when the free lanes the queue can reach outnumber the exclusive chunks
+ * waiting for them, a chunk that finds its node EMPTY goes out as one
+ * unpinned process on every card. A node already running pinned lanes keeps
+ * pinning: an unpinned process would share their cards. Once there is enough
+ * work to fill the lanes, pinning wins again (the per-process sync overlaps).
+ *
+ * The unpinned chunk holds the node (lanes 1): the scheduler must count the
+ * node as full while it runs, since the agent starts a pinned spec beside
+ * any run fewer than that spec's own lane count.
+ */
+export function dispatchLanePlan(i: {
+  /** the node's lane plan under its guard (guardedLanePlan) */
+  plan: LanePlan
+  /** exclusive runs already on this node */
+  nodeInFlight: number
+  /** free exclusive lanes on the usable nodes this chunk could go to, this node's included */
+  freeLanes: number
+  /** pending exclusive chunks those lanes could take, this chunk included */
+  pendingExclusive: number
+}): LanePlan {
+  if (!i.plan.pin || i.nodeInFlight > 0) return i.plan
+  if (i.freeLanes > i.pendingExclusive) return { lanes: 1, pin: false }
+  return i.plan
+}
