@@ -6,6 +6,7 @@
 #   provision.sh base                      # apt deps + dirs + agent under tmux
 #   provision.sh install-blender <version> # e.g. 4.5.3 → ~/vastai/blender/4.5.3/
 #   provision.sh probe-eevee <version>     # 1-frame EEVEE render capability probe
+#   provision.sh ensure-optix              # add OptiX libs when the container lacks them
 set -euo pipefail
 
 VASTAI_HOME="${VASTAI_HOME:-$HOME/vastai}"
@@ -51,6 +52,11 @@ cmd_base() {
     fi
   fi
   log "ffmpeg: $("$VASTAI_HOME/bin/ffmpeg" -version | head -1)"
+  # Background (fully detached): ~300 MB download that overlaps the Blender
+  # install + EEVEE probe. A chunk that starts before it lands renders on CUDA.
+  setsid nohup bash "$VASTAI_HOME/provision.sh" ensure-optix \
+    > "$VASTAI_HOME/logs/ensure_optix.log" 2>&1 < /dev/null &
+  log "ensure-optix started in background (logs/ensure_optix.log)"
   log "starting agent…"
   tmux kill-session -t vr-agent 2>/dev/null || true
   # Kill stray render processes from a previous agent (SIGHUP from the tmux
@@ -126,8 +132,96 @@ cmd_probe_eevee() {
   fi
 }
 
+# Some hosts' container runtime mounts libcuda but NOT the OptiX libraries
+# (libnvoptix / libnvidia-rtcore), so Cycles logs "OptiX initialization failed
+# with error code 7804" and enable_gpu.py falls back to CUDA — measured ~1.5x
+# slower sampling on an RTX 4090 (2026-09-24). Fetch the driver package that
+# matches the host kernel module and install just those libraries. Best
+# effort: any failure leaves the node on CUDA, exactly as before.
+cmd_ensure_optix() {
+  local libdir=/usr/lib/x86_64-linux-gnu
+  if [ -e "$libdir/libnvoptix.so.1" ]; then
+    log "optix: already present"
+    return 0
+  fi
+  local ver
+  # nvidia-smi first; /proc fallback covers both "Kernel Module  550.142" and
+  # "Open Kernel Module for x86_64  580.159.03".
+  ver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)"
+  if ! [[ "$ver" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+    ver="$(grep -oE '[0-9]{3}\.[0-9]+(\.[0-9]+)?' /proc/driver/nvidia/version 2>/dev/null | head -1 || true)"
+  fi
+  [ -n "$ver" ] || { log "optix: driver version unknown — staying on CUDA"; return 0; }
+  local tmp=/tmp/optix-$ver
+  rm -rf "$tmp"; mkdir -p "$tmp"
+  log "optix: fetching driver $ver libraries"
+  if ! curl -fsSL --retry 3 -o "$tmp/drv.run" \
+      "https://us.download.nvidia.com/XFree86/Linux-x86_64/$ver/NVIDIA-Linux-x86_64-$ver.run"; then
+    log "optix: driver $ver download failed — staying on CUDA"; rm -rf "$tmp"; return 0
+  fi
+  if ! sh "$tmp/drv.run" --extract-only --target "$tmp/x" > /dev/null 2>&1; then
+    log "optix: extract failed — staying on CUDA"; rm -rf "$tmp"; return 0
+  fi
+  [ -f "$tmp/x/libnvoptix.so.$ver" ] || { log "optix: no libnvoptix in package"; rm -rf "$tmp"; return 0; }
+
+  # VERIFY BEFORE ACTIVATING. Libraries that load are not libraries that work:
+  # on an open-kernel-module 580.159.03 host they loaded, then every Cycles
+  # render died with OPTIX_ERROR_INTERNAL_COMPILER_ERROR (exit 1) — worse than
+  # CUDA. So stage them in a private dir, prove a real OptiX render passes via
+  # LD_LIBRARY_PATH, and only then expose them system-wide.
+  local stage="$tmp/stage" f
+  mkdir -p "$stage"
+  for f in libnvidia-rtcore.so.$ver libnvoptix.so.$ver; do
+    [ -f "$tmp/x/$f" ] && cp "$tmp/x/$f" "$stage/"
+  done
+  ln -sf "libnvoptix.so.$ver" "$stage/libnvoptix.so.1"
+  local blender="" i
+  for i in $(seq 1 60); do  # Blender is installed in parallel; wait up to 10 min
+    blender="$(ls -d "$BLENDER_ROOT"/*/blender 2>/dev/null | head -1 || true)"
+    [ -n "$blender" ] && [ -x "$blender" ] && break
+    sleep 10
+  done
+  [ -x "$blender" ] || { log "optix: no blender to verify with — staying on CUDA"; rm -rf "$tmp"; return 0; }
+  local expr="import bpy
+p=bpy.context.preferences.addons['cycles'].preferences
+p.compute_device_type='OPTIX'; p.refresh_devices()
+d=[x for x in p.devices if x.type=='OPTIX']
+assert d, 'no OptiX device'
+for x in p.devices: x.use = x.type=='OPTIX'
+s=bpy.context.scene; s.render.engine='CYCLES'; s.cycles.device='GPU'; s.cycles.samples=1
+s.render.resolution_x=s.render.resolution_y=32; s.render.filepath='$tmp/verify.png'
+bpy.ops.render.render(write_still=True)"
+  if LD_LIBRARY_PATH="$stage" "$blender" -b --factory-startup -noaudio --python-exit-code 1 \
+       --python-expr "$expr" > "$tmp/verify.log" 2>&1 \
+     && ! grep -qE "Failed to load OptiX|OPTIX_ERROR|OptiX initialization failed" "$tmp/verify.log" \
+     && [ -s "$tmp/verify.png" ]; then
+    log "optix: verified with $blender"
+  else
+    log "optix: verification FAILED — staying on CUDA:"
+    grep -E "OptiX|OPTIX|Error|assert" "$tmp/verify.log" | head -5 || true
+    rm -rf "$tmp"; return 0
+  fi
+
+  # Activate. Stage-then-rename so a render starting mid-install never
+  # dlopens a half-written library.
+  for f in libnvidia-rtcore.so.$ver libnvoptix.so.$ver; do
+    [ -f "$stage/$f" ] || continue
+    [ -e "$libdir/$f" ] && continue
+    cp "$stage/$f" "$libdir/.$f.tmp" && mv -f "$libdir/.$f.tmp" "$libdir/$f"
+  done
+  # (nvoptix.bin deliberately not installed: activate exactly what was verified.)
+  if [ "${OPTIX_VERIFY_ONLY:-0}" = 1 ]; then
+    log "optix: verify-only mode — not activating"; rm -rf "$tmp"; return 0
+  fi
+  ln -sf "libnvoptix.so.$ver" "$libdir/.libnvoptix.so.1.tmp" && mv -f "$libdir/.libnvoptix.so.1.tmp" "$libdir/libnvoptix.so.1"
+  ldconfig || true
+  rm -rf "$tmp"
+  log "optix: installed driver $ver OptiX libraries"
+}
+
 case "${1:-}" in
   base) cmd_base ;;
+  ensure-optix) cmd_ensure_optix ;;
   install-blender) cmd_install_blender "$2" ;;
   probe-eevee) cmd_probe_eevee "$2" ;;
   *) echo "usage: provision.sh base|install-blender <ver>|probe-eevee <ver>"; exit 1 ;;
