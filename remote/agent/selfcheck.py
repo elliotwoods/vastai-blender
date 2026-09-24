@@ -23,7 +23,13 @@ Covers the failure modes that actually bit:
     even after Blender crashed, so the frame it died writing (or a leftover from
     a killed earlier attempt) was manifested with a hash over truncated bytes —
     and the app verified against that hash, accepted it and never re-rendered it.
-    These cases drive the real run_render against a scripted fake `blender`.
+    A frame Blender could not write ("cannot save", e.g. a full disk) took the
+    same route when Blender still exited 0.
+  * the EEVEE OpenGL retry deleted a frame the first attempt had finished but
+    not yet flushed, and was skipped for a re-dispatched chunk whose manifest
+    already held frames.
+    These cases drive the real run_render against a scripted fake `blender`,
+    and are skipped on Windows, where its `#!/bin/sh` wrapper cannot run.
 """
 
 import contextlib
@@ -207,6 +213,8 @@ with open(argv[argv.index("-b") + 1]) as f:
     script = json.load(f)
 attempt = script["opengl" if "--gpu-backend" in argv else "default"]
 out = os.path.dirname(argv[argv.index("-o") + 1])
+for line in attempt.get("print", []):
+    print(line, flush=True)
 for name, body, announce in attempt.get("write", []):
     path = os.path.join(out, name)
     if script.get("noOverwrite") and os.path.exists(path):
@@ -214,6 +222,12 @@ for name, body, announce in attempt.get("write", []):
         continue
     with open(path, "w") as f:
         f.write(body)
+    if announce == "error":
+        # Blender's report for a failed write. It stops the animation there,
+        # whatever exit code follows.
+        print("Error: Render error (No space left on device) cannot save: '%s'" % path,
+              flush=True)
+        break
     if announce:
         print("Saved: '%s'" % path, flush=True)
 sys.exit(attempt.get("exit", 0))
@@ -226,13 +240,22 @@ def fake_node():
 
     Script shape: {"default": attempt, "opengl": attempt, "noOverwrite": bool},
     where "opengl" is the attempt run with `--gpu-backend opengl` and an attempt
-    is {"write": [[name, body, announce]], "exit": code}. `announce` prints
-    Blender's "Saved:" line; `noOverwrite` mimics a .blend with Overwrite
-    unchecked, which skips any frame already on disk.
+    is {"print": [line], "write": [[name, body, announce]], "exit": code}.
+    "print" lines come first. `announce` True prints Blender's "Saved:" line,
+    and "error" its "cannot save" line, after which the fake stops writing, as
+    Blender does. `noOverwrite` mimics a .blend with Overwrite unchecked, which
+    skips any frame already on disk.
     """
-    names = ("ROOT", "RENDERS", "STATE", "LOGS", "BLENDER_ROOT")
+    names = ("ROOT", "RENDERS", "STATE", "LOGS", "BLENDER_ROOT", "size_stable", "SETTLE_PAUSE")
     saved = {k: getattr(nr, k) for k in names}
     with tempfile.TemporaryDirectory() as tmp:
+        # The agent watches a frame's size for 0.5-1 s, and pauses 0.5 s between
+        # settle passes, for Blender's slow writes. The fake writes each file
+        # whole and then exits, and the real waits made these cases ~20 s of
+        # every `npm test`.
+        real_stable = saved["size_stable"]
+        nr.size_stable = lambda path, wait=1.0: real_stable(path, wait=0.01)
+        nr.SETTLE_PAUSE = 0.01
         nr.ROOT = tmp
         nr.RENDERS = os.path.join(tmp, "renders")
         nr.STATE = os.path.join(tmp, "state")
@@ -278,6 +301,11 @@ def sha(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def render_log():
+    with open(os.path.join(nr.LOGS, "c1.log")) as f:
+        return f.read()
+
+
 def test_crashed_render_adopts_nothing_unannounced():
     with fake_node() as tmp:
         cdir = make_chunk(tmp, ["0001.exr"], ["0001.exr"])
@@ -294,6 +322,41 @@ def test_crashed_render_adopts_nothing_unannounced():
         check("crash: an already-manifested frame is kept",
               files.count("frames/0001.exr") == 1
               and os.path.exists(os.path.join(cdir, "frames", "0001.exr")))
+        # Not left for this chunk's next attempt here: the app may re-dispatch
+        # it to another node, and the partial would sit on this disk for good.
+        check("crash: the partial frame is deleted at once",
+              sorted(os.listdir(os.path.join(cdir, "frames"))) == ["0001.exr", "0002.exr"])
+
+
+def test_write_error_is_a_failed_frame():
+    with fake_node() as tmp:
+        cdir = make_chunk(tmp)
+        # The disk fills while 0002 is written: Blender reports it, stops the
+        # animation and exits 0 anyway, leaving a partial 0002 on the grid.
+        err, entries = render(tmp, {"default": {
+            "write": [["0001.exr", "whole", True], ["0002.exr", "part", "error"]],
+            "exit": 0,
+        }})
+        files = [e["file"] for e in entries]
+        check("write error: the chunk fails although blender exited 0",
+              (err or "").startswith("blender could not save 0002.exr (exit 0)"))
+        check("write error: the frame blender could not save is not manifested",
+              "frames/0002.exr" not in files)
+        check("write error: its partial file is deleted",
+              not os.path.exists(os.path.join(cdir, "frames", "0002.exr")))
+        check("write error: frames saved before it are kept",
+              files == ["frames/0001.exr"]
+              and os.path.exists(os.path.join(cdir, "frames", "0001.exr")))
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        # Where Blender exits non-zero after it, EEVEE must not be retried on
+        # OpenGL: the GPU backend worked, the disk did not.
+        err, _entries = render(tmp, {"default": {
+            "write": [["0001.exr", "part", "error"]], "exit": 1,
+        }}, engine="eevee")
+        check("write error: no OpenGL retry for EEVEE",
+              "retrying" not in render_log()
+              and (err or "").startswith("blender could not save 0001.exr (exit 1)"))
 
 
 def test_stale_leftovers_are_discarded():
@@ -353,10 +416,64 @@ def test_eevee_opengl_retry():
         check("eevee: the retry's frames are manifested", sorted(by_file) == ["frames/0001.exr", "frames/0002.exr"])
         check("eevee: the failed attempt's corpse is discarded, not adopted",
               by_file.get("frames/0001.exr", {}).get("sha256") == sha("gl1"))
-        with open(os.path.join(nr.LOGS, "c1.log")) as f:
-            check("eevee: the discard is logged", "discarded 1 unmanifested" in f.read())
+        check("eevee: the discard is logged", "discarded 1 unmanifested" in render_log())
         check("eevee: frames/ holds only manifested frames",
               sorted(os.listdir(os.path.join(cdir, "frames"))) == ["0001.exr", "0002.exr"])
+
+
+def test_eevee_retry_keeps_finished_frames():
+    with fake_node() as tmp:
+        cdir = make_chunk(tmp)
+        # Vulkan renders frame 1, announces it and dies on frame 2, all within
+        # the 2 s between in-loop flushes, so 1 is still pending at the exit.
+        # Were the chunk retried, the OpenGL attempt would fail at startup.
+        err, entries = render(tmp, {
+            "default": {"print": ["Fra:1 Mem:12.00M | Syncing Cube"],
+                        "write": [["0001.exr", "vk1", True]], "exit": 1},
+            "opengl": {"exit": 1},
+        }, frames=(1, 2, 1), engine="eevee")
+        by_file = {e["file"]: e for e in entries}
+        check("eevee: a frame the failed attempt finished is manifested and kept",
+              by_file.get("frames/0001.exr", {}).get("sha256") == sha("vk1")
+              and os.path.exists(os.path.join(cdir, "frames", "0001.exr")))
+        check("eevee: no OpenGL retry once the first attempt produced a frame",
+              "retrying" not in render_log() and err == "blender exited 1")
+
+
+def test_eevee_retry_forgets_unrecorded_announcements():
+    """FrameTracker.forget_pending: the retry inherits no announcement."""
+    with fake_node() as tmp:
+        cdir = make_chunk(tmp)
+        # Vulkan announces 0001 but leaves it empty, so it never becomes
+        # size-stable and stays pending. The OpenGL retry then dies writing
+        # 0001 without announcing it. Under the stale announcement, its
+        # truncated bytes would be manifested.
+        err, entries = render(tmp, {
+            "default": {"write": [["0001.exr", "", True]], "exit": 1},
+            "opengl": {"write": [["0001.exr", "trun", False]], "exit": 1},
+        }, frames=(1, 2, 1), engine="eevee")
+        check("retry: runs when the first attempt recorded nothing",
+              "retrying with --gpu-backend opengl" in render_log() and err == "blender exited 1")
+        check("retry: a stale announcement cannot manifest the retry's partial frame",
+              "frames/0001.exr" not in [e["file"] for e in entries])
+        check("retry: nothing unmanifested is left in frames/",
+              os.listdir(os.path.join(cdir, "frames")) == [])
+
+
+def test_eevee_retry_on_a_redispatched_chunk():
+    with fake_node() as tmp:
+        # 0003 was finished by an earlier run of this chunk on this node, so the
+        # manifest is not empty when Vulkan fails to start this time.
+        make_chunk(tmp, ["0003.exr"], ["0003.exr"])
+        err, entries = render(tmp, {
+            "default": {"exit": 1},
+            "opengl": {"write": [["0001.exr", "gl1", True], ["0002.exr", "gl2", True]],
+                       "exit": 0},
+        }, frames=(1, 3, 1), engine="eevee")
+        check("eevee: a re-dispatched chunk with frames recorded is still retried",
+              err is None
+              and sorted(e["file"] for e in entries)
+              == ["frames/0001.exr", "frames/0002.exr", "frames/0003.exr"])
 
 
 def test_sweep_filters():
@@ -406,11 +523,23 @@ def main():
         test_resubscribe_fills_the_gap,
         test_write_state_under_threads,
         test_sweep_filters,
+    ):
+        fn()
+    # Through fake_node, whose `blender` is a `#!/bin/sh` wrapper that Windows
+    # cannot exec. The agent itself only ever runs on Linux nodes.
+    for fn in (
         test_crashed_render_adopts_nothing_unannounced,
+        test_write_error_is_a_failed_frame,
         test_stale_leftovers_are_discarded,
         test_clean_render_is_manifested,
         test_eevee_opengl_retry,
+        test_eevee_retry_keeps_finished_frames,
+        test_eevee_retry_forgets_unrecorded_announcements,
+        test_eevee_retry_on_a_redispatched_chunk,
     ):
+        if os.name == "nt":
+            print(f"SKIP  {fn.__name__}: the fake blender needs a POSIX shell")
+            continue
         fn()
     print()
     if FAILED:
