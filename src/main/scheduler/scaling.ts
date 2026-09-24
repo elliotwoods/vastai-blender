@@ -18,11 +18,13 @@
  * - It returns a CapacityBudget (shared/models.ts: node room, $/hr headroom,
  *   and the exclusive lanes and shared slots still wanted) instead of a node
  *   count. requestNodes subtracts each offer's real contribution as it rents
- *   (offerContribution, subtractRental) and stops once the demand is covered. A node count sized on the
- *   GPU-count filter and placeholder slot counts rented whatever ranked
- *   best, 8-GPU boxes included, for 1-lane demand (#227, #237).
- * - The spend cap is a budget, not a yes/no: capHeadroom() goes to the offer
- *   search as maxDphTotal, and every rental spends from it.
+ *   (offerContribution, subtractRental) and stops once the demand is
+ *   covered. A node count sized on the GPU-count filter and placeholder slot
+ *   counts rented whatever ranked best, 8-GPU boxes included, for 1-lane
+ *   demand (#227, #237).
+ * - The spend cap is a budget, not a yes/no: the headroom goes to the offer
+ *   search as maxDphTotal, and every rental spends from it. capHeadroom()
+ *   and nodeState.capacityBudget() read the cap and round it the same way.
  * - It knows the tail. A new node takes ~10 min to boot and provision
  *   before its first frame. In job da68b61b every frame had landed except a
  *   1-frame requeue sub-chunk, sitting on a live node, and buy-ahead rented
@@ -284,8 +286,9 @@ export function planScaling(i: PlanScalingInput): ScalingPlan {
   if (i.usableNodes + i.booting.length > 0) {
     // What a new node could be given: pending work, or for buy-ahead whatever
     // is left (buy-ahead exists for queues the fleet has already prefetched).
-    // Pending frames count whole, even those free lanes will take: an
-    // overestimate, so the rule only ever rents less than before, never more.
+    // Pending frames count whole, even those free lanes will take. That
+    // overstates a new node's share, so this errs toward renting, as before:
+    // the tail rules can only ever stop a rental, never add one.
     const givable = i.eager ? i.remainingExclusiveFrames + i.remainingSharedFrames : i.pendingFrames
     if (i.newNodeFramesPerHour != null && i.newNodeFramesPerHour > 0) {
       const workMs = (givable / i.newNodeFramesPerHour) * 3_600_000
@@ -315,6 +318,9 @@ export function planScaling(i: PlanScalingInput): ScalingPlan {
   const headroom = i.cap.headroomPerHour
   const minOffer = Math.max(0, i.minOfferDph ?? 0)
   if (headroom != null && (!(headroom > 0) || headroom < minOffer)) {
+    if (!(i.cap.spendCap != null && i.cap.spendCap > 0)) {
+      return stop('spend-cap', 'no spend cap is set, and "no cap" is off: nothing is rented')
+    }
     return stop(
       'spend-cap',
       `spend cap: ${money(i.cap.perHour)} of ${money(i.cap.spendCap)} in use leaves ${money(headroom)}` +

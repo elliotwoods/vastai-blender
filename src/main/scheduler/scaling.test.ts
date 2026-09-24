@@ -353,7 +353,9 @@ describe('planScaling: holds and limits', () => {
 
   it('a blank cap without the no-cap flag rents nothing', () => {
     const cap = caps([], { spendCapPerHour: null, noSpendCap: false })
-    expect(planScaling(plan({ ...big, cap })).status).toBe('spend-cap')
+    const p = planScaling(plan({ ...big, cap }))
+    expect(p.status).toBe('spend-cap')
+    expect(p.reason).toMatch(/no spend cap is set/)
   })
 
   it('stops at max nodes and bounds a batch by room and the per-tick burst', () => {
