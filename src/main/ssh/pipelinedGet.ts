@@ -16,13 +16,19 @@
  *   a dead connection that never errors);
  * - resume: on any failure the `.part` file is truncated to the longest fully
  *   written prefix, and a later call with `start` = that size continues from
- *   there instead of from zero.
+ *   there instead of from zero;
+ * - `onProgress`, so a caller can tell a slow transfer from a dead one;
+ * - `signal`, so a caller that has given up stops the transfer's writes
+ *   instead of leaving them to land in a file someone else now owns;
+ * - local disk failures (full, read-only, not ours to write) come out as
+ *   `LocalSinkError`, never mistaken for a problem with the node.
  *
  * The SFTP surface is a small interface so the stall/resume logic can be
  * unit-tested against a fake.
  */
 
 import { promises as fsp } from 'fs'
+import type { FileHandle } from 'fs/promises'
 
 export class TransferStalledError extends Error {
   constructor(
@@ -34,6 +40,60 @@ export class TransferStalledError extends Error {
       `transfer stalled: no data for ${Math.round(stalledMs / 1000)}s at ${bytes} bytes (${remotePath})`
     )
   }
+}
+
+/** The caller's AbortSignal fired: the transfer stopped, keeping its prefix. */
+export class TransferAbortedError extends Error {
+  constructor(readonly remotePath: string) {
+    super(`transfer aborted (${remotePath})`)
+  }
+}
+
+/**
+ * The local disk would not take the file: full, over quota, read-only, not
+ * ours to write, or failing. Not the node's fault, nor the network's: the file
+ * is still on the node, and fetching it again fails the same way until the
+ * disk is fixed. So it must not count against the transfer's retries, and the
+ * file must not be taken as lost, which re-renders it on a paid GPU (B6).
+ */
+export class LocalSinkError extends Error {
+  constructor(
+    /** The fs error code: ENOSPC, EACCES... */
+    readonly code: string,
+    message: string,
+    /** The local path the failing step was writing. */
+    readonly path?: string
+  ) {
+    super(message)
+  }
+}
+
+/**
+ * fs error codes that mean the local disk cannot take a file, whichever step
+ * hit them. EPERM is macOS refusing an app a protected folder; EIO a failing
+ * or unplugged drive.
+ */
+const SINK_CODES: ReadonlySet<string> = new Set([
+  'ENOSPC',
+  'EDQUOT',
+  'EROFS',
+  'EACCES',
+  'EPERM',
+  'EIO'
+])
+
+/**
+ * A local fs error with one of the SINK_CODES (or `alsoCodes`) as a
+ * LocalSinkError; anything else unchanged. Only for errors from local steps:
+ * the codes are fs's strings, where ssh2's SFTP status codes are numbers.
+ */
+export function asLocalSinkError(e: unknown, alsoCodes: readonly string[] = []): unknown {
+  if (e instanceof LocalSinkError) return e
+  const code = (e as { code?: unknown } | null)?.code
+  if (typeof code !== 'string') return e
+  if (!SINK_CODES.has(code) && !alsoCodes.includes(code)) return e
+  const path = (e as { path?: unknown }).path
+  return new LocalSinkError(code, (e as Error).message, typeof path === 'string' ? path : undefined)
 }
 
 type Cb<T> = (err: Error | null | undefined, v: T) => void
@@ -64,12 +124,16 @@ export interface PipelinedGetOptions {
   /** watchdog tick; defaults to min(stallMs / 4, 5s) */
   checkEveryMs?: number
   now?: () => number
+  /** Called with the size of each read as it arrives: bytes that just landed. */
+  onProgress?: (bytes: number) => void
+  /** Stop the transfer: it fails with TransferAbortedError, keeping its prefix. */
+  signal?: AbortSignal
 }
 
 /**
  * Fetch `remote` into `localPart`, from `start` to `size`. Resolves when every
- * byte is written; rejects on error or stall with the local file truncated to
- * its contiguous prefix (so the caller can resume from its size).
+ * byte is written; rejects on error, stall or abort with the local file
+ * truncated to its contiguous prefix (so the caller can resume from its size).
  */
 export async function pipelinedGet(
   sftp: SftpReader,
@@ -82,7 +146,8 @@ export async function pipelinedGet(
   const concurrency = Math.max(1, opts.concurrency ?? 64)
   const chunkSize = Math.max(1, opts.chunkSize ?? 32_768)
   const now = opts.now ?? Date.now
-  const fh = await fsp.open(localPart, start > 0 ? 'r+' : 'w')
+  const { signal } = opts
+  if (signal?.aborted) throw new TransferAbortedError(remote)
 
   // Ranges not yet on disk: queued, or requested and awaiting a reply.
   const outstanding = new Map<number, number>() // position → length
@@ -92,7 +157,12 @@ export async function pipelinedGet(
   let received = start
   let lastProgress = now()
   let handle: Buffer | null = null
+  let fh: FileHandle | null = null
   let dead = false
+  /** Set while the transfer runs: fails it (the abort listener's way in). */
+  let failNow: ((e: Error) => void) | null = null
+  const onAbort = (): void => failNow?.(new TransferAbortedError(remote))
+  signal?.addEventListener('abort', onAbort, { once: true })
 
   const lowestIncomplete = (): number => {
     let low = size
@@ -100,6 +170,14 @@ export async function pipelinedGet(
     for (const p of outstanding.keys()) low = Math.min(low, p)
     return low
   }
+
+  // Opened (or reopened, to resume) only once the remote file has: a file
+  // already gone from the node used to leave an empty .part behind in the
+  // job folder, which is the user's delivery folder.
+  const openLocal = (): Promise<FileHandle> =>
+    fsp.open(localPart, start > 0 ? 'r+' : 'w').catch((e: unknown) => {
+      throw asLocalSinkError(e)
+    })
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -109,6 +187,7 @@ export async function pipelinedGet(
         clearInterval(watchdog)
         reject(e)
       }
+      failNow = fail
       const watchdog = setInterval(
         () => {
           const idle = now() - lastProgress
@@ -116,6 +195,15 @@ export async function pipelinedGet(
         },
         opts.checkEveryMs ?? Math.max(50, Math.min(opts.stallMs / 4, 5_000))
       )
+      /** The local file opened: keep it, unless the transfer ended meanwhile. */
+      const adopt = (f: FileHandle): boolean => {
+        if (dead) {
+          void f.close().catch(() => {})
+          return false
+        }
+        fh = f
+        return true
+      }
 
       const finishIfDone = (): void => {
         if (dead || queue.length > 0 || outstanding.size > 0) return
@@ -125,7 +213,8 @@ export async function pipelinedGet(
       }
 
       const issue = (): void => {
-        while (!dead && handle && outstanding.size < concurrency && queue.length > 0) {
+        const out = fh
+        while (!dead && handle && out && outstanding.size < concurrency && queue.length > 0) {
           const [pos, len] = queue.shift()!
           outstanding.set(pos, len)
           const buf = Buffer.allocUnsafe(len)
@@ -137,18 +226,19 @@ export async function pipelinedGet(
             }
             lastProgress = now()
             received += n
+            opts.onProgress?.(n)
             // Short read: the rest of this range goes back on the queue.
             if (n < len) queue.unshift([pos + n, len - n])
-            const w = fh.write(buf, 0, n, pos).then(
+            const w = out.write(buf, 0, n, pos).then(
               () => {
                 writes.delete(w)
                 outstanding.delete(pos)
                 issue()
                 finishIfDone()
               },
-              (e: Error) => {
+              (e: unknown) => {
                 writes.delete(w)
-                fail(e)
+                fail(asLocalSinkError(e) as Error)
               }
             )
             writes.add(w)
@@ -157,9 +247,11 @@ export async function pipelinedGet(
       }
 
       if (queue.length === 0) {
-        dead = true
-        clearInterval(watchdog)
-        resolve()
+        // Nothing to fetch (an empty file, or a resume that already has every
+        // byte): only the local file has to exist.
+        openLocal().then((f) => {
+          if (adopt(f)) finishIfDone()
+        }, fail)
         return
       }
       sftp.open(remote, 'r', (err, h) => {
@@ -169,22 +261,34 @@ export async function pipelinedGet(
         }
         if (err) return fail(err)
         handle = h
-        lastProgress = now()
-        issue()
+        openLocal().then((f) => {
+          if (!adopt(f)) return
+          lastProgress = now()
+          issue()
+        }, fail)
       })
     })
   } catch (e) {
     // Keep only what is contiguous from the start, so a resume never skips a
     // hole left by a read that was still outstanding when this gave up.
     await Promise.allSettled([...writes])
-    const keep = lowestIncomplete()
-    await fh.truncate(keep).catch(() => {})
-    await fh.close().catch(() => {})
+    const out = fh as FileHandle | null
+    if (out) {
+      await out.truncate(lowestIncomplete()).catch(() => {})
+      await out.close().catch(() => {})
+    }
     // Best-effort: on a wedged channel this callback may never come.
     if (handle) sftp.close(handle, () => {})
     throw e
+  } finally {
+    failNow = null
+    signal?.removeEventListener('abort', onAbort)
   }
   await Promise.allSettled([...writes])
-  await fh.close()
   if (handle) sftp.close(handle, () => {})
+  // A deferred write error (a network drive, a full disk that took the
+  // writes into cache) can surface only here.
+  await (fh as FileHandle | null)?.close().catch((e: unknown) => {
+    throw asLocalSinkError(e)
+  })
 }
