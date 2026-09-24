@@ -83,7 +83,20 @@ export function GradeCanvas({
       // inset:-1 — sub-pixel layout rounding must never leave a sliver of the
       // ungraded (and, on an HDR display, HDR-composited) video at the edge.
       // The parent tile clips with overflow:hidden, so the bleed is invisible.
-      style={{ position: 'absolute', inset: -1, display: 'block' }}
+      //
+      // Explicit width/height are NOT redundant with inset: a canvas is a
+      // replaced element, and an absolutely positioned one keeps its intrinsic
+      // size (= the drawing buffer, sized to the video's native resolution)
+      // instead of stretching between its insets. Without them a 1920×1080
+      // buffer rendered at 1920×1080 CSS px inside a smaller tile, and
+      // overflow:hidden showed only its top-left corner — the preview "crop".
+      style={{
+        position: 'absolute',
+        inset: -1,
+        width: 'calc(100% + 2px)',
+        height: 'calc(100% + 2px)',
+        display: 'block'
+      }}
     />
   )
 }
