@@ -4,7 +4,7 @@
   "description": "Electron render-farm manager: Blender rendering on Vast.ai GPU fleets",
   "main": "./out/main/index.js",
   "author": "Elliot Woods",
-  "homepage": "https://electron-vite.org",
+  "homepage": "https://github.com/elliotwoods/vastai-blender",
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint --cache .",
@@ -20,7 +20,7 @@
     "build:mac": "electron-vite build && electron-builder --mac",
     "build:linux": "electron-vite build && electron-builder --linux",
     "test": "npm run test:remote && vitest run",
-    "test:remote": "python3 -B remote/agent/selfcheck.py"
+    "test:remote": "node -e \"const {spawnSync}=require('node:child_process');const win=process.platform==='win32';for(const py of win?['py','python3','python']:['python3']){const r=spawnSync(py,['-B','remote/agent/selfcheck.py'],{stdio:'inherit'});if(r.error||r.status===9009)continue;process.exit(r.status??1)}console.error(win?'test:remote: skipped, no Python 3 on PATH (tried py, python3, python)':'test:remote: python3 not found');process.exit(win?0:1)\""
   },
   "dependencies": {
     "@electron-toolkit/utils": "^4.0.0",

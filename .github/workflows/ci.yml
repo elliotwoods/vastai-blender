@@ -10,10 +10,11 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same ref makes the older run moot.
+# A newer push to the same branch makes the older run moot. Not on main: two
+# quick pushes there would leave the first commit with no CI result at all.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 defaults:
   run:
@@ -64,7 +65,11 @@ jobs:
         run: |
           shopt -s globstar
           python3 -m py_compile remote/**/*.py
+      # Every script is parsed before the step fails, so one run names every
+      # broken file (under -e, a bare loop would stop at the first).
       - name: Parse remote/ shell scripts
         run: |
           shopt -s globstar
-          for f in remote/**/*.sh; do bash -n "$f"; done
+          rc=0
+          for f in remote/**/*.sh; do bash -n "$f" || rc=1; done
+          exit $rc
