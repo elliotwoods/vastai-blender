@@ -7,7 +7,11 @@ import { setup, type App, type World } from '../test/harness'
 // exists, which is before the instance does and minutes before it answers
 // SSH, so a destroy can land in the middle of any step of driveToReady. What
 // must hold whenever it does: the instance is destroyed exactly once, the
-// node ends 'destroyed', and nothing reports it as a node failure.
+// node ends 'destroyed', and nothing reports it as a node failure. Unless the
+// instance may still be billing: the destroy's DELETE threw, or the create
+// ended with no answer as to whether it rented anything. Then the node ends
+// 'failed', the state that says so, and one alert tells the user. Either way
+// the cancelled rental is not replaced by another.
 
 let w: World
 beforeEach(async () => {
@@ -48,9 +52,20 @@ function statesSince(nodeId: string, from: number): NodeState[] {
  * this is the only thing it changes.
  */
 async function rentsAgain(app: App, machineId: number): Promise<boolean> {
+  // Only this offer, so what rents is this machine or nothing.
+  w.vast.offers = []
   w.vast.addOffer({ machine_id: machineId })
   const ids = await app.nodeManager.requestNodes(1).catch(() => [])
   return ids.length === 1
+}
+
+/**
+ * The orphan sweep, as the next start runs it. It is private, and a world
+ * boots once, so this is the only way to run it again; what it acts on (the
+ * account's instances and the node rows) is all in the world already.
+ */
+function sweepOrphans(app: App): Promise<void> {
+  return (app.nodeManager as unknown as { reconcileOrphans(): Promise<void> }).reconcileOrphans()
 }
 
 describe('destroy while createInstance is in flight (finding #110)', () => {
@@ -117,6 +132,70 @@ describe('destroy while createInstance is in flight (finding #110)', () => {
     expect(w.vast.live()).toEqual([])
     expect(app.nodeManager.get(id)?.state).toBe('destroyed')
   })
+
+  it('a create Vast refuses is the end of it: no failure, no blacklist, no replacement', async () => {
+    const app = await w.boot()
+    const offer = w.vast.addOffer()
+    // A second offer the batch would move on to if it took the refusal for
+    // a failed rental.
+    w.vast.addOffer()
+    const gate = w.vast.hold('createInstance')
+    const renting = app.nodeManager.requestNodes(1)
+    await w.until(() => gate.reached, 'createInstance in flight')
+    const [{ id }] = w.all<{ id: string }>('SELECT id FROM nodes')
+    const from = w.events.length
+    await app.nodeManager.destroyNode(id)
+
+    // The offer went to someone else meanwhile: a 4xx, so nothing was rented.
+    gate.fail({ status: 400, message: 'create instance failed: no_such_ask' })
+    await expect(renting).resolves.toEqual([id])
+
+    expect(w.vast.count('createInstance')).toBe(1)
+    expect(w.vast.live()).toEqual([])
+    expect(statesSince(id, from)).toEqual(['destroying', 'destroyed'])
+    expect(w.all('SELECT id FROM nodes')).toEqual([{ id }])
+    expect(w.alerts('error')).toEqual([])
+    expect(await rentsAgain(app, offer.machine_id)).toBe(true)
+  })
+
+  it('a create that ends with no answer leaves the node failed and says it may be billing', async () => {
+    const app = await w.boot()
+    w.vast.addOffer()
+    w.vast.addOffer()
+    const gate = w.vast.hold('createInstance')
+    const renting = app.nodeManager.requestNodes(1)
+    await w.until(() => gate.reached, 'createInstance in flight')
+    const [{ id }] = w.all<{ id: string }>('SELECT id FROM nodes')
+    await app.nodeManager.destroyNode(id)
+
+    // Vast rents the instance, then the connection drops before the reply:
+    // the app never learns the instance id.
+    gate.loseReply(new Error('read ECONNRESET'))
+    await expect(renting).resolves.toEqual([id])
+
+    expect(w.vast.count('createInstance')).toBe(1)
+    const [instanceId] = w.vast.created
+    const label = `vastai-blender ${id.slice(0, 8)}`
+    expect(w.vast.instance(instanceId)?.label).toBe(label)
+    expect(w.vast.live()).toEqual([instanceId])
+    // Not 'destroyed': that would say nothing is billing.
+    const row = w.get<{ state: string; instance_id: number | null; last_error: string }>(
+      'SELECT state, instance_id, last_error FROM nodes WHERE id = ?',
+      id
+    )
+    expect(row).toMatchObject({ state: 'failed', instance_id: null })
+    expect(row?.last_error).toContain('ECONNRESET')
+    const errors = w.alerts('error')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain(label)
+    expect(errors[0]).toContain('Vast.ai console')
+
+    // The row is the evidence the next start's orphan sweep claims the
+    // instance by: its label carries the row's id.
+    await sweepOrphans(app)
+    expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
+    expect(w.vast.live()).toEqual([])
+  })
 })
 
 describe('destroy during the first-connect SSH retry (findings #239, #221)', () => {
@@ -176,6 +255,36 @@ describe('destroy during the first-connect SSH retry (findings #239, #221)', () 
     expect(w.vast.count('destroyInstance')).toBe(1)
     expect(w.alerts('error')).toEqual([])
   })
+
+  it('a destroy whose DELETE fails stops the retry: the box is still up, but not ours to use', async () => {
+    const app = await w.boot()
+    const provisioned: string[] = []
+    app.nodeManager.onReady = async ({ id }) => {
+      provisioned.push(id)
+    }
+    w.vast.addOffer()
+    w.vast.bootMs = 20_000
+    const [id] = await app.nodeManager.requestNodes(1)
+    w.machineFor(id).refuseConnects = 2
+    await w.until(() => sshRetries(id) >= 1, 'first attempt failed')
+    const [instanceId] = w.vast.created
+
+    const from = w.events.length
+    w.vast.fail('destroyInstance', { status: 500, message: 'internal error' })
+    await app.nodeManager.destroyNode(id)
+    // sshd answers from the next attempt on, had there been one.
+    await w.advance(2 * 60_000)
+
+    expect(provisioned).toEqual([])
+    expect(statesSince(id, from)).toEqual(['destroying', 'failed'])
+    expect(app.nodeManager.get(id)?.ssh).toBeNull()
+    expect(w.vast.count('destroyInstance')).toBe(1)
+    expect(w.alerts('error')).toEqual([
+      `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
+    ])
+    await expect(app.nodeManager.clearFailed()).resolves.toBe(1)
+    expect(w.vast.live()).toEqual([])
+  })
 })
 
 describe('destroy during provisioning', () => {
@@ -193,6 +302,46 @@ describe('destroy during provisioning', () => {
 
     expect(app.nodeManager.get(id)?.state).toBe('destroyed')
     expect(w.alerts().filter((m) => m.endsWith(' ready'))).toEqual([])
+    expect(w.vast.count('destroyInstance')).toBe(1)
+    expect(w.alerts('error')).toEqual([])
+  })
+
+  it('a destroy whose DELETE fails is not undone when provisioning ends', async () => {
+    const app = await w.boot()
+    let provisioning = false
+    let finish: () => void = () => {}
+    app.nodeManager.onReady = () => {
+      provisioning = true
+      return new Promise<void>((r) => (finish = r))
+    }
+    const offer = w.vast.addOffer()
+    const [id] = await app.nodeManager.requestNodes(1)
+    await w.until(() => provisioning, 'provisioning')
+    const [instanceId] = w.vast.created
+
+    const from = w.events.length
+    w.vast.fail('destroyInstance', { status: 500, message: 'internal error' })
+    await app.nodeManager.destroyNode(id)
+    finish()
+    await w.advance(60_000)
+
+    // 'failed' with the instance id: still billing, and the row says so. Not
+    // 'ready', where the scheduler would take it back into the fleet.
+    expect(statesSince(id, from)).toEqual(['destroying', 'failed'])
+    expect(w.get('SELECT state, instance_id FROM nodes WHERE id = ?', id)).toEqual({
+      state: 'failed',
+      instance_id: instanceId
+    })
+    expect(w.alerts().filter((m) => m.endsWith(' ready'))).toEqual([])
+    expect(w.alerts('error')).toEqual([
+      `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
+    ])
+    expect(w.vast.count('destroyInstance')).toBe(1)
+    expect(w.vast.live()).toEqual([instanceId])
+
+    await expect(app.nodeManager.clearFailed()).resolves.toBe(1)
+    expect(w.vast.live()).toEqual([])
+    expect(await rentsAgain(app, offer.machine_id)).toBe(true)
   })
 
   it('provisioning that fails because of the destroy is not a node failure', async () => {
