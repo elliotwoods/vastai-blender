@@ -18,9 +18,12 @@
  *              insufficient_credit.
  *   job        The job itself: a scene check or startup script failed, or
  *              Blender exited with an error.
- *   local      This computer: disk full, permission denied, an output folder
+ *   localFs    This computer: disk full, permission denied, an output folder
  *              gone. Nothing remote is wrong, and failing chunks for it throws
  *              away renders already paid for.
+ *
+ * The classes are shared/models.ts's ErrorClass, which chunks and job
+ * attention carry to the renderer.
  *
  * The reason is never empty and always carries the error's code, errno, HTTP
  * status or exit code. In job 1d59516c, 16 chunks burned all their retries
@@ -30,10 +33,12 @@
  *
  * Pure and duck-typed: VastError, ssh2's errors, Node's system errors and the
  * agent's failure state are recognised by their shape, not their class, so
- * this module imports nothing and an error that was re-wrapped still sorts.
+ * this module imports no code and an error that was re-wrapped still sorts.
  */
 
-export type ErrorClass = 'transient' | 'machine' | 'account' | 'job' | 'local'
+import type { ErrorClass } from '../shared/models'
+
+export type { ErrorClass }
 
 /** Where the error came from, when the caller knows. It only breaks ties. */
 export type ErrorSource = 'vast' | 'ssh' | 'agent' | 'local'
@@ -324,7 +329,7 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
 
   // --- Local sink (plan 1.10 names its error LocalSinkError). ---
   if (name === 'LocalSinkError') {
-    return result('local', 'local-sink', 'cannot write output on this computer', e, false)
+    return result('localFs', 'local-sink', 'cannot write output on this computer', e, false)
   }
 
   // --- The account: before anything retries or blacklists. ---
@@ -410,7 +415,7 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
           : code === 'ENOENT' || code === 'ENOTDIR'
             ? 'a local file or folder is missing'
             : 'local file error'
-    return result('local', `local-${code}`, label, e, false)
+    return result('localFs', `local-${code}`, label, e, false)
   }
 
   // --- ssh2 SFTP statuses (numeric codes): the node's side of a transfer. ---

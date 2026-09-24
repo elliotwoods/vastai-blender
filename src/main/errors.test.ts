@@ -157,7 +157,7 @@ describe('classify: this computer', () => {
       -28,
       'write'
     )
-    expect(classify(full)).toMatchObject({ kind: 'local', retryable: false })
+    expect(classify(full)).toMatchObject({ kind: 'localFs', retryable: false })
     expect(classify(full).reason).toMatch(/disk full/)
     const denied = sysErr(
       "EACCES: permission denied, open '/Volumes/x/0001.exr'",
@@ -165,24 +165,24 @@ describe('classify: this computer', () => {
       -13,
       'open'
     )
-    expect(classify(denied).kind).toBe('local')
+    expect(classify(denied).kind).toBe('localFs')
     const gone = sysErr("ENOENT: no such file or directory, open '/x/y'", 'ENOENT', -2, 'open')
-    expect(classify(gone).kind).toBe('local')
+    expect(classify(gone).kind).toBe('localFs')
   })
 
   it('knows a local file error by its message when a wrapper dropped the code', () => {
     const e = new Error("ENOSPC: no space left on device, open '/Users/me/renders/x.part'")
-    expect(classify(e).kind).toBe('local')
+    expect(classify(e).kind).toBe('localFs')
   })
 
   it("does not take a node's quoted stderr for this computer's disk", () => {
     const e = new Error('provision.sh base failed: npm ERR! code ENOSPC while unpacking')
-    expect(classify(e).kind).not.toBe('local')
+    expect(classify(e).kind).not.toBe('localFs')
   })
 
   it("plan 1.10's LocalSinkError is local whatever it says", () => {
     const e = Object.assign(new Error('output folder unwritable'), { name: 'LocalSinkError' })
-    expect(classify(e).kind).toBe('local')
+    expect(classify(e).kind).toBe('localFs')
   })
 })
 
