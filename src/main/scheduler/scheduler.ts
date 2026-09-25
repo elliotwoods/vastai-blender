@@ -13,7 +13,7 @@
  */
 
 import { posix } from 'path'
-import { getDb } from '../db/db'
+import { getDb, readAppState, writeAppState } from '../db/db'
 import { emit } from '../events'
 import { emitChunkChanged, emitChunksChanged, refreshJobState } from '../jobs/jobs'
 import { installBlender, installExtension, REMOTE_ROOT } from '../nodes/provisioner'
@@ -122,6 +122,14 @@ interface Resplit {
   outcome: 'complete' | 'pending' | 'failed'
   /** chunks whose rows it wrote, the ones it created included */
   touched: string[]
+}
+
+/** The startup recovery hold as app_state keeps it (key 'recovery_hold'). */
+interface RecoveryHoldRecord {
+  /** the jobs that had unfinished work when the hold was set */
+  jobIds: string[]
+  /** epoch ms the hold was first set, kept across relaunches */
+  since: number
 }
 
 interface JobRow {
@@ -701,8 +709,11 @@ class Scheduler {
    * chunk. See reserveForExclusive.
    */
   private reservation: { nodeId: string; chunkId: string } | null = null
-  /** Startup-recovered chunks awaiting confirmation before renting. See start(). */
-  private recoveryHold: number | null = null
+  /**
+   * Unfinished work from an earlier session, whose scale-up waits for the
+   * user. Mirrors app_state's 'recovery_hold'. See start().
+   */
+  private recoveryHold: RecoveryHoldRecord | null = null
   /** The last scale-up decision, and why (see scalePolicy). */
   private lastScalePlan: ScalingPlan | null = null
 
@@ -842,22 +853,17 @@ class Scheduler {
       refreshJobState(jobId)
       if (completed.has(jobId)) jobClips.schedule(jobId)
     }
-    // A pending chunk whose every frame had landed is complete, not work.
+    // Before the hold is judged, so a queue whose only work had already
+    // landed is not held for.
     this.settleDownloadedPending()
-    // Recovered work is real work, and the very next tick would buy a whole
-    // fleet for it. That is right when you meant to resume and expensive when
-    // you did not: a profile left with a day-old half-finished campaign starts
-    // renting up to maxActiveNodes the moment the app opens, before you have
-    // seen a single screen. Hold scale-up until it is confirmed. One node is
-    // not worth asking about; a fleet is. Only chunks that were in flight
-    // count: a queue that had nothing in flight when the app closed is not
-    // held, and rents on the first tick.
-    if (stranded.length > 0 && getSettings().maxActiveNodes > 1) {
-      this.recoveryHold = stranded.length
+
+    this.recoveryHold = this.recoverHold()
+    const held = this.recoveryHoldCount()
+    if (held != null) {
       emit('alert', {
         level: 'warn',
         message:
-          `${stranded.length} chunk(s) recovered from the last session — ` +
+          `${held} unfinished chunk(s) from an earlier session — ` +
           `fleet scale-up is paused until you resume`
       })
     }
@@ -865,19 +871,108 @@ class Scheduler {
   }
 
   /**
-   * Chunks recovered at startup whose scale-up is waiting on confirmation, or
-   * null when nothing is held. Only ever blocks BUYING: existing nodes are still
-   * dispatched to, idle ones still scale down, and an explicit "add node" still
-   * works — so resuming is never the only way out.
+   * The recovery hold for this launch, written to app_state, or null.
+   *
+   * Unfinished work is real work, and the very next tick would buy a whole
+   * fleet for it. That is right when you meant to resume and expensive when
+   * you did not: a profile left with a day-old half-finished campaign starts
+   * renting up to maxActiveNodes the moment the app opens, before you have
+   * seen a single screen. So scale-up is held until the user confirms.
+   *
+   * Judged from every unfinished chunk of a queued or running job, whatever
+   * its state. It used to count only the chunks stranded in flight, which
+   * start() itself sets back to pending: quit without resuming, and the next
+   * launch found none, held nothing and rented a full fleet (#147). A queue
+   * whose fleet was still booting at quit was never held at all (#27).
+   *
+   * One node is not worth asking about; a fleet is. A hold an earlier launch
+   * set and nobody resumed is kept whatever maxActiveNodes says now: the user
+   * has not confirmed that work yet.
+   */
+  private recoverHold(): RecoveryHoldRecord | null {
+    const db = getDb()
+    const stored = this.storedRecoveryHold()
+    const jobIds = this.unfinishedJobIds()
+    if (jobIds.length === 0) {
+      if (stored) writeAppState(db, 'recovery_hold', null)
+      return null
+    }
+    if (!stored && getSettings().maxActiveNodes <= 1) return null
+    const hold: RecoveryHoldRecord = { jobIds, since: stored?.since ?? Date.now() }
+    writeAppState(db, 'recovery_hold', JSON.stringify(hold))
+    return hold
+  }
+
+  /** app_state's recovery hold; a value this build cannot read counts as held, for every job. */
+  private storedRecoveryHold(): RecoveryHoldRecord | null {
+    const raw = readAppState(getDb(), 'recovery_hold')
+    if (raw == null) return null
+    try {
+      const v = JSON.parse(raw) as Partial<RecoveryHoldRecord>
+      if (Array.isArray(v.jobIds) && typeof v.since === 'number') {
+        return { jobIds: v.jobIds.filter((id) => typeof id === 'string'), since: v.since }
+      }
+    } catch {
+      // unreadable: held, below
+    }
+    return { jobIds: [], since: Date.now() }
+  }
+
+  /** Jobs still queued or running with a chunk that is neither complete nor failed. */
+  private unfinishedJobIds(): string[] {
+    return (
+      getDb()
+        .prepare(
+          `SELECT DISTINCT c.job_id FROM chunks c JOIN jobs j ON j.id = c.job_id
+            WHERE j.state IN ('queued', 'running') AND c.state NOT IN ('complete', 'failed')`
+        )
+        .all() as Array<{ job_id: string }>
+    ).map((r) => r.job_id)
+  }
+
+  /**
+   * Unfinished chunks of the held jobs, or null when nothing is held. Only
+   * ever blocks BUYING: existing nodes are still dispatched to, idle ones
+   * still scale down, and an explicit "add node" still works — so resuming is
+   * never the only way out.
+   *
+   * The hold lets itself go once none of its jobs has work left: the user
+   * cancelled them, or the fleet already running finished them. A hold kept
+   * after that blocked scale-up for any new job until Resume, with a banner
+   * about work that no longer existed (#203).
    */
   recoveryHoldCount(): number | null {
-    return this.recoveryHold
+    const hold = this.recoveryHold
+    if (!hold) return null
+    const db = getDb()
+    const marks = hold.jobIds.map(() => '?').join(', ')
+    const n =
+      hold.jobIds.length === 0
+        ? 0
+        : (
+            db
+              .prepare(
+                `SELECT COUNT(*) AS n FROM chunks c JOIN jobs j ON j.id = c.job_id
+                  WHERE c.job_id IN (${marks}) AND j.state IN ('queued', 'running')
+                    AND c.state NOT IN ('complete', 'failed')`
+              )
+              .get(...hold.jobIds) as { n: number }
+          ).n
+    if (n > 0) return n
+    this.releaseRecoveryHold()
+    return null
   }
 
   resumeRecovery(): void {
     if (this.recoveryHold == null) return
-    this.recoveryHold = null
+    this.releaseRecoveryHold()
     this.kick()
+  }
+
+  /** Drop the hold here and in app_state, so no later launch revives it. */
+  private releaseRecoveryHold(): void {
+    this.recoveryHold = null
+    writeAppState(getDb(), 'recovery_hold', null)
   }
 
   /**

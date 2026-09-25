@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { setup, type AgentSpec, type App, type World } from '../test/harness'
+import { imageOf, restoreImage } from '../test/relaunch'
 
 // Plan 1.9, restart without paying twice. A restart kills the renders the
 // last process started (its nodes' agents are restarted), so each chunk it
 // left in flight is sent again: narrowed to the frames this computer still
-// lacks, with no retry charged, since nothing about the chunk failed.
+// lacks, with no retry charged, since nothing about the chunk failed. And a
+// profile with unfinished work does not rent a fleet for it on launch until
+// the user resumes, however many times the app is opened in between.
 
 let w: World
 afterEach(() => w.dispose())
@@ -38,6 +41,10 @@ function downloaded(jobId: string): number[] {
       jobId
     )
     .map((f) => f.frame)
+}
+
+function storedHold(): string | undefined {
+  return w.get<{ value: string }>("SELECT value FROM app_state WHERE key = 'recovery_hold'")?.value
 }
 
 /**
@@ -115,7 +122,7 @@ describe('1.9 restart recovery', () => {
     expect(chunksOf(jobId).map((c) => c.retries)).toEqual([1, 1])
   })
 
-  it('completes a stranded chunk whose every frame had landed', async () => {
+  it('completes a stranded chunk whose every frame had landed, and holds nothing for it', async () => {
     w = await setup({ settings: { maxActiveNodes: 4 } })
     const app = await w.boot({ start: false })
     const jobId = await w.submitJob(app)
@@ -123,10 +130,81 @@ describe('1.9 restart recovery', () => {
     // Quit in the chunk's final download pass, after its last frame landed.
     leftInFlight(jobId, chunk.id, 'downloading')
     w.db.prepare("UPDATE frames SET state = 'downloaded' WHERE job_id = ?").run(jobId)
+    w.vast.addOffer()
 
     launch(app)
+    await w.advance(30_000)
 
     expect(chunksOf(jobId)[0]).toMatchObject({ state: 'complete', retries: 0 })
     expect(jobState(jobId)).toBe('complete')
+    expect(app.scheduler.recoveryHoldCount()).toBeNull()
+    expect(w.vast.count('createInstance')).toBe(0)
+  })
+})
+
+describe('1.9 the recovery hold', () => {
+  it('survives a second restart', async () => {
+    const settings = { maxActiveNodes: 4 }
+    w = await setup({ settings })
+    let app = await w.boot({ start: false })
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 8, chunkSize: 4 })
+    const [a] = chunksOf(jobId)
+    leftInFlight(jobId, a.id)
+    w.vast.addOffer()
+    w.vast.addOffer()
+
+    // First launch: held, and nothing rented.
+    launch(app)
+    expect(app.scheduler.recoveryHoldCount()).not.toBeNull()
+    await w.advance(30_000)
+    expect(w.vast.count('createInstance')).toBe(0)
+
+    // Quit without resuming. The chunk that was in flight is now 'pending',
+    // like every other: nothing reads as stranded on the next launch.
+    const now = Date.now()
+    const image = imageOf(w)
+    await w.dispose()
+    w = await setup({ settings, now })
+    restoreImage(w, image)
+    w.vast.addOffer()
+    w.vast.addOffer()
+
+    // Second launch: still held, for all of the job's unfinished work.
+    app = await w.boot()
+    expect(app.scheduler.recoveryHoldCount()).toBe(2)
+    expect(await w.invoke('scheduler:recoveryHold')).toEqual({ chunks: 2 })
+    await w.advance(30_000)
+    expect(w.vast.count('createInstance')).toBe(0)
+    expect(app.scheduler.scaleStatus()?.status).toBe('held')
+    expect(w.alerts('warn').join('\n')).toContain('paused until you resume')
+
+    // Resuming releases it for good.
+    await w.invoke('scheduler:resumeRecovery')
+    await w.until(() => w.vast.count('createInstance') > 0, 'scale-up after resuming', {
+      timeoutMs: 60_000
+    })
+    expect(app.scheduler.recoveryHoldCount()).toBeNull()
+    expect(storedHold()).toBeUndefined()
+  })
+
+  it('lets go once the held jobs are cancelled, so new work rents', async () => {
+    w = await setup({ settings: { maxActiveNodes: 4 } })
+    const app = await w.boot({ start: false })
+    const old = await w.submitJob(app)
+    leftInFlight(old, chunksOf(old)[0].id)
+    launch(app)
+    expect(app.scheduler.recoveryHoldCount()).not.toBeNull()
+
+    // The user does not want the old work: cancels it, submits something new.
+    await w.invoke('job:cancel', old)
+    await w.submitJob(app)
+    w.vast.addOffer()
+    app.scheduler.kick()
+
+    await w.until(() => w.vast.count('createInstance') > 0, 'scale-up for the new job', {
+      timeoutMs: 60_000
+    })
+    expect(app.scheduler.recoveryHoldCount()).toBeNull()
+    expect(storedHold()).toBeUndefined()
   })
 })
