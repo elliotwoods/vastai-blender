@@ -774,6 +774,33 @@ describe('1.8: a node prep that hangs', () => {
     expect(app.scheduler.nodeUnfit(nodeId)).toBeNull()
     expect(w.alerts().join('\n')).not.toMatch(/did not finish|is stuck/)
   }, 20_000)
+
+  it('a scene upload that never ends lets go of the prep lock at twelve hours', async () => {
+    // Review round 2: a step bounded by its stall guard had no wall clock at
+    // all, and the guard sees only the bytes on the wire. The scene is hashed
+    // on this computer first, with no deadline: a .blend on a network volume
+    // that hangs held every node's prep lock for good, its chunks 'assigned'
+    // and its nodes billing. Here the transfer itself never ends.
+    w = await setup({ settings: { maxActiveNodes: 1, idleTimeoutMinutes: 5 } })
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    slowUploads(app.nodeManager.get(nodeId)!.ssh, 48 * 60 * 60_000)
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => assignedTo(nodeId) === 1, 'in node prep')
+    await w.advance(11.9 * 60 * 60_000, 60_000)
+    expect(chunksOf(jobId)[0].state).toBe('assigned')
+
+    await w.until(() => chunksOf(jobId)[0].state !== 'assigned', 'the prep lock released', {
+      timeoutMs: 30 * 60_000,
+      stepMs: 5_000
+    })
+    expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /setting up the node did not finish: uploading the scene was still going after 12 h/
+    )
+    expect(app.scheduler.nodeUnfit(nodeId)).toMatch(/uploading the scene/)
+  }, 60_000)
 })
 
 /** The SFTP channel as slowUploads handles it. */

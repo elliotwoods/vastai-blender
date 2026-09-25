@@ -132,8 +132,8 @@ const PREP_DEADLINE_MS = 60 * 60_000
  *   run under. The shared budget does not run meanwhile, and the prep
  *   times out when the step does.
  * - 'progress': a transfer that its own stall guard ends once it stops
- *   moving. No wall clock: a large scene over a home uplink shared by
- *   several nodes can take hours, moving all the while.
+ *   moving, under PROGRESS_STEP_CEILING_MS only: a large scene over a home
+ *   uplink shared by several nodes can take hours, moving all the while.
  *
  * One 60-minute deadline over the whole prep was shorter than what it
  * covered: install-blender may take 130 minutes on healthy mirrors, and an
@@ -142,6 +142,17 @@ const PREP_DEADLINE_MS = 60 * 60_000
  * and its replacement ran the same step into the same deadline.
  */
 type StepBound = 'prep' | number | 'progress'
+
+/**
+ * The most a 'progress' step may hold the prep lock, moving or not: a
+ * backstop, far past any transfer worth waiting for. Its stall guard sees
+ * only the bytes on the wire, and the scene is hashed on this computer
+ * first (uploadFileVerified) with no deadline: a .blend on a network volume
+ * that hangs, or an evicted iCloud file read offline, held every node's
+ * prep lock for good, since every node hashes the same file, with their
+ * chunks 'assigned' and the nodes billing.
+ */
+const PROGRESS_STEP_CEILING_MS = 12 * 60 * 60_000
 
 /** Names the prep step now running, and what bounds it (StepBound). */
 type PrepStep = (what: string, bound?: StepBound) => void
@@ -218,7 +229,11 @@ async function withNodePrep<T>(nodeId: string, fn: (step: PrepStep) => Promise<T
             typeof bound === 'number'
               ? `setting up the node did not finish: ${step} ran past its own ` +
                   `${Math.round(bound / 60_000)} min limit, and nothing more is sent to the node`
-              : `setting up the node did not finish in ${PREP_DEADLINE_MS / 60_000} min: ${step} ` +
+              : bound === 'progress'
+                ? `setting up the node did not finish: ${step} was still going after ` +
+                  `${PROGRESS_STEP_CEILING_MS / 3_600_000} h, the most any transfer is given, ` +
+                  'and nothing more is sent to the node'
+                : `setting up the node did not finish in ${PREP_DEADLINE_MS / 60_000} min: ${step} ` +
                   'is still running, and nothing more is sent to the node'
           )
         )
@@ -228,8 +243,13 @@ async function withNodePrep<T>(nodeId: string, fn: (step: PrepStep) => Promise<T
     // step with its own ceiling times out here first, at the same moment.
     const arm = (): void => {
       clearTimeout(timer)
-      if (settled || bound === 'progress') return
-      const ms = bound === 'prep' ? PREP_DEADLINE_MS - shared : bound
+      if (settled) return
+      const ms =
+        bound === 'prep'
+          ? PREP_DEADLINE_MS - shared
+          : bound === 'progress'
+            ? PROGRESS_STEP_CEILING_MS
+            : bound
       timer = setTimeout(expire, Math.max(0, ms))
     }
     const next: PrepStep = (what, b = 'prep') => {
@@ -896,7 +916,8 @@ class ChunkRun {
       }
 
       // 3. Scene upload (hash-skipped when the node already has this version),
-      // bounded by its stall guard: a large scene can take hours, moving.
+      // bounded by its stall guard, and by PROGRESS_STEP_CEILING_MS: a large
+      // scene can take hours, moving.
       step('uploading the scene', 'progress')
       const result = await uploadFileVerified(
         this.ssh,
