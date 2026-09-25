@@ -1605,9 +1605,8 @@ class Scheduler {
     // Chunks that may go out now: none while the local disk refuses frames
     // (plan 1.10; they would render with nowhere to land), and none still
     // waiting out a transient failure's backoff (plan 1.17).
-    const ready = localSinkHold()
-      ? []
-      : pending.filter((c) => c.not_before == null || c.not_before <= now)
+    const sinkHeld = localSinkHold() != null
+    const ready = sinkHeld ? [] : pending.filter((c) => c.not_before == null || c.not_before <= now)
 
     const eligible = nodeManager
       .list()
@@ -1700,7 +1699,7 @@ class Scheduler {
       }
     }
 
-    this.scalePolicy(pending)
+    this.scalePolicy(pending, { sendable: sinkHeld ? 0 : pending.length })
   }
 
   /**
@@ -2257,8 +2256,15 @@ class Scheduler {
     return out
   }
 
-  /** Scale up when there's queued work; scale down long-idle nodes. */
-  private scalePolicy(pending: PendingChunk[]): void {
+  /**
+   * Scale up when there's queued work; scale down long-idle nodes.
+   *
+   * `sendable` is how many of the pending chunks an idle node could be sent
+   * without waiting on the user or this computer: none while the local disk
+   * refuses frames. A chunk waiting out a backoff counts, since its wait is
+   * short and bounded.
+   */
+  private scalePolicy(pending: PendingChunk[], opts: { sendable: number }): void {
     const settings = getSettings()
     const pendingCount = pending.length
     const nodes = nodeManager.list()
@@ -2374,8 +2380,11 @@ class Scheduler {
         })
     }
 
-    // Scale down: idle with nothing pending for idleTimeout.
-    if (pendingCount === 0) {
+    // Scale down: idle with nothing it could be sent for idleTimeout. Not
+    // `pendingCount`: during a local-disk hold tick() sends nothing, and the
+    // pending chunks kept every idle node alive, billing, for as long as the
+    // disk stayed full. frameDownloader's SINK_HOLD_MS is the bound on that.
+    if (opts.sendable === 0) {
       for (const n of usable) {
         if (n.state !== 'idle' && n.state !== 'ready') continue
         if (this.hasRuns(n.id)) continue

@@ -78,6 +78,10 @@ async function nodes(n: number): Promise<{ app: App; ids: string[] }> {
   return { app, ids }
 }
 
+function nodeState(nodeId: string): string {
+  return w.get<{ state: string }>('SELECT state FROM nodes WHERE id = ?', nodeId)!.state
+}
+
 /** The agent reports a failed chunk, with what the real one adds to a failure. */
 function failWith(machine: FakeMachine, chunkId: string, state: Record<string, unknown>): void {
   machine.agent.fail(chunkId, String(state.error ?? ''), (state.exitCode as number) ?? 1)
@@ -546,15 +550,49 @@ describe('1.10 / 1.17: frames the local disk will not take', () => {
     expect(app.scheduler.fleetHolds().localSink?.reason).toMatch(/ENOSPC/)
 
     // Nothing is rendered again while the disk still refuses: it would only
-    // be held back again, on a paid node.
+    // be held back again, on a paid node. And the node, with nothing it can
+    // be sent, is let go after the idle timeout, not kept billing for as
+    // long as the disk stays full. Nothing is rented meanwhile.
+    await w.until(() => nodeState(nodeId) === 'destroyed', 'idle node destroyed', {
+      timeoutMs: (w.settings.idleTimeoutMinutes + 2) * 60_000
+    })
     await w.advance(10 * 60_000)
     expect(assignedTo(nodeId)).toBe(1)
+    expect(w.vast.count('createInstance')).toBe(1)
 
+    // The disk takes files again: a node is rented for the chunk, which
+    // renders there, still charged nothing.
+    w.vast.addOffer()
     disk.full = false
+    await w.until(() => w.vast.count('createInstance') === 2, 'a node rented for the chunk')
+    const fresh = w.vast.live()[0]
+    w.vast.machine(fresh).agent.autoFinish()
     await w.until(() => jobState(jobId) === 'complete', 'job complete')
-    expect(assignedTo(nodeId)).toBe(2)
+    expect(assignedTo(nodeId)).toBe(1)
     expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
     expect(chunkRow(chunk.id)).toMatchObject({ retries: 0, infra_retries: 0 })
     expect(app.scheduler.fleetHolds().localSink).toBeUndefined()
+  })
+
+  it('1.10 B6: an idle fleet during a local-disk hold scales down, and rents nothing', async () => {
+    const { app, ids } = await nodes(2)
+    for (const id of ids) w.machineFor(id).agent.autoFinish()
+    fullDisk()
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 2 })
+    app.scheduler.kick()
+
+    // The disk stays full. Each node renders its chunk, holds its frames for
+    // SINK_HOLD_MS, goes idle, and is let go after the idle timeout: an hour
+    // on, neither bills, and nothing new was rented for the waiting work.
+    await w.advance(60 * 60_000, 5_000)
+    expect(ids.map(nodeState)).toEqual(['destroyed', 'destroyed'])
+    expect(w.vast.live()).toEqual([])
+    expect(w.vast.count('createInstance')).toBe(2)
+    // The work waits for the disk, charged nothing, and the job with it.
+    expect(['queued', 'running']).toContain(jobState(jobId))
+    expect(chunksOf(jobId).map((c) => [c.state, c.retries, c.infra_retries])).toEqual([
+      ['pending', 0, 0],
+      ['pending', 0, 0]
+    ])
   })
 })
