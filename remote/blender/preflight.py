@@ -41,10 +41,13 @@ library lacks: packing is no fix for those.
 
 Input: VR_PREFLIGHT in the environment, JSON set by the agent:
     {"jobChunks": int|null, "first": int|null, "last": int|null,
-     "contiguous": bool, "mode": "enforce"|"warn"}
+     "contiguous": bool, "stepped": bool, "resumed": bool,
+     "mode": "enforce"|"warn"}
 first/last are the first and last frames Blender will actually render
 (Overwrite is off, so frames already on disk are skipped), contiguous whether
-it renders every frame between them, and "warn" reports without refusing.
+it renders every frame between them, stepped whether the chunk's own frames
+skip any (a frame step), resumed whether frames already on disk are being
+skipped, and "warn" reports without refusing.
 
 WHY THIS IS DEFENSIVE (enable_gpu.py's rule): the Blender version is whatever
 the job asks for, and bpy moves between releases. Every property is probed
@@ -416,21 +419,36 @@ def renders_from(sim_start):
 
 
 def stepping_problem(sim_start):
-    """Why this render cannot run a simulation forward from its start, or None."""
+    """(why, what else would do) when this render cannot run a simulation
+    forward from its start, else None. "What else" is the way out that is not
+    a bake: a resumed chunk is told so, not to render the job as one chunk,
+    which it may already be."""
     if not renders_from(sim_start):
         return None
     chunks = ARGS.get("jobChunks")
     if isinstance(chunks, int) and chunks > 1:
-        return f"the job is split into {chunks} chunks, each of which starts it cold"
-    if not ARGS.get("contiguous", True):
-        return ("this chunk does not render every frame in turn (a frame step, or frames"
-                " already rendered), so it cannot run it forward")
+        return (f"the job is split into {chunks} chunks, each of which starts it cold",
+                "render the job as one chunk")
+    if ARGS.get("stepped"):
+        return ("this chunk renders with a frame step, so it cannot run it forward",
+                "render it with a frame step of 1")
     first = ARGS["first"]
     start = int(getattr(scene, "frame_start", first))
     if sim_start is not None:
         start = max(start, int(sim_start))
+    again = "render the chunk again from its first frame"
+    if ARGS.get("resumed") and first > start:
+        return (f"this chunk resumes at frame {first}, after frames it had already rendered,"
+                " so it starts cold there", again)
+    if ARGS.get("resumed") and not ARGS.get("contiguous", True):
+        return ("this chunk skips frames it had already rendered, so it starts cold after them",
+                again)
+    if not ARGS.get("contiguous", True):
+        return ("this chunk does not render every frame in turn, so it cannot run it forward",
+                "render every frame in turn")
     if first > start:
-        return f"this chunk starts at frame {first}, after it starts at {start}, so it starts cold"
+        return (f"this chunk starts at frame {first}, after it starts at {start}, so it starts"
+                " cold", f"start the render at frame {start}")
     return None
 
 
@@ -455,11 +473,12 @@ def point_cache(kind, owner, pc):
                     " uploaded with the .blend; bake it with Disk Cache off and re-save"
                 )
         return
-    reason = stepping_problem(start)
-    if reason:
+    found = stepping_problem(start)
+    if found:
+        reason, remedy = found
         problems.append(
             f"{kind} on '{owner}' is not baked, and {reason}; bake it (Disk Cache off) and"
-            " re-save, or render the job as one chunk"
+            f" re-save, or {remedy}"
         )
 
 
@@ -468,11 +487,12 @@ def fluid_domain(owner, ds):
         return
     start = getattr(ds, "cache_frame_start", None)
     if getattr(ds, "cache_type", "REPLAY") == "REPLAY":
-        reason = stepping_problem(start)
-        if reason:
+        found = stepping_problem(start)
+        if found:
+            reason, remedy = found
             problems.append(
                 f"fluid domain '{owner}' simulates as it plays (Replay cache), and {reason};"
-                " render the job as one chunk"
+                f" {remedy}"
             )
         return
     if not getattr(ds, "has_cache_baked_any", True):
@@ -532,8 +552,9 @@ def check_simulations():
             elif kind == "FLUID" and getattr(mod, "fluid_type", "") == "DOMAIN":
                 fluid_domain(obj.name, getattr(mod, "domain_settings", None))
             elif kind == "NODES" and has_simulation_zone(getattr(mod, "node_group", None)):
-                reason = stepping_problem(None)
-                if reason:
+                found = stepping_problem(None)
+                if found:
+                    reason = found[0]
                     warnings.append(
                         f"geometry-nodes simulation on '{obj.name}': {reason}. Unless it is"
                         " baked (which Python cannot tell), those frames will be wrong"

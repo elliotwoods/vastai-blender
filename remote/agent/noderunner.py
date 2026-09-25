@@ -1201,6 +1201,10 @@ def preflight_args(spec, frames, frames_dir):
         "first": todo[0] if todo else None,
         "last": todo[-1] if todo else None,
         "contiguous": all(b - a == 1 for a, b in zip(todo, todo[1:])),
+        # Why they are not: the chunk's own frames skip some, or frames on
+        # disk are skipped. preflight.py words its refusal by which.
+        "stepped": not all(b - a == 1 for a, b in zip(frames, frames[1:])),
+        "resumed": len(todo) < len(frames),
         "mode": "warn" if spec.get("preflight") == "warn" else "enforce",
     }
 

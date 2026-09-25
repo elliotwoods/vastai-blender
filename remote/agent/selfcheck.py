@@ -1105,7 +1105,8 @@ def layer(coll, children=(), exclude=False, hide_render=False):
 
 def preflight(tmp, bpy, **args):
     """(raised, report) for preflight.py over `bpy`, with VR_PREFLIGHT `args`."""
-    base = {"jobChunks": None, "first": 1, "last": 50, "contiguous": True, "mode": "enforce"}
+    base = {"jobChunks": None, "first": 1, "last": 50, "contiguous": True, "stepped": False,
+            "resumed": False, "mode": "enforce"}
     base.update(args)
     err, printed = blender_script("preflight.py", bpy, {"VR_PREFLIGHT": json.dumps(base)})
     return err, marker(printed, "VR_PREFLIGHT")
@@ -1234,8 +1235,8 @@ def test_preflight_simulations():
             ("split job", scene(cloth()), {"jobChunks": 3}, False),
             ("one chunk from the start", scene(cloth()), {"jobChunks": 1}, True),
             ("one chunk, frames 1-50 already on disk", scene(cloth()),
-             {"jobChunks": 1, "first": 51, "last": 60}, False),
-            ("a frame step", scene(cloth()), {"contiguous": False}, False),
+             {"jobChunks": 1, "first": 51, "last": 60, "resumed": True}, False),
+            ("a frame step", scene(cloth()), {"contiguous": False, "stepped": True}, False),
             ("every frame already on disk", scene(cloth()), {"first": None, "last": None}, True),
             ("render ends before the sim starts", scene(cloth(pc=cache(frame_start=100))),
              {"jobChunks": 3}, True),
@@ -1276,6 +1277,23 @@ def test_preflight_simulations():
             err, report = preflight(tmp, bpy, **args)
             check(f"preflight sim: {label} -> {'renders' if ok else 'refused'}",
                   report is not None and report["ok"] is ok and (err is None) is ok)
+
+        # Review of 1.16: a single-chunk job sent again mid-way was told to
+        # "render the job as one chunk", which it already was.
+        for label, args, says in (
+            ("a split job", {"jobChunks": 3}, "or render the job as one chunk"),
+            ("a resumed chunk", {"jobChunks": 1, "first": 51, "last": 60, "resumed": True},
+             "resumes at frame 51, after frames it had already rendered"),
+            ("a resumed chunk with a gap", {"jobChunks": 1, "contiguous": False, "resumed": True},
+             "skips frames it had already rendered, so it starts cold after them; bake it"
+             " (Disk Cache off) and re-save, or render the chunk again from its first frame"),
+            ("a frame step", {"contiguous": False, "stepped": True},
+             "or render it with a frame step of 1"),
+        ):
+            _err, report = preflight(tmp, scene(cloth()), **args)
+            problem = (report or {}).get("problems", [""])[0]
+            check(f"preflight sim: the refusal of {label} says so",
+                  says in problem and ("one chunk" in problem) is (label == "a split job"))
 
 
 def test_preflight_reads_only_what_renders():
@@ -1411,7 +1429,8 @@ def test_agent_runs_the_preflight():
               and argv.index("-x") < argv.index("-a"))
         check("preflight: told the first frame that will really render, and the chunking",
               json.loads(env.get("VR_PREFLIGHT") or "{}")
-              == {"jobChunks": 4, "first": 2, "last": 5, "contiguous": True, "mode": "enforce"})
+              == {"jobChunks": 4, "first": 2, "last": 5, "contiguous": True, "stepped": False,
+                  "resumed": True, "mode": "enforce"})
         check("preflight: a clean pass renders as before", state.get("status") == "done")
 
     report = {"ok": False, "summary": "1 file(s) not packed into the .blend and not on the node:"
