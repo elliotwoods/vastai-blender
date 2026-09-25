@@ -294,6 +294,38 @@ const PROBE_COMMAND =
 const LIVENESS_COMMAND = `echo ok; ${HEARTBEAT_AGE}`
 
 /**
+ * How long a withdraw (withdrawGivenBack) goes on stopping the renders of
+ * the chunks it withdraws: a pkill a second, this many times. One pkill was
+ * not enough. The agent retries an EEVEE attempt that made no frame once
+ * more on the OpenGL backend (noderunner.py), under the same chunk directory,
+ * a few seconds after the first attempt dies: its settle takes 2.5 s at
+ * most. So a withdrawn EEVEE chunk caught before its first frame rendered
+ * again, on a lane the app counts as free, with nobody to collect it. The
+ * node is out of the fleet until the withdraw returns, so nothing new of its
+ * own can be caught.
+ */
+const WITHDRAW_KILL_ROUNDS = 8
+const WITHDRAW_TIMEOUT_MS = 30_000
+
+/**
+ * The command that withdraws `chunkIds` from a node: their specs removed from
+ * the inbox and their renders stopped, for WITHDRAW_KILL_ROUNDS seconds. By
+ * the render's own directory (Blender's -o and the encode's input): the
+ * trailing slash keeps chunk 1-1 from matching 1-10, and `[r]` keeps pkill -f
+ * from matching, and killing, the shell running this command.
+ */
+export function withdrawCommand(chunkIds: readonly string[]): string {
+  const specs = chunkIds.map((id) => `rm -f ${shq(`${REMOTE_ROOT}/jobs/inbox/${id}.json`)}`)
+  const kills = chunkIds.map(
+    (id) => `pkill -f ${shq(`/[r]enders/${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`)}`
+  )
+  return (
+    `${specs.join('; ')}; ` +
+    `for i in $(seq ${WITHDRAW_KILL_ROUNDS}); do ${kills.join('; ')}; sleep 1; done; true`
+  )
+}
+
+/**
  * The heartbeat age a probe reported, in seconds: null when the agent never
  * beat, undefined when the probe said nothing about it.
  */
@@ -1952,17 +1984,7 @@ export class NodeManager {
     const given = before.filter((id) => !holds.has(id))
     if (given.length === 0) return 0
     const label = 'withdraw given-back chunks'
-    // By the render's own directory (Blender's -o and the encode's input):
-    // the trailing slash keeps chunk 1-1 from matching 1-10, and `[r]` keeps
-    // pkill -f from matching, and killing, the shell running this command.
-    const command =
-      given
-        .map((id) => {
-          const pattern = `/[r]enders/${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`
-          return `rm -f ${shq(`${REMOTE_ROOT}/jobs/inbox/${id}.json`)}; pkill -f ${shq(pattern)}`
-        })
-        .join('; ') + '; true'
-    const r = await ssh.exec(command, { timeoutMs: ANSWER_TIMEOUT_MS, label })
+    const r = await ssh.exec(withdrawCommand(given), { timeoutMs: WITHDRAW_TIMEOUT_MS, label })
     // No exit status: the link went, and whether the renders were stopped is
     // not known. Taken as done, they rendered on, paid for twice.
     if (exitStatus(r.code) === null) throw new ConnectionLostError(label)
