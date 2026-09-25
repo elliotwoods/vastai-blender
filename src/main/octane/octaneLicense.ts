@@ -551,14 +551,17 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  * desktop up, OctaneServer running and licensed. Resolves 'licensed'.
  * Safe to repeat: nothing running is restarted.
  *
- * A server that needs a sign-in is waited on, OCTANE_LOGIN_WAIT_MS at most
- * and once per node while it still needs one (OctaneLoginNeededError after
- * that), with one alert telling the user where to sign in; not at all once
- * a sign-in has been missed (octaneSignInHold). `signal` ends the wait
- * early. Credentials are sent only when the user opted in to the
- * scripted sign-in, only to a node they may go to (scriptedSignInFor), and
- * only on stdin. With secure cloud only on, a node known to have been
- * rented without it gets no sign-in of either kind (unvetted).
+ * A server that needs a sign-in is waited on (waitForOctaneLicence), unless
+ * `wait` is false: setupOctane then resolves the state the launch left, at
+ * once, for the caller to wait on once it holds nothing. That is for the
+ * scheduler, which runs this inside the node's prep lock: a wait of up to
+ * 11 minutes there holds every other dispatch to the node, Cycles chunks
+ * included, its freed lanes idle and billing.
+ *
+ * Credentials are sent only when the user opted in to the scripted sign-in,
+ * only to a node they may go to (scriptedSignInFor), and only on stdin.
+ * With secure cloud only on, a node known to have been rented without it
+ * gets no sign-in of either kind (unvetted).
  *
  * Throws OctaneHostNotVettedError, OctaneBlenderMissingError,
  * OctaneLoginNeededError, ConnectionLostError (a command the link dropped
@@ -569,14 +572,13 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 export async function setupOctane(
   ssh: SshConnection,
   nodeId: string,
-  opts: { loginWaitMs?: number; signal?: AbortSignal } = {}
+  opts: { loginWaitMs?: number; signal?: AbortSignal; wait?: boolean } = {}
 ): Promise<OctaneState> {
   const rental = rentedAs(nodeId)
   // A host the settings keep Octane from: nothing is started there, and
   // nobody is asked to sign in. One signed in already has nothing more to
   // give away, and renders.
-  const notVetted = unvetted(rental)
-  if (notVetted && storedState(nodeId) !== 'licensed') throw new OctaneHostNotVettedError()
+  if (unvetted(rental) && storedState(nodeId) !== 'licensed') throw new OctaneHostNotVettedError()
 
   const check = answered(
     await ssh.exec(`test -x ${OCTANE_BLENDER}`, {
@@ -587,7 +589,7 @@ export async function setupOctane(
   )
   if (check.code !== 0) {
     blenderMissing.add(nodeId)
-    throw new OctaneBlenderMissingError(rentedAs(nodeId)?.engine === 'octane')
+    throw new OctaneBlenderMissingError(rental?.engine === 'octane')
   }
   blenderMissing.delete(nodeId)
 
@@ -635,9 +637,49 @@ export async function setupOctane(
   }
   const word = parseOctaneState(launch.stdout)
   if (!word) throw new Error('OctaneServer launch failed: setup_octane.sh reported no state')
-  let state = judge(nodeId, word, /OctaneServer launched/.test(launch.stdout))
+  const state = judge(nodeId, word, /OctaneServer launched/.test(launch.stdout))
   writeState(nodeId, state)
+  if (state === 'none') {
+    throw new Error('OctaneServer launch failed: the server stopped before it was licensed')
+  }
+  if (opts.wait === false) return state
+  return licensedOrThrow(ssh, nodeId, state, opts)
+}
 
+/**
+ * Wait for the node's OctaneServer, which setupOctane launched, to be
+ * licensed; resolves 'licensed'. For a caller that set it up with `wait:
+ * false`, and holds nothing now: the scheduler, once out of the node's prep
+ * lock.
+ *
+ * A server that needs a sign-in is waited on, OCTANE_LOGIN_WAIT_MS at most
+ * and once per node while it still needs one (OctaneLoginNeededError after
+ * that), with one alert telling the user where to sign in; not at all once
+ * a sign-in has been missed (octaneSignInHold). A scripted sign-in's
+ * licence line is waited for OCTANE_LICENSE_WAIT_MS. `signal` ends the wait
+ * early.
+ *
+ * Throws OctaneLoginNeededError, OctaneHostNotVettedError (an unvetted node
+ * that needs a sign-in again), ConnectionLostError, or 'OctaneServer launch
+ * failed: the server stopped before it was licensed'.
+ */
+export async function waitForOctaneLicence(
+  ssh: SshConnection,
+  nodeId: string,
+  opts: { loginWaitMs?: number; signal?: AbortSignal } = {}
+): Promise<OctaneState> {
+  return licensedOrThrow(ssh, nodeId, storedState(nodeId), opts)
+}
+
+async function licensedOrThrow(
+  ssh: SshConnection,
+  nodeId: string,
+  from: OctaneState,
+  opts: { loginWaitMs?: number; signal?: AbortSignal }
+): Promise<OctaneState> {
+  let state = from
+  const rental = rentedAs(nodeId)
+  const notVetted = unvetted(rental)
   // A sign-in already missed on some node (octaneSignInHold): nobody is
   // there to sign this one in either, so only a scripted sign-in's licence
   // line is waited for.

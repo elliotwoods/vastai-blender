@@ -856,6 +856,53 @@ describe('setupOctane: the node and its state (1.18, #85)', () => {
     }
   })
 
+  it('1.18 (review 2): set up without waiting, the node is launched at once, and its sign-in waited for apart', async () => {
+    // For the scheduler's prep lock: the first Octane chunk on a node held
+    // it for up to 11 minutes, every other dispatch to the node queued
+    // behind it, Cycles chunks included.
+    const state = { now: 'none' as OctaneState }
+    const { ssh, calls } = octaneNode(state)
+    const t = Date.now()
+    await expect(octane.setupOctane(ssh, NODE, { wait: false })).resolves.toBe('serverRunning')
+    expect(Date.now()).toBe(t)
+    expect(calls.map((c) => c.opts.label)).toEqual([
+      'check OctaneBlender',
+      'install Octane',
+      'start VNC',
+      'start OctaneServer'
+    ])
+    expect(row().octane_state).toBe('serverRunning')
+
+    // The wait, apart: the licence wait, then the one wait for a sign-in.
+    let settled = false
+    const waited = octane.waitForOctaneLicence(ssh, NODE).finally(() => (settled = true))
+    waited.catch(() => {})
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LICENSE_WAIT_MS + 10_000)
+    expect(row().octane_state).toBe('needsLogin')
+    expect(alerts.map((a) => a.message)).toEqual([expect.stringMatching(/waiting for a sign-in/)])
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LOGIN_WAIT_MS - 30_000)
+    expect(settled).toBe(false)
+    state.now = 'licensed'
+    await vi.advanceTimersByTimeAsync(5_000)
+    await expect(waited).resolves.toBe('licensed')
+
+    // A repeat on a licensed node, without waiting, says so at once.
+    await expect(octane.setupOctane(ssh, NODE, { wait: false })).resolves.toBe('licensed')
+    await expect(octane.waitForOctaneLicence(ssh, NODE)).resolves.toBe('licensed')
+    // And the once-per-node rule holds apart too: a node waited on already
+    // fails at once.
+    state.now = 'needsLogin'
+    h.db.prepare(`UPDATE nodes SET octane_state = 'needsLogin' WHERE id = ?`).run(NODE)
+    const missed = octane.waitForOctaneLicence(ssh, NODE).catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LOGIN_WAIT_MS + 10_000)
+    expect(await missed).toBeInstanceOf(octane.OctaneLoginNeededError)
+    const t2 = Date.now()
+    await expect(octane.waitForOctaneLicence(ssh, NODE)).rejects.toBeInstanceOf(
+      octane.OctaneLoginNeededError
+    )
+    expect(Date.now()).toBe(t2)
+  })
+
   it('1.18: the wait ends when the chunk is taken back', async () => {
     const { ssh } = octaneNode({ now: 'needsLogin' })
     const stop = new AbortController()
