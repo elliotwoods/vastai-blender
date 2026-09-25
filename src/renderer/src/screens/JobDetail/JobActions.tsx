@@ -1,6 +1,8 @@
 /**
  * JobDetail's actions on the job itself: "resume" for a job the retry
- * breaker held (plan 1.17), "Re-render missing" (plan 1.15) and cancel.
+ * breaker held (plan 1.17), "Re-render missing" (plan 1.15), cancel, and
+ * for a finished job a trash button that takes it off the Jobs list (its
+ * files stay on disk).
  * Each asks before it acts (ConfirmButton): a cancel was one click, and a
  * stray one stopped a long render (audit D4); a resume or a re-render
  * rents nodes. Kept free of the IPC bridge so it renders in a test; the
@@ -18,12 +20,15 @@ export function JobActions({
   onResume,
   onRetryMissing,
   onCancel,
+  onRemove,
   note
 }: {
   job: JobDetail
   onResume: () => Promise<unknown>
   onRetryMissing: () => Promise<unknown>
   onCancel: () => Promise<unknown>
+  /** take a finished job off the Jobs list; no button without it */
+  onRemove?: () => Promise<unknown>
   /** what the last resume or re-render did, or why it was refused */
   note: string | null
 }): React.JSX.Element {
@@ -62,6 +67,16 @@ export function JobActions({
           confirmLabel="cancel the job?"
           title="Stop every render of this job. Frames already downloaded are kept."
           onConfirm={onCancel}
+        />
+      ) : null}
+      {!running && onRemove ? (
+        <ConfirmButton
+          label="remove from list"
+          confirmLabel="remove from list?"
+          icon="trash"
+          iconOnly
+          title="Remove this job from the Jobs list. Its frames and files stay on disk."
+          onConfirm={onRemove}
         />
       ) : null}
     </>

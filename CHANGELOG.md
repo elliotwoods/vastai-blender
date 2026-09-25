@@ -191,6 +191,25 @@ stalled the app).
 
 ### Changed
 
+- **The job detail view, rebuilt.** One scrolling column in place of the
+  fixed 58/42 split, with every job down the left on a window at least
+  1280 px wide (folds to a rail, remembered; Alt+↑/↓ hops to the previous or
+  next job). In order: *settings*, where node sharing is a labelled switch
+  saying what off and on mean and that a change applies to chunks not yet
+  started (it was a bare "share node" checkbox), with the engine, frames,
+  chunk size, Blender version, add-ons, scene and output folders, and the
+  job's place in the queue or its group (ungroup from here); *progress*, the
+  job's bar drawn chunk by chunk with live counts, elapsed / left / ETA, and
+  chunks counted complete, failed and cancelled apart; *rendering now*, each
+  chunk in flight with its node and GPU, frame, bar, Blender's phase,
+  samples, memory and time left on the frame, and its last line, faded and
+  marked stale after 30 s without progress; *frames*, the zoomable filmstrip
+  (its minimap now drawn from the same chunk segments as the progress bar);
+  then the chunks and node logs, side by side when the column is 1100 px
+  wide. Failed chunks are red and marked "!", cancelled ones grey hatching
+  marked "–", with a legend and the last error in each tooltip. A finished
+  job can be removed from the Jobs list from here (its files stay).
+
 - **Cancelled is not failed.** Cancelling a job used to mark its unfinished
   chunks *failed*, so the job screen could not tell what the user stopped from
   what ran out of retries. They are now *cancelled* (a new chunk state), jobs

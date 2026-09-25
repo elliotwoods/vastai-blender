@@ -96,6 +96,40 @@ describe('JobActions', () => {
   })
 })
 
+describe('remove from list', () => {
+  const withRemove = (j: JobDetail): string =>
+    renderToStaticMarkup(
+      <JobActions
+        job={j}
+        onResume={() => Promise.resolve()}
+        onRetryMissing={() => Promise.resolve()}
+        onCancel={() => Promise.resolve()}
+        onRemove={() => Promise.resolve()}
+        note={null}
+      />
+    )
+
+  it('a finished job gets a trash button that asks first, saying the files stay', () => {
+    for (const state of ['complete', 'cancelled', 'failed', 'partial'] as const) {
+      const html = withRemove(job({ state, chunks: [chunk('complete')] }))
+      expect(html).toContain('aria-label="remove from list"')
+      expect(html).toContain('stay on disk')
+      expect(html).toContain('<svg')
+    }
+  })
+
+  it('a queued or running job has none: it is cancelled first', () => {
+    expect(withRemove(job({}))).not.toContain('remove from list')
+    expect(withRemove(job({ state: 'queued' }))).not.toContain('remove from list')
+  })
+
+  it('nor does a finished job when no remove is wired', () => {
+    expect(render(job({ state: 'complete', chunks: [chunk('complete')] }))).not.toContain(
+      'remove from list'
+    )
+  })
+})
+
 describe('1.17: a job the retry breaker held', () => {
   const held = {
     kind: 'repeatedFailure' as const,
