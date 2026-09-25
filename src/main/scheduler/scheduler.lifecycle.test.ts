@@ -294,6 +294,34 @@ describe('bookkeeping that throws', () => {
     expect(w.alerts('error').join('\n')).toMatch(/could not be requeued/)
   })
 
+  it('a requeue stands when announcing it throws (1.9 review)', async () => {
+    const { app, machine } = await oneNode()
+    const jobId = await w.submitJob(app)
+    const chunk = onlyChunk(jobId)
+    // The job's state write fails whenever it would go back to 'queued', as
+    // a full disk fails it: right after a requeue of its only chunk has
+    // committed, in the refreshJobState that announces it.
+    w.db.exec(
+      `CREATE TRIGGER harness_queued_fails BEFORE UPDATE OF state ON jobs
+       WHEN NEW.state = 'queued' BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END`
+    )
+    // The first attempt fails; the retry renders.
+    machine.onSpec = (spec) => {
+      machine.onSpec = (retry) => machine.agent.finish(retry.chunkId)
+      machine.agent.fail(spec.chunkId, 'blender exited with code 1')
+    }
+    app.scheduler.kick()
+
+    await w.until(() => ['complete', 'partial'].includes(jobState(jobId) ?? ''), 'job settled')
+
+    // The chunk was back in the queue before anything threw, so it is
+    // retried, not failed for a write that only reports it.
+    expect(jobState(jobId)).toBe('complete')
+    expect(chunkRow(chunk.id)).toMatchObject({ state: 'complete', retries: 1 })
+    expect(w.alerts('error').join('\n')).not.toContain('could not be requeued')
+    expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
+  })
+
   it('a run that throws while settling its chunk still lets go of its node', async () => {
     const { app, nodeId, machine } = await oneNode()
     const jobId = await w.submitJob(app)

@@ -97,6 +97,18 @@ interface PendingChunk extends ChunkRow {
   blender_version: string | null
 }
 
+/**
+ * What a requeue or re-split did, for announcing once it has committed.
+ * - complete: every frame of the range had already landed
+ * - pending: back in the queue, narrowed to the frames still missing
+ * - failed: out of retries
+ */
+interface Resplit {
+  outcome: 'complete' | 'pending' | 'failed'
+  /** chunks whose rows it wrote, the ones it created included */
+  touched: string[]
+}
+
 interface JobRow {
   id: string
   blend_path: string
@@ -1191,11 +1203,16 @@ class Scheduler {
    * it. A throw from requeue (missingRanges refuses a range or step it cannot
    * walk) skipped all of that, and an instance kept billing. So a chunk
    * requeue cannot handle is failed, loudly, and the caller goes on.
+   *
+   * Only the requeue itself can fail the chunk. Announcing it (the chunk
+   * events, refreshJobState) used to sit in the same try, so a throw there,
+   * after the requeue had committed, marked a chunk failed that was already
+   * back in the queue: a job gone 'partial' for a failed write of its state.
    */
   private requeueOrFail(chunkId: string, jobId: string): void {
+    let r: Resplit | null
     try {
-      this.requeue(chunkId)
-      refreshJobState(jobId)
+      r = this.requeue(chunkId)
     } catch (e) {
       emit('alert', {
         level: 'error',
@@ -1208,26 +1225,48 @@ class Scheduler {
       } catch (e2) {
         console.warn(`[scheduler] could not fail chunk ${chunkId}: ${(e2 as Error).message}`)
       }
+      return
+    }
+    this.announceRequeue(jobId, r)
+  }
+
+  /**
+   * Tell the UI about a requeue that has committed: its chunks, the job's
+   * state, and a job clip for a chunk it completed. Never throws: whatever
+   * fails here, the requeue stands.
+   */
+  private announceRequeue(jobId: string, r: Resplit | null): void {
+    try {
+      // These ids can include rows that did not exist a moment ago, so
+      // anything caching a node's chunk list has to re-read.
+      if (r) emitChunksChanged(r.touched)
+      refreshJobState(jobId)
+      if (r?.outcome === 'complete') jobClips.schedule(jobId)
+    } catch (e) {
+      console.warn(
+        `[scheduler] requeued ${r?.touched.join(', ') ?? 'a chunk'} of job ${jobId}, ` +
+          `but announcing it failed: ${(e as Error).message}`
+      )
     }
   }
 
   /**
    * Requeue a failed chunk: re-split around already-downloaded frames so only
-   * missing work re-renders; give up after MAX_RETRIES. Throws on a range or
-   * step missingRanges refuses: call it through requeueOrFail.
+   * missing work re-renders; give up after MAX_RETRIES. Writes rows only, and
+   * returns what it did for announceRequeue; null for a cancelled job, which
+   * it leaves alone. Throws on a range or step missingRanges refuses: call it
+   * through requeueOrFail.
    */
-  private requeue(chunkId: string): void {
+  private requeue(chunkId: string): Resplit | null {
     const db = getDb()
     const chunk = db.prepare('SELECT * FROM chunks WHERE id = ?').get(chunkId) as ChunkRow
     const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(chunk.job_id) as JobRow
     // A cancelled job's chunks stay as cancelJob left them. Requeueing one put
     // it back to 'pending' — work nobody wants, which then read as unfinished.
-    if (job.state === 'cancelled') return
+    if (job.state === 'cancelled') return null
     if (chunk.retries >= MAX_RETRIES) {
       db.prepare("UPDATE chunks SET state = 'failed' WHERE id = ?").run(chunkId)
-      emitChunkChanged(chunkId)
-      refreshJobState(chunk.job_id)
-      return
+      return { outcome: 'failed', touched: [chunkId] }
     }
     const downloaded = new Set(
       (
@@ -1243,13 +1282,10 @@ class Scheduler {
     )
     if (ranges.length === 0) {
       db.prepare("UPDATE chunks SET state = 'complete' WHERE id = ?").run(chunkId)
-      emitChunkChanged(chunkId)
-      refreshJobState(chunk.job_id)
-      jobClips.schedule(chunk.job_id)
-      return
+      return { outcome: 'complete', touched: [chunkId] }
     }
     const touched: string[] = [chunkId]
-    const rewrite = db.transaction(() => {
+    db.transaction(() => {
       // Narrow the original chunk to the first missing range, add new chunks
       // for the rest, and re-point frame rows.
       const first = ranges[0]
@@ -1267,12 +1303,8 @@ class Scheduler {
         ).run(newId, chunk.job_id, range.start, range.end)
         touched.push(newId)
       }
-    })
-    rewrite()
-    // After the transaction commits: these ids include rows that did not exist
-    // a moment ago, so anything caching a node's chunk list has to re-read.
-    emitChunksChanged(touched)
-    refreshJobState(chunk.job_id)
+    })()
+    return { outcome: 'pending', touched }
   }
 
   /** Scale up when there's queued work; scale down long-idle nodes. */
