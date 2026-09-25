@@ -183,6 +183,50 @@ describe('classify: did the far end act? (plan 1.4)', () => {
     for (const e of notSent) expect(classify(e, { via: 'ssh' }).outcomeUnknown).toBe(false)
     expect(classify({ exitCode: 1, error: 'blender exited 1' }).outcomeUnknown).toBe(false)
   })
+
+  it('a create lost to this computer going offline may exist; one whose name never resolved does not', () => {
+    // ENETDOWN or ENETUNREACH can arrive on a keep-alive socket after the PUT
+    // was written. Once vastClient keeps fetch's cause (plan 1.6), such a
+    // create must not read as "nothing sent".
+    const down = sysErr('read ENETDOWN', 'ENETDOWN', -50, 'read')
+    const noRoute = sysErr('connect ENETUNREACH 104.18.1.1:443', 'ENETUNREACH', -51, 'connect')
+    const wrapped = Object.assign(new VastError('network error: fetch failed'), { cause: down })
+    for (const e of [down, noRoute, wrapped]) {
+      const c = classify(e, { via: 'vast' })
+      expect(c, c.reason).toMatchObject({ kind: 'transient', outcomeUnknown: true })
+      expect(c.reason).toMatch(/ENET(DOWN|UNREACH)/)
+    }
+    expect(classify(wrapped).outcomeUnknown).toBe(true)
+    // DNS failed: no connection, nothing sent.
+    for (const e of [
+      sysErr('getaddrinfo ENOTFOUND console.vast.ai', 'ENOTFOUND', -3008, 'getaddrinfo'),
+      sysErr('getaddrinfo EAI_AGAIN console.vast.ai', 'EAI_AGAIN', -3001, 'getaddrinfo')
+    ]) {
+      const c = classify(e, { via: 'vast' })
+      expect(c, c.reason).toMatchObject({ kind: 'transient', outcomeUnknown: false })
+    }
+  })
+
+  it('over SSH, the network going down under a sent command is a dropped link', () => {
+    const underExec = Object.assign(sysErr('read ENETDOWN', 'ENETDOWN', -50, 'read'), {
+      level: 'client-socket'
+    })
+    expect(classify(underExec, { via: 'ssh' })).toMatchObject({
+      kind: 'transient',
+      outcomeUnknown: true
+    })
+    // Failing to connect sent nothing, however the error was wrapped.
+    const connecting = [
+      sysErr('connect ENETUNREACH 1.2.3.4:22', 'ENETUNREACH', -51, 'connect'),
+      new Error('reconnect budget exhausted: connect ENETUNREACH 1.2.3.4:22'),
+      new Error('connect ENETDOWN 1.2.3.4:22 (gave up after 3 attempts over 95s)'),
+      sysErr('getaddrinfo ENOTFOUND ssh5.vast.ai', 'ENOTFOUND', -3008, 'getaddrinfo')
+    ]
+    for (const e of connecting) {
+      const c = classify(e, { via: 'ssh' })
+      expect(c.outcomeUnknown, c.reason).toBe(false)
+    }
+  })
 })
 
 describe('classify: SSH to a node', () => {

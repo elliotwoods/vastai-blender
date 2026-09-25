@@ -102,6 +102,8 @@ interface ErrorLike {
 const UNREACHABLE = new Set(['ECONNREFUSED', 'EHOSTUNREACH', 'EHOSTDOWN', 'ETIMEDOUT'])
 /** Connection failures that say more about this computer's network than the far end. */
 const LOCAL_NET = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'ENETDOWN'])
+/** A name that did not resolve: no connection was made, so nothing was sent. */
+const DNS = new Set(['ENOTFOUND', 'EAI_AGAIN'])
 /** A connection that was up and dropped. */
 const DROPPED = new Set(['ECONNRESET', 'ECONNABORTED', 'EPIPE'])
 /** Node file-system codes: only local file operations raise them with a string code. */
@@ -194,6 +196,24 @@ function createReplyRefused(message: string): boolean | null {
     return true
   }
   return isObject(body) && (body as { success?: unknown }).success === false
+}
+
+/**
+ * Did the connection fail while it was being made, before anything could be
+ * sent on it? Node says so with syscall 'connect' (or 'getaddrinfo'), and in
+ * its message ("connect ENETUNREACH 1.2.3.4:22"); a wrapper may keep only the
+ * message, or the error as its cause, and a multi-address connect fails as an
+ * AggregateError of such parts.
+ */
+function failedConnecting(e: ErrorLike, depth = 0): boolean {
+  if (e.syscall === 'connect' || e.syscall === 'getaddrinfo') return true
+  if (/(^|[\s:])(connect|getaddrinfo) E[A-Z]+\b/.test(str(e.message))) return true
+  if (depth > 3) return false
+  if (isObject(e.cause) && failedConnecting(e.cause, depth + 1)) return true
+  if (Array.isArray(e.errors) && e.errors.length > 0) {
+    return e.errors.every((part) => isObject(part) && failedConnecting(part, depth + 1))
+  }
+  return false
 }
 
 /** The HTTP status of a Vast reply, from VastError.status or its message ("→ 400:"). */
@@ -306,8 +326,9 @@ function describeAgent(f: AgentFailure): string {
  * The rules after which the request may have been carried out. Everything
  * else is a definite answer (a 4xx, the agent's own report, an SSH
  * connection or channel refused) or never left this computer. A Vast
- * connection failure counts as unknown whatever its code: a lookup by label
- * costs far less than an instance billing unseen.
+ * connection failure counts as unknown whatever its code, bar a name that did
+ * not resolve: a lookup by label costs far less than an instance billing
+ * unseen. The network-down rule (net-local) decides per error: see classify.
  */
 const OUTCOME_UNKNOWN = new Set([
   'vast-5xx',
@@ -328,13 +349,15 @@ function result(
   rule: string,
   label: string,
   e: unknown,
-  retryable: boolean
+  retryable: boolean,
+  /** For a rule whose outcome depends on the error: overrides OUTCOME_UNKNOWN. */
+  outcomeUnknown?: boolean
 ): Classification {
   return {
     kind,
     rule,
     retryable,
-    outcomeUnknown: OUTCOME_UNKNOWN.has(rule),
+    outcomeUnknown: outcomeUnknown ?? OUTCOME_UNKNOWN.has(rule),
     reason: clip(`${label}: ${describe(e, 0)}`)
   }
 }
@@ -452,7 +475,15 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
 
   // --- Network codes. ---
   if (code && LOCAL_NET.has(code)) {
-    return result('transient', 'net-local', 'network unavailable on this computer', e, true)
+    const label = 'network unavailable on this computer'
+    // A name that did not resolve sent nothing. A network that went down or
+    // lost its route can take a connection that was already up, after a
+    // request was written: from Vast (a keep-alive socket carrying a create)
+    // that is as unknown as any other Vast connection failure, and over SSH
+    // as unknown as a dropped link, unless it failed while connecting.
+    if (DNS.has(code)) return result('transient', 'net-local', label, e, true, false)
+    if (vast) return result('transient', 'vast-unreachable', label, e, true)
+    return result('transient', 'net-local', label, e, true, !failedConnecting(e))
   }
   if (code && DROPPED.has(code)) {
     return result(
