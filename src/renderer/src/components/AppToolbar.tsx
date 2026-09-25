@@ -2,7 +2,7 @@ import type { CSSProperties, ReactNode } from 'react'
 import { SCALE, TOKENS } from '../lib/theme'
 import { mono, readout } from '../lib/controls'
 import { compareCo2 } from '../lib/co2'
-import { fmtCo2, fmtEnergy, fmtRate } from '../lib/format'
+import { fmtCo2, fmtEnergy, fmtRate, fmtWatts } from '../lib/format'
 import { HINTS } from '../lib/hints'
 import { Icon } from './Icon'
 import { InfoDot, Tooltip } from './Tooltip'
@@ -63,9 +63,10 @@ function FleetReadouts(): React.JSX.Element {
   const { data: nodes } = useNodes()
   const { data: settings } = useSettings()
   const navigate = useNav((s) => s.navigate)
-  const active = (nodes ?? []).filter(
-    (n) => !['destroyed', 'failed', 'destroying'].includes(n.state)
-  ).length
+  const live = (nodes ?? []).filter((n) => !['destroyed', 'failed', 'destroying'].includes(n.state))
+  const active = live.length
+  // Summed from each node's latest sample; 0 until a node reports a draw.
+  const powerW = live.reduce((sum, n) => sum + (n.metrics?.powerW ?? 0), 0)
   // Every readout is a live number with a past — clicking one opens its series.
   const toHistory = (metric: HistoryMetric) => () => navigate({ screen: 'history', metric })
   const linked: CSSProperties = { ...readout(), cursor: 'pointer' }
@@ -84,6 +85,19 @@ function FleetReadouts(): React.JSX.Element {
         <button style={linked} onClick={toHistory('spend')}>
           <span style={{ color: TOKENS.textFaint }}>rate</span>
           <span style={mono}>{cost ? fmtRate(cost.perHour) : '$0.000/hr'}</span>
+          <span style={{ color: TOKENS.border }}>|</span>
+          <span
+            style={{
+              ...mono,
+              color: powerW > 0 ? TOKENS.textMuted : TOKENS.textDisabled,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 3
+            }}
+          >
+            <Icon name="power" size={11} />
+            {powerW > 0 ? fmtWatts(powerW) : '— W'}
+          </span>
           <InfoDot size={10} />
         </button>
       </Tooltip>

@@ -20,7 +20,7 @@ export const HINTS = {
   power: 'Current GPU power draw against the card’s limit, and energy used this session.',
 
   fleetRate:
-    'Combined $/hr of every live node — what the fleet costs while it stays up. Click for spend history.',
+    'Combined $/hr of every live node — what the fleet costs while it stays up — and the GPU power the fleet is drawing right now (latest nvidia-smi sample per node, refreshed every 15 s). Click for spend history.',
   fleetSession:
     'Estimated total spend and GPU energy. The cost log is never cleared, so this covers every run, not just this session. Click for spend history.',
   balance: 'Your vast.ai credit. Click for balance history, or “+” to add funds.',
