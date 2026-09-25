@@ -28,6 +28,7 @@ import type {
 } from '../shared/models'
 import { localPathProblem } from '../shared/settingsSanitize'
 import { applySettingsPatch, describeFieldErrors, type GateOptions } from './app/settingsGate'
+import { jobMediaUrl } from './app/mediaProtocol'
 import { reprovisionNode, retryMissing } from './app/recovery'
 import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
 import { dismissAlerts, onAlertSurfaced, onEvent, recentAlerts } from './events'
@@ -79,7 +80,7 @@ function nodeChunks(nodeId: string, limit = 12): NodeChunkView[] {
   const rows = db
     .prepare(
       `SELECT c.id, c.job_id, c.frame_start, c.frame_end, c.state, c.retries, c.assigned_at,
-              j.name AS job_name, j.engine, j.frame_step
+              j.name AS job_name, j.engine, j.frame_step, j.output_dir
          FROM chunks c JOIN jobs j ON j.id = c.job_id
         WHERE c.node_id = ?
         ORDER BY c.assigned_at IS NULL, c.assigned_at DESC, c.frame_start
@@ -96,6 +97,7 @@ function nodeChunks(nodeId: string, limit = 12): NodeChunkView[] {
     job_name: string
     engine: EngineId
     frame_step: number
+    output_dir: string
   }>
   if (rows.length === 0) return []
 
@@ -137,8 +139,29 @@ function nodeChunks(nodeId: string, limit = 12): NodeChunkView[] {
     live: scheduler.isLive(r.id),
     gpu: scheduler.gpuOf(r.id),
     assignedAt: r.assigned_at,
-    thumbUrl: thumbByChunk.has(r.id) ? toMediaUrl(thumbByChunk.get(r.id) as string) : null
+    thumbUrl: thumbByChunk.has(r.id)
+      ? jobFileUrl(r.job_id, r.output_dir, thumbByChunk.get(r.id) as string)
+      : null
   }))
+}
+
+/**
+ * The URL the renderer loads one of a job's files by: media://job/<jobId>/…
+ * inside the job's own folder (plan 1.13), so it still loads after the
+ * project root has moved. A URL relative to the current root pointed
+ * nowhere once it had, and every earlier job's previews went blank (#9
+ * #214). A file outside the job's folder, which nothing writes, keeps the
+ * old form.
+ */
+function jobFileUrl(jobId: string, outputDir: string, absPath: string): string {
+  return jobMediaUrl(jobId, outputDir, absPath) ?? toMediaUrl(absPath)
+}
+
+/** A job's jobs.output_dir, or null for no such job. */
+function jobOutputDir(jobId: string): string | null {
+  const row = getDb().prepare('SELECT output_dir FROM jobs WHERE id = ?').get(jobId) as
+    { output_dir: string } | undefined
+  return row?.output_dir ?? null
 }
 
 /** Thumbnails for a frame range — the filmstrip's visible window. */
@@ -150,11 +173,12 @@ function frameThumbs(jobId: string, from: number, to: number): ThumbAsset[] {
         ORDER BY frame`
     )
     .all(jobId, from, to) as Array<{ frame: number; chunk_id: string; thumb_path: string }>
+  const outputDir = rows.length > 0 ? jobOutputDir(jobId) : null
   return rows.map((r) => ({
     frame: r.frame,
     chunkId: r.chunk_id,
     absPath: r.thumb_path,
-    mediaUrl: toMediaUrl(r.thumb_path)
+    mediaUrl: outputDir ? jobFileUrl(jobId, outputDir, r.thumb_path) : toMediaUrl(r.thumb_path)
   }))
 }
 
@@ -900,6 +924,7 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
       hdr: number
       segments: string | null
     }>
+    const outputDir = jobOutputDir(jobId)
     // Allow-list, not `kind !== 'frame'`: a deny-list silently admits every
     // future asset kind into the gallery, mislabelled as SDR.
     const clips = rows
@@ -912,7 +937,7 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
         chunkId: r.chunk_id ?? '',
         label: `${r.chunk_id ?? 'job'} ${r.kind === 'previewHdr' ? 'HDR' : r.kind === 'proxy' ? 'proxy' : 'SDR'}`,
         absPath: r.abs_path,
-        mediaUrl: toMediaUrl(r.abs_path),
+        mediaUrl: outputDir ? jobFileUrl(jobId, outputDir, r.abs_path) : toMediaUrl(r.abs_path),
         fps: r.fps ?? 25,
         frames: r.frames ?? 0,
         width: r.width ?? 0,
