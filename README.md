@@ -10,7 +10,7 @@ Vast Render is a desktop app for macOS and Windows that renders Blender projects
 provisions them (matching Blender version, ffmpeg, render agent), splits the
 animation into frame chunks across the fleet, streams frames and HDR preview
 clips back to your disk as they finish, and destroys the machines once they go
-idle, as long as the app is running: quitting leaves them billing (see
+idle. Quitting asks whether to destroy the fleet or leave it running (see
 [Safety model](#safety-model)).
 
 Vast.ai rents time on other people's GPU machines — typically far cheaper than
@@ -36,9 +36,12 @@ Vast.ai balance in view on every screen.*
   measures throughput per node and tunes the number of concurrent renders on
   its own; *Max render slots per node* in Settings caps it if you want.
 - **Per-GPU render slots** — on a multi-GPU node each GPU renders its own
-  chunk (pinned with `CUDA_VISIBLE_DEVICES`), so per-frame CPU work such as
-  scene sync doesn't idle the other GPUs. One or two slots per GPU, or off, in
-  Settings; *Min GPUs per node* in the offer filters.
+  Cycles chunk (pinned with `CUDA_VISIBLE_DEVICES`), so per-frame CPU work such
+  as scene sync doesn't idle the other GPUs. One or two slots per GPU, or off,
+  in Settings; *Min GPUs per node* in the offer filters. EEVEE and Octane
+  chunks take the whole node, and a Cycles chunk that finds a node with cards
+  to spare (the tail of a job, say) runs across all of them. A node that runs
+  out of GPU memory with two renders on a card drops to one per card.
 - **Engines** — Cycles (OptiX/CUDA), EEVEE (per-node capability
   probe), Octane (see `docs/OCTANE.md`).
 - **Automatic Blender version matching** — the app reads each `.blend`'s
@@ -46,8 +49,12 @@ Vast.ai balance in view on every screen.*
   (side-by-side per version; override in Settings).
 - **Direct, verified transfers** — scenes go up and frames come down over the
   instance's own SSH (SFTP, SHA-256 verified, resumable). No Dropbox, no
-  cloud bucket, no credentials on untrusted machines, except the optional
-  OTOY sign-in for Octane (see `docs/OCTANE.md`).
+  cloud bucket, no credentials on untrusted machines, except Octane's
+  opt-in scripted OTOY sign-in (see `docs/OCTANE.md`). A job keeps its own
+  copy of the `.blend` as submitted (`scene.blend` in its folder), so saving
+  the scene mid-render doesn't mix two versions; each node receives it once.
+  A full disk on this computer pauses downloads and new work, and they resume
+  on their own once there is room.
 - **Remote preview encodes** — each chunk is encoded on the node to H.265:
   SDR, 10-bit HLG BT.2020 **HDR**, and a small proxy — all All-Intra for
   frame-exact scrubbing.
@@ -64,14 +71,21 @@ Vast.ai balance in view on every screen.*
   can also carry `startup*` text blocks, executed before rendering.
 - **Live telemetry** — %GPU, %VRAM, true %CPU (from `/proc/stat` deltas, not
   load average), %RAM, GPU watts, and Wh of energy per node.
+- **GPU usage over time** — the Fleet screen charts GPUs busy against GPUs
+  rented, with mean utilisation and what the idle ones cost per hour (15 min
+  to 24 h). Each node row has a 30-minute utilisation sparkline, and an
+  expanded node charts utilisation and VRAM per GPU and total power, shading
+  where a GPU sat at or under 10% with a render assigned to it.
 - **History** — spend, account balance, fleet GPU power and fleet size over
   1 day / 7 days / 30 days / all time, with the jobs that cost the most and an
   estimated CO₂ figure behind every energy readout.
 - **Cost control** — live $/hr and fleet power draw, per-node metered spend,
-  total spend and this session's energy, account balance, idle-timeout
-  auto-destroy while the app runs, a spend cap on automatic scale-up, and a
-  sweep at launch that destroys instances this profile rented but lost track
-  of. All of it has limits; see [Safety model](#safety-model).
+  total spend and this session's energy, account balance with its runway,
+  idle-timeout auto-destroy, a spend cap every rental must fit under, a quit
+  that asks before leaving anything billing, a pause on renting when the
+  balance runs low, and a reconcile every 5 minutes that destroys instances
+  this profile lost track of and lists everything else on the account. All of
+  it has limits; see [Safety model](#safety-model).
 
 ![History screen](docs/screenshots/history.png)
 
@@ -120,6 +134,8 @@ was interrupted — see `docs/hdr-notes.md` for the manual fix.
 2. **Settings → General** — set the project root (where renders land), max
    active nodes, spend cap ($/hr), idle timeout, and (optionally) a cap on
    render slots per node — leave it blank to let the app judge concurrency.
+   With the spend cap blank, scale-up rents nothing; tick *no spend cap* to
+   rent without one.
 3. **Settings → Offer filters** — GPU allowlist, max $/hr, minimum
    VRAM/network/reliability. Turn on *CPU-bound* for scenes whose frame time
    is dominated by CPU work, so ranking stops favouring premium datacenter
@@ -146,9 +162,17 @@ reaches the node. Before submitting:
 - Image sequences, movie clips, Alembic/USD caches and files over 2 GB cannot
   be packed, and neither can fluid (Mantaflow) bakes, which Blender writes only
   to a disk cache. Scenes that need any of them are not supported yet.
+- Render to an image format (OpenEXR, PNG, …), not a movie: each chunk saves
+  one image per frame.
 
-Nothing checks for any of this before the fleet starts. A missing texture
-renders magenta, and those frames complete and are billed like any other.
+A scene preflight on the node checks this before Blender renders the first
+frame of each chunk. Unpacked files or libraries the render reads, missing
+linked data, a movie output, and a simulation that is not baked into the
+file when the job is split into more than one chunk each fail the job at
+once, with no retries spent, and the job page says what to fix. Things the
+render never reads (a hidden object's texture, a reference image) are only
+warnings. The check runs on a rented node, so the first node has already
+booted and billed by then.
 
 **Jobs → new render**: pick `.blend` file(s), the engine, the frame range and
 step, optionally the extensions to enable and a chunk size (blank = the
@@ -168,48 +192,114 @@ Useful controls while a job runs:
   there's work and the spend cap allows. Lowering it only stops new rentals:
   nodes already running stay until they idle out or you destroy them.
 - **Fleet → + request node** — add one machine now. It counts against max
-  nodes but ignores the spend cap.
+  nodes. Past the spend cap it asks first, and then rents at no more than the
+  offer filters' max $/hr, or the cap itself when the filters set no price.
 - **Fleet → row → ssh** — open a terminal on that machine using the app's own
   key (clicking the ssh endpoint copies the command instead).
 - **Fleet → row → destroy** — kill a bad machine; its chunks are re-queued.
-- **Jobs → cancel** — stop dispatching and stop the job's renders on the
+  Destroy, cancel and the other buttons that cost work or money ask for a
+  second click.
+- **Fleet → row → reprovision** — ship the scripts again and restart the
+  node's agent. Its renders go back to the queue, charged to the chunks'
+  allowance for machine failures, not their render retries.
+- **Job page → cancel** — stop dispatching and stop the job's renders on the
   nodes; frames already downloaded are kept.
+- **Job page → re-render missing** — queue again the frames that never
+  arrived, with fresh retries. Frames already on this computer are not
+  rendered again. It is not offered for a job that failed outright (a scene
+  the preflight refused, say), which would fail the same way.
+- **Job page → resume** — a job whose chunks failed the same way on two
+  nodes is held, and nothing more of it is sent until you resume it.
+- The job page shows *scene changed since submit* when the `.blend` was
+  saved after the job was submitted. The job keeps rendering its own copy;
+  submit again to render the new version.
 
 ## Safety model
 
 Rented machines bill by the hour whether or not they render. What the app
 does about that, and what it doesn't:
 
-- **Quitting leaves the fleet billing.** Quitting the app (on Windows and
-  Linux, closing its window) does not destroy nodes, and nothing on a node
-  shuts it down. They bill until you open the app again and they idle out, or
-  until you destroy them. Before you quit, set **Fleet → max nodes** to 0 (or
-  cancel every unfinished job), then destroy each node. Otherwise their chunks
-  go back to the queue and, within seconds, the scheduler rents replacements
-  to render them. A scale-up already under way (up to 8 rentals) can keep
-  renting after max nodes reaches 0, so wait until no new rows appear and
-  destroy those too. Check the
-  [Vast.ai console](https://cloud.vast.ai/instances/) afterwards. The 0 is
-  saved, so the next launch rents nothing and shows no *Resume rendering*
-  prompt; renting starts when you raise max nodes again. Sleep is the same as
-  quitting: nodes keep billing and nothing is metered until the computer wakes.
-- **A restart re-renders in-flight work.** On launch the app re-provisions
-  every node it can reach, which kills the renders running there. Each chunk
-  that was in flight goes back to the queue and renders its whole frame range
-  again. When any chunk was in flight and max nodes is above 1, renting waits
-  behind a *Resume rendering* prompt; a queue with nothing in flight rents
-  straight away.
-- **The spend cap limits automatic scale-up only.** It stops renting once the
-  fleet's combined quoted $/hr reaches the cap. It doesn't count the price of
-  the machine about to be rented, so the last rental can go over, and
-  *+ request node* ignores it. Rates are the quotes at rent time, not vast.ai's
-  invoice.
-- **Instance ownership.** Each instance is labelled `vastai-blender` followed
-  by the first 8 characters of its node's id. At launch the app destroys any
-  instance with such a label that this profile rented but no longer tracks,
-  such as one whose destroy failed. An instance another profile or install
-  rented is left running, with a warning, and instances without the label are
-  never touched. The sweep runs only at launch.
+- **Quitting asks.** When any node may be billing, quitting (Cmd+Q, closing
+  the last window on Windows and Linux, or Ctrl+C in the terminal) shows
+  *N nodes are billing $X/hr* with three choices, every time:
+  - **Destroy all & quit** stops renting and dispatching, destroys every node
+    (3 s apart, dearest first) and quits once Vast.ai has confirmed each one
+    gone. Renders in progress go back in the queue for next time. Anything it
+    cannot confirm is listed with *Try again*, *Open Vast.ai console* and
+    *Quit anyway*; *Quit anyway* leaves those instances billing.
+  - **Leave running** quits at once. The nodes keep billing until the app,
+    once open again, scales them down, or until you destroy them in the
+    [Vast.ai console](https://cloud.vast.ai/instances/), or until the node
+    lease below retires them.
+  - **Cancel** goes back to the app.
+
+  On macOS, closing the window does not quit: the app keeps managing the
+  fleet. On Windows, a shutdown or sign-out destroys the fleet without asking,
+  and so does closing the terminal that runs the app.
+- **Sleep warns.** Going to sleep with nodes billing raises an alert and a
+  notification: they keep billing, and nothing renders or downloads, until the
+  computer wakes. On waking the app says about what the sleep cost, meters it,
+  and reconciles the account at once. Nothing is destroyed for sleeping.
+- **Node lease (not yet verified on a real node).** Each 15 s probe renews a
+  lease on the node. A node that has heard nothing from the app for
+  30 minutes, and has nothing rendering or queued, destroys its own instance
+  (stopping OctaneServer first) using the per-instance key Vast.ai gives each
+  instance: the app never sends your account key to a node. This covers
+  *Leave running*, a crash, a closed lid or a lost network. Frames a node
+  rendered but the app had not downloaded go with it, and render again once
+  the app is back. There is no setting to turn it off, the app does not yet
+  show whether a node's lease is armed, and a node whose agent is dead, or
+  still busy with a render nobody collects, never destroys itself.
+- **A restart stops in-flight renders, but re-renders only what is missing.**
+  On launch the app re-provisions every node it can reach, which restarts its
+  agent and stops the renders running there. Each chunk that was in flight is
+  narrowed to the frames not yet on this computer, with no retry charged; a
+  frame rendered but not downloaded is rendered again. Whenever unfinished
+  work is left from the last session (and max nodes is above 1), renting
+  waits behind a *Resume rendering* banner; nodes already up still take the
+  work. The hold is saved, so it survives another relaunch, and it lifts by
+  itself once none of that work is left.
+- **The spend cap is a budget at rent time.** It counts every node that may
+  still be billing, and a machine is rented only if its own price still fits
+  under the cap. *+ request node* asks before going past it. A blank cap rents
+  nothing unless *no spend cap* is ticked. Rates are the quotes at rent time,
+  not vast.ai's invoice. The Fleet screen says why scale-up is or is not
+  renting.
+- **Credit guard.** The balance is read every minute and judged against
+  what the whole account bills (this fleet plus any other instance on it).
+  Under 30 minutes of runway you get a warning. Under 10 minutes, or when
+  Vast.ai refuses a rental for lack of credit, renting pauses: no machine is
+  blacklisted, nodes already rented keep rendering and billing, and renting
+  resumes by itself once a top-up covers 20 minutes. A refused API key pauses
+  renting until a key is saved or Vast.ai accepts it again. The toolbar's
+  balance turns amber, then red, as the runway shortens.
+- **Holds say why.** A banner above every screen lists each reason the fleet
+  has stopped renting — the balance or API key, the local disk, scale-up
+  backing off after failed rentals, unfinished work from the last session, an
+  Octane sign-in nobody made — with what lifts it and a button where one
+  helps.
+- **Instance ownership and reconcile.** Each instance is labelled
+  `vastai-blender <install>:<node>`, the first 8 characters of this install's
+  id and its node's id (older `vastai-blender <node>` labels are still
+  recognised). Every 5 minutes, at launch, on waking and when an API key is
+  saved, the app compares the account with its own records. An instance
+  labelled for one of this profile's nodes that the node no longer holds is
+  destroyed (instances younger than 2 minutes are left for the next pass).
+  Everything else is listed under **Fleet → Unclaimed instances** with its
+  owner (this install, another Vast Render, or not Vast Render) and $/hr, and
+  is destroyed only when you click *destroy* there, twice.
+- **A destroy is done when Vast.ai confirms it.** A destroy that fails is
+  retried every minute, and its node stays listed and counted as billing
+  until Vast.ai no longer lists the instance. So does a rental whose create
+  got no answer: the app looks for its instance by label rather than renting
+  again, uses it or destroys it if found, and says so if Vast.ai stays silent.
+- **Stuck nodes are let go.** A node that stops answering over SSH is taken
+  out of work within about 45 s; if Vast.ai no longer knows its instance, or
+  it does not come back within 10 minutes, it is destroyed and its chunks
+  requeued. Provisioning has a 25-minute deadline. A Blender that starts or
+  saves no frame for 3 times the slowest frame its job has taken on that
+  hardware (at least 45 minutes; 3 hours before its first frame) is stopped,
+  and its chunk requeued.
 - **One app per profile.** A second launch on the same profile writes one
   line to stderr and quits with status 0, and the app already running brings
   its window forward. A scripted one — headless (`VR_JOB_SPEC`,
@@ -218,7 +308,8 @@ does about that, and what it doesn't:
   `VR_USERDATA` profile is a separate profile, so it runs alongside.
 - **Billing-risk alerts stay up.** A destroy that failed, or an instance left
   running, stays in a banner above every screen until you dismiss it, with a
-  link to the Vast.ai console.
+  link to the Vast.ai console. An unexpected error in the app becomes an alert
+  rather than a dialog that stalls it.
 
 ## Headless campaigns
 
@@ -265,9 +356,30 @@ chunks) rather than duplicating them. Events and node logs are mirrored to
 stdout in this mode so a scripted run is diagnosable.
 
 The spec's fleet settings (`maxActiveNodes`, `spendCapPerHour`, `eagerFleet`,
-`maxNodeSlots`, `slotsPerGpu`, `offerFilters`) are saved into the profile's
-settings and stay in force after the run, in the app as well. Run campaigns on
-their own profile (`VR_USERDATA`) if that matters.
+`maxNodeSlots`, `slotsPerGpu`, `offerFilters`) apply to this run only: they
+go through the same checks as the Settings screen, and `settings.json` is
+never written. A clamped value is reported on stderr. If any of them cannot
+be put in force, nothing of the campaign is submitted. A setting you change
+in the app during the run is saved and replaces the spec's.
+
+Submitting a campaign lifts the *Resume rendering* hold for its own jobs
+only, and resumes a job it names again that the retry breaker held. Other
+unfinished work on the profile stays held.
+
+A headless run never shows the quit dialog. `VR_QUIT_POLICY` decides what
+happens on Ctrl+C, SIGTERM, a closed terminal, a quit and the end of the
+campaign:
+
+- `destroy` (the default, and what any other value falls back to): once no
+  job of the campaign is queued or running, the run destroys every node and
+  exits; a signal or quit does the same sooner. A second Ctrl+C (or SIGTERM)
+  at least 2 s after the first abandons the destroy.
+- `leave`: exit and leave the nodes as they are; the next launch on the
+  profile picks them up. A finished campaign does not end the run.
+
+The exit status is 3 when something may be left billing (a destroy not
+confirmed, or nodes left by `leave`), 1 when part of the campaign was never
+submitted, and 0 otherwise.
 
 Other environment switches (development aids):
 
@@ -291,7 +403,8 @@ profile. On Windows, copy `Local State` from the real profile into a throwaway o
 if you need the stored API key to decrypt there: Chromium keeps the `safeStorage`
 key in that file, DPAPI-wrapped. A profile with a working key is a second fleet
 on the same account. It rents up to its own max nodes and spend cap, not the
-real profile's, and its launch sweep leaves the other profile's instances alone.
+real profile's, and its reconcile lists the other profile's instances under
+*Unclaimed instances* rather than destroying them.
 
 ## How machines are chosen
 
@@ -326,9 +439,9 @@ in Settings → Offer filters.
   unavailable on a node.
 - Spend, energy (Wh), GPU draw and fleet size are metered once a minute and
   persisted in SQLite, so the History screen survives a restart. Everything there
-  is what this app observed **while running** — it never reads back Vast.ai's
-  billing, so totals read low for any period the app was closed or the
-  computer slept.
+  is what this app metered from the quoted rates — it never reads back
+  Vast.ai's billing. Time asleep is charged on waking, but totals read low for
+  any period the app was closed.
 - Versioning and release notes: see [CHANGELOG.md](CHANGELOG.md).
 - License: GPL-3.0 (see `LICENSE`). A GPL-licensed Dropbox uploader this repo
   used to bundle set it, and that bundle is gone. Packaged builds now ship an

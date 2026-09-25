@@ -13,6 +13,217 @@ GitHub Releases with the notes from this file.
 
 ## [Unreleased]
 
+Phase 1 of the audit ([docs/AUDIT-2026-09.md](docs/AUDIT-2026-09.md)): what
+the app spends, what it keeps, and how busy the GPUs it pays for really are.
+Field incidents behind it: job 81fe2875 (7 of 24 paid GPUs held by renders
+nobody was doing), 1d59516c (the Vast balance ran out mid-render) and
+da68b61b (two 8×4090s rented for a frame already downloaded, then a full disk
+stalled the app).
+
+### Added
+
+- **Quitting asks.** Quitting, closing the lid or a Windows shutdown used to
+  leave every node billing with nothing running to render on it, scale it
+  down or destroy it. With any node that may be billing, a quit now asks
+  "N nodes are billing $X/hr" every time: *Destroy all & quit* (stops renting,
+  destroys the fleet 3 s apart, dearest first, and quits only once Vast.ai
+  confirms each instance gone, or lists what it could not confirm with *Try
+  again*, *Open Vast.ai console* and *Quit anyway*), *Leave running* or
+  *Cancel*. Ctrl+C and a closed terminal ask the same. A Windows shutdown, or
+  closing the terminal on Windows, destroys without asking. Going to sleep
+  with nodes billing raises an alert and a notification; on waking the app
+  says about what the sleep cost, meters it (it used to count as one minute)
+  and reconciles the account at once. Headless runs never ask:
+  `VR_QUIT_POLICY=destroy` (the default) destroys the fleet when the campaign
+  is done or the run is stopped, `leave` leaves it, and the exit status is 3
+  when anything may be left billing.
+- **Node lease** (not yet verified on a real node). *Leave running*, a crash,
+  a closed lid or a lost network left nodes billing until the app came back.
+  Each 15 s probe now renews a lease on the node, and a node with no word
+  from the app for 30 minutes and nothing rendering or queued destroys its own
+  instance, stopping OctaneServer first. It uses the key Vast.ai gives each
+  instance, never the account key, which the app never sends to a node.
+- **Credit guard.** In job 1d59516c the balance hit $0 with nothing having
+  said it was running low; Vast.ai stopped two of three 8×4090 nodes, and
+  scale-up made 12 rent attempts, each refused `insufficient_credit`, each a
+  failed row and a blacklisted machine, with no alert. The balance is now read
+  every minute and judged against what the whole account bills (this fleet
+  plus every other instance on it). Under 30 minutes of runway: one warning.
+  Under 10, or on any refusal for lack of credit: an account hold that stops
+  renting, blacklists nothing, survives a relaunch and lifts by itself once a
+  top-up covers 20 minutes. A refused API key holds renting until a key is
+  saved or Vast.ai accepts it again. The toolbar's balance turns amber and
+  red by runway rather than under $5.
+- **Holds banner.** Every reason the fleet has stopped renting shows above
+  every screen with what lifts it: the balance (*Top up*) or API key (*API
+  key*, *Try now*), the local disk (*Check again*), scale-up backing off
+  after failed rentals (*Try now*), unfinished work from the last session
+  (*Resume rendering*), and an Octane sign-in nobody made (*Release*).
+- **Unclaimed instances** on the Fleet screen. The sweep for instances this
+  profile lost track of ran only at launch, and an instance another install
+  rented drew one warning and was forgotten. A reconcile now runs every 5
+  minutes, at launch, on waking and when an API key is saved. Rentals are
+  labelled `vastai-blender <install8>:<node8>` (older labels are still
+  recognised); an orphan of this profile is destroyed as before, and
+  everything else on the account is listed with its owner, $/hr and a
+  *destroy* that asks first. It is never destroyed on its own. Another
+  install is announced once a session, not once per node.
+- **GPU usage over time** on the Fleet screen. Only the latest reading was
+  shown, so phantom runs, collapsing GPU lanes and idle paid GPUs went unseen
+  (81fe2875). A strip charts GPUs busy against GPUs rented, mean utilisation
+  and the idle GPUs' $/hr over 15 min, 1 h, 6 h or 24 h; each node row has a
+  30-minute sparkline; an expanded node charts utilisation and VRAM per GPU
+  and total power, shaded where a GPU sat at or under 10% with a render
+  assigned, with a tick for each chunk sent. Samples are kept every 15 s, 7
+  days in the database; a missed poll is a gap, not a zero.
+- **Scene preflight.** Nothing checked a scene before it rendered: a missing
+  texture rendered magenta and was billed. A preflight now runs in Blender
+  before the first frame of each chunk and fails the job at once, with no
+  retries spent, for unpacked files or libraries the render reads, missing
+  linked data, a movie output format, or a simulation that is not baked into
+  the file when the job is split. What the render never reads is a warning
+  only. Cycles with no GPU device enabled now fails instead of rendering on
+  the CPU at GPU prices, and a job's engine is taken from the scene.
+- **Recovery actions.** The job page offers *re-render missing (N frames)*:
+  the frames that never arrived are queued again with fresh retries, and
+  frames already on this computer are not rendered again. A node's
+  *reprovision* restarts its agent and requeues its renders. Destroy, cancel,
+  reprovision and resume ask for a second click.
+- **Retry breaker.** A job whose chunks fail the same way on two nodes is
+  held, with an alert, rather than burning its retries across the fleet; the
+  job page's *resume* sends it again.
+- **A job keeps its scene.** The `.blend` is copied into the job's folder
+  (`scene.blend`; a clone where the filesystem allows) and hashed, and each
+  node receives it once. Saving the scene mid-render no longer mixes two
+  versions; the job page shows *scene changed since submit*.
+- **Octane, working.** Sign-in is by hand over VNC by default: a node waiting
+  for one shows *Open VNC login* with a local address and password to copy.
+  The scripted sign-in is opt-in. Octane nodes are rented from a docker image
+  set per engine in Settings, optionally from datacenter (secure cloud) hosts
+  only; setup never starts a second OctaneServer or restarts VNC; every
+  destroy of a node the app can reach stops OctaneServer first; while
+  a sign-in is by hand, scale-up keeps at most one Octane node waiting for
+  one. See `docs/OCTANE.md`.
+- **Why scale-up is (not) renting** is a line on the Fleet screen: at max
+  nodes, spend cap, the tail, or what it is short of.
+- The Settings key test says which of the app's permissions the API key has.
+
+### Changed
+
+- **The spend cap is a budget at rent time.** It checked only the fleet's
+  current rate, so the last rental could go over, and *+ request node*
+  ignored it. Offers are now searched at or under what the cap leaves, each
+  rental is re-checked against it, and it counts every node that may still be
+  billing. *+ request node* past the cap asks first and rents at no more than
+  the offer filters' price, or the cap. A blank cap now means *no rentals*
+  unless *no spend cap* is ticked (it used to mean no cap).
+- **A restart re-renders only what is missing.** A chunk in flight at quit
+  went back with its whole range and rendered every frame again, those
+  already downloaded included. It now resumes narrowed to its missing frames,
+  with no retry charged, and agents render with Overwrite off. The *Resume
+  rendering* hold is saved, judged on all unfinished work (it missed a queue
+  whose fleet was still booting), and lifts itself once that work is gone.
+- **No work, no rent** (da68b61b). With all 1903 frames downloaded, a
+  leftover one-frame retry chunk sat assigned at 0% GPU, and buy-ahead rented
+  two more 8×4090s (about $8/h) for it. A chunk whose frames have all landed
+  is now complete and never sent; scale-up counts frames, not chunks, and
+  does not rent when the fleet would finish the last frames before a new node
+  could boot (about 10 minutes). After failed boots, scale-up backs off and
+  then rents one node at a time until one is ready.
+- **Headless specs no longer rewrite your settings.** `VR_JOB_SPEC`'s fleet
+  settings were saved into `settings.json`, so the app later rented with a
+  campaign's 30 nodes and filters. They now apply to the run only, through
+  the same checks as the Settings screen; a spec whose settings cannot all be
+  put in force submits nothing and exits 1. A campaign lifts the *Resume
+  rendering* hold for its own jobs only.
+- **Retries are charged to whoever failed.** Render failures and machine or
+  network failures have separate budgets (4 and 8), and a wait for an Octane
+  sign-in or this computer's disk charges neither. In 1d59516c, 16 chunks burned all
+  their retries on stopped nodes with an empty error while a healthy node
+  sat idle. Every alert now names the error's code, errno or status.
+- **GPU lanes.** EEVEE and Octane chunks take a whole node; a chunk with
+  cards to spare runs unpinned across all of them; a node out of GPU memory
+  with two renders on a card drops to one per card; the memory guard reads
+  each card and recovers; learned per-GPU throughput and slot counts are
+  measured from what a run actually used, and stale ones fade.
+- **Settings are checked before they are saved.** Numbers commit when an
+  edit is done, not per keystroke; out-of-range values are clamped and
+  reported. An emptied idle timeout saved 0, which destroyed nodes the moment
+  they idled, and "1e3" saved 1000 max nodes.
+- A job's files are served from its own output folder, so changing the
+  project root mid-job no longer splits it or breaks older jobs' previews.
+- The toolbar and Fleet count and list a node that may still be billing (a
+  destroy not yet confirmed, a rental with no answer).
+
+### Fixed
+
+- **Nodes that stopped answering kept their work** (81fe2875). A second
+  launch re-provisioned three 8×4090 nodes mid-render; the first process's
+  runs then polled forever, holding 7 of 24 paid GPUs. A node that stops
+  answering is now out of work within about 45 s; if Vast.ai no longer knows
+  its instance, or it has not come back within 10 minutes, it is destroyed
+  and its chunks requeued. A run whose agent lost its spec gives the chunk
+  back, a stale heartbeat alone no longer condemns a node, and a Blender that
+  starts or saves no frame for 3 times its job's slowest frame on that
+  hardware (at least 45 minutes; 3 hours before its first) is stopped.
+- **Stopped instances were treated as nodes.** An instance Vast.ai stopped
+  (a $0 balance, 1d59516c) is destroyed and its chunks requeued, at launch as
+  well as mid-session, without blacklisting its machine.
+- **Provisioning and prep could hang for good.** Provisioning now has a
+  25-minute deadline, every node-prep step its own, every SSH command and
+  Vast.ai request a deadline, and the per-node prep lock is always released.
+- **A destroy was taken on trust.** A destroy now counts only once Vast.ai no
+  longer lists the instance (a 404 or 410 counts as gone); a failed one is
+  retried every minute and stays counted as billing. Rate-limited DELETEs
+  wait Vast.ai's 3 s.
+- **A rental whose create got no answer could bill unseen or be rented
+  twice.** The create is never sent again; the app looks for the instance by
+  its label, uses it (or destroys it, if cancelled meanwhile) or confirms
+  there is none, and counts it as billing until then.
+- **Vast.ai being down read as instances gone.** Timeouts, 5xx and network
+  errors are retried with backoff and are no longer taken for an instance
+  that does not exist.
+- **A full disk stalled the app** (da68b61b). The headless stdout mirror
+  threw `ENOSPC` and Electron showed its modal error box while nodes billed.
+  Diagnostic writes that fail are dropped and counted, and an uncaught error
+  is now an alert, never the modal box. A full project disk (under 1 GB
+  free) pauses downloads, dispatch and renting and resumes by itself, with
+  nothing charged; only a file the disk refuses on its own is. Frames wait on
+  their node for up to 20 minutes; after that the node is let go, and they
+  render again once the disk takes files.
+- **Transfers.** Partial downloads are keyed by content, so a different
+  render of the same frame is never resumed as its prefix; a whole partial is
+  checked rather than fetched again; the final pass gives up after 3 minutes
+  with no progress rather than a fixed 10; uploads can no longer hang node
+  prep.
+- **Stereo frames.** A frame is recorded only once all its views have
+  landed, and a view lost from every frame is rendered again.
+- An Octane job on a node without OctaneBlender rendered with stock Blender's
+  default engine, and the wrong frames were billed; a job that names a
+  Blender version got the newest other one when it was missing. Both now
+  refuse.
+- The install id could overwrite a `settings.json` that failed to read
+  (antivirus lock, hand edit), losing the API key and settings.
+
+### Security
+
+- **OTOY credentials** are sent only when the scripted sign-in is turned on,
+  and then on OctaneServer's standard input: never in a command line, the
+  environment or a file on the node, and, with *datacenter hosts only*, only
+  to nodes rented that way. SSH errors name a label, never the command, so a
+  timed-out command can no longer put credentials in an alert.
+- **Shell quoting.** The Blender version override and an extension's
+  manifest id reached a node's shell as typed; an id with a quote in it ran as
+  shell, and `../` in it wrote outside the add-ons folder. Every value in a
+  remote command now goes through one quoting helper, and settings, add-on
+  ids and log requests are validated.
+- **The API key stays out of errors.** It is scrubbed from Vast.ai error
+  messages and their cause chain. (It is still sent as `?api_key=` alongside
+  the Bearer header.)
+- A scene, project root or SSH key must be a local path, and *Show in folder*
+  refuses a network share, which would make Explorer hand the share's host
+  your login hash.
+
 ## [2.3.0] — 2026-09-25
 
 Safety and security fixes from a full audit of the app
