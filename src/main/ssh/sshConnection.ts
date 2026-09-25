@@ -41,6 +41,14 @@ export interface ExecOptions {
    * only the program the command runs (see describeCommand).
    */
   label?: string
+  /**
+   * Written to the command's stdin once its channel opens, and stdin then
+   * closed (exec only). For a secret the command reads (`IFS= read -r`):
+   * Octane's VNC password and a scripted OTOY sign-in (plan 1.18), which the
+   * command line and the process list must never show. Without it stdin is
+   * left as ssh2 opens it.
+   */
+  stdin?: string
 }
 
 export class HostKeyMismatchError extends Error {
@@ -294,9 +302,14 @@ export class SshConnection extends EventEmitter {
               s.stderr.on('data', (d: Buffer) => {
                 stderr += d.toString()
               })
-              s.on('close', (code: number | null) =>
-                settle(() => resolve({ code, stdout, stderr }))
+              // ssh2 closes a channel whose connection went with no exit
+              // status at all (undefined), and one a signal killed with null:
+              // both are "no answer", passed on as null, which every caller
+              // reads as such (provisioner's exitStatus; n4 review).
+              s.on('close', (code: number | null | undefined) =>
+                settle(() => resolve({ code: code ?? null, stdout, stderr }))
               )
+              if (opts.stdin !== undefined) s.end(opts.stdin)
             },
             () => settled
           )
@@ -366,10 +379,11 @@ export class SshConnection extends EventEmitter {
                 rej(e)
                 stream.close()
               }
-              stream.on('close', (code: number | null) => {
+              stream.on('close', (code: number | null | undefined) => {
                 if (timer) clearTimeout(timer)
                 if (buf) onLine(buf)
-                res(code)
+                // As exec: no exit status at all is null.
+                res(code ?? null)
               })
             })
             // A caller that never awaits `done` (the log tail) must not turn

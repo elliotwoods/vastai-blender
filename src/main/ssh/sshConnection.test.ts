@@ -118,6 +118,57 @@ describe('exec', () => {
   })
 })
 
+describe('exec: stdin and a missing exit status', () => {
+  it('1.18: writes a secret to stdin and closes it, never to the command line', async () => {
+    // Octane's start-vnc --password-stdin and start-server
+    // --credentials-stdin read their secrets with `IFS= read -r`.
+    // SshConnection dropped `stdin`: the script got nothing and waited on
+    // an open stdin until its deadline ('missing vnc password'), and a
+    // scripted sign-in's credentials never arrived (n5, release-blocking).
+    const conn = connection()
+    const r = watch(
+      conn.exec('bash /root/vastai/octane/setup_octane.sh start-vnc --password-stdin', {
+        label: 'start VNC',
+        stdin: `${SECRET}\n`
+      })
+    )
+    await flush()
+    const [ch] = ssh2.execsOf(/start-vnc/)
+    expect(ch.stdin).toBe(`${SECRET}\n`)
+    expect(ch.stdinEnded).toBe(true)
+    expect(ch.command).not.toContain(SECRET)
+    ch.exit(0)
+    await flush()
+    expect(r.value).toMatchObject({ code: 0 })
+
+    // No stdin asked for: none written, none closed.
+    void conn.exec('true')
+    await flush()
+    const [plain] = ssh2.execsOf(/^true$/)
+    expect(plain.stdinEnded).toBe(false)
+  })
+
+  it.each([
+    ['the connection went (undefined)', undefined],
+    ['a signal killed it (null)', null]
+  ])('n4 review: a command that ended with no exit status (%s) reads null', async (_what, code) => {
+    const conn = connection()
+    const r = watch(conn.exec('cat /x'))
+    const lines: string[] = []
+    const stream = await (async () => {
+      const p = conn.execStream('tail -F /y', (l) => lines.push(l))
+      await flush()
+      return p
+    })()
+    await flush()
+    ssh2.execsOf(/^cat /)[0].exit(code)
+    ssh2.execsOf(/^tail /)[0].exit(code)
+    await flush()
+    expect(r.value).toMatchObject({ code: null })
+    await expect(stream.done).resolves.toBeNull()
+  })
+})
+
 describe('describeCommand', () => {
   it('names a command by its label, or else only by the program it runs', () => {
     expect(describeCommand('rm -f /x', 'retract spec')).toBe('retract spec')
@@ -189,7 +240,8 @@ describe('execStream', () => {
     call.value!.stop()
     await flush()
     await vi.advanceTimersByTimeAsync(10_000)
-    expect(await call.value!.done).toBeUndefined()
+    // Closed with no exit status: null, as every such close reads.
+    expect(await call.value!.done).toBeNull()
   })
 
   it('a deadline on a stream whose done nobody awaits is not an unhandled rejection', async () => {

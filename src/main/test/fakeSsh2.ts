@@ -41,9 +41,18 @@ export class FakeExecChannel extends EventEmitter {
   closed = false
   /** close() calls the app made on it. */
   closeCalls = 0
+  /** What the app wrote to the command's stdin, and whether it closed it (end()). */
+  stdin = ''
+  stdinEnded = false
 
   constructor(readonly command: string) {
     super()
+  }
+
+  /** ssh2's Channel.end(data): write the command's stdin, then close it. */
+  end(data?: string | Buffer): void {
+    if (data != null) this.stdin += data.toString()
+    this.stdinEnded = true
   }
 
   /** The command prints to stdout. */

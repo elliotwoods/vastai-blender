@@ -17,7 +17,9 @@
  * When a connection closes — the app's close(), or the instance destroyed —
  * every channel on it ends the way ssh2 ends a channel whose connection went:
  * - an exec resolves with exit code null and whatever output had arrived
- *   (none, here), and an execStream's `done` resolves null;
+ *   (none, here), and an execStream's `done` resolves null: what the real
+ *   SshConnection passes on, ssh2's undefined (connection gone) and null
+ *   (a signal) both read as null there;
  * - the SFTP channel fails every request still waiting for an answer with
  *   "No response from server" (ssh2's cleanupRequests) and emits 'end' and
  *   'close'. A request made on the old wrapper after that is never answered
