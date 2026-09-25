@@ -80,9 +80,9 @@ export class NotRevivable extends Error {
  * Put every missing frame of `jobId` back in the queue (see the header).
  * Returns the frames queued and the chunks they are in: `{ frames: 0,
  * chunks: 0 }` when nothing is missing. Throws NotRevivable for an unknown
- * job and for one the scheduler failed outright, and whatever missingRanges
- * or splitFrames throw on a range or step they refuse; either way having
- * written nothing.
+ * job, one the scheduler failed outright and one whose frame step would
+ * never advance, and whatever missingRanges or splitFrames throw on a range
+ * or chunk size they refuse; either way having written nothing.
  */
 export function reviveFailedChunks(jobId: string): RetryMissingResult {
   const db = getDb()
@@ -95,6 +95,17 @@ export function reviveFailedChunks(jobId: string): RetryMissingResult {
       `job ${job.name} failed outright: no node can render it as it stands, and rendering ` +
         'it again would fail the same way. Fix the scene and submit it again.'
     )
+  }
+  // Checked before any walk over the job's grid, the one below included:
+  // a step that never advances would spin there for good. This runs on the
+  // main process's one thread (job:retryMissing, the VR_JOB_SPEC driver),
+  // so a spin stops everything: destroys, the supervisor, the quit dialog.
+  // createJob cannot write such a step; a hand-edited or damaged database
+  // can. As missingRanges' own check, which lets old jobs' fractional steps
+  // through.
+  const step = job.frame_step
+  if (!Number.isFinite(step) || step <= 0) {
+    throw new NotRevivable(`job ${job.name} has no usable frame step (${step})`)
   }
 
   const chunks = db
@@ -119,7 +130,6 @@ export function reviveFailedChunks(jobId: string): RetryMissingResult {
     return { frames: 0, chunks: 0 }
   }
 
-  const step = job.frame_step
   const touched: string[] = []
   let frames = 0
   let queued = 0

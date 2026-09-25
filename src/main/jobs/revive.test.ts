@@ -213,6 +213,25 @@ describe('reviveFailedChunks', () => {
     expect(w.events.length).toBe(events)
   })
 
+  it('refuses a job whose frame step would never advance, at once and writing nothing', async () => {
+    // Only a hand-edited or damaged database holds such a step. Walked
+    // before it was checked, the step spun the job's grid for good, inside
+    // the main process: destroys, the supervisor and the quit dialog with it.
+    const app = await w.boot({ start: false })
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 4 })
+    const [a] = chunksOf(jobId)
+    download(jobId, 1)
+    fail(a.id)
+    const events = w.events.length
+
+    for (const step of [0, -1]) {
+      w.db.prepare(`UPDATE jobs SET frame_step = ? WHERE id = ?`).run(step, jobId)
+      await expect(revive(jobId)).rejects.toThrow(/no usable frame step/)
+    }
+    expect(chunksOf(jobId)[0]).toMatchObject({ state: 'failed', frame_start: 1, frame_end: 4 })
+    expect(w.events.length).toBe(events)
+  })
+
   it('refuses a job that does not exist', async () => {
     await w.boot({ start: false })
     await expect(revive('no-such-job')).rejects.toThrow(/no job no-such-job/)
