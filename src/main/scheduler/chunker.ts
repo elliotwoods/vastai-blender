@@ -67,16 +67,17 @@ export function splitFrames(
 }
 
 /**
- * Given a failed chunk's range and the set of frames already safely
- * downloaded, produce the minimal set of contiguous ranges still needing
- * rendering (so requeues never redo verified work).
+ * Given a chunk's range and the set of frames already safely downloaded,
+ * produce the minimal set of contiguous ranges still needing rendering (so
+ * requeues, and the resends after a restart, never redo verified work).
  *
  * Throws on a step that would never advance (zero, negative, missing) and on
  * an inverted range. No writer produces an inverted range; one used to come
  * back empty here, and requeue marked the chunk complete. This runs on rows
- * already in the database, from inside the scheduler's requeue, which is only
- * ever called through requeueOrFail: a throw fails the chunk with an alert,
- * and the caller (destroyNode among them) carries on.
+ * already in the database, from inside the scheduler's
+ * resplitAroundDownloaded. Its callers carry on after a throw, with an alert:
+ * requeueOrFail fails the chunk, and the caller (destroyNode among them) goes
+ * on; restart recovery (start()) leaves the chunk's range as it was.
  *
  * The step check is deliberately looser than splitFrames'. Jobs created
  * before submissions were validated can carry a fractional frame_step (the
