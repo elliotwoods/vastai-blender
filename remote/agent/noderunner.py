@@ -1464,6 +1464,12 @@ def run_encode(spec, state, log_path):
     if not enc:
         return
     chunk_dir = os.path.join(RENDERS, chunk_id)
+    if not manifest_files(chunk_dir, kind="frame"):
+        # Nothing to encode: the spec listed no frames, and no earlier run left
+        # any. encode_preview exits non-zero on a frames/ with no numbered
+        # frame, which failed a chunk that had nothing to do as "encode failed".
+        log_line(chunk_id, "no frames in the manifest; nothing to encode")
+        return
     state["status"] = "encoding"
     write_state(chunk_id, state)
     cmd = [

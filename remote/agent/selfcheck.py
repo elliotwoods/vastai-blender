@@ -319,7 +319,8 @@ def fake_node():
     "record" appends each run's argv and VR_* environment to a JSON-lines file.
     """
     names = ("ROOT", "RENDERS", "STATE", "LOGS", "BLENDER_ROOT", "INBOX", "DONE", "FAILED",
-             "CONTROL", "OCTANE_BLENDER", "size_stable", "SETTLE_PAUSE", "write_state")
+             "CONTROL", "OCTANE_BLENDER", "ENCODE_SCRIPT", "size_stable", "SETTLE_PAUSE",
+             "write_state")
     saved = {k: getattr(nr, k) for k in names}
     with tempfile.TemporaryDirectory() as tmp:
         # The agent watches a frame's size for 0.5-1 s, and pauses 0.5 s between
@@ -338,8 +339,9 @@ def fake_node():
         nr.DONE = os.path.join(tmp, "jobs", "done")
         nr.FAILED = os.path.join(tmp, "jobs", "failed")
         nr.CONTROL = os.path.join(tmp, "control")
-        # Absent unless a case installs it.
+        # Absent unless a case installs them.
         nr.OCTANE_BLENDER = os.path.join(tmp, "octane", "blender")
+        nr.ENCODE_SCRIPT = os.path.join(tmp, "encode", "encode_preview.py")
         bin_dir = os.path.join(nr.BLENDER_ROOT, "fake")
         for d in (nr.RENDERS, nr.STATE, nr.LOGS, nr.INBOX, nr.DONE, nr.FAILED, nr.CONTROL,
                   bin_dir, os.path.join(tmp, "work", "scenes")):
@@ -791,10 +793,13 @@ def test_explicit_frame_list():
     with fake_node() as tmp:
         make_chunk(tmp)
         rec = os.path.join(tmp, "runs.jsonl")
-        state, _ = run_chunk(tmp, {"record": rec, "default": {"render": "f"}}, frames=[])
-        check("frame list: an empty list is done without starting Blender",
+        # The app always sends an encode block; with nothing rendered there is
+        # nothing to encode, and encode_preview would fail on the empty frames/.
+        state, _ = run_chunk(tmp, {"record": rec, "default": {"render": "f"}}, frames=[],
+                             encode={"sdr": True, "thumbs": True})
+        check("frame list: an empty list is done without starting Blender or the encoder",
               state.get("status") == "done" and state.get("framesTotal") == 0
-              and not os.path.exists(rec))
+              and not os.path.exists(rec) and "nothing to encode" in render_log())
 
 
 def test_never_a_stand_in_blender():
