@@ -22,6 +22,15 @@ stalled the app).
 
 ### Added
 
+- **A campaign can be handed to the running app.** A `VR_JOB_SPEC` launch on
+  a profile the app already has open used to submit nothing and exit 1. It now
+  hands its spec to the running app, which submits it, and exits 0 when the
+  whole campaign went in, else 1 with what was not submitted. The spec's fleet
+  settings apply only when the running app has no other open jobs, and are
+  released when the campaign is done; with other jobs open, a spec whose
+  settings differ from those in force is refused whole. Relative paths resolve
+  from the launch's directory. The running app's window is left alone.
+
 - **Quitting asks.** Quitting, closing the lid or a Windows shutdown used to
   leave every node billing with nothing running to render on it, scale it
   down or destroy it. With any node that may be billing, a quit now asks

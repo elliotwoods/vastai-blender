@@ -302,10 +302,12 @@ does about that, and what it doesn't:
   and its chunk requeued.
 - **One app per profile.** A second launch on the same profile writes one
   line to stderr and quits with status 0, and the app already running brings
-  its window forward. A scripted one — headless (`VR_JOB_SPEC`,
-  `VR_E2E_BLEND`) or a window capture (`VR_SHOT`) — submits or captures
-  nothing, exits with status 1, and leaves the running app's window alone. A
-  `VR_USERDATA` profile is a separate profile, so it runs alongside.
+  its window forward. A `VR_JOB_SPEC` campaign is handed to the app already
+  running, which submits it (see [Headless campaigns](#headless-campaigns)).
+  Any other scripted launch — `VR_E2E_BLEND` or a window capture (`VR_SHOT`) —
+  submits or captures nothing and exits with status 1. Scripted launches
+  leave the running app's window alone. A `VR_USERDATA` profile is a separate
+  profile, so it runs alongside.
 - **Billing-risk alerts stay up.** A destroy that failed, or an instance left
   running, stays in a banner above every screen until you dismiss it, with a
   link to the Vast.ai console. An unexpected error in the app becomes an alert
@@ -340,11 +342,19 @@ at boot:
 VR_JOB_SPEC=C:/specs/campaign.json npm run dev
 ```
 
-The spec must run on a profile no other instance has open: close the app
-first, or give the campaign its own profile with `VR_USERDATA`. On a profile
-that is already open, the run submits nothing, prints one line to stderr
-naming the profile, and exits with status 1 (see
-[Safety model](#safety-model)).
+If the app is already open on the profile, the launch **hands the spec to
+it** instead of starting a second app (only one app runs per profile; see
+[Safety model](#safety-model)). The running app submits the campaign as a
+headless run would, leaves its window as it is, and answers; the launch prints
+the jobs it submitted and exits 0 when the whole campaign went in, or 1 with
+what was not submitted and why. Relative paths in the spec are taken from the
+directory the launch ran in. A running app from before hand-off gives no
+answer, and the launch exits 1 after two minutes saying nothing is known to be
+submitted. The spec's fleet settings are applied only when the running app has
+no other open jobs, and released again when the campaign is done; while other
+jobs are open, they must match what is already in force, otherwise nothing is
+submitted, so a campaign never changes the fleet caps of work already running.
+A spec without fleet settings just adds its jobs.
 
 Each blend entry is **one job**, however many nodes render it. To put more
 machines on a job, raise `maxActiveNodes` (and set `eagerFleet: true` to rent

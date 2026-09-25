@@ -64,6 +64,23 @@ export interface JobSpecDeps {
    * open one it names again. What a headless run waits on (drivers.ts).
    */
   campaign?: string[]
+  /**
+   * Where relative paths in the spec (blends, blendDir, addonZips) are from:
+   * the directory the run was started in. A spec handed to a running app
+   * (handoff.ts) passes the launching process's; defaults to this process's.
+   */
+  cwd?: string
+  /**
+   * 'session' (a headless run's own app, the default): the spec's settings go
+   * in force for the session (applySpecSettings). 'handoff' (a spec handed to
+   * an app already running, handoff.ts): the same when the app has no other
+   * open work, else they must already be in force (applyHandoffSettings).
+   */
+  settingsMode?: 'session' | 'handoff'
+  /** Open jobs on the app now (drivers.openJobs); read by 'handoff'. */
+  openWork?: () => number
+  /** Filled with the fields this spec put in the overlay, for the caller to release later. */
+  applied?: OverlayFields
 }
 
 /** What a headless campaign may lift (JobSpecDeps.resume). */
@@ -189,6 +206,51 @@ export function applySpecSettings(
   return fields
 }
 
+/**
+ * A spec handed to an app already running (handoff.ts). Its fleet settings are
+ * that app's for everything it renders: with other work open there (another
+ * campaign, or a person's jobs), putting them in force would change that
+ * work's fleet caps and filters behind its back. So with no other open work
+ * they go in force as for a headless run (applySpecSettings) and the caller
+ * releases them when the campaign is done; with open work, each must already
+ * be in force (as sanitized), else SpecSettingsRefused and nothing is
+ * submitted. A spec without fleet settings just adds its jobs.
+ */
+export function applyHandoffSettings(
+  spec: Record<string, unknown>,
+  getSettings: () => SettingsPublic,
+  openWork: () => number,
+  overlay: SettingsOverlay = sessionOverlay
+): OverlayFields {
+  const asked = specSettingsPatch(spec)
+  if (Object.keys(asked).length === 0) return {}
+  const open = openWork()
+  if (open === 0) return applySpecSettings(spec, getSettings, overlay)
+  const now = getSettings()
+  const result = sanitizeSettingsPatch(asked, now, { pathFlavour: hostPathFlavour() })
+  const refused = result.errors.filter((e) => e.outcome === 'rejected')
+  if (refused.length) {
+    throw new SpecSettingsRefused(refused.map((e) => `${e.field}: ${e.message}`))
+  }
+  // An unset flag is false (e.g. noSpendCap, which the sanitizer adds beside a cap): not a change.
+  const differ = notInForce(acceptedFields(asked, result), now).filter(
+    (m) => !(m.inForce === undefined && m.asked === false)
+  )
+  if (differ.length) {
+    throw new SpecSettingsRefused(
+      differ.map(
+        (m) =>
+          `${m.field}: asks ${JSON.stringify(m.asked)}, the running app has ` +
+          `${m.inForce === undefined ? 'it unset' : JSON.stringify(m.inForce)}`
+      ),
+      `the running app has ${open} open job(s) at its own settings; submit without fleet ` +
+        'settings (or with the ones in force), or when its work is done'
+    )
+  }
+  console.log('[spec] settings already in force on the running app; nothing changed')
+  return {}
+}
+
 function describeOutcome(e: SettingsFieldError): string {
   return `${e.outcome === 'clamped' ? 'clamped' : 'refused'}: ${e.message}`
 }
@@ -210,14 +272,19 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
 
   const spec = JSON.parse(readFileSync(specPath, 'utf-8'))
 
-  applySpecSettings(spec, getSettings, deps.overlay)
+  const base = deps.cwd ?? process.cwd()
+  const applied =
+    deps.settingsMode === 'handoff'
+      ? applyHandoffSettings(spec, getSettings, deps.openWork ?? (() => 0), deps.overlay)
+      : applySpecSettings(spec, getSettings, deps.overlay)
+  if (deps.applied) Object.assign(deps.applied, applied)
 
   // Register each zip fresh: the registry keys on the manifest id and re-hashes the
   // file, so re-running after an extension rebuild replaces the stale entry even
   // when the version string is unchanged.
   const addonIds: string[] = []
   for (const zip of spec.addonZips ?? []) {
-    const info = registerAddon(zip)
+    const info = registerAddon(resolve(base, zip))
     addonIds.push(info.id)
     console.log(`[spec] addon ${info.id} v${info.version} ${info.zipHash.slice(0, 12)}`)
   }
@@ -238,10 +305,11 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
     typeof b === 'string' ? { path: b } : b
   )
   if (!blends.length && spec.blendDir) {
-    blends = readdirSync(spec.blendDir)
+    const dir = resolve(base, spec.blendDir)
+    blends = readdirSync(dir)
       .filter((f: string) => f.toLowerCase().endsWith('.blend'))
       .sort()
-      .map((f: string): BlendEntry => ({ path: join(spec.blendDir, f) }))
+      .map((f: string): BlendEntry => ({ path: join(dir, f) }))
   }
   // A spec may name its scenes relative to where the run was started, as it
   // always could. A job's scene must be a full path now (validateSubmission),
@@ -251,7 +319,7 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
   const named = new Map<BlendEntry, string>()
   blends = blends.map((b) => {
     if (typeof b.path !== 'string' || b.path === '' || /^[\\/]{2}/.test(b.path)) return b
-    const full = { ...b, path: resolve(b.path) }
+    const full = { ...b, path: resolve(base, b.path) }
     named.set(full, b.path)
     return full
   })

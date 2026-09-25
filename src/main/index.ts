@@ -9,7 +9,8 @@ import {
   type MessageBoxOptions
 } from 'electron'
 import { createReadStream, statSync, writeSync } from 'fs'
-import { extname, join } from 'path'
+import { randomUUID } from 'crypto'
+import { extname, join, resolve } from 'path'
 import { Readable } from 'stream'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -21,7 +22,15 @@ import {
   type Lifecycle,
   type Prompt
 } from './app/lifecycle'
-import { startHeadlessDrivers } from './app/headless/drivers'
+import { openJobs, startHeadlessDrivers } from './app/headless/drivers'
+import {
+  acceptHandoff,
+  awaitHandoffResult,
+  describeHandoff,
+  handoffResultPath,
+  isHandoffRequest,
+  type HandoffRequest
+} from './app/headless/handoff'
 import { resolveMediaUrl, type MediaPlaces, type MediaTarget } from './app/mediaProtocol'
 import { externalUrl, isAppPage, type AppPage } from './app/windowPolicy'
 import { resolveBlenderRelease } from './blender/blendInfo'
@@ -85,7 +94,33 @@ if (process.env.VR_USERDATA) {
 const headless = Boolean(process.env.VR_JOB_SPEC || process.env.VR_E2E_BLEND)
 const capture = process.env.VR_SHOT
 const scripted = headless || Boolean(capture)
-if (!app.requestSingleInstanceLock({ scripted })) {
+/** How long a handed-off launch waits for the running app's answer (it reads the spec and blends). */
+const HANDOFF_WAIT_MS = 120_000
+// A VR_JOB_SPEC launch refused by the lock hands its spec to the running app
+// instead of submitting nothing (app/headless/handoff.ts), and waits for its
+// answer: exit 0 when the whole campaign was submitted there, else 1.
+const handoff: HandoffRequest | null = process.env.VR_JOB_SPEC
+  ? {
+      scripted: true,
+      jobSpec: resolve(process.env.VR_JOB_SPEC),
+      requestId: randomUUID(),
+      cwd: process.cwd()
+    }
+  : null
+if (!app.requestSingleInstanceLock(handoff ?? { scripted })) {
+  if (handoff) {
+    const userData = app.getPath('userData')
+    const out = describeHandoff(
+      awaitHandoffResult(handoffResultPath(userData, handoff.requestId), HANDOFF_WAIT_MS),
+      userData
+    )
+    try {
+      writeSync(out.status === 0 ? 1 : 2, out.text)
+    } catch {
+      // No stdout/stderr attached: nowhere to say it.
+    }
+    process.exit(out.status)
+  }
   const msg =
     `[vast-render] another instance is already running on ${app.getPath('userData')}; ` +
     (headless
@@ -111,6 +146,19 @@ if (!app.requestSingleInstanceLock({ scripted })) {
 // pop a window up there. A launch that sent no data (an older build) counts
 // as a person's. Emitted only after ready.
 app.on('second-instance', (_event, _argv, _cwd, data) => {
+  if (isHandoffRequest(data)) {
+    // A VR_JOB_SPEC launch handed its campaign over: submit it here, leave the window as it is.
+    void acceptHandoff(data, {
+      userData: app.getPath('userData'),
+      kick: () => scheduler.kick(),
+      resume: {
+        recovery: (jobIds) => scheduler.resumeRecoveryFor(jobIds),
+        job: (jobId) => scheduler.resumeJob(jobId, { octaneSignIn: false })
+      },
+      openJobs
+    }).catch((e) => console.error('[handoff] failed:', e))
+    return
+  }
   if ((data as { scripted?: unknown } | null)?.scripted === true) {
     console.log('[vast-render] refused a scripted second launch; window left as it is')
     return
