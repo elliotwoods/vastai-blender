@@ -13,11 +13,14 @@
  * `setup_octane.sh start-server --credentials-stdin`, which hands them on
  * to OctaneServer's stdin. They are never in a command line, the
  * environment, a file on the node, or an error's text (exec errors name
- * the label). With settings.octane.secureCloudOnly on as well, they go only
- * to a node this session rented through that filter (setRentalFacts); any
- * other node an Octane chunk reaches signs in by hand. The per-node VNC
- * password goes on stdin too, and is kept in memory only: after a restart
- * the app sets a new one when it next opens the tunnel.
+ * the label). With settings.octane.secureCloudOnly on, they go only to a
+ * node this session rented through that filter (setRentalFacts); a node
+ * known to have been rented without it is asked for no sign-in at all
+ * (OctaneHostNotVettedError), and one whose rental is not known (from
+ * before a restart) signs in by hand, the alert warning that the app cannot
+ * vouch for its host. The per-node VNC password goes on stdin too, and is
+ * kept in memory only: after a restart the app sets a new one when it next
+ * opens the tunnel.
  *
  * nodes.octane_state says where a node's Octane is, as setup_octane.sh's
  * `OCTANE_STATE <word>` lines say it (OctaneState: none | serverRunning |
@@ -135,6 +138,29 @@ export class OctaneBlenderMissingError extends Error {
   }
 }
 
+/** Why an unvetted node is unfit for Octane (octaneUnfit, OctaneHostNotVettedError). */
+const NOT_VETTED =
+  'this node was not rented as a datacenter (secure cloud) host, which the Octane settings ' +
+  'keep Octane to'
+
+/**
+ * With secure cloud only on, an Octane chunk reached a node rented without
+ * that filter (unvetted): a Cycles node in a mixed queue, a rental made
+ * without its engine. Found before anything is started there, and nobody is
+ * asked to sign in on it (plan 1.18 review: the sign-in by hand still used
+ * to be asked for, on exactly the host the setting exists to avoid). Not the
+ * job's fault, nor the machine's: only this node is unfit for Octane
+ * (octaneUnfit), and a node rented for Octane through the filter may render
+ * the chunk.
+ */
+export class OctaneHostNotVettedError extends Error {
+  override readonly name = 'OctaneHostNotVettedError'
+
+  constructor() {
+    super(`Octane job, but ${NOT_VETTED}: no sign-in, by hand or scripted, is asked for on it`)
+  }
+}
+
 /** exec's options, and the stdin the command reads its secrets from. */
 type StdinExecOptions = ExecOptions & { stdin?: string }
 
@@ -247,6 +273,21 @@ function signInWithheld(rental: OctaneRentalFacts | null): boolean {
 }
 
 /**
+ * With secure cloud only on, a node known to have been rented without that
+ * filter (plan 1.18 review): a host nobody vetted, which the setting keeps
+ * Octane from. No sign-in is asked for there, scripted or by hand: whatever
+ * is typed at its desktop is its host's to read, as the credentials would
+ * be. A node whose rental is not known (null: from before a restart, or
+ * found on Vast by its label) is not taken for one; its sign-in by hand is
+ * asked for with a warning (announceLogin).
+ */
+function unvetted(rental: OctaneRentalFacts | null): boolean {
+  return (
+    getSettings().octane?.secureCloudOnly === true && rental !== null && rental.secureCloud !== true
+  )
+}
+
+/**
  * Why no Octane chunk should go to this node now, or null: for the
  * scheduler's dispatch and its idle scale-down, so a node that cannot render
  * the Octane work queued is let go rather than kept for it. Found by this
@@ -261,6 +302,9 @@ export function octaneUnfit(nodeId: string): string | null {
   }
   if (signInMissed && storedState(nodeId) === 'needsLogin') {
     return 'its Octane waits for a sign-in, and one was already missed on another node'
+  }
+  if (unvetted(rentedAs(nodeId)) && storedState(nodeId) !== 'licensed') {
+    return NOT_VETTED
   }
   return null
 }
@@ -463,20 +507,30 @@ export async function refreshOctaneState(
   }
 }
 
-/** The scripted sign-in was withheld from this node: see scriptedSignInFor. */
-const WITHHELD =
-  ' The scripted sign-in was not used: this node was not rented as a datacenter (secure ' +
-  'cloud) host, which the Octane settings send the OTOY credentials to only.'
+/**
+ * Under secure cloud only, a node whose rental is not known (see unvetted):
+ * the user decides whether to sign in on it, told what the app cannot.
+ */
+const HOST_UNKNOWN =
+  ' The app does not know whether this node is a datacenter (secure cloud) host, which the ' +
+  'Octane settings keep Octane to: it has no record of how the node was rented (one rented ' +
+  "before the app last started, say). The host can read what is typed at the node's desktop: " +
+  'sign in only if you trust it, or destroy the node.'
 
-function announceLogin(nodeId: string, withheld: boolean): void {
+/** ...and the scripted sign-in was withheld from it: see scriptedSignInFor. */
+const WITHHELD = ' The scripted sign-in was not used for that reason.'
+
+function announceLogin(nodeId: string, rental: OctaneRentalFacts | null): void {
   if (loginAlerted.has(nodeId)) return
   loginAlerted.add(nodeId)
+  const unknownHost = getSettings().octane?.secureCloudOnly === true && rental === null
   emit('alert', {
     level: 'warn',
     message:
       `Octane on ${nodeName(nodeId)} is waiting for a sign-in: open the node in Fleet, use ` +
       'Open VNC login, and sign in to OTOY there. Its Octane chunks start once it is licensed; ' +
-      `the node bills meanwhile.${withheld ? WITHHELD : ''}`
+      `the node bills meanwhile.${unknownHost ? HOST_UNKNOWN : ''}` +
+      (unknownHost && signInWithheld(rental) ? WITHHELD : '')
   })
 }
 
@@ -503,18 +557,27 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  * a sign-in has been missed (octaneSignInHold). `signal` ends the wait
  * early. Credentials are sent only when the user opted in to the
  * scripted sign-in, only to a node they may go to (scriptedSignInFor), and
- * only on stdin.
+ * only on stdin. With secure cloud only on, a node known to have been
+ * rented without it gets no sign-in of either kind (unvetted).
  *
- * Throws OctaneBlenderMissingError, OctaneLoginNeededError,
- * ConnectionLostError (a command the link dropped under), or a setup
- * failure ('octane install failed: …', 'vnc start failed: …',
- * 'OctaneServer launch failed: …', the node-setup rule in errors.ts).
+ * Throws OctaneHostNotVettedError, OctaneBlenderMissingError,
+ * OctaneLoginNeededError, ConnectionLostError (a command the link dropped
+ * under), or a setup failure ('octane install failed: …', 'vnc start
+ * failed: …', 'OctaneServer launch failed: …', the node-setup rule in
+ * errors.ts).
  */
 export async function setupOctane(
   ssh: SshConnection,
   nodeId: string,
   opts: { loginWaitMs?: number; signal?: AbortSignal } = {}
 ): Promise<OctaneState> {
+  const rental = rentedAs(nodeId)
+  // A host the settings keep Octane from: nothing is started there, and
+  // nobody is asked to sign in. One signed in already has nothing more to
+  // give away, and renders.
+  const notVetted = unvetted(rental)
+  if (notVetted && storedState(nodeId) !== 'licensed') throw new OctaneHostNotVettedError()
+
   const check = answered(
     await ssh.exec(`test -x ${OCTANE_BLENDER}`, {
       timeoutMs: 30_000,
@@ -537,7 +600,6 @@ export async function setupOctane(
   )
   if (install.code !== 0) throw new Error(`octane install failed: ${said(install)}`)
 
-  const rental = rentedAs(nodeId)
   const scripted = scriptedSignInFor(rental)
   const withheld = signInWithheld(rental)
   if ((await startVnc(ssh, vncPassword(nodeId))) === 'notVnc' && !scripted) {
@@ -589,7 +651,9 @@ export async function setupOctane(
       throw new Error('OctaneServer launch failed: the server stopped before it was licensed')
     }
     if (state === 'needsLogin') {
-      announceLogin(nodeId, withheld)
+      // Signed in once, and signed out since: not asked for again there.
+      if (notVetted) throw new OctaneHostNotVettedError()
+      announceLogin(nodeId, rental)
       if (loginWaited.has(nodeId)) throw new OctaneLoginNeededError()
       if (loginDeadline === Infinity) loginDeadline = Date.now() + loginWaitMs
     }

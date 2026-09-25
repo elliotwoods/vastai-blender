@@ -211,6 +211,49 @@ describe('setupOctane: deadlines and labels (1.8)', () => {
   })
 })
 
+/**
+ * One setup on a fresh node rented as `rental` (freshly loaded module, so
+ * nothing of an earlier node's is kept): the start-server call, and the
+ * alerts it raised. The node licenses itself once past the licence wait,
+ * as a scripted sign-in, or a user at its desktop, would.
+ */
+async function launchOn(
+  rental: import('./octaneLicense').OctaneRentalFacts | null | 'noProvider'
+): Promise<{ launch: Call; alerts: string[] }> {
+  vi.resetModules()
+  octane = await import('./octaneLicense')
+  if (rental !== 'noProvider') octane.setRentalFacts((id) => (id === NODE ? rental : null))
+  h.db.prepare(`UPDATE nodes SET octane_state = 'none' WHERE id = ?`).run(NODE)
+  alerts.length = 0
+  const state = { now: 'none' as OctaneState }
+  const { ssh, calls } = octaneNode(state)
+  const setup = octane.setupOctane(ssh, NODE)
+  // Past the licence wait: the node asks for a sign-in by hand, unless the
+  // credentials went.
+  await vi.advanceTimersByTimeAsync(octane.OCTANE_LICENSE_WAIT_MS + 5_000)
+  state.now = 'licensed'
+  await vi.advanceTimersByTimeAsync(10_000)
+  await expect(setup).resolves.toBe('licensed')
+  return {
+    launch: calls.find((c) => /start-server/.test(c.command))!,
+    alerts: alerts.map((a) => a.message)
+  }
+}
+
+/** One setup on a fresh node rented as `rental` that is expected to fail: what it ran, and why. */
+async function refusedOn(
+  rental: import('./octaneLicense').OctaneRentalFacts
+): Promise<{ calls: Call[]; error: unknown }> {
+  vi.resetModules()
+  octane = await import('./octaneLicense')
+  octane.setRentalFacts((id) => (id === NODE ? rental : null))
+  h.db.prepare(`UPDATE nodes SET octane_state = 'none' WHERE id = ?`).run(NODE)
+  alerts.length = 0
+  const { ssh, calls } = octaneNode({ now: 'none' })
+  const error = await octane.setupOctane(ssh, NODE).catch((e: unknown) => e)
+  return { calls, error }
+}
+
 describe('setupOctane: credentials (1.18, #40 #156)', () => {
   it('1.18: by default no credential leaves this computer, saved or not: the sign-in is by hand', async () => {
     secrets.otoyUsername = USER
@@ -267,51 +310,20 @@ describe('setupOctane: credentials (1.18, #40 #156)', () => {
     expect(launch.opts.stdin).toBeUndefined()
   })
 
-  it('1.18 (review): with secure cloud only, the credentials go only to a node rented through it; any other signs in by hand', async () => {
+  it('1.18 (review): with secure cloud only, the credentials go only to a node rented through it', async () => {
     secrets.otoyUsername = USER
     secrets.otoyPassword = PASS
     h.settings = { octane: { scriptedSignIn: true, secureCloudOnly: true } }
 
-    /** One setup on a fresh node rented as `rental`: the start-server call, and the alerts it raised. */
-    async function launchOn(
-      rental: import('./octaneLicense').OctaneRentalFacts | null | 'noProvider'
-    ): Promise<{ launch: Call; alerts: string[] }> {
-      vi.resetModules()
-      octane = await import('./octaneLicense')
-      if (rental !== 'noProvider') octane.setRentalFacts((id) => (id === NODE ? rental : null))
-      h.db.prepare(`UPDATE nodes SET octane_state = 'none' WHERE id = ?`).run(NODE)
-      alerts.length = 0
-      const state = { now: 'none' as OctaneState }
-      const { ssh, calls } = octaneNode(state)
-      const setup = octane.setupOctane(ssh, NODE)
-      // Past the licence wait: the node asks for a sign-in by hand, unless
-      // the credentials went.
-      await vi.advanceTimersByTimeAsync(octane.OCTANE_LICENSE_WAIT_MS + 5_000)
-      state.now = 'licensed'
-      await vi.advanceTimersByTimeAsync(10_000)
-      await expect(setup).resolves.toBe('licensed')
-      return {
-        launch: calls.find((c) => /start-server/.test(c.command))!,
-        alerts: alerts.map((a) => a.message)
-      }
-    }
-
-    // A Cycles node on someone's own machine that an Octane chunk reached,
-    // a node rented without its engine, one from before a restart: none of
-    // them is known to be a datacenter host.
-    for (const rental of [
-      { engine: 'cycles' as const, secureCloud: false },
-      { engine: null, secureCloud: false },
-      { engine: 'octane' as const, secureCloud: false },
-      null,
-      'noProvider' as const
-    ]) {
+    // From before a restart, or with no rentals known at all: not known to
+    // be a datacenter host, so no credential; signed in by hand, warned.
+    for (const rental of [null, 'noProvider' as const]) {
       const { launch, alerts: said } = await launchOn(rental)
       expect(launch.command).toBe('bash /root/vastai/octane/setup_octane.sh start-server')
       expect(launch.opts.stdin).toBeUndefined()
       expect(said).toEqual([
         expect.stringMatching(
-          /is waiting for a sign-in: .*Open VNC login.* The scripted sign-in was not used: this node was not rented as a datacenter \(secure cloud\) host/
+          /is waiting for a sign-in: .*Open VNC login.* The app does not know whether this node is a datacenter \(secure cloud\) host.*sign in only if you trust it, or destroy the node\. The scripted sign-in was not used for that reason\.$/
         ),
         expect.stringMatching(/is signed in/)
       ])
@@ -323,7 +335,61 @@ describe('setupOctane: credentials (1.18, #40 #156)', () => {
       'bash /root/vastai/octane/setup_octane.sh start-server --credentials-stdin'
     )
     expect(launch.opts.stdin).toBe(`${USER}\n${PASS}\n`)
-    expect(said.join('\n')).not.toMatch(/scripted sign-in was not used/)
+    expect(said.join('\n')).not.toMatch(/does not know whether|scripted sign-in was not used/)
+  })
+
+  it('1.18 (review 2): with secure cloud only, a node known to be rented without it is asked for no sign-in at all', async () => {
+    secrets.otoyUsername = USER
+    secrets.otoyPassword = PASS
+    // A Cycles node on someone's own machine that an Octane chunk reached,
+    // a node rented without its engine, an Octane rental from before the
+    // setting: none is a host the setting lets Octane on. The sign-in by
+    // hand used to be asked for there all the same, scripted or not.
+    for (const scriptedSignIn of [true, false]) {
+      h.settings = { octane: { scriptedSignIn, secureCloudOnly: true } }
+      for (const rental of [
+        { engine: 'cycles' as const, secureCloud: false },
+        { engine: null, secureCloud: false },
+        { engine: 'octane' as const, secureCloud: false }
+      ]) {
+        const { calls, error } = await refusedOn(rental)
+        expect(error).toBeInstanceOf(octane.OctaneHostNotVettedError)
+        expect((error as Error).message).toBe(
+          'Octane job, but this node was not rented as a datacenter (secure cloud) host, which ' +
+            'the Octane settings keep Octane to: no sign-in, by hand or scripted, is asked for on it'
+        )
+        // Nothing started there, no alert asking anyone to sign in.
+        expect(calls).toEqual([])
+        expect(alerts).toEqual([])
+        expect(octane.octaneUnfit(NODE)).toBe(
+          'this node was not rented as a datacenter (secure cloud) host, which the Octane ' +
+            'settings keep Octane to'
+        )
+      }
+    }
+    // Without the setting, the same node is fit, and signs in by hand.
+    h.settings = { octane: { scriptedSignIn: false, secureCloudOnly: false } }
+    const { launch, alerts: said } = await launchOn({ engine: 'cycles', secureCloud: false })
+    expect(launch.opts.stdin).toBeUndefined()
+    expect(said[0]).toMatch(/is waiting for a sign-in: .*bills meanwhile\.$/)
+  })
+
+  it('1.18 (review 2): with secure cloud only, a node signed in before renders; signed out, it is not asked again', async () => {
+    h.settings = { octane: { scriptedSignIn: false, secureCloudOnly: true } }
+    octane.setRentalFacts(() => ({ engine: null, secureCloud: false }))
+    h.db.prepare(`UPDATE nodes SET octane_state = 'licensed' WHERE id = ?`).run(NODE)
+    const state = { now: 'licensed' as OctaneState }
+    const { ssh } = octaneNode(state)
+    await expect(octane.setupOctane(ssh, NODE)).resolves.toBe('licensed')
+    expect(octane.octaneUnfit(NODE)).toBeNull()
+
+    // Its server restarted, and it is back to waiting for a sign-in.
+    state.now = 'none'
+    const setup = octane.setupOctane(ssh, NODE).catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LICENSE_WAIT_MS + 10_000)
+    expect(await setup).toBeInstanceOf(octane.OctaneHostNotVettedError)
+    expect(alerts).toEqual([])
+    expect(octane.octaneUnfit(NODE)).not.toBeNull()
   })
 
   it('1.18: the VNC password goes on stdin, stays the same for the node, and is what the tunnel hands out', async () => {

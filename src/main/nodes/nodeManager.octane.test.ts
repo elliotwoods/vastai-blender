@@ -306,10 +306,11 @@ describe('1.18 (review): the scripted sign-in, under secure cloud only', () => {
     )
   }
 
-  it('1.18 (review): an Octane chunk that reaches a node not rented through the filter sends it no credential', async () => {
+  it('1.18 (review 2): an Octane chunk that reaches a node not rented through the filter asks nobody to sign in there, and sends no credential', async () => {
     Object.assign(w.settings, { octane: { scriptedSignIn: true, secureCloudOnly: true } })
     const app = await w.boot()
     const nm = await import('./nodeManager')
+    const lic = await import('../octane/octaneLicense')
     // Rented with no engine, as scale-up rents today: any host could take it.
     const nodeId = await w.readyNode(app, { datacenter: false } as never)
     expect(app.nodeManager.rentalOf(nodeId)).toEqual({
@@ -318,21 +319,28 @@ describe('1.18 (review): the scripted sign-in, under secure cloud only', () => {
       secureCloud: false
     })
     const machine = w.machineFor(nodeId)
-    const octane = fakeOctane(machine, { signIn: 'byHand' })
-    const done = renderOctaneOn(app, nodeId)
+    fakeOctane(machine, { signIn: 'byHand' })
+    const specs: AgentSpec[] = []
+    machine.onSpec = (spec) => specs.push(spec)
+    const jobId = await w.submitJob(app, { engine: 'octane' })
+    app.scheduler.kick()
     await w.until(
-      () => app.nodeManager.get(nodeId)?.snapshot.octaneState === 'needsLogin',
-      'needs a sign-in',
-      { timeoutMs: 3 * MIN }
+      () =>
+        w.all('SELECT id FROM chunks WHERE job_id = ? AND retries + infra_retries > 0', jobId)
+          .length > 0,
+      'the chunk refused',
+      { timeoutMs: 2 * MIN }
     )
-    expect(w.alerts('warn')).toEqual([
-      expect.stringMatching(
-        /waiting for a sign-in: .* The scripted sign-in was not used: this node was not rented as a datacenter/
-      )
-    ])
-    octane.state = 'licensed'
-    await done
+    expect(JSON.stringify(w.events)).toContain(
+      'this node was not rented as a datacenter (secure cloud) host'
+    )
+    expect(lic.octaneUnfit(nodeId)).toMatch(/not rented as a datacenter/)
+    // Nothing of Octane started there, nobody asked to sign in at its
+    // desktop, and no credential sent.
+    expect(machine.ran(/setup_octane|OctaneBlender/)).toEqual([])
+    expect(w.alerts('warn').filter((m) => /waiting for a sign-in/.test(m))).toEqual([])
     expect(machine.ran(/--credentials-stdin|hunter2|artist@|OCTANE_USER|OCTANE_PASS/)).toEqual([])
+    expect(specs).toEqual([])
   })
 
   it('1.18 (review): a node rented for Octane through the filter gets the scripted sign-in', async () => {
