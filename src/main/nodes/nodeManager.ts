@@ -10,8 +10,8 @@
 
 import { randomUUID } from 'crypto'
 import { co2Grams } from '../carbon/intensity'
-import { getDb } from '../db/db'
-import { classify } from '../errors'
+import { getDb, readAppState, writeAppState } from '../db/db'
+import { classify, type Classification } from '../errors'
 import { emit } from '../events'
 import { getSettings } from '../settings'
 import { ensureKeyRegistered, readPrivateKey } from '../ssh/keys'
@@ -29,6 +29,8 @@ import {
   vastErrorKind
 } from '../vast/vastClient'
 import type {
+  FleetCost,
+  FleetHolds,
   GpuSample,
   NodeMetrics,
   NodeSnapshot,
@@ -120,6 +122,22 @@ const RECONCILE_EVERY_MS = 5 * 60_000
  */
 const RECONCILE_MIN_AGE_MS = 2 * 60_000
 
+/**
+ * Plan 1.20: the credit guard's thresholds, in minutes of runway (the Vast
+ * balance over what the fleet bills per minute). Under WARN the user is told
+ * once; under HOLD renting stops (an account hold) until the balance goes up
+ * again and lasts at least RELEASE. WARN is armed again once the runway is
+ * back over REARM, so a balance hovering at the line warns once, not every
+ * minute.
+ */
+const RUNWAY_WARN_MIN = 30
+const RUNWAY_HOLD_MIN = 10
+const RUNWAY_RELEASE_MIN = 20
+const RUNWAY_REARM_MIN = 45
+
+/** A rise in the balance smaller than this is rounding, not a top-up. */
+const TOP_UP_MIN = 0.01
+
 /** What every rental label starts with; nothing else marks a Vast Render rental. */
 const LABEL_PREFIX = 'vastai-blender'
 
@@ -148,6 +166,70 @@ export function parseRentalLabel(
   const colon = rest.indexOf(':')
   if (colon < 0) return rest ? { install: null, node: rest } : null
   return { install: rest.slice(0, colon), node: rest.slice(colon + 1) }
+}
+
+/** Minutes the balance lasts at `perHour`: 0 once it is spent, unbounded for a fleet billing nothing. */
+function runwayMinutes(balance: number, perHour: number): number {
+  if (!(balance > 0)) return 0
+  if (!(perHour > 0)) return Number.POSITIVE_INFINITY
+  return (balance / perHour) * 60
+}
+
+function money(v: number): string {
+  return `$${v.toFixed(2)}`
+}
+
+/**
+ * Why renting is on hold for the account (plan 1.20), as FleetHolds.account
+ * carries it, and what releases it:
+ *   credit  Vast refused a rental for lack of credit. Released once the
+ *           balance has gone up (a top-up) and lasts RUNWAY_RELEASE_MIN.
+ *   runway  The balance fell under RUNWAY_HOLD_MIN of the fleet's rate.
+ *           Released the same way, at the higher of the fleet's rate now and
+ *           then, so destroying nodes to stretch the runway does not reopen
+ *           renting on money that would last minutes once scale-up refills
+ *           the fleet.
+ *   auth    Vast refused the account itself (a 401 or 403). Released when an
+ *           API key is saved, when the key is accepted again (a 401), or by
+ *           the user. Kept for the session only: a restart asks Vast afresh.
+ */
+interface AccountHold {
+  reason: string
+  /** The balance the hold was set at, or the first read after it; a rise over it is a top-up. */
+  balance: number | null
+  since: number
+  cause: 'credit' | 'runway' | 'auth'
+  /** $/hr the fleet billed when the hold was set. */
+  perHour: number
+  /** classify()'s rule, for an auth hold: what would clear it. */
+  rule?: string
+}
+
+/** An account hold from app_state, or null. A value that does not parse is a hold all the same. */
+function loadAccountHold(): AccountHold | null {
+  const raw = readAppState(getDb(), 'account_hold')
+  if (raw == null) return null
+  try {
+    const h = JSON.parse(raw) as Partial<AccountHold>
+    if (typeof h.reason === 'string' && (h.cause === 'credit' || h.cause === 'runway')) {
+      return {
+        reason: h.reason,
+        balance: typeof h.balance === 'number' ? h.balance : null,
+        since: typeof h.since === 'number' ? h.since : Date.now(),
+        cause: h.cause,
+        perHour: typeof h.perHour === 'number' ? h.perHour : 0
+      }
+    }
+  } catch {
+    // Unreadable: held all the same, below.
+  }
+  return {
+    reason: 'renting was paused for the Vast balance when the app last ran',
+    balance: null,
+    since: Date.now(),
+    cause: 'credit',
+    perHour: 0
+  }
 }
 
 /**
@@ -622,10 +704,18 @@ export class NodeManager {
   private destroyErrors = new Map<number, string>()
   private lastOrphanLine = ''
   private unclaimedListeners = new Set<(list: UnclaimedInstance[]) => void>()
+  /** The account hold (plan 1.20), or null while renting is free. */
+  private hold: AccountHold | null = null
+  /** The runway was under RUNWAY_HOLD_MIN at the last reading, hold or no hold. */
+  private runwayLow = false
+  /** The low-runway warning has been given, and not re-armed since. */
+  private runwayWarned = false
+  private holdListeners = new Set<(holds: FleetHolds) => void>()
   /** Phase 3 hook: called when a node reaches SSH-reachable. */
   onReady: ((node: { id: string; ssh: SshConnection }) => Promise<void>) | null = null
 
   init(): void {
+    this.hold = loadAccountHold()
     const rows = getDb().prepare('SELECT * FROM nodes').all() as NodeRow[]
     for (const r of rows) {
       const facts = rowFacts(r)
@@ -649,6 +739,9 @@ export class NodeManager {
     this.destroyTimer = setInterval(() => void this.retryDestroys(0), DESTROY_RETRY_MS)
     void this.retryDestroys(DESTROY_BUDGET_MS)
     void this.reconcile()
+    // The balance, the credit guard and the fleet totals now, not a minute
+    // from now: the toolbar read $0.00 until the first accrual tick.
+    void this.refreshCost()
   }
 
   /**
@@ -679,11 +772,13 @@ export class NodeManager {
 
   /**
    * The app shell calls this once a Vast API key is saved: the account may be
-   * another one now, and the last reconcile may have had no key to ask with.
-   * Reconciles at once.
+   * another one now, and a hold the old key caused (a 401 or 403) says
+   * nothing about the new one. Reconciles, and reads the balance, at once.
    */
   async onApiKeySaved(): Promise<void> {
-    await this.reconcile()
+    if (this.hold?.cause === 'auth')
+      this.releaseHold('Renting resumes: a new Vast.ai API key was saved')
+    await Promise.all([this.reconcile(), this.refreshCost()])
   }
 
   /**
@@ -1133,13 +1228,18 @@ export class NodeManager {
 
   /** Rent the best matching offer and drive it to ready. */
   async requestNode(): Promise<string> {
+    const held = this.accountHold()
+    if (held) throw new Error(`Renting is paused: ${held.reason}`)
     const settings = getSettings()
     if (this.activeCount() >= settings.maxActiveNodes) {
       throw new Error(`max active nodes (${settings.maxActiveNodes}) reached`)
     }
     const ids = await this.requestNodes(1, { respectSpendCap: false })
-    if (ids.length === 0) throw new Error('no node could be rented')
-    return ids[0]
+    if (ids.length > 0) return ids[0]
+    // Vast refused for the account in this very request: its hold says why.
+    const refused = this.accountHold()
+    if (refused) throw new Error(`Renting is paused: ${refused.reason}`)
+    throw new Error('no node could be rented')
   }
 
   /**
@@ -1159,10 +1259,14 @@ export class NodeManager {
    * is how one lost reply became two instances (#223 #231). The batch waits
    * for the label lookup to find it or confirm there is none, a minute at
    * most. So does a refusal that is no fault of the offer's (a 429): the next
-   * offer would meet it too.
+   * offer would meet it too. And so does an account refusal (plan 1.20): it
+   * sets the account hold, and nothing is rented until that is released.
    */
   async requestNodes(count: number, opts: { respectSpendCap?: boolean } = {}): Promise<string[]> {
     if (count <= 0) return []
+    // Held for the account (plan 1.20): the hold's one alert has said why.
+    // Scale-up asks every tick, and each ask used to add a failed row.
+    if (this.hold) return []
     const settings = getSettings()
     await ensureKeyRegistered()
 
@@ -1180,6 +1284,7 @@ export class NodeManager {
       // A systemic refusal (no credit, a bad key) fails every offer the same
       // way; stop before it turns into a failed node row per offer.
       if (failures >= 3) break
+      if (this.hold) break
       if (this.activeCount() >= settings.maxActiveNodes) break
       if (opts.respectSpendCap !== false && settings.spendCapPerHour != null) {
         if (this.billingPerHour() >= settings.spendCapPerHour) break
@@ -1202,8 +1307,189 @@ export class NodeManager {
       }
       if (r.stop) break
     }
-    if (ids.length === 0 && lastErr) throw lastErr
+    // An account refusal set the hold, and its alert has said why; a throw
+    // on top would be a second alert (scale-up failed: …) for one refusal.
+    if (ids.length === 0 && lastErr && !this.hold) throw lastErr
     return ids
+  }
+
+  // -- the account hold (plan 1.20) ---------------------------------------------
+
+  /**
+   * The holds on renting this module owns: the account's (plan 1.20). The
+   * scheduler adds its own (recovery, local sink) to build FleetHolds.
+   */
+  getHolds(): FleetHolds {
+    const account = this.accountHold()
+    return account ? { account } : {}
+  }
+
+  /** The account hold as FleetHolds carries it, or null while renting is free. */
+  accountHold(): NonNullable<FleetHolds['account']> | null {
+    const h = this.hold
+    return h ? { reason: h.reason, balance: h.balance, since: h.since } : null
+  }
+
+  /**
+   * Called with this module's holds whenever one is set or released (for
+   * fleet:holds). Returns the unsubscribe function.
+   */
+  onHoldsChanged(listener: (holds: FleetHolds) => void): () => void {
+    this.holdListeners.add(listener)
+    return () => {
+      this.holdListeners.delete(listener)
+    }
+  }
+
+  /**
+   * The user releases the account hold (fleet:releaseHold('account')).
+   * Renting may resume at once. A runway still under RUNWAY_HOLD_MIN does not
+   * set it again until it has recovered first; Vast refusing a rental for
+   * credit does, at once. Returns the holds left.
+   */
+  releaseAccountHold(): FleetHolds {
+    if (this.hold) this.releaseHold('Renting resumes: the account hold was released by hand')
+    return this.getHolds()
+  }
+
+  private holdsChanged(): void {
+    const holds = this.getHolds()
+    for (const l of [...this.holdListeners]) {
+      try {
+        l(holds)
+      } catch {
+        // A listener's failure is its own.
+      }
+    }
+  }
+
+  /**
+   * Pause renting for the account, with one alert. The first reason stands
+   * while held. A credit or runway hold is kept in app_state, so a relaunch
+   * does not rent into an empty account; an auth hold is for the session.
+   */
+  private setHold(h: Omit<AccountHold, 'since'>, message: string, level: 'warn' | 'error'): void {
+    if (this.hold) return
+    this.hold = { ...h, since: Date.now() }
+    this.saveHold()
+    emit('alert', { level, message })
+    this.holdsChanged()
+  }
+
+  private saveHold(): void {
+    const h = this.hold
+    const keep = h && h.cause !== 'auth'
+    writeAppState(getDb(), 'account_hold', keep ? JSON.stringify(h) : null)
+  }
+
+  private releaseHold(message: string): void {
+    if (!this.hold) return
+    this.hold = null
+    writeAppState(getDb(), 'account_hold', null)
+    this.runwayWarned = false
+    emit('alert', { level: 'info', message })
+    this.holdsChanged()
+  }
+
+  /**
+   * Vast refused for the account (classify kind 'account'): no credit, or a
+   * key it rejects or that may not rent. No machine is at fault, so none is
+   * blacklisted, and the next offer would meet the same refusal: hold.
+   * Field incident 1d59516c: with the balance at $0, scale-up made 12 rent
+   * attempts, each refused with 400 insufficient_credit, each a failed row
+   * and a blacklisted machine, and no alert said why.
+   */
+  private accountRefused(c: Classification): void {
+    const credit = c.rule === 'vast-credit' || c.rule === 'vast-402'
+    const perHour = this.billingPerHour()
+    if (credit) {
+      const b = this.balance
+      this.setHold(
+        { reason: c.reason, balance: b, cause: 'credit', perHour },
+        `Vast balance ${b != null ? money(b) : 'unknown'}: Vast refused a rental for lack of credit, so renting is paused until the balance goes up. Top up in the Vast.ai console; no machine was blacklisted. (${c.reason})`,
+        'error'
+      )
+      return
+    }
+    this.setHold(
+      { reason: c.reason, balance: this.balance, cause: 'auth', perHour, rule: c.rule },
+      `Vast refused the account (${c.reason}): renting is paused until the Vast.ai API key is fixed in Settings`,
+      'error'
+    )
+  }
+
+  /**
+   * The credit guard (plan 1.20), on every balance reading: the runway is
+   * the balance over what the fleet bills. Field incident 1d59516c: the
+   * balance hit $0 mid-render and nothing had said it was running low.
+   *
+   * - Under RUNWAY_WARN_MIN: one warning, until the runway is back over
+   *   RUNWAY_REARM_MIN.
+   * - Under RUNWAY_HOLD_MIN, or nothing left: the account hold, set as the
+   *   runway crosses the line (so a hold released by hand is not set again
+   *   until the runway has recovered first).
+   * - Held: released once the balance has gone up, a top-up, and lasts at
+   *   least RUNWAY_RELEASE_MIN at the higher of the fleet's rate now and
+   *   when it was held. An auth hold waits for its key, not for money; a 401
+   *   one lifts once Vast answers the key again.
+   */
+  private guardCredit(balance: number, perHour: number): void {
+    const runway = runwayMinutes(balance, perHour)
+    const h = this.hold
+    if (h) {
+      if (h.cause === 'auth') {
+        if (h.rule === 'vast-401' || h.rule === 'vast-no-key') {
+          this.releaseHold('Renting resumes: Vast accepts the API key again')
+        }
+        return
+      }
+      if (h.balance == null) {
+        // Held before any balance was known: this reading is the mark a
+        // top-up has to beat.
+        h.balance = balance
+        this.saveHold()
+        return
+      }
+      const toppedUp = balance >= h.balance + TOP_UP_MIN
+      if (toppedUp && runwayMinutes(balance, Math.max(perHour, h.perHour)) >= RUNWAY_RELEASE_MIN) {
+        this.runwayLow = runway < RUNWAY_HOLD_MIN
+        this.releaseHold(`Vast balance ${money(balance)}: renting resumes`)
+      }
+      return
+    }
+    if (runway < RUNWAY_HOLD_MIN) {
+      if (this.runwayLow) return
+      this.runwayLow = true
+      const lasts =
+        perHour > 0 && balance > 0
+          ? `, about ${Math.floor(runway)} min at the fleet's ${money(perHour)}/hr`
+          : ''
+      this.setHold(
+        {
+          reason: `Vast balance ${money(balance)}${lasts}`,
+          balance,
+          cause: 'runway',
+          perHour
+        },
+        `Vast balance ${money(balance)}${lasts}: renting is paused until the balance goes up. Top up in the Vast.ai console.` +
+          (perHour > 0
+            ? ' Nodes already rented are left running, and Vast stops them when the balance runs out.'
+            : ''),
+        perHour > 0 ? 'error' : 'warn'
+      )
+      return
+    }
+    if (runway >= RUNWAY_RELEASE_MIN) this.runwayLow = false
+    if (runway < RUNWAY_WARN_MIN) {
+      if (this.runwayWarned) return
+      this.runwayWarned = true
+      emit('alert', {
+        level: 'warn',
+        message: `Vast balance ${money(balance)} lasts about ${Math.floor(runway)} min at the fleet's ${money(perHour)}/hr. Renting pauses under ${RUNWAY_HOLD_MIN} min: top up in the Vast.ai console.`
+      })
+    } else if (runway >= RUNWAY_REARM_MIN) {
+      this.runwayWarned = false
+    }
   }
 
   /** Create an instance from one offer and start driving it to ready. */
@@ -1280,6 +1566,13 @@ export class NodeManager {
       return { id: node.id }
     }
     node.update({ state: 'failed', last_error: e.message, create_unknown_since: null })
+    // The account, not the machine (plan 1.20): no credit, or a key Vast
+    // rejects. Every offer would be refused the same way. Hold renting, with
+    // one alert, and blacklist nothing.
+    if (c.kind === 'account') {
+      this.accountRefused(c)
+      return { error: e, stop: true }
+    }
     // Refused before anything was done (a 429), or never sent (a name that
     // did not resolve). Not this machine's doing, and the next offer would
     // meet the same. Asking again once PUT /asks is refused is the next
@@ -1795,8 +2088,12 @@ export class NodeManager {
       // instance id, which the retry timer and clearFailed retry.
       if (node.movedOn(held)) return
       node.setState('failed', (e as Error).message)
-      // Vast silent for the whole boot says nothing against the machine.
-      if (machineId != null && e !== vastSilent) this.blacklist.add(machineId)
+      const c = classify(e)
+      // Vast refusing the account (no credit, a key it rejects) says nothing
+      // against the machine, and holds renting (plan 1.20).
+      if (c.kind === 'account') this.accountRefused(c)
+      // Nor does Vast being silent for the whole boot.
+      else if (machineId != null && e !== vastSilent) this.blacklist.add(machineId)
       emit('alert', { level: 'error', message: `Node failed: ${(e as Error).message}` })
       // Clean up the rented instance — never leave a failed node billing.
       await this.ensureInstanceGone(instanceId, { node })
@@ -2029,17 +2326,16 @@ export class NodeManager {
   }
 
   /**
-   * The cost timer's tick: accumulate $ cost from dph × elapsed, push the
-   * fleet totals, and run the reconcile when it is due (plan 1.3).
+   * The cost timer's tick: accumulate $ cost from dph × elapsed, read the
+   * balance (and guard the credit), push the fleet totals, and run the
+   * reconcile when it is due (plan 1.3).
    */
   private async accrueCosts(): Promise<void> {
     const db = getDb()
     const ts = Date.now() // one timestamp for the tick, so buckets line up
     const usage: UsageRow[] = []
-    const facts: NodeCostFacts[] = []
     for (const node of this.nodes.values()) {
       const s = node.snapshot
-      facts.push(s)
       // Metered while it may be billing, whatever its state: a 'failed' node
       // whose destroy Vast never confirmed is billed all the same, and
       // skipping it hid the leak from History and the session total (#64).
@@ -2054,28 +2350,52 @@ export class NodeManager {
       usage.push(...splitUsage(s.id, ts, delta, flushEnergy(s.id)))
     }
     writeUsage(usage)
-    const sessionTotal = (
-      db.prepare('SELECT COALESCE(SUM(delta_cost), 0) AS t FROM cost_log').get() as { t: number }
-    ).t
+    await this.refreshCost(ts)
+    if (Date.now() >= this.nextReconcileAt) void this.reconcile()
+  }
+
+  /**
+   * Read the Vast balance, run the credit guard on it (plan 1.20) and push
+   * fleet:cost. From every cost tick, and from init, so the toolbar has its
+   * figures from the start rather than a minute in. Never rejects.
+   */
+  private async refreshCost(ts = Date.now()): Promise<void> {
+    let fresh: number | null = null
     try {
       const u = await currentUser()
-      const credit = u.credit ?? u.balance
-      if (credit != null) {
-        this.balance = Number(credit)
-        recordBalance(ts, this.balance)
+      const credit = Number(u.credit ?? u.balance)
+      if ((u.credit ?? u.balance) != null && Number.isFinite(credit)) {
+        fresh = credit
+        this.balance = credit
+        recordBalance(ts, credit)
       }
     } catch {
       // keep last known balance (no key / offline)
     }
-    emit('fleet:cost', {
+    // Only a balance read just now is judged: an old one says nothing about
+    // the runway left.
+    if (fresh != null) this.guardCredit(fresh, this.billingPerHour())
+    emit('fleet:cost', this.fleetCost())
+  }
+
+  /**
+   * The fleet totals fleet:cost pushes, as they stand, with the last balance
+   * read. For a window that opens between pushes.
+   */
+  fleetCost(): FleetCost {
+    const sessionTotal = (
+      getDb().prepare('SELECT COALESCE(SUM(delta_cost), 0) AS t FROM cost_log').get() as {
+        t: number
+      }
+    ).t
+    return {
       // The fleet rate the caps use: every node that may be billing.
-      perHour: capUsage(facts).perHour,
+      perHour: this.billingPerHour(),
       sessionTotal,
       sessionWh: sessionEnergyWh(),
       sessionCo2g: sessionCo2Grams(),
       balance: this.balance
-    })
-    if (Date.now() >= this.nextReconcileAt) void this.reconcile()
+    }
   }
 }
 
