@@ -43,7 +43,9 @@
  *   VR_QUIT_POLICY decides what happens on SIGINT, SIGTERM or SIGHUP, on a
  *   quit, on a Windows session end, and at the end of the campaign:
  *   - `destroy` (the default): destroy every node, then exit. When the
- *     campaign is done (no job queued or running), the run stops by itself.
+ *     campaign is done (no job queued or running), the run stops by itself,
+ *     and so it does at once when the campaign's settings could not be put
+ *     in force for the run (endCampaign).
  *   - `leave`: exit and leave the nodes as they are. The next launch on the
  *     profile picks them back up. A finished campaign does not stop the run:
  *     it stays up, as it always did, and the idle scale-down retires the
@@ -52,7 +54,8 @@
  *   may be left billing: a destroy that could not be confirmed (listed on
  *   stderr), or nodes left by `leave`. Otherwise it is EXIT_NOT_SUBMITTED (1)
  *   for a campaign that ended with part of it never submitted (a spec that
- *   did not parse, a blend createJob refused), and 0 when all is well.
+ *   did not parse, a blend createJob refused, settings that could not be
+ *   put in force), and 0 when all is well.
  *   A signal during the destroy does not cut it short by itself. SIGHUP
  *   never does: it says the terminal went away, so nobody is there to want
  *   out, and closing a terminal delivers it twice, 0.4 ms apart (the shell
@@ -704,6 +707,17 @@ export interface Lifecycle {
    */
   watchCampaign(openJobs: () => number, unsubmitted?: readonly string[]): void
   /**
+   * A headless run's campaign was refused whole, before any of it was
+   * submitted: its spec's settings could not be put in force for this run
+   * (app/headless/jobSpec.ts). The run ends now, by its policy, rather than
+   * wait out jobs an earlier run left open. The scheduler would render those
+   * at the saved settings, a fleet size, spend cap and filters the campaign
+   * did not ask for. The exit status is EXIT_NOT_SUBMITTED, with
+   * `unsubmitted` on stderr, or EXIT_BILLING_LEFT as ever. A no-op for the
+   * app a person runs, and once a quit is under way.
+   */
+  endCampaign(unsubmitted: readonly string[]): void
+  /**
    * A person is closing the app's last window, where that quits it (index.ts
    * asks on Windows). True keeps the window (the caller's preventDefault):
    * with anything billing, the quit asks now, with the window still there,
@@ -1074,6 +1088,20 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
         }
         doneBefore = done
       }, CAMPAIGN_CHECK_MS)
+    },
+
+    endCampaign(unsubmitted: readonly string[]): void {
+      if (!deps.headless || phase !== 'idle') return
+      deps.stderr(
+        '[vast-render] the campaign was not submitted, so the run ends now:\n' +
+          unsubmitted.map((u) => `  ${u}\n`).join('')
+      )
+      void stopUnattended(
+        'campaign not submitted',
+        deps.headless.policy,
+        HEADLESS_ATTEMPTS,
+        EXIT_NOT_SUBMITTED
+      ).catch(fail('campaign end'))
     }
   }
 }

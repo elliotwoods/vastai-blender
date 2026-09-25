@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { NodeSnapshot } from '../../shared/models'
+import type { NodeSnapshot, SettingsPublic } from '../../shared/models'
 
 // index.ts wires app/lifecycle.ts (plan 1.1): the real before-quit,
 // powerMonitor, session-end and signal handling, against a recorded electron
@@ -125,12 +125,20 @@ function node(patch: Partial<NodeSnapshot> = {}): NodeSnapshot {
  * Load index.ts as a launch with `env`, run its whenReady, with `nodes` in
  * the fleet. `createJob` stands in for jobs.createJob (the drivers' submit).
  * `userData` runs the real settings.ts against a profile in that folder
- * instead of a stub.
+ * instead of a stub, and with `layOverlay` its getSettings() lays the
+ * session overlay over what it saved, as plan 1.14 has settings.ts do (a
+ * no-op once it does). `settings` is a stub settings.ts that hands out
+ * those and never lays the overlay: a build whose settings.ts does not.
  */
 async function load(
   nodes: NodeSnapshot[],
   env: Record<string, string> = {},
-  opts: { createJob?: () => Promise<string>; userData?: string } = {}
+  opts: {
+    createJob?: () => Promise<string>
+    userData?: string
+    layOverlay?: boolean
+    settings?: SettingsPublic
+  } = {}
 ): Promise<Loaded> {
   for (const k of ['VR_JOB_SPEC', 'VR_E2E_BLEND', 'VR_SHOT', 'VR_USERDATA', 'VR_QUIT_POLICY']) {
     vi.stubEnv(k, env[k] ?? '')
@@ -261,7 +269,21 @@ async function load(
   }))
   vi.doMock('../transfer/jobClip', () => ({ jobClips: { catchUp: () => {} } }))
   // A mock outlives resetModules, so an earlier load's stub is undone here.
-  if (opts.userData) vi.doUnmock('../settings')
+  const fixed = opts.settings
+  if (fixed) {
+    vi.doMock('../settings', () => ({
+      getSettings: () => structuredClone(fixed),
+      updateSettings: () => {
+        throw new Error('settings.json written')
+      }
+    }))
+  } else if (opts.userData && opts.layOverlay) {
+    vi.doMock('../settings', async (importOriginal) => {
+      const real = await importOriginal<typeof import('../settings')>()
+      const { sessionOverlay } = await import('./settingsOverlay')
+      return { ...real, getSettings: () => sessionOverlay.apply(real.getSettings()) }
+    })
+  } else if (opts.userData) vi.doUnmock('../settings')
   else vi.doMock('../settings', () => ({ getSettings: () => ({}), updateSettings: () => {} }))
   vi.doMock('../db/db', () => ({
     closeDb: () => {
@@ -639,6 +661,7 @@ describe("index.ts, a headless run's settings (plan 1.14)", () => {
       { VR_JOB_SPEC: spec },
       {
         userData: dir,
+        layOverlay: true,
         createJob: async () => {
           submitted.push('hero')
           return 'job-1'
@@ -660,6 +683,76 @@ describe("index.ts, a headless run's settings (plan 1.14)", () => {
       slotsPerGpu: 2,
       offerFilters: { minNumGpus: 4 }
     })
+  })
+
+  it('not in force (a settings.ts that does not lay the overlay): nothing submitted, and the run ends at once with 1', async () => {
+    // 1.14 review. Saved as the field incident left Elliot's profile. The
+    // smoke test asks for 1 node at $2/hr and no buy-ahead; run at the
+    // saved settings instead, it could rent 30 nodes and buy ahead to
+    // $50/hr. The node billing is one an earlier run rented for a job it
+    // left open, which the scheduler would otherwise render on at those caps.
+    const saved: SettingsPublic = {
+      hasVastApiKey: true,
+      hasOtoyCredentials: false,
+      projectRoot: '/Users/me/vast-renders',
+      maxActiveNodes: 30,
+      spendCapPerHour: 50,
+      noSpendCap: false,
+      idleTimeoutMinutes: 5,
+      proxyCodec: 'hevc',
+      blenderVersionOverride: null,
+      offerFilters: {
+        gpuNames: [],
+        maxDphTotal: null,
+        minGpuRamGb: 10,
+        minInetDownMbps: 100,
+        minReliability: 0.95,
+        minDiskGb: 40
+      },
+      sshKeyPath: '',
+      concurrentTransfersPerNode: 3,
+      thumbnails: true,
+      livePreview: 'onDemand',
+      livePreviewWidth: 960,
+      maxNodeSlots: 0,
+      slotsPerGpu: 1,
+      eagerFleet: true,
+      co2OverheadFactor: 1.6
+    }
+    const spec = join(dir, 'smoke.json')
+    writeFileSync(
+      spec,
+      JSON.stringify({
+        blends: ['/scenes/hero.blend'],
+        maxActiveNodes: 1,
+        spendCapPerHour: 2,
+        eagerFleet: false
+      })
+    )
+    const submitted: string[] = []
+    const r = await load(
+      [node()],
+      { VR_JOB_SPEC: spec },
+      {
+        settings: saved,
+        createJob: async () => {
+          submitted.push('hero')
+          return 'job-1'
+        }
+      }
+    )
+    await vi.advanceTimersByTimeAsync(3_000)
+    await vi.dynamicImportSettled()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(submitted).toEqual([])
+    expect(r.destroyed).toEqual(['node-1-abcdef'])
+    // Not after the campaign checks, a minute on: at once.
+    expect(r.exits).toEqual([1])
+    expect(r.stderr).toContain('the campaign was not submitted, so the run ends now')
+    expect(r.stderr).toContain('maxActiveNodes is 30, not the 1 the spec asked for')
+    const { sessionOverlay } = await import('./settingsOverlay')
+    expect(sessionOverlay.isEmpty()).toBe(true)
   })
 })
 

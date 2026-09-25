@@ -23,6 +23,15 @@
  * the app it rented with a campaign's fleet size and filters. They now go
  * through the same sanitizer as the Settings screen's and into the session
  * overlay (app/settingsOverlay.ts), and settings.json is never written.
+ *
+ * All of them are in force, or the campaign is not submitted. A setting the
+ * sanitizer refuses, or one getSettings() does not then hand out (a build
+ * whose settings.ts does not lay the overlay), would leave the campaign
+ * renting at the saved settings instead: a smoke test asking for 1 node at
+ * $2/hr could rent 30 and buy ahead to $50/hr on a profile saved that way.
+ * So applySpecSettings throws SpecSettingsRefused, before anything is
+ * submitted or kicked, and the run ends (drivers.ts, Lifecycle.endCampaign).
+ * A value clamped to its limit is in force at the limit, said on stderr.
  */
 
 import { join } from 'path'
@@ -94,12 +103,33 @@ function notInForce(fields: OverlayFields, settings: SettingsPublic): NotInForce
 }
 
 /**
+ * A spec's settings that cannot all be put in force for its run: the
+ * campaign is refused whole, before any of it is submitted (see the header).
+ * `problems` names each setting and what is wrong with it; `why`, when
+ * given, is what they have in common.
+ */
+export class SpecSettingsRefused extends Error {
+  override readonly name = 'SpecSettingsRefused'
+
+  constructor(
+    readonly problems: readonly string[],
+    why?: string
+  ) {
+    super(
+      "the spec's settings cannot all be put in force for this run, so none of it was " +
+        `submitted: ${problems.join('; ')}${why ? ` (${why})` : ''}`
+    )
+  }
+}
+
+/**
  * Put the spec's settings in force for this session: checked by the
  * sanitizer against what is in force now, then laid over it in the
- * overlay. Nothing is saved. Says on stderr what the sanitizer refused or
- * clamped, and any field getSettings() does not then hand out as set, so a
- * campaign never runs at settings other than it asked for without a word.
- * Returns the fields put in force.
+ * overlay. Nothing is saved. Says on stderr what the sanitizer clamped.
+ * Throws SpecSettingsRefused, leaving none of the spec's settings in the
+ * overlay, when the sanitizer refuses one or getSettings() does not then
+ * hand out each as set: a campaign never runs at settings other than it
+ * asked for. Returns the fields put in force.
  */
 export function applySpecSettings(
   spec: Record<string, unknown>,
@@ -110,23 +140,28 @@ export function applySpecSettings(
   if (Object.keys(asked).length === 0) return {}
   const result = sanitizeSettingsPatch(asked, getSettings(), { pathFlavour: hostPathFlavour() })
   for (const e of result.errors) console.error(`[spec] setting ${describeOutcome(e)}`)
+  const refused = result.errors.filter((e) => e.outcome === 'rejected')
+  if (refused.length) {
+    throw new SpecSettingsRefused(refused.map((e) => `${e.field}: ${e.message}`))
+  }
   const fields = acceptedFields(asked, result)
   overlay.set(fields)
+  const missing = notInForce(fields, getSettings())
+  if (missing.length) {
+    // Taken back out: nothing of a refused campaign stays in force.
+    overlay.release(fields)
+    throw new SpecSettingsRefused(
+      missing.map(
+        (m) =>
+          `${m.field} is ${m.inForce === undefined ? 'unset' : JSON.stringify(m.inForce)}, ` +
+          `not the ${JSON.stringify(m.asked)} the spec asked for`
+      ),
+      "this build's settings.ts does not apply settings for one run only"
+    )
+  }
   console.log(
     `[spec] settings for this run only (settings.json is left as it is) ${JSON.stringify(fields)}`
   )
-  const missing = notInForce(fields, getSettings())
-  if (missing.length) {
-    console.error(
-      '[spec] not in force: this build does not apply a run-only setting, so these run ' +
-        `at the saved value: ${missing
-          .map(
-            (m) =>
-              `${m.field} ${JSON.stringify(m.inForce)} (the spec asked for ${JSON.stringify(m.asked)})`
-          )
-          .join(', ')}`
-    )
-  }
   return fields
 }
 
@@ -136,8 +171,10 @@ function describeOutcome(e: SettingsFieldError): string {
 
 /**
  * Submit the campaign at `specPath`. Throws when the spec cannot be read or
- * parsed; each blend createJob refuses is collected in `deps.unsubmitted`
- * instead, so one bad blend does not cost the rest of the campaign.
+ * parsed, and SpecSettingsRefused when its settings cannot all be put in
+ * force, in each case before anything is submitted or kicked. Each blend
+ * createJob refuses is collected in `deps.unsubmitted` instead, so one bad
+ * blend does not cost the rest of the campaign.
  */
 export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<void> {
   const { readFileSync, readdirSync } = await import('fs')

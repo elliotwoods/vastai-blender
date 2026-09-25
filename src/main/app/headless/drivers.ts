@@ -14,12 +14,17 @@
  * scale-down. The exit status is 3 when instances may be left billing,
  * else 1 when part of the campaign was never submitted (each such part is
  * collected in `unsubmitted`), else 0.
+ *
+ * A spec whose settings cannot all be put in force for the run
+ * (SpecSettingsRefused, jobSpec.ts) submits nothing, and the run ends at
+ * once, by either policy (Lifecycle.endCampaign), rather than wait out jobs
+ * an earlier run left open at the saved settings.
  */
 
 import { getDb } from '../../db/db'
 import type { Lifecycle } from '../lifecycle'
 import { runE2e } from './e2e'
-import { runJobSpec } from './jobSpec'
+import { SpecSettingsRefused, runJobSpec } from './jobSpec'
 
 /** How long after boot a driver submits: the scheduler and node manager are started by then. */
 export const SUBMIT_DELAY_MS = 3_000
@@ -29,7 +34,7 @@ export interface HeadlessDriverOptions {
   jobSpecPath?: string
   /** VR_E2E_BLEND */
   e2eBlend?: string
-  lifecycle: Pick<Lifecycle, 'watchCampaign'>
+  lifecycle: Pick<Lifecycle, 'watchCampaign' | 'endCampaign'>
   /** scheduler.kick */
   kick(): void
 }
@@ -47,13 +52,20 @@ export function startHeadlessDrivers(opts: HeadlessDriverOptions): void {
   const { jobSpecPath, e2eBlend, lifecycle, kick } = opts
   if (jobSpecPath) {
     const unsubmitted: string[] = []
+    let refused = false
     setTimeout(() => {
       void runJobSpec(jobSpecPath, { kick, unsubmitted })
         .catch((e) => {
-          console.error('[spec] submission failed:', e)
+          refused = e instanceof SpecSettingsRefused
+          if (refused) console.error(`[spec] ${(e as Error).message}`)
+          else console.error('[spec] submission failed:', e)
           unsubmitted.push(`${jobSpecPath}: ${(e as Error)?.message ?? e}`)
         })
-        .finally(() => lifecycle.watchCampaign(openJobs, unsubmitted))
+        .finally(() =>
+          refused
+            ? lifecycle.endCampaign(unsubmitted)
+            : lifecycle.watchCampaign(openJobs, unsubmitted)
+        )
     }, SUBMIT_DELAY_MS)
   }
 

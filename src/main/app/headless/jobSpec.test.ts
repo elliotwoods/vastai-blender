@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SettingsPublic } from '../../../shared/models'
 import { SettingsOverlay } from '../settingsOverlay'
-import { applySpecSettings, specSettingsPatch } from './jobSpec'
+import { SpecSettingsRefused, applySpecSettings, specSettingsPatch } from './jobSpec'
 
 // Plan 1.14: a VR_JOB_SPEC campaign's settings are its session's alone,
 // through the same sanitizer as the Settings screen's. Field: two sessions
@@ -100,33 +100,75 @@ describe('applySpecSettings (plan 1.14)', () => {
     expect(stderr).toEqual([])
   })
 
-  it('a value past its limit runs at the limit, and a refused one at the saved value, each said', () => {
+  it('a value past its limit is in force at the limit, and said on stderr', () => {
     const o = new SettingsOverlay()
-    const fields = applySpecSettings(
-      { maxActiveNodes: 500, eagerFleet: 'yes', slotsPerGpu: 1.5 },
-      withOverlay(o),
-      o
-    )
+    const fields = applySpecSettings({ maxActiveNodes: 500 }, withOverlay(o), o)
     expect(fields).toEqual({ maxActiveNodes: 64 })
+    expect(o.fields()).toEqual({ maxActiveNodes: 64 })
     expect(stderr).toEqual([
-      expect.stringMatching(/^\[spec\] setting clamped: max active nodes can be at most 64/),
-      expect.stringMatching(/^\[spec\] setting refused: buy-ahead fleet must be on or off/),
-      expect.stringMatching(
-        /^\[spec\] setting refused: render slots per GPU must be a whole number/
-      )
+      expect.stringMatching(/^\[spec\] setting clamped: max active nodes can be at most 64/)
     ])
   })
 
-  it('a setting getSettings() does not hand out as asked is named on stderr, with the value in force', () => {
-    // A build whose settings.ts does not yet lay the overlay over what it
-    // saved: the campaign must not run at other settings without a word.
+  it('a setting the sanitizer refuses refuses the campaign, and puts none of its settings in force', () => {
+    // It would otherwise run at the saved value, which may rent more.
     const o = new SettingsOverlay()
-    applySpecSettings({ maxActiveNodes: 30, offerFilters: { minNumGpus: 4 } }, () => SAVED, o)
-    expect(stderr).toEqual([
-      '[spec] not in force: this build does not apply a run-only setting, so these run at the ' +
-        'saved value: maxActiveNodes 2 (the spec asked for 30), offerFilters.minNumGpus ' +
-        'undefined (the spec asked for 4)'
+    const apply = (): unknown =>
+      applySpecSettings(
+        { maxActiveNodes: 1, eagerFleet: 'yes', slotsPerGpu: 1.5 },
+        withOverlay(o),
+        o
+      )
+    expect(apply).toThrow(SpecSettingsRefused)
+    expect(apply).toThrow(/^the spec's settings cannot all be put in force for this run, so none/)
+    expect(apply).toThrow(/eagerFleet: buy-ahead fleet must be on or off/)
+    expect(apply).toThrow(/slotsPerGpu: render slots per GPU must be a whole number/)
+    expect(o.isEmpty()).toBe(true)
+    expect(stderr).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^\[spec\] setting refused: buy-ahead fleet must be on or off/)
+      ])
+    )
+  })
+
+  it('1.14 review: settings getSettings() does not hand out refuse the campaign, rather than run it at the saved caps', () => {
+    // A build whose settings.ts does not lay the overlay over what it saved
+    // (the one this landed in). Saved as the field incident left Elliot's
+    // profile: a smoke test asking for 1 node at $2/hr, no buy-ahead, would
+    // have rented up to 30 and bought ahead to $50/hr.
+    const saved: SettingsPublic = {
+      ...SAVED,
+      maxActiveNodes: 30,
+      spendCapPerHour: 50,
+      eagerFleet: true
+    }
+    const o = new SettingsOverlay()
+    let thrown: unknown
+    try {
+      applySpecSettings(
+        {
+          maxActiveNodes: 1,
+          spendCapPerHour: 2,
+          eagerFleet: false,
+          offerFilters: { minNumGpus: 4 }
+        },
+        () => saved,
+        o
+      )
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).toBeInstanceOf(SpecSettingsRefused)
+    expect((thrown as SpecSettingsRefused).problems).toEqual([
+      'maxActiveNodes is 30, not the 1 the spec asked for',
+      'eagerFleet is true, not the false the spec asked for',
+      'offerFilters.minNumGpus is unset, not the 4 the spec asked for',
+      'spendCapPerHour is 50, not the 2 the spec asked for'
     ])
+    expect((thrown as Error).message).toMatch(
+      /\(this build's settings\.ts does not apply settings for one run only\)$/
+    )
+    expect(o.isEmpty()).toBe(true)
   })
 
   it('a spec with no settings leaves the overlay empty', () => {

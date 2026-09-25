@@ -781,6 +781,57 @@ describe('headless runs follow VR_QUIT_POLICY, never a dialog (plan 1.1)', () =>
     )
   })
 
+  it("1.14 review: a spec refused whole ends the run at once; an earlier run's open job does not render on", async () => {
+    // Its settings could not be put in force (app/headless/jobSpec.ts), so
+    // nothing was submitted. Waiting out the job an earlier run left open
+    // would render it at the saved caps, which the campaign did not ask for.
+    w = await setup()
+    const engine = await w.boot()
+    const nodeId = await w.readyNode(engine)
+    const instance = instanceOf(nodeId)
+    const { agent } = w.machineFor(nodeId)
+    const r = await rig(engine, { headless: 'destroy' })
+    const jobId = await w.submitJob(engine)
+    engine.scheduler.kick()
+    await w.until(() => agent.inbox().length === 1, "the earlier run's chunk to land")
+
+    r.lifecycle.endCampaign([
+      "/campaign/smoke.json: the spec's settings cannot all be put in force"
+    ])
+    await w.until(() => r.app.exits.length > 0, 'the run to exit')
+
+    expect(r.app.exits).toEqual([{ code: 1, live: [], created: [instance] }])
+    expect(jobState(jobId)).not.toBe('complete')
+    expect(r.stderr.join('')).toContain(
+      'the campaign was not submitted, so the run ends now:\n' +
+        "  /campaign/smoke.json: the spec's settings cannot all be put in force\n"
+    )
+  })
+
+  it('a spec refused whole, policy leave: exits at once, leaving the node as the policy asks (3)', async () => {
+    w = await setup()
+    const engine = await w.boot()
+    const instance = instanceOf(await w.readyNode(engine))
+    const r = await rig(engine, { headless: 'leave' })
+
+    r.lifecycle.endCampaign(['/campaign/smoke.json: refused'])
+    await w.until(() => r.app.exits.length > 0, 'the run to exit')
+
+    expect(r.app.exits).toEqual([{ code: 3, live: [instance], created: [instance] }])
+    expect(w.vast.count('destroyInstance')).toBe(0)
+  })
+
+  it("a person's app: endCampaign does nothing", async () => {
+    w = await setup()
+    const engine = await w.boot()
+    await w.readyNode(engine)
+    const r = await rig(engine)
+    r.lifecycle.endCampaign(['/campaign/smoke.json: refused'])
+    await w.advance(60_000)
+    expect(r.app.exits).toEqual([])
+    expect(w.vast.count('destroyInstance')).toBe(0)
+  })
+
   it('the campaign done, policy leave: the run stays up for the idle scale-down', async () => {
     w = await setup({ settings: { idleTimeoutMinutes: 5 } })
     const engine = await w.boot()
