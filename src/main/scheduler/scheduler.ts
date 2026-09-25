@@ -1576,6 +1576,7 @@ class Scheduler {
    * HUNG_UNKNOWN_MS again.
    */
   private frameTimes = new Map<string, Map<string, number>>()
+  private frameKeys = new WeakMap<ChunkRun, string>()
   /**
    * At most one node at a time may be held empty for a waiting exclusive
    * chunk. See reserveForExclusive.
@@ -2036,10 +2037,16 @@ class Scheduler {
    * of what it needs.
    */
   private frameTimeKey(run: ChunkRun): string {
-    const snap = nodeManager.get(run.nodeId)?.snapshot
-    const gpus = Math.max(1, Math.floor(snap?.numGpus || 1))
-    const cards = run.shareNode ? 'shared' : (gpus / Math.max(1, run.lanes.lanes)).toFixed(2)
-    return `${snap?.gpuName ?? '?'}|${cards}`
+    // Once per run (a node's GPUs do not change), not a snapshot read per poll.
+    let key = this.frameKeys.get(run)
+    if (key === undefined) {
+      const snap = nodeManager.get(run.nodeId)?.snapshot
+      const gpus = Math.max(1, Math.floor(snap?.numGpus || 1))
+      const cards = run.shareNode ? 'shared' : (gpus / Math.max(1, run.lanes.lanes)).toFixed(2)
+      key = `${snap?.gpuName ?? '?'}|${cards}`
+      this.frameKeys.set(run, key)
+    }
+    return key
   }
 
   /** A run of the job saw a frame take `seconds` (ChunkRun.noteProgress). */
