@@ -122,6 +122,18 @@ export function emulateProvision(machine: FakeMachine): ProvisionLog {
     return `[provision] starting agent (${reason})…\nAGENT_RESTARTED ${reason}\n`
   })
 
+  // nodeManager withdrawing chunks it gave back while the node was silent:
+  // `rm -f '<inbox>/<id>.json'; pkill -f '/[r]enders/<id>/'` per chunk. The
+  // render stops (its state file stays as it was) and the spec goes.
+  machine.onExec(/pkill -f '\/\[r\]enders\//, (command) => {
+    for (const m of command.matchAll(/pkill -f '\/\[r\]enders\/([^/']+)\/'/g)) {
+      if (renders().includes(m[1])) log.killed.push(m[1])
+      killedAt.set(m[1], Date.now())
+    }
+    for (const m of command.matchAll(/rm -f '([^']+)'/g)) machine.files.delete(m[1])
+    return ''
+  })
+
   machine.onExec(/provision\.sh deps$/, () => {
     log.depsRuns++
     log.depsCurrent = true

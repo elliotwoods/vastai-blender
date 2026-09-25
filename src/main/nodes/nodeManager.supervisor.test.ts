@@ -645,3 +645,44 @@ describe('1.7: a link that drops under the agent check costs a round, not the no
     expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
   })
 })
+
+describe('1.7: work the app gave back while a node was silent', () => {
+  it('1.7: a chunk cancelled while its node was silent is stopped there when the node comes back; the rest keep rendering', async () => {
+    w.settings.idleTimeoutMinutes = 600
+    const app = await w.boot()
+    const node = await w.readyNode(app, { num_gpus: 2 })
+    const machine = w.machineFor(node)
+    const prov = emulateProvision(machine)
+    const keptJob = await w.submitJob(app, { blendPath: w.blend('kept.blend') })
+    const cancelledJob = await w.submitJob(app, { blendPath: w.blend('cancelled.blend') })
+    app.scheduler.kick()
+    await w.until(
+      () => [keptJob, cancelledJob].every((j) => chunksOf(j)[0]?.state === 'rendering'),
+      'both rendering'
+    )
+    const [kept] = chunksOf(keptJob)
+    const [cancelled] = chunksOf(cancelledJob)
+    expect([kept.node_id, cancelled.node_id]).toEqual([node, node])
+    for (const c of [kept, cancelled]) machine.agent.progress(c.id, 1, 2)
+
+    dropOff(machine)
+    await w.until(() => app.nodeManager.get(node)?.state === 'unreachable', 'unreachable')
+    // The cancel's own pkill cannot reach the node.
+    await app.scheduler.cancelJob(cancelledJob)
+    comeBack(machine)
+
+    await w.until(() => app.nodeManager.get(node)?.state === 'rendering', 'back in service', {
+      timeoutMs: 5 * MIN
+    })
+    // The cancelled chunk's render is stopped, the kept one's left alone,
+    // and the agent is not restarted.
+    expect(prov.killed).toEqual([cancelled.id])
+    expect(prov.restarts).toEqual([])
+    expect(chunksOf(keptJob)).toMatchObject([
+      { id: kept.id, node_id: node, state: 'rendering', infra_retries: 0 }
+    ])
+    machine.agent.finish(kept.id)
+    await w.until(() => jobState(keptJob) === 'complete', 'kept job complete')
+    expect(w.vast.count('destroyInstance')).toBe(0)
+  })
+})

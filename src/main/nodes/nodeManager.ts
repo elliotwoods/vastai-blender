@@ -25,6 +25,7 @@ import { learnedSlots } from '../scheduler/slotController'
 import { getSecret, getSettings } from '../settings'
 import { ensureKeyRegistered, readPrivateKey } from '../ssh/keys'
 import { FIRST_CONNECT_BUDGET_MS, retryWithBackoff } from '../ssh/connectRetry'
+import { shq } from '../ssh/shq'
 import { HostKeyMismatchError, SshConnection, type ExecResult } from '../ssh/sshConnection'
 import { findOffers } from '../vast/offers'
 import {
@@ -328,7 +329,7 @@ function failureReason(e: unknown): string {
 
 /** How reviveAgent left the agent of a node that answers again. */
 type AgentRevival =
-  | { kind: 'kept'; renders: number }
+  | { kind: 'kept'; renders: number; withdrawn: number }
   | { kind: 'restarted'; reason: string | null }
   | { kind: 'reprovisioned' }
 
@@ -1750,11 +1751,12 @@ export class NodeManager {
     if (!ssh || this.recovering.has(node.id)) return
     this.recovering.add(node.id)
     try {
+      const before = (activeWorkProvider?.(node.id) ?? []).map((w) => w.chunkId)
       node.setState('provisioning', `${why}: checking the agent`)
       const held: NodeState = 'provisioning'
       try {
         const revival = await withDeadline(
-          this.reviveAgent(node, ssh),
+          this.reviveAgent(node, ssh, before),
           PROVISION_DEADLINE_MS,
           'bringing the agent back'
         )
@@ -1788,10 +1790,12 @@ export class NodeManager {
    *   it. So does one whose tree has no agent-status.
    * - A live agent running this build's code is kept, renders and all, as
    *   long as the app still holds work on the node, or it has none: the
-   *   node carries on where it was.
-   * - A live agent rendering work the app no longer holds (the scheduler
-   *   gave the chunks back while the node was silent) is restarted: its
-   *   renders would be paid for with nobody to collect them.
+   *   node carries on where it was. Chunks of `before` (what the node had
+   *   when it went silent) that the app gave back meanwhile are stopped
+   *   there first (withdrawGivenBack).
+   * - A live agent rendering work the app no longer holds at all (the
+   *   scheduler gave the chunks back while the node was silent) is
+   *   restarted: its renders would be paid for with nobody to collect them.
    * - A dead one is restarted (deps first if they are not this build's),
    *   unless it has been AGENT_RESTARTS_MAX times within the hour already.
    *
@@ -1801,7 +1805,11 @@ export class NodeManager {
    * without a verdict (the link went, it timed out, another one held the
    * node) may have restarted it, and counts as one.
    */
-  private async reviveAgent(node: ManagedNode, ssh: SshConnection): Promise<AgentRevival> {
+  private async reviveAgent(
+    node: ManagedNode,
+    ssh: SshConnection,
+    before: readonly string[] = []
+  ): Promise<AgentRevival> {
     if (!this.provisioned.has(node.id)) return this.reprovision(node, ssh)
     const status = await agentStatus(ssh)
     if (!status) return this.reprovision(node, ssh)
@@ -1811,8 +1819,12 @@ export class NodeManager {
       (t) => now - t < AGENT_RESTART_WINDOW_MS
     )
     if (!status.restartNeeded) {
-      if (held > 0 || (status.blenderProcs === 0 && status.inboxSpecs === 0)) {
-        return { kind: 'kept', renders: status.blenderProcs }
+      if (held > 0) {
+        const withdrawn = await this.withdrawGivenBack(node, ssh, before)
+        return { kind: 'kept', renders: Math.max(0, status.blenderProcs - withdrawn), withdrawn }
+      }
+      if (status.blenderProcs === 0 && status.inboxSpecs === 0) {
+        return { kind: 'kept', renders: 0, withdrawn: 0 }
       }
     } else {
       if (recent.length >= AGENT_RESTARTS_MAX) {
@@ -1829,13 +1841,52 @@ export class NodeManager {
       forgetNodeProvider?.(node.id)
       throw e
     }
-    if (!r.restarted) return { kind: 'kept', renders: status.blenderProcs }
+    if (!r.restarted) return { kind: 'kept', renders: status.blenderProcs, withdrawn: 0 }
     forgetNodeProvider?.(node.id)
     if (status.restartNeeded) this.agentRestarts.set(node.id, [...recent, Date.now()])
     return {
       kind: 'restarted',
       reason: status.restartNeeded ? r.reason : 'it was rendering work the app no longer holds'
     }
+  }
+
+  /**
+   * Stop on a node that answers again the chunks of `before` the app has
+   * given back since it went silent: a cancel whose own pkill could not
+   * reach the node, a run the scheduler gave up on (STATE_UNREADABLE_MS)
+   * while a sibling's had not yet. Their specs are removed and their renders
+   * killed, as retractSpec does. Kept, they rendered there as well as where
+   * they went, paid for twice, on lanes the app counts as free. The node's
+   * other renders go on. How many chunks it withdrew.
+   */
+  private async withdrawGivenBack(
+    node: ManagedNode,
+    ssh: SshConnection,
+    before: readonly string[]
+  ): Promise<number> {
+    const holds = new Set((activeWorkProvider?.(node.id) ?? []).map((w) => w.chunkId))
+    const given = before.filter((id) => !holds.has(id))
+    if (given.length === 0) return 0
+    const label = 'withdraw given-back chunks'
+    // By the render's own directory (Blender's -o and the encode's input):
+    // the trailing slash keeps chunk 1-1 from matching 1-10, and `[r]` keeps
+    // pkill -f from matching, and killing, the shell running this command.
+    const command =
+      given
+        .map((id) => {
+          const pattern = `/[r]enders/${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`
+          return `rm -f ${shq(`${REMOTE_ROOT}/jobs/inbox/${id}.json`)}; pkill -f ${shq(pattern)}`
+        })
+        .join('; ') + '; true'
+    const r = await ssh.exec(command, { timeoutMs: ANSWER_TIMEOUT_MS, label })
+    if (r.code === null) throw new ConnectionLostError(label)
+    emit('render:logLine', {
+      nodeId: node.id,
+      chunkId: null,
+      line: `stopped ${given.length} chunk(s) given back while the node was silent: ${given.join(', ')}`,
+      ts: Date.now()
+    })
+    return given.length
   }
 
   /**
@@ -1855,7 +1906,8 @@ export class NodeManager {
     node.setState(busy ? 'rendering' : 'ready')
     const done =
       revival.kind === 'kept'
-        ? `its agent was alive and kept its ${revival.renders} render(s)`
+        ? `its agent was alive and kept its ${revival.renders} render(s)` +
+          (revival.withdrawn > 0 ? `, less ${revival.withdrawn} chunk(s) given back meanwhile` : '')
         : revival.kind === 'restarted'
           ? `its agent was restarted${revival.reason ? ` (${revival.reason})` : ''}`
           : 'it was provisioned again'
@@ -3177,6 +3229,9 @@ export class NodeManager {
     // See movedOn.
     const held = node.state
     const instanceId = node.facts.instanceId
+    // What the node had when it went silent: what the app gives back
+    // meanwhile is stopped there if it comes back (reviveAgent).
+    const before = (activeWorkProvider?.(node.id) ?? []).map((w) => w.chunkId)
     let why = opts.why ?? node.snapshot.lastError ?? 'no answer over SSH'
     if (opts.askVast && instanceId != null) {
       const fate = await this.askVast(instanceId)
@@ -3228,7 +3283,7 @@ export class NodeManager {
           deadline = Date.now() + RECONNECT_SLICE_MS
         }
         const revival = await withDeadline(
-          this.reviveAgent(node, ssh),
+          this.reviveAgent(node, ssh, before),
           PROVISION_DEADLINE_MS,
           'bringing the agent back'
         )
