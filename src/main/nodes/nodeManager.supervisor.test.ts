@@ -633,6 +633,28 @@ describe('1.7: a link that drops under the agent check costs a round, not the no
     expect(w.alerts('warn').join('\n')).not.toMatch(/Destroying it/)
   })
 
+  it('1.7: a dead agent whose restart loses the link is restarted once the node answers again', async () => {
+    const { app, busy, idle, jobId, chunkId, prov } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    await app.nodeManager.destroyNode(idle)
+    finishWhenAlive(machine)
+    dropUnder(machine, /provision\.sh restart-agent$/, 5_000)
+    machine.agent.alive = false
+
+    await w.until(() => prov.get(busy)!.restarts.length > 0, 'agent restarted', {
+      timeoutMs: 5 * MIN
+    })
+    await w.until(() => app.nodeManager.get(busy)?.state === 'ready', 'back in service')
+    expect(machine.ran(/provision\.sh restart-agent$/)).toHaveLength(2)
+    expect(states(busy).slice(-4)).toEqual(['rendering', 'provisioning', 'unreachable', 'ready'])
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 20 * MIN })
+    expect(chunksOf(jobId)).toMatchObject([
+      { id: chunkId, node_id: busy, retries: 0, infra_retries: 1 }
+    ])
+    expect(w.vast.count('destroyInstance')).toBe(1) // the idle node's
+    expect(w.alerts('warn').join('\n')).not.toMatch(/Destroying it/)
+  })
+
   it('1.7: another restart-agent holding the node is waited out, not taken for a broken node', async () => {
     const { app, busy, idle, jobId, prov } = await renderingOnOne()
     const machine = w.machineFor(busy)
