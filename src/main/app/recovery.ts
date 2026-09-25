@@ -18,9 +18,10 @@ import { emit } from '../events'
 import { reviveFailedChunks } from '../jobs/revive'
 import { getDb } from '../db/db'
 import { nodeManager } from '../nodes/nodeManager'
-import { AgentBusyError, provisionBase } from '../nodes/provisioner'
+import { AgentBusyError, agentStatus, provisionBase, restartAgent } from '../nodes/provisioner'
 import { scheduler } from '../scheduler/scheduler'
 import { classify } from '../errors'
+import type { SshConnection } from '../ssh/sshConnection'
 import type { NodeState, ReprovisionResult, RetryMissingResult } from '../../shared/models'
 
 /**
@@ -54,6 +55,46 @@ const REPROVISIONABLE: ReadonlySet<NodeState> = new Set<NodeState>([
 ])
 
 /**
+ * How long a reprovision may hold its node out of the fleet: nodeManager's
+ * PROVISION_DEADLINE_MS (plan 1.8). Every other step that puts a node in
+ * 'provisioning' (onReady, resumeNode, restoreAgent, recoverUnreachable)
+ * runs under it, and the supervisor leaves a 'provisioning' node alone
+ * because of it. provisionBase's own step timeouts add up to over an hour
+ * (the deps step alone may take 75 min, sized for a trickling ffmpeg
+ * mirror). The node bills all that time with nothing rendered, and scaling
+ * counts it as capacity on its way. Keep the two equal. A reprovision past
+ * it has failed, and its node is destroyed like any other; the destroy
+ * closes the connection the hung step runs on.
+ */
+export const REPROVISION_DEADLINE_MS = 25 * 60_000
+
+/** A reprovision that ran past REPROVISION_DEADLINE_MS. */
+class ReprovisionTimeout extends Error {
+  override readonly name = 'ReprovisionTimeout'
+
+  constructor(ms: number) {
+    super(`reprovisioning did not finish within ${Math.round(ms / 60_000)} min`)
+  }
+}
+
+/** `work`, or a ReprovisionTimeout once `ms` has passed without it. As nodeManager's withDeadline. */
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new ReprovisionTimeout(ms)), ms)
+    work.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (e: unknown) => {
+        clearTimeout(timer)
+        reject(e)
+      }
+    )
+  })
+}
+
+/**
  * Restart a node's agent, and requeue what was in flight on it.
  *
  * In this order, each step for a reason:
@@ -70,20 +111,23 @@ const REPROVISIONABLE: ReadonlySet<NodeState> = new Set<NodeState>([
  *    the agent restarted with --force, which kills every Blender on the node
  *    and empties its inbox. The scripts go first so that a node provisioned
  *    by an older build, whose provision.sh has no restart-agent, is
- *    reprovisioned rather than failed.
+ *    reprovisioned rather than failed. All of it under
+ *    REPROVISION_DEADLINE_MS.
  * 4. 'ready', unless the node was destroyed meanwhile, which is the
  *    destroy's to finish (ManagedNode.movedOn).
  *
- * A reprovision that fails leaves a node whose runs are forgotten and whose
- * old renders may still hold its GPUs, or with no agent at all: it could
- * only bill. So it is destroyed, as driveToReady destroys a node that
- * cannot be provisioned, and the call rejects saying so. Except when
- * another restart-agent held the node (AgentBusyError, the node busy, not
- * broken): that restart kills the old renders itself, and the node goes
- * back to 'ready'.
+ * A reprovision that fails, or runs past its deadline, leaves a node whose
+ * runs are forgotten and whose old renders may still hold its GPUs, or with
+ * no agent at all: it could only bill. So it is destroyed, as driveToReady
+ * destroys a node that cannot be provisioned, and the call rejects saying
+ * so. Not when the app ended it: a destroy, or a quit closing every
+ * connection (below). When another restart-agent held the node, see
+ * restartForReprovision.
  *
  * The requeued chunks are charged an infrastructure retry by forgetNode, as
- * for a node that went away; their render retries are untouched.
+ * for a node that went away, and it raises its "node went away mid-render"
+ * alert; their render retries are untouched. scheduler.ts has no forget
+ * that charges nothing yet.
  */
 export async function reprovisionNode(nodeId: string): Promise<ReprovisionResult> {
   const node = nodeManager.get(nodeId)
@@ -103,24 +147,33 @@ export async function reprovisionNode(nodeId: string): Promise<ReprovisionResult
   scheduler.forgetNode(nodeId)
   const requeued = countPending(inFlight)
 
+  // The app ended this reprovision rather than the node failing it: the
+  // deadline passed, a destroy moved the node on, or the quit's
+  // nodeManager.shutdown() closed its connection. Nothing but a destroy and
+  // shutdown() closes the connection of a node a step holds.
+  let over = false
+  const endedByApp = (): boolean => over || node.movedOn(held) || node.ssh !== ssh
+
+  let kept: string | null
   try {
-    await provisionBase(ssh, nodeId)
+    kept = await withDeadline(
+      restartForReprovision(ssh, nodeId, endedByApp),
+      REPROVISION_DEADLINE_MS
+    )
   } catch (e) {
+    over = true
     // Destroyed meanwhile: the destroy closed the connection under the
     // restart. Not this node failing; the destroy finishes it.
     if (node.movedOn(held)) return { requeued }
-    const reason = classify(e, { via: 'ssh' }).reason
-    if (e instanceof AgentBusyError) {
-      node.setState('ready')
-      emit('alert', {
-        level: 'warn',
-        message:
-          `Node ${name} was not reprovisioned: another agent restart is under way on it ` +
-          `(${reason}). ${requeued} chunk(s) went back to the queue.`
-      })
-      scheduler.kick()
-      throw new Error(`another agent restart is under way on node ${short}`, { cause: e })
+    // The app is quitting. Not this node failing either, and on a "leave
+    // running" quit the user chose to keep it: a destroy here would overrule
+    // that, and race the database's close. Left as the quit leaves it, as
+    // the supervisor's recoveries leave theirs (`|| this.shutDown`); the
+    // next launch takes it up.
+    if (node.ssh !== ssh) {
+      throw new Error(`node ${short} was not reprovisioned: the app is quitting`, { cause: e })
     }
+    const reason = classify(e, { via: 'ssh' }).reason
     const message =
       `Node ${name} could not be reprovisioned (${reason}), so it is being destroyed. ` +
       `${requeued} chunk(s) went back to the queue.`
@@ -129,14 +182,63 @@ export async function reprovisionNode(nodeId: string): Promise<ReprovisionResult
     throw new Error(message, { cause: e })
   }
 
-  if (node.movedOn(held)) return { requeued }
+  if (endedByApp()) return { requeued }
   node.setState('ready')
+  scheduler.kick()
+  if (kept) {
+    emit('alert', {
+      level: 'warn',
+      message:
+        `Node ${name} was not reprovisioned: ${kept}, so it is back in service. ` +
+        `${requeued} chunk(s) went back to the queue.`
+    })
+    throw new Error(`node ${short} was not reprovisioned: ${kept}`)
+  }
   emit('alert', {
     level: 'info',
     message: `Node ${name} reprovisioned: agent restarted, ${requeued} chunk(s) back in the queue`
   })
-  scheduler.kick()
   return { requeued }
+}
+
+/**
+ * provisionBase, and what follows when another restart-agent held the node
+ * through both of restartAgent's waits (AgentBusyError: busy, not broken).
+ *
+ * The node's runs are already forgotten, so an old render still going on it
+ * renders a chunk the app has requeued elsewhere: paid for twice, never
+ * collected, on GPUs the scheduler counts as free, with a fresh heartbeat
+ * the supervisor never questions. The other run cannot be trusted to kill
+ * it: a restart-agent without --force keeps a live agent, renders and all
+ * (AGENT_KEPT). So the node is asked (agent-status):
+ * - A live agent of this build, rendering nothing, with an empty inbox:
+ *   there is nothing to kill, and a restart-agent without --force keeps
+ *   such an agent. It is left as it is, and this resolves with why.
+ * - Anything else (renders, specs, an agent that needs restarting, no
+ *   answer): the agent is forced once more, and if that fails too, so does
+ *   the reprovision.
+ *
+ * Resolves null once the agent was restarted. Once `ended` says the app has
+ * ended the reprovision, nothing more is run on the node.
+ */
+async function restartForReprovision(
+  ssh: SshConnection,
+  nodeId: string,
+  ended: () => boolean
+): Promise<string | null> {
+  try {
+    await provisionBase(ssh, nodeId)
+    return null
+  } catch (e) {
+    if (!(e instanceof AgentBusyError) || ended()) throw e
+  }
+  const status = await agentStatus(ssh)
+  if (ended()) throw new Error('the reprovision was ended')
+  if (status && !status.restartNeeded && status.blenderProcs === 0 && status.inboxSpecs === 0) {
+    return 'another agent restart was under way on it, and its agent is up with nothing to render'
+  }
+  await restartAgent(ssh, nodeId, { force: true })
+  return null
 }
 
 /** How many of these chunks are pending: requeued, not complete or failed for good. */

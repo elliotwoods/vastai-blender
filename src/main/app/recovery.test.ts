@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { emulateProvision } from '../test/fakeProvision'
 import { HANG, setup, type App, type World } from '../test/harness'
 
 // Recovery actions (plan 1.15): job:retryMissing and node:reprovision, called
@@ -179,20 +180,122 @@ describe('node:reprovision', () => {
     expect(w.alerts('error')).toEqual([])
   })
 
-  it('another restart already under way: the node goes back to ready, with a warning', async () => {
+  /** restart-agent's answer when another one held the node for its whole wait. */
+  const BUSY = { code: 1, stdout: 'another restart-agent still running after 90s — nothing done\n' }
+
+  it('another restart held the node, whose agent is up with nothing on it: back to ready, with a warning', async () => {
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    const machine = w.machineFor(nodeId)
+    const node = emulateProvision(machine)
+    const restarts = machine.ran(/provision\.sh restart-agent/).length
+    machine.onExec(/provision\.sh restart-agent/, BUSY)
+
+    await expect(w.invoke('node:reprovision', nodeId)).rejects.toThrow(
+      /not reprovisioned: another agent restart was under way on it/
+    )
+    expect(nodeState(app, nodeId)).toBe('ready')
+    // Asked, and not forced again: there was nothing to kill.
+    expect(node.statusCalls).toBe(1)
+    expect(machine.ran(/provision\.sh restart-agent/)).toHaveLength(restarts + 2)
+    expect(w.vast.count('destroyInstance')).toBe(0)
+    expect(w.alerts('warn')).toContainEqual(expect.stringMatching(/was not reprovisioned/))
+  })
+
+  it('1.15: another restart held the node while the render it gave back was on it: the agent is forced once more', async () => {
+    // A restart-agent without --force keeps a live agent, renders and all.
+    // Sent back to 'ready' on the other run's word, the node went on
+    // rendering a chunk the app had requeued: paid for twice, never
+    // collected, on a GPU the scheduler counted as free.
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    const machine = w.machineFor(nodeId)
+    const chunkId = await rendering(app, nodeId)
+    const node = emulateProvision(machine)
+    machine.onExec(/provision\.sh restart-agent/, BUSY, 2)
+    const sent: string[] = []
+    machine.onSpec = (spec) => sent.push(spec.chunkId)
+
+    expect(await w.invoke('node:reprovision', nodeId)).toEqual({ requeued: 1 })
+
+    expect(node.restarts).toEqual([{ force: true, restarted: true, reason: 'forced' }])
+    expect(nodeState(app, nodeId)).toBe('ready')
+    expect(w.vast.count('destroyInstance')).toBe(0)
+    // The old spec went with the restart; the chunk is sent to the new agent.
+    await w.until(() => sent.includes(chunkId), 'chunk sent again')
+  })
+
+  it('another restart held the node through the forced one too: the node is destroyed', async () => {
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    const machine = w.machineFor(nodeId)
+    const chunkId = await rendering(app, nodeId)
+    emulateProvision(machine)
+    const restarts = machine.ran(/provision\.sh restart-agent/).length
+    machine.onExec(/provision\.sh restart-agent/, BUSY)
+
+    await expect(w.invoke('node:reprovision', nodeId)).rejects.toThrow(
+      /could not be reprovisioned .*being destroyed/
+    )
+    expect(machine.ran(/provision\.sh restart-agent/)).toHaveLength(restarts + 4)
+    expect(nodeState(app, nodeId)).toBe('destroyed')
+    expect(w.vast.count('destroyInstance')).toBe(1)
+    expect(chunkState(chunkId)).toBe('pending')
+  })
+
+  it('1.15/1.8: a reprovision whose deps step hangs is destroyed at the provisioning deadline', async () => {
+    // Every other step that holds a node in 'provisioning' gives it up at
+    // 25 min, and the supervisor leaves such a node alone on that premise.
+    // provisionBase's own step timeouts allow over an hour (deps 75 min, for
+    // a trickling ffmpeg mirror): billed, rendering nothing, and counted by
+    // scaling as capacity on its way.
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    const machine = w.machineFor(nodeId)
+    const chunkId = await rendering(app, nodeId)
+    const deps = machine.ran(/provision\.sh deps/).length
+    machine.onExec(/provision\.sh deps/, HANG)
+
+    let outcome: string | undefined
+    void w.invoke('node:reprovision', nodeId).then(
+      () => (outcome = 'resolved'),
+      (e: Error) => (outcome = e.message)
+    )
+    await w.until(() => machine.ran(/provision\.sh deps/).length > deps, 'deps under way')
+    await w.advance(24 * 60_000, 10_000)
+    expect(nodeState(app, nodeId)).toBe('provisioning')
+    expect(w.vast.count('destroyInstance')).toBe(0)
+
+    await w.advance(2 * 60_000, 10_000)
+    expect(nodeState(app, nodeId)).toBe('destroyed')
+    expect(w.vast.count('destroyInstance')).toBe(1)
+    expect(outcome).toMatch(/could not be reprovisioned .*25 min.*being destroyed/)
+    expect(chunkState(chunkId)).toBe('pending')
+  })
+
+  it('a quit during a reprovision leaves the node as the quit leaves it: no destroy', async () => {
+    // nodeManager.shutdown() closes every connection on the way out, which
+    // fails the restart. Taken for the node failing, that destroyed a node
+    // the user had chosen to leave running, racing the database's close.
     const app = await w.boot()
     const nodeId = await w.readyNode(app)
     const machine = w.machineFor(nodeId)
     await rendering(app, nodeId)
-    machine.onExec(/provision\.sh restart-agent/, {
-      code: 1,
-      stdout: 'another restart-agent still running after 90s — nothing done\n'
-    })
+    const restarts = machine.ran(/provision\.sh restart-agent/).length
+    machine.onExec(/provision\.sh restart-agent/, HANG)
 
-    await expect(w.invoke('node:reprovision', nodeId)).rejects.toThrow(/another agent restart/)
-    expect(nodeState(app, nodeId)).toBe('ready')
+    const call = w.invoke('node:reprovision', nodeId)
+    await w.until(
+      () => machine.ran(/provision\.sh restart-agent/).length > restarts,
+      'restart under way'
+    )
+    app.nodeManager.shutdown()
+
+    await expect(call).rejects.toThrow(/not reprovisioned: the app is quitting/)
+    await w.advance(60_000)
     expect(w.vast.count('destroyInstance')).toBe(0)
-    expect(w.alerts('warn')).toContainEqual(expect.stringMatching(/was not reprovisioned/))
+    expect(nodeState(app, nodeId)).toBe('provisioning')
+    expect(w.alerts('error')).toEqual([])
   })
 
   it('refuses a node that is not up, forgetting nothing', async () => {
