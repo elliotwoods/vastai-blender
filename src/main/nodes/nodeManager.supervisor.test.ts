@@ -466,6 +466,26 @@ describe('1.7: liveness supervision', () => {
     expect(app.nodeManager.get(busy)?.state).toBe('unreachable')
   })
 
+  it('1.7: shutting down while Vast is asked about a silent node opens no connection to it', async () => {
+    const { app, busy, prov } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    const asked = w.vast.hold('showInstance')
+    dropOff(machine)
+    await w.until(() => asked.reached, 'Vast asked')
+    app.scheduler.stop()
+    app.nodeManager.shutdown()
+    comeBack(machine)
+    const connects = machine.connects
+    asked.release()
+    await w.advance(5 * MIN, 5_000)
+    // Nothing reconnected to a node the user chose to leave running, and
+    // nothing restarted its agent.
+    expect(machine.connects).toBe(connects)
+    expect(prov.get(busy)!.statusCalls).toBe(0)
+    expect(prov.get(busy)!.restarts).toEqual([])
+    expect(w.vast.count('destroyInstance')).toBe(0)
+  })
+
   it('1.7: the snapshot says when the node last answered', async () => {
     const { app, busy } = await renderingOnOne()
     await w.advance(20_000)

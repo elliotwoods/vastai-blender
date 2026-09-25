@@ -882,6 +882,8 @@ class ManagedNode {
    * the next probe gets through (plan 1.7).
    */
   private drops = 0
+  /** The app is shutting down: see retire. */
+  private retired = false
 
   constructor(public readonly id: string) {}
 
@@ -979,6 +981,9 @@ class ManagedNode {
    * closed connection all the same, kept its session to the dying box.
    */
   async connectSsh(): Promise<SshConnection> {
+    // The app is quitting: nothing may open a connection to a node the user
+    // chose to leave running (see retire).
+    if (this.retired) throw new Error('connection closed: the app is shutting down')
     const row = this.row
     if (!row.ssh_host || !row.ssh_port) throw new Error('no SSH endpoint yet')
     let ssh = this.ssh
@@ -1005,6 +1010,17 @@ class ManagedNode {
   closeSsh(): void {
     this.ssh?.close()
     this.ssh = null
+  }
+
+  /**
+   * shutdown(): close the connection, and refuse to open another. A step
+   * still running for the node (a recovery waiting on Vast, say) would
+   * otherwise connect again after the quit, and could restart the agent of a
+   * node left running.
+   */
+  retire(): void {
+    this.retired = true
+    this.closeSsh()
   }
 
   /** The connection drops since the last call (see drops). */
@@ -1553,7 +1569,7 @@ export class NodeManager {
     if (this.costTimer) clearInterval(this.costTimer)
     if (this.metricsTimer) clearInterval(this.metricsTimer)
     if (this.destroyTimer) clearInterval(this.destroyTimer)
-    for (const n of this.nodes.values()) n.closeSsh()
+    for (const n of this.nodes.values()) n.retire()
   }
 
   /**
@@ -3235,7 +3251,9 @@ export class NodeManager {
     let why = opts.why ?? node.snapshot.lastError ?? 'no answer over SSH'
     if (opts.askVast && instanceId != null) {
       const fate = await this.askVast(instanceId)
-      if (node.movedOn(held)) return
+      // Shut down meanwhile: the node's connection is closed, and going on
+      // would open another to a node the user chose to leave running.
+      if (node.movedOn(held) || this.shutDown) return
       if (fate.kind === 'gone' || fate.kind === 'stopped') {
         await this.lost(node, instanceId, fate, why)
         return
