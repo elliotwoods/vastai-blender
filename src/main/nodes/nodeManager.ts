@@ -3534,6 +3534,23 @@ export class NodeManager {
         await this.ensureInstanceGone(instanceId, { node, reason })
         return
       }
+      if (instanceStopped(inst)) {
+        // Vast stopped it while the app was away: at a $0 balance Vast stops
+        // every instance on the account (field incident 1d59516c, the app
+        // relaunched after). It will not come back by itself, and it is no
+        // fault of the machine's, so it is destroyed as lost() destroys one,
+        // with no blacklist. It used to be polled for 8 min as a boot, then
+        // failed and its machine blacklisted (n4 review).
+        const reason = `Vast reports its instance ${inst.actual_status ?? inst.intended_status ?? 'stopped'} at resume`
+        forgetNodeProvider?.(node.id)
+        emit('alert', {
+          level: 'warn',
+          message: `Node ${nodeName(node.snapshot)}: ${reason}. Destroying it.`
+        })
+        node.setState('destroying', reason)
+        await this.ensureInstanceGone(instanceId, { node, reason })
+        return
+      }
       if (inst.actual_status !== 'running') {
         // Still booting (or wedged) — never leave it billing: drive it like a
         // fresh request (poll → ready) with the same timeout + destroy path.

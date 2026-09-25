@@ -250,6 +250,30 @@ describe('an instance Vast does not list at resume', () => {
   })
 })
 
+describe('an instance Vast stopped while the app was away (field incident 1d59516c)', () => {
+  it('is destroyed at once at resume, and its machine not blamed', async () => {
+    // At a $0 balance Vast stops every instance on the account. Relaunched
+    // after, the app polled each for 8 minutes as a boot, then failed it and
+    // blacklisted its machine, as it does a machine that would not boot.
+    const { app, id, instanceId } = await restartWith('rendering', () => {
+      for (const live of w.vast.live()) {
+        w.vast.patchInstance(live, { actual_status: 'exited', intended_status: 'stopped' })
+      }
+    })
+    const machineId = w.vast.instance(instanceId)!.machine_id
+    await w.until(() => app.nodeManager.get(id)?.state === 'destroyed', 'node let go', {
+      timeoutMs: 60_000
+    })
+    expect(w.vast.live()).toEqual([])
+    expect(w.get('SELECT last_error FROM nodes WHERE id = ?', id)).toEqual({
+      last_error: 'Vast reports its instance exited at resume'
+    })
+    // Not blacklisted: an offer on the same machine is rented.
+    w.vast.addOffer({ machine_id: machineId })
+    await expect(app.nodeManager.requestNodes(1)).resolves.toHaveLength(1)
+  })
+})
+
 describe('destroy while an unreachable node is reconnecting (recoverUnreachable)', () => {
   it('is not a node failure: no second destroy, no error alert', async () => {
     // sshd does not answer: resume marks the node unreachable and retries.
