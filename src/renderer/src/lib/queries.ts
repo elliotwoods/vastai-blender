@@ -31,6 +31,7 @@ import type {
   NodeSnapshot,
   RequestNodeOptions,
   RetryMissingResult,
+  ScaleStatusInfo,
   SettingsPatch,
   SettingsPatchResult,
   SettingsPublic,
@@ -63,36 +64,11 @@ export const qk = {
   fleetCost: ['fleetCost'] as const,
   history: (range: HistoryRange) => ['history', range] as const,
   holds: ['fleetHolds'] as const,
+  scaleStatus: ['scaleStatus'] as const,
   unclaimed: ['unclaimed'] as const,
   fleetGpuHistory: (range: UsageRange) => ['fleetGpuHistory', range] as const,
   nodeMetricsHistory: (nodeId: string, range: UsageRange) =>
     ['nodeMetricsHistory', nodeId, range] as const
-}
-
-/**
- * Main's reply for a channel it has no handler for. Phase 1's channels were
- * declared before their handlers (shared/ipc.ts), and one that has not
- * landed rejects with this.
- */
-function noHandler(e: unknown): boolean {
-  return e instanceof Error && e.message.includes('No handler registered')
-}
-
-/**
- * Every hold in force, for HoldsBanner. The recovery hold also answers on
- * scheduler:recoveryHold, the channel RecoveryBanner read before FleetHolds
- * gathered the holds in one place. While main has no fleet:holds handler it
- * is read from there, so the banner that says "Resume rendering" never goes
- * missing: without it, recovered work waits for a Resume nobody is offered.
- */
-async function readHolds(): Promise<FleetHolds> {
-  try {
-    return await ipc.invoke('fleet:holds')
-  } catch (e) {
-    if (!noHandler(e)) throw e
-    const r = await ipc.invoke('scheduler:recoveryHold')
-    return r ? { recovery: r.chunks } : {}
-  }
 }
 
 /**
@@ -104,8 +80,22 @@ async function readHolds(): Promise<FleetHolds> {
 export function useFleetHolds(): UseQueryResult<FleetHolds> {
   return useQuery({
     queryKey: qk.holds,
-    queryFn: readHolds,
+    queryFn: () => ipc.invoke('fleet:holds'),
     refetchInterval: 30_000,
+    retry: 1
+  })
+}
+
+/**
+ * Why scale-up is renting or not, as the scheduler decided at its last
+ * tick (every 15 s): the spend cap, max nodes, work the nodes up already
+ * cover, the tail of a job. Read on the same beat; main pushes nothing.
+ */
+export function useScaleStatus(): UseQueryResult<ScaleStatusInfo | null> {
+  return useQuery({
+    queryKey: qk.scaleStatus,
+    queryFn: () => ipc.invoke('scheduler:scaleStatus'),
+    refetchInterval: 15_000,
     retry: 1
   })
 }
@@ -114,16 +104,7 @@ export function useFleetHolds(): UseQueryResult<FleetHolds> {
 export function useReleaseHold(): UseMutationResult<FleetHolds, Error, FleetHoldKind> {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (kind: FleetHoldKind) => {
-      try {
-        return await ipc.invoke('fleet:releaseHold', kind)
-      } catch (e) {
-        // As readHolds: recovery's own channel, until fleet:releaseHold lands.
-        if (kind !== 'recovery' || !noHandler(e)) throw e
-        await ipc.invoke('scheduler:resumeRecovery')
-        return readHolds()
-      }
-    },
+    mutationFn: (kind: FleetHoldKind) => ipc.invoke('fleet:releaseHold', kind),
     onSuccess: (holds) => qc.setQueryData(qk.holds, holds)
   })
 }
@@ -352,13 +333,20 @@ export function useAddons(): UseQueryResult<AddonInfo[]> {
   return useQuery({ queryKey: qk.addons, queryFn: () => ipc.invoke('addons:list') })
 }
 
-export function useFleetCost(): UseQueryResult<FleetCost | null> {
-  // Filled by the fleet:cost push event; null until the first event arrives.
-  return useQuery({
-    queryKey: qk.fleetCost,
-    queryFn: () => Promise.resolve<FleetCost | null>(null),
-    staleTime: Infinity
-  })
+/**
+ * The fleet's totals and the Vast balance. Read once when the window opens,
+ * then kept by the fleet:cost push: main's cost timer pushes once a minute,
+ * so a window that only listened showed $0.00 for up to a minute after
+ * launch or a reopen.
+ */
+export const fleetCostQuery = {
+  queryKey: qk.fleetCost,
+  queryFn: (): Promise<FleetCost> => ipc.invoke('fleet:cost'),
+  staleTime: Infinity
+}
+
+export function useFleetCost(): UseQueryResult<FleetCost> {
+  return useQuery(fleetCostQuery)
 }
 
 /**
@@ -406,11 +394,28 @@ export function useSetJobShareNode(): UseMutationResult<
  * downloaded again. Main emits chunk:changed and job:changed for what it
  * queued; the invalidations cover a result that changed nothing visible.
  */
-export function useRetryMissing(): UseMutationResult<RetryMissingResult | void, Error, string> {
+export function useRetryMissing(): UseMutationResult<RetryMissingResult, Error, string> {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (jobId: string) => ipc.invoke('job:retryMissing', jobId),
     onSuccess: (_r, jobId) => {
+      void qc.invalidateQueries({ queryKey: qk.jobs })
+      void qc.invalidateQueries({ queryKey: qk.job(jobId) })
+    }
+  })
+}
+
+/**
+ * Release a job the retry breaker held (plan 1.17): its failures are
+ * counted afresh and its chunks go out again. Resolves false when the job
+ * was not held. Before this, a held job's only way on was cancel and
+ * resubmit, which renders and bills every finished frame again.
+ */
+export function useResumeJob(): UseMutationResult<boolean, Error, string> {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (jobId: string) => ipc.invoke('job:resume', jobId),
+    onSettled: (_r, _e, jobId) => {
       void qc.invalidateQueries({ queryKey: qk.jobs })
       void qc.invalidateQueries({ queryKey: qk.job(jobId) })
     }
