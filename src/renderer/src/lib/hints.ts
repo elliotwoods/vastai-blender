@@ -32,7 +32,7 @@ export const HINTS = {
     'Measured GPU watts are scaled by this before becoming a CO₂ figure, to stand in for the host CPU, power-supply losses and datacentre cooling that nvidia-smi never sees. 1.6 is a typical whole-facility ratio; 1 counts the card alone. Energy readouts in Wh are never scaled by it.',
 
   spendCap:
-    'Automatic scale-up stops renting once the fleet’s combined quoted rate reaches this. The next machine’s price is not counted, so the last rental can take the fleet over the cap, and “+ request node” ignores it. Leave blank to disable the cap.',
+    'The most the fleet may bill per hour, counting every node that may still be billing. A machine is rented only if its own price still fits under the cap, and “+ request node” stops at it too. Tick “no spend cap” to rent without one.',
   maxDph:
     'Offer filter — only machines at or below this on-demand price are considered when renting.'
 } as const

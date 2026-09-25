@@ -25,6 +25,8 @@ import type {
   JobSummary,
   NodeChunkView,
   NodeSnapshot,
+  SettingsPatch,
+  SettingsPatchResult,
   SettingsPublic
 } from '../../../shared/models'
 import type { EventChannel, IpcEventMap } from '../../../shared/ipc'
@@ -73,15 +75,16 @@ export function useSettings(): UseQueryResult<SettingsPublic> {
   return useQuery({ queryKey: qk.settings, queryFn: () => ipc.invoke('settings:get') })
 }
 
-export function useUpdateSettings(): UseMutationResult<
-  SettingsPublic,
-  Error,
-  Partial<SettingsPublic>
-> {
+/**
+ * Save a settings change through main's sanitizer (plan 1.14). The result
+ * says which fields main refused or clamped, and why, so the screen can show
+ * it next to the field; the cache takes the settings as main now has them.
+ */
+export function useUpdateSettings(): UseMutationResult<SettingsPatchResult, Error, SettingsPatch> {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (patch: Partial<SettingsPublic>) => ipc.invoke('settings:set', patch),
-    onSuccess: (next) => qc.setQueryData(qk.settings, next)
+    mutationFn: (patch: SettingsPatch) => ipc.invoke('settings:update', patch),
+    onSuccess: (result) => qc.setQueryData(qk.settings, result.settings)
   })
 }
 

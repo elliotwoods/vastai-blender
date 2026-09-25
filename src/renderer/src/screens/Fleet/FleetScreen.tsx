@@ -67,8 +67,10 @@ function MaxNodesStepper(): React.JSX.Element {
     // 64, not 16: a headless spec can set 30+, and clamping at 16 meant a
     // single click on "−" silently shrank such a fleet to 16.
     const clamped = Math.max(0, Math.min(MAX_NODES_UI, next))
+    // One save, through main's sanitizer (plan 1.14). It used to be sent
+    // twice, the second time through fleet:setMaxNodes with nothing
+    // listening for its failure.
     update.mutate({ maxActiveNodes: clamped })
-    void ipc.invoke('fleet:setMaxNodes', clamped)
   }
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
