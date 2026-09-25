@@ -153,3 +153,30 @@ describe('nodeManager lifecycle', () => {
     expect(seen).toBe(app.nodeManager.get(id)?.ssh)
   })
 })
+
+// Plan 1.1: the cost timer charges one minute a tick, and a computer asleep
+// runs no ticks. A night asleep with the fleet billing was metered as one
+// minute: not in the session total, History or a job's cost (#66).
+describe('1.1 time asleep is metered', () => {
+  it('accrueElapsed charges each billing node for the time, less the tick that follows', async () => {
+    const app = await w.boot()
+    const id = await w.readyNode(app, { dph_total: 0.6 })
+    const before = app.nodeManager.get(id)!.snapshot.accumulatedCost
+    const logged = (): number =>
+      w.get<{ t: number }>('SELECT COALESCE(SUM(delta_cost), 0) AS t FROM cost_log')!.t
+    const usage = (): number =>
+      w.get<{ t: number }>('SELECT COALESCE(SUM(delta_cost), 0) AS t FROM usage_log')!.t
+    const [log0, use0] = [logged(), usage()]
+
+    app.nodeManager.accrueElapsed(3 * 60 * 60_000)
+
+    // 3 h less the minute the next tick charges: 179 min at $0.60/h.
+    const expected = (0.6 * 179) / 60
+    expect(app.nodeManager.get(id)!.snapshot.accumulatedCost - before).toBeCloseTo(expected, 6)
+    expect(logged() - log0).toBeCloseTo(expected, 6)
+    expect(usage() - use0).toBeCloseTo(expected, 6)
+    // A sleep no longer than a tick is the tick's.
+    app.nodeManager.accrueElapsed(45_000)
+    expect(logged() - log0).toBeCloseTo(expected, 6)
+  })
+})

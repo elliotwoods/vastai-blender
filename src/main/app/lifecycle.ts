@@ -388,9 +388,9 @@ export interface FleetPort {
   /** Close every node connection and stop the node timers. */
   shutdown(): void
   /**
-   * On waking. Neither is wired yet: nodeManager's accrual and orphan sweep
-   * are private, and the sweep as it stands would destroy a rental whose
-   * create reply is still in flight (plan 1.3 adds the guards). See index.ts.
+   * On waking: meter the time asleep (nodeManager.accrueElapsed) and check
+   * the account against the rows now (nodeManager.reconcile). index.ts adds
+   * both to fleetPort's; a test's port may leave them out.
    */
   accrueSleep?(sleptMs: number): unknown
   reconcile?(): unknown

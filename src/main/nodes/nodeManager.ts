@@ -3841,6 +3841,37 @@ export class NodeManager {
   }
 
   /**
+   * Meter time this process did not see: the computer asleep (plan 1.1,
+   * app/lifecycle.ts on powerMonitor 'resume'). The cost timer charges one
+   * minute a tick, and a sleeping computer runs no ticks, so a night asleep
+   * with the fleet billing showed up nowhere: not in the session total, not
+   * in History, not in a job's cost (#66). Each node that may be billing is
+   * charged its $/hr for `ms`, less the minute the first tick after waking
+   * charges anyway, and the totals and credit guard are refreshed at once.
+   * The nodes went on rendering meanwhile (their agents do not need this
+   * computer), so the time is split over their work as a tick's is.
+   */
+  accrueElapsed(ms: number): void {
+    const extra = ms - 60_000
+    if (!Number.isFinite(extra) || extra <= 0) return
+    const db = getDb()
+    const ts = Date.now()
+    const usage: UsageRow[] = []
+    for (const node of this.nodes.values()) {
+      const s = node.snapshot
+      if (!holdsInstance(s) || s.dphTotal == null || !s.startedAt) continue
+      const delta = (s.dphTotal * extra) / 3_600_000
+      node.update({ accumulated_cost: s.accumulatedCost + delta })
+      db.prepare(
+        'INSERT INTO cost_log (node_id, ts, dph_total, delta_cost) VALUES (?, ?, ?, ?)'
+      ).run(s.id, ts, s.dphTotal, delta)
+      usage.push(...splitUsage(s.id, ts, delta, 0))
+    }
+    writeUsage(usage)
+    void this.refreshCost(ts)
+  }
+
+  /**
    * Read the Vast balance, run the credit guard on it (plan 1.20) and push
    * fleet:cost. From every cost tick, and from init, so the toolbar has its
    * figures from the start rather than a minute in. Never rejects.

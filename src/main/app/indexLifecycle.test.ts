@@ -93,6 +93,10 @@ interface Loaded {
   nodes: NodeSnapshot[]
   /** protocol.handle registrations, by scheme. */
   protocols: Map<string, (request: Request) => Promise<Response>>
+  /** nodeManager.accrueElapsed calls, by the ms each was given. */
+  accrued: number[]
+  /** nodeManager.reconcile calls. */
+  reconciles: number
 }
 
 function node(patch: Partial<NodeSnapshot> = {}): NodeSnapshot {
@@ -168,7 +172,9 @@ async function load(
     schedulerStopped: 0,
     shutdowns: 0,
     nodes,
-    protocols: new Map()
+    protocols: new Map(),
+    accrued: [],
+    reconciles: 0
   }
   FakeWindow.app = out.listeners
   let ready!: () => void
@@ -260,6 +266,12 @@ async function load(
       },
       shutdown: () => {
         out.shutdowns++
+      },
+      accrueElapsed: (ms: number) => {
+        out.accrued.push(ms)
+      },
+      reconcile: async () => {
+        out.reconciles++
       }
     },
     setActiveWorkProvider: () => {},
@@ -450,6 +462,19 @@ describe('index.ts installs the quit lifecycle (plan 1.1, field incident A1)', (
       'Going to sleep with 1 node billing $0.40/hr: it keeps billing while this computer ' +
         'sleeps, and nothing renders or downloads until it wakes'
     ])
+  })
+
+  it('1.1: waking meters the time asleep and reconciles the account at once', async () => {
+    // Neither was wired: a night asleep with the fleet billing was metered
+    // as the one minute the first tick after waking charges (#66), and the
+    // account was next checked at the 5-minute reconcile.
+    const r = await load([node()])
+    r.power.emit('suspend')
+    await vi.advanceTimersByTimeAsync(3 * 60 * 60_000)
+    r.power.emit('resume')
+    expect(r.accrued).toHaveLength(1)
+    expect(r.accrued[0]).toBeGreaterThanOrEqual(3 * 60 * 60_000)
+    expect(r.reconciles).toBe(1)
   })
 
   it("a person's app: Ctrl+C or a closed terminal asks, as Cmd+Q does, once however many arrive", async () => {

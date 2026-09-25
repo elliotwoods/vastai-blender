@@ -471,10 +471,14 @@ app.whenReady().then(() => {
     ensureWindow: () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
     },
-    // Nothing for the port's accrueSleep and reconcile yet: nodeManager's
-    // accrual and orphan sweep are private, and the sweep as it stands would
-    // destroy a rental whose create reply is still in flight (plan 1.3).
-    fleet: fleetPort(nodeManager, scheduler),
+    // On waking (plan 1.1): the time asleep metered, and the account
+    // checked against the rows at once (plan 1.3's reconcile, which leaves
+    // a create still in flight alone), rather than at the next 5-minute pass.
+    fleet: {
+      ...fleetPort(nodeManager, scheduler),
+      accrueSleep: (ms) => nodeManager.accrueElapsed(ms),
+      reconcile: () => nodeManager.reconcile()
+    },
     closeDb,
     headless: headless ? { policy: quitPolicy.policy } : null,
     signals: process,
