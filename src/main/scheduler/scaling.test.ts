@@ -311,17 +311,110 @@ describe('planScaling: no work, no rent (plan 1.21, job da68b61b)', () => {
     expect(p.nodes).toBe(1)
   })
 
-  it('takes the tail rules only on a learned rate, falling back to lane demand', () => {
+  describe('before any run has a rate (its first frame has not landed)', () => {
+    // The live 8×4090's runs have all started, none has finished a frame.
+    const unrated: Fixture = {
+      ...oneBusy8x4090,
+      fleetFramesPerHour: null,
+      ratedRuns: 0,
+      runningRuns: 8
+    }
+
+    it('1 frame left with 1 live node → no rent, on the rate learned for its GPUs', () => {
+      // The node's last chunks (8 frames) and a 1-frame requeue behind them:
+      // gpu_perf says ~1 min for all 9. A heavy scene is slower, but only
+      // until a run's first frame lands and the measured rate takes over.
+      const p = planScaling(
+        plan({
+          ...unrated,
+          provisionalFramesPerHour: 480,
+          pendingExclusive: 1,
+          pendingFrames: 1,
+          remainingExclusiveFrames: 9
+        })
+      )
+      expect(p.status).toBe('tail')
+      expect(p.reason).toMatch(/last 9 frames .* at the rate learned for its GPUs/)
+      expect(p.nodes).toBe(0)
+      expect(budgetOpen(p.budget)).toBe(false)
+    })
+
+    it('with nothing learned either, lane demand decides', () => {
+      const p = planScaling(
+        plan({ ...unrated, pendingExclusive: 1, pendingFrames: 1, remainingExclusiveFrames: 9 })
+      )
+      expect(p.status).toBe('rent')
+    })
+
+    it('a learned rate never stops the queue rule: that waits for a measured one', () => {
+      // 1 frame queued behind 2000 in flight: 4 h of the fleet at gpu_perf, so
+      // the first rule does not stop it, and how long the queued frame waits
+      // for a lane is not judged on gpu_perf.
+      const p = planScaling(
+        plan({
+          ...unrated,
+          provisionalFramesPerHour: 480,
+          pendingExclusive: 1,
+          pendingFrames: 1,
+          remainingExclusiveFrames: 2000
+        })
+      )
+      expect(p.status).toBe('rent')
+    })
+
+    it('holds a heavy scene back only until the first frame lands', () => {
+      // gpu_perf, learned on a light scene, says the 4×4090 does 4800 frames/h:
+      // 500 frames look like ~6 min. Measured, it does 80.
+      const heavy: Fixture = {
+        cap: caps([node(1.6)]),
+        usableNodes: 1,
+        usableLanes: 4,
+        runningRuns: 4,
+        provisionalFramesPerHour: 4800,
+        newNodeLanes: 4,
+        pendingExclusive: 10,
+        pendingFrames: 460,
+        remainingExclusiveFrames: 500
+      }
+      expect(planScaling(plan({ ...heavy, fleetFramesPerHour: null, ratedRuns: 0 })).status).toBe(
+        'tail'
+      )
+      const measured = planScaling(plan({ ...heavy, fleetFramesPerHour: 20, ratedRuns: 1 }))
+      expect(measured.status).toBe('rent')
+      expect(measured.budget.exclusiveLanes).toBe(10)
+    })
+  })
+
+  it("counts the runs that have no rate yet at the rated runs' pace", () => {
+    // 8 runs on the 8×4090, 2 of them rated at 60 frames/h each: the fleet
+    // does ~480, not the 120 the rated two sum to. 72 frames left is ~9 min
+    // of it. Read as 120, it was 36 min, and an 8×4090 was rented for the tail.
     const p = planScaling(
       plan({
         ...oneBusy8x4090,
-        fleetFramesPerHour: null,
+        fleetFramesPerHour: 120,
+        ratedRuns: 2,
+        runningRuns: 8,
         pendingExclusive: 1,
-        pendingFrames: 1,
-        remainingExclusiveFrames: 2000
+        pendingFrames: 40,
+        remainingExclusiveFrames: 72
       })
     )
-    expect(p.status).toBe('rent')
+    expect(p.status).toBe('tail')
+    expect(p.reason).toMatch(/last 72 frames in ~9 min, before a new node could boot/)
+    // The queued chunk still gets one run's worth: 40 frames at 60/h.
+    const q = planScaling(
+      plan({
+        ...oneBusy8x4090,
+        fleetFramesPerHour: 120,
+        ratedRuns: 2,
+        runningRuns: 8,
+        pendingExclusive: 1,
+        pendingFrames: 40,
+        remainingExclusiveFrames: 400
+      })
+    )
+    expect(q.status).toBe('rent')
   })
 
   it('buy-ahead still widens a long drain the fleet has prefetched', () => {

@@ -31,8 +31,9 @@
  *   1-frame requeue sub-chunk, sitting on a live node, and buy-ahead rented
  *   two more 8×4090s (~$8/h) for it. It never rents when no frame is left to
  *   render, nor for work the fleet, at the rate it is measured rendering it,
- *   gets through before a new node could boot. Buy-ahead counts frames, not
- *   chunks.
+ *   gets through before a new node could boot (until a run has a rate, the
+ *   rate learned for the fleet's own GPUs judges only the last few frames).
+ *   Buy-ahead counts frames, not chunks.
  * - Any FleetHolds entry (account, local sink, recovery, scale backoff)
  *   stops it with the hold's reason, for scheduler:scaleStatus.
  *
@@ -236,6 +237,27 @@ export interface PlanScalingInput {
   fleetFramesPerHour: number | null
   /** how many running chunks fleetFramesPerHour is summed over */
   ratedRuns: number
+  /**
+   * Every chunk rendering on a usable node now, rated or not; default
+   * ratedRuns. A run has no rate until its first frame lands, yet its frames
+   * are in the remaining counts, so the measured sum alone read the fleet as
+   * slower than it is, most of all at the tail, where runs have just started.
+   * The sum is scaled by runningRuns / ratedRuns: an unrated run is taken at
+   * the rated runs' average.
+   */
+  runningRuns?: number
+  /**
+   * While no run has a rate: the usable nodes at what gpu_perf learned for
+   * their GPU models (per-GPU frames/h × each node's GPUs, summed), or null
+   * when nothing is learned. Only the first tail rule reads it (the fleet
+   * finishes every remaining frame before a new node could boot), so the
+   * last few frames on a live node rent nothing before their first frame
+   * lands. A heavy scene runs far below gpu_perf, so this can hold a rental
+   * back until the first frame of a run lands and the measured rate takes
+   * over, never longer. It never causes a rental, and the queue rule waits
+   * for a measured rate.
+   */
+  provisionalFramesPerHour?: number | null
   /** boot + provision time of a new node; default NEW_NODE_LEAD_MS */
   newNodeLeadMs?: number
 
@@ -328,29 +350,41 @@ export function planScaling(i: PlanScalingInput): ScalingPlan {
   // it is worth renting only if work would still be waiting when it arrives.
   // That is judged on the rate the fleet is measured rendering these jobs at,
   // never on what a new node might do: a rate learned on another scene made a
-  // heavy one look like minutes of work. With nothing rendering there is no
-  // rate to judge by (and with no node at all, a single frame still needs
-  // one), so this errs toward renting: the tail rules only ever stop a rental.
+  // heavy one look like minutes of work. Until a run has a rate, only the
+  // first rule may use what gpu_perf learned for the fleet's own GPUs. With
+  // no node at all a single frame still needs one, so this errs toward
+  // renting: the tail rules only ever stop a rental.
   const lead = i.newNodeLeadMs ?? NEW_NODE_LEAD_MS
-  const rate = i.fleetFramesPerHour
-  if (i.usableNodes > 0 && rate != null && rate > 0) {
+  const rated = Math.max(0, i.ratedRuns)
+  const running = Math.max(rated, i.runningRuns ?? rated)
+  const measured =
+    i.fleetFramesPerHour != null && i.fleetFramesPerHour > 0
+      ? i.fleetFramesPerHour * (rated > 0 ? running / rated : 1)
+      : null
+  const provisional =
+    measured == null && i.provisionalFramesPerHour != null && i.provisionalFramesPerHour > 0
+      ? i.provisionalFramesPerHour
+      : null
+  const rate = measured ?? provisional
+  if (i.usableNodes > 0 && rate != null) {
     const remaining = i.remainingExclusiveFrames + i.remainingSharedFrames
     const finishMs = (remaining / rate) * 3_600_000
     if (finishMs <= lead) {
+      const learned = measured == null ? ' at the rate learned for its GPUs' : ''
       return stop(
         'tail',
-        `the fleet finishes the last ${plural(remaining, 'frame')} in ~${mins(finishMs)}, before a new node could boot (~${mins(lead)})`
+        `the fleet finishes the last ${plural(remaining, 'frame')} in ~${mins(finishMs)}${learned}, before a new node could boot (~${mins(lead)})`
       )
     }
-    if (!i.eager) {
+    if (!i.eager && measured != null) {
       // The queue at the rate the fleet can give it. A chunk renders in one
       // run, so a few chunks get a few runs' worth of the fleet, not all of
       // it. Taken up as the fleet's runs free, the queue adds no more than
       // this to the job, and a new node idle for the whole boot could save no
       // more than that.
       const chunks = i.pendingExclusive + i.pendingShared
-      const share = i.ratedRuns > 0 ? Math.min(1, chunks / i.ratedRuns) : 1
-      const queueMs = (givable / (rate * share)) * 3_600_000
+      const share = running > 0 ? Math.min(1, chunks / running) : 1
+      const queueMs = (givable / (measured * share)) * 3_600_000
       if (queueMs <= lead) {
         return stop(
           'tail',
