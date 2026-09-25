@@ -1,0 +1,183 @@
+import { afterEach, describe, expect, it } from 'vitest'
+import { REMOTE_ROOT } from '../test/fakeSsh'
+import { setup, type App, type FakeMachine, type SetupOptions, type World } from '../test/harness'
+
+// A run that has lost its render must let go of its chunk and its lane
+// (plan 1.7, the run's side of it), end to end on the lifecycle harness.
+// Before, a run polled every 5 s for as long as the app ran whenever the
+// agent's state file never appeared or could not be read: the chunk stayed
+// 'rendering', its lane stayed taken, and its node never went idle.
+
+let w: World
+afterEach(() => w.dispose())
+
+interface ChunkRow {
+  id: string
+  state: string
+  node_id: string | null
+  retries: number
+  infra_retries: number
+}
+
+function chunksOf(jobId: string): ChunkRow[] {
+  return w.all<ChunkRow>('SELECT * FROM chunks WHERE job_id = ? ORDER BY frame_start', jobId)
+}
+
+function jobState(jobId: string): string | undefined {
+  return w.get<{ state: string }>('SELECT state FROM jobs WHERE id = ?', jobId)?.state
+}
+
+function nodeState(nodeId: string): string | undefined {
+  return w.get<{ state: string }>('SELECT state FROM nodes WHERE id = ?', nodeId)?.state
+}
+
+/** Chunks dispatched to a node: every 'assigned' the renderer heard with its id. */
+function assignedTo(nodeId: string): number {
+  return w.eventsOf('chunk:changed').filter((c) => c.state === 'assigned' && c.nodeId === nodeId)
+    .length
+}
+
+async function fleet(
+  n: number,
+  offer: { num_gpus?: number } = {},
+  settings: SetupOptions['settings'] = {}
+): Promise<{ app: App; ids: string[] }> {
+  w = await setup({ settings: { maxActiveNodes: n, ...settings } })
+  const app = await w.boot()
+  const ids: string[] = []
+  for (let i = 0; i < n; i++) ids.push(await w.readyNode(app, offer))
+  return { app, ids }
+}
+
+/** What provision.sh base did to a node the second launch re-provisioned: its inbox emptied. */
+function emptyInbox(machine: FakeMachine): string[] {
+  const gone = machine.agent.inbox()
+  for (const id of gone) machine.files.delete(`${REMOTE_ROOT}/jobs/inbox/${id}.json`)
+  return gone
+}
+
+describe('1.7 field incident 81fe2875: phantom runs', () => {
+  it('specs a second launch deleted from the inbox are requeued, and the lanes they held are used again', async () => {
+    // One 4-GPU node, four lanes, four specs waiting in its inbox when a
+    // second copy of the app re-provisioned it: `rm jobs/inbox/*.json`.
+    const { app, ids } = await fleet(1, { num_gpus: 4 })
+    const machine = w.machineFor(ids[0])
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 8, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => machine.agent.inbox().length === 4, 'four specs queued')
+    const lost = emptyInbox(machine)
+    // The node renders whatever it is sent from here on.
+    machine.agent.autoFinish()
+
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 30 * 60_000 })
+    // Each lost chunk went back in the queue, charged to the machines, not
+    // to the render, and was rendered on the lanes it had held.
+    for (const id of lost) {
+      expect(chunksOf(jobId).find((c) => c.id === id)).toMatchObject({
+        state: 'complete',
+        retries: 0,
+        infra_retries: 1
+      })
+    }
+    expect(w.alerts('warn').join('\n')).toMatch(/spec left the node's inbox with no render started/)
+    expect(app.scheduler.activeWorkForNode(ids[0])).toEqual([])
+  })
+
+  it('a spec waiting its turn in the inbox of a live agent is left alone', async () => {
+    const { app, ids } = await fleet(1)
+    const machine = w.machineFor(ids[0])
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => machine.agent.inbox().length === 1, 'spec queued')
+    // Behind busy slots for half an hour: no state, the agent alive.
+    await w.advance(30 * 60_000)
+    expect(chunksOf(jobId)[0]).toMatchObject({ state: 'rendering', infra_retries: 0 })
+    expect(assignedTo(ids[0])).toBe(1)
+    machine.agent.finish(chunksOf(jobId)[0].id)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+  })
+
+  it('a node whose agent is dead: the spec is withdrawn, the chunk moves on, and the node is let go', async () => {
+    const { app, ids } = await fleet(2, {}, { idleTimeoutMinutes: 5 })
+    const [dead, live] = ids
+    w.machineFor(dead).agent.alive = false
+    // The live node renders each chunk in two minutes: work stays queued
+    // while the dead one should be let go.
+    const liveMachine = w.machineFor(live)
+    liveMachine.onSpec = (spec) =>
+      setTimeout(() => liveMachine.agent.finish(spec.chunkId), 2 * 60_000)
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 10, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => assignedTo(dead) === 1, 'a chunk sent to the dead node')
+    const stranded = w
+      .eventsOf('chunk:changed')
+      .find((c) => c.state === 'assigned' && c.nodeId === dead)!.chunkId
+
+    await w.until(() => nodeState(dead) === 'destroyed', 'the dead node let go', {
+      timeoutMs: 20 * 60_000
+    })
+    // Before the queue ran out: nothing but the dead agent kept it from work.
+    expect(chunksOf(jobId).some((c) => c.state === 'pending')).toBe(true)
+    // Sent one chunk, never another, and that one withdrawn from its inbox.
+    expect(assignedTo(dead)).toBe(1)
+    expect(w.machineFor(dead).ran(new RegExp(`jobs/inbox/${stranded}\\.json; pkill`))).toHaveLength(
+      1
+    )
+    expect(w.alerts('error').join('\n')).toMatch(/agent is not running.*Nothing more is sent to it/)
+
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 60 * 60_000 })
+    expect(chunksOf(jobId).find((c) => c.id === stranded)).toMatchObject({
+      state: 'complete',
+      node_id: live,
+      retries: 0,
+      infra_retries: 1
+    })
+  })
+
+  it('a node whose agent is dead is not counted as room for the queue', async () => {
+    // Kept past the test, so only scale-up can make room.
+    const { app, ids } = await fleet(2, {}, { maxActiveNodes: 3, idleTimeoutMinutes: 120 })
+    const [dead, live] = ids
+    w.machineFor(dead).agent.alive = false
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 2, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => assignedTo(dead) === 1 && assignedTo(live) === 1, 'one chunk each')
+    // The live node is busy with its chunk for a long while.
+    w.vast.addOffer()
+    await w.until(
+      () => w.alerts('error').some((a) => /agent is not running/.test(a)),
+      'the dead agent found'
+    )
+    // Its free lane read as room for the chunk it gave back: covered, so
+    // nothing was rented, and the chunk waited for the live node's.
+    await w.until(() => w.vast.count('createInstance') === 3, 'a node rented for it')
+    expect(nodeState(dead)).not.toBe('destroyed')
+    expect(chunksOf(jobId).filter((c) => c.state === 'pending')).toHaveLength(1)
+  })
+
+  it('a node that stops answering: the run gives its chunk back, and it renders elsewhere', async () => {
+    // The other node idles through the ten minutes, and must still be there.
+    const { app, ids } = await fleet(2, {}, { idleTimeoutMinutes: 60 })
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => chunksOf(jobId)[0].state === 'rendering', 'rendering')
+    const silent = chunksOf(jobId)[0].node_id!
+    const other = ids.find((id) => id !== silent)!
+    w.machineFor(silent).agent.progress(chunk.id, 1)
+    await w.advance(10_000)
+    // Every read of the state fails from here on, as on a wedged link.
+    w.machineFor(silent).onExec(/^cat \S*\/state\//, () =>
+      Promise.reject(new Error('(SSH) Channel open failure'))
+    )
+    w.machineFor(other).agent.autoFinish()
+
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 30 * 60_000 })
+    expect(chunksOf(jobId)[0]).toMatchObject({ node_id: other, retries: 0, infra_retries: 1 })
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /has not answered for 10 min \(.*Channel open failure.*requeued without charging the render/
+    )
+    // Withdrawn on the silent node, in case it answers again.
+    expect(w.machineFor(silent).ran(new RegExp(`pkill -f '${chunk.id}'`))).not.toEqual([])
+  })
+})

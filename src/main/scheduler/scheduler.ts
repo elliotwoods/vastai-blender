@@ -23,7 +23,7 @@ import {
   noteChunkError,
   refreshJobState
 } from '../jobs/jobs'
-import { installBlender, installExtension, REMOTE_ROOT } from '../nodes/provisioner'
+import { agentAlive, installBlender, installExtension, REMOTE_ROOT } from '../nodes/provisioner'
 import { listAddons } from '../addons/addons'
 import { nodeManager } from '../nodes/nodeManager'
 import { getSettings } from '../settings'
@@ -376,6 +376,59 @@ function attentionKind(errorKind: 'scene' | 'job', message: string): JobAttentio
  */
 const STATE_STALL_MS = 15 * 60_000
 
+/**
+ * No state file for this long after the spec was queued, and the run asks
+ * the node why (ChunkRun.checkMissingState). The agent writes one within
+ * seconds of taking a spec, and the spec stays in its inbox until the render
+ * is over, so the only good reason for none is a spec still waiting its turn
+ * there (prefetched, behind busy slots), with the agent alive.
+ *
+ * Field incident 81fe2875: the app was launched twice on one profile, and the
+ * second launch re-provisioned every node, deleting the specs waiting in
+ * their inboxes. The first launch's runs for them never saw a state file,
+ * and the stall watchdog only ever looked at one, so they polled for good:
+ * 7 of 24 paid GPUs held by work nobody was doing.
+ */
+const STATE_MISSING_MS = 3 * 60_000
+
+/**
+ * Every read of the state failing (exec throws, times out or loses its
+ * channel) for this long, and the run gives its chunk back. A node that
+ * stops answering was otherwise polled every 5 s for good, its chunk
+ * 'rendering' and its lane held, since the failed reads read as "no news".
+ * Noticing a dead node and letting it go is the node supervisor's (plan
+ * 1.7); this is the run's own bound on it.
+ */
+const STATE_UNREADABLE_MS = 10 * 60_000
+
+/** Deadline on the agentAlive heartbeat check, which has none of its own. */
+const AGENT_CHECK_TIMEOUT_MS = 30_000
+
+/** A state read, as the run needs to tell them apart. */
+type StateRead =
+  | { kind: 'state'; state: AgentState }
+  /** no state file: cat said there is none */
+  | { kind: 'missing' }
+  /** the read itself failed: nothing is known */
+  | { kind: 'unread'; error: string }
+
+/** Resolve `p`, or null once `ms` pass or it rejects. */
+function within<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms)
+    p.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      () => {
+        clearTimeout(timer)
+        resolve(null)
+      }
+    )
+  })
+}
+
 /** EWMA weight for the per-chunk frame-rate estimate (30% new sample). */
 const RATE_ALPHA = 0.3
 
@@ -385,6 +438,9 @@ class ChunkRun {
   private stopTail: (() => void) | null = null
   private dispatchedAt = Date.now()
   private engineNoted = false
+  /** Since when the state file has been missing / every read of it failed, in a row (epoch ms). */
+  private missingSince: number | null = null
+  private unreadSince: number | null = null
 
   /** EWMA of frames/sec while rendering; null until two progress samples land. */
   private framesPerSec: number | null = null
@@ -769,30 +825,146 @@ class ChunkRun {
     }
   }
 
-  private async readAgentState(): Promise<AgentState | null> {
+  /**
+   * The agent's state for this chunk. A missing file and a failed read used
+   * to come back alike, as null, "no news", and the loop polled on for good
+   * through either: an agent that never took the spec, a node that stopped
+   * answering. Told apart, each has its bound (noState).
+   */
+  private async readAgentState(): Promise<StateRead> {
     try {
       // Timed out: an exec on a wedged connection never returns, and this loop
       // is the only thing that notices a chunk finishing or failing.
       const r = await this.ssh.exec(`cat ${REMOTE_ROOT}/state/${this.chunkId}.json 2>/dev/null`, {
-        timeoutMs: 30_000
+        timeoutMs: 30_000,
+        label: 'read agent state'
       })
-      if (r.stdout.trim()) return JSON.parse(r.stdout) as AgentState
-    } catch {
-      // connection hiccup — caller keeps polling
+      // cat's answer for no such file: exit 1 and nothing printed. Anything
+      // else non-zero, null included (the channel closed under it), is a
+      // read that did not happen.
+      if (r.code === 1 && r.stdout === '') return { kind: 'missing' }
+      if (r.code !== 0) return { kind: 'unread', error: `the read ended with exit ${r.code}` }
+      return { kind: 'state', state: JSON.parse(r.stdout) as AgentState }
+    } catch (e) {
+      return { kind: 'unread', error: describeError(e) }
     }
-    return null
+  }
+
+  /**
+   * A poll that brought no state: bound how long that may go on. True when
+   * the run has settled its chunk and must stop.
+   */
+  private async noState(read: Exclude<StateRead, { kind: 'state' }>): Promise<boolean> {
+    const now = Date.now()
+    if (read.kind === 'unread') {
+      this.unreadSince ??= now
+      if (now - this.unreadSince < STATE_UNREADABLE_MS) return false
+      // Withdrawn, in case the node answers again: its agent would render
+      // on with nobody to fetch the frames. Bounded, like every exec here.
+      await this.retractSpec()
+      if (this.stopped) return true
+      this.fail(
+        'node',
+        own(
+          'machine',
+          'node-silent',
+          `the node has not answered for ${Math.round(STATE_UNREADABLE_MS / 60_000)} min ` +
+            `(${read.error})`
+        )
+      )
+      return true
+    }
+    this.unreadSince = null
+    this.missingSince ??= now
+    if (now - this.missingSince < STATE_MISSING_MS) return false
+    const settled = await this.checkMissingState()
+    if (settled || this.stopped) return true
+    // Waiting its turn, or nothing could be told: ask again in a while.
+    this.missingSince = Date.now()
+    return false
+  }
+
+  /**
+   * No state file STATE_MISSING_MS after the spec was queued: is the spec
+   * still in the agent's inbox, and is the agent alive (its heartbeat)?
+   * - both: it is waiting its turn behind busy slots; wait on.
+   * - the agent is not alive: nothing will ever take the spec. It is
+   *   withdrawn, the chunk goes to another node, and the node is sent
+   *   nothing more (Scheduler.agentDownOn).
+   * - the spec is gone with nothing written for it: something else emptied
+   *   the inbox, as a second launch of the app re-provisioning the node did
+   *   (81fe2875). The chunk goes back in the queue.
+   * Neither costs a render retry: no render was paid for. True when it has
+   * settled the run.
+   */
+  private async checkMissingState(): Promise<boolean> {
+    const [queued, alive] = await Promise.all([this.specQueued(), this.agentUp()])
+    if (this.stopped) return true
+    // One of the checks did not answer: nothing can be told this time.
+    if (queued == null || alive == null) return false
+    if (queued && alive) return false
+    if (!alive) {
+      await this.retractSpec()
+      if (this.stopped) return true
+      await this.downloader?.drain()
+      if (this.stopped) return true
+      const reason =
+        "the node's agent is not running (no heartbeat), so nothing takes the chunks sent to it"
+      scheduler.agentDownOn(this.nodeId, reason)
+      this.fail('dispatch', own('machine', 'agent-down', reason))
+      return true
+    }
+    // Frames of an earlier attempt may be listed: fetched, so the requeue
+    // leaves them out.
+    await this.downloader?.drain()
+    if (this.stopped) return true
+    this.fail(
+      'dispatch',
+      own(
+        'machine',
+        'spec-lost',
+        `the chunk's spec left the node's inbox with no render started for it ` +
+          `(${Math.round(STATE_MISSING_MS / 60_000)} min with no state): something else ` +
+          're-provisioned the node or restarted its agent'
+      )
+    )
+    return true
+  }
+
+  /** Is this chunk's spec still in the agent's inbox? null when that could not be read. */
+  private async specQueued(): Promise<boolean | null> {
+    try {
+      const r = await this.ssh.exec(
+        `cat ${REMOTE_ROOT}/jobs/inbox/${this.chunkId}.json 2>/dev/null`,
+        { timeoutMs: 30_000, label: 'check agent inbox' }
+      )
+      if (r.code === 0) return true
+      if (r.code === 1 && r.stdout === '') return false
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  /** The agent's heartbeat is fresh (provisioner's agentAlive); null when that could not be read. */
+  private agentUp(): Promise<boolean | null> {
+    return within(agentAlive(this.ssh), AGENT_CHECK_TIMEOUT_MS)
   }
 
   private async pollUntilDone(): Promise<void> {
     const frameStep = this.job().frame_step
     for (;;) {
       if (this.stopped) return
-      const state = await this.readAgentState()
+      const read = await this.readAgentState()
       // Aborted during the read: the chunk now belongs to requeue() or
       // cancelJob, and every write below would be to a row this run no longer
       // owns — 'downloading' over the 'pending' a requeue had just set, say.
       if (this.stopped) return
-      if (state) {
+      if (read.kind !== 'state' && (await this.noState(read))) return
+      if (read.kind === 'state') {
+        const state = read.state
+        this.missingSince = null
+        this.unreadSince = null
         // Re-read the range every iteration rather than computing it once:
         // requeue() can narrow this chunk mid-flight, and a cached total then
         // reports progress against a range that no longer exists.
@@ -1100,6 +1272,15 @@ class Scheduler {
    */
   private laneCeilings = new Map<string, number>()
   /**
+   * Nodes whose agent a run found not running (ChunkRun.checkMissingState),
+   * and why. Each chunk sent to one waited STATE_MISSING_MS for nothing and
+   * cost an infrastructure retry, and nothing brings the agent back by
+   * itself, so such a node is sent nothing more and is let go of once idle
+   * (scalePolicy). Restarting its agent is the node supervisor's (plan 1.7);
+   * forgetNode clears the mark when a node comes back.
+   */
+  private agentDown = new Map<string, { since: number; reason: string }>()
+  /**
    * At most one node at a time may be held empty for a waiting exclusive
    * chunk. See reserveForExclusive.
    */
@@ -1203,6 +1384,8 @@ class Scheduler {
     this.slots.delete(nodeId)
     this.laneGuards.delete(nodeId)
     this.laneCeilings.delete(nodeId)
+    this.agentDown.delete(nodeId)
+    this.idleSince.delete(nodeId)
     if (this.reservation?.nodeId === nodeId) this.reservation = null
     // Sent nothing for a while. destroyNode forgets a node before it marks it
     // destroying, and the kick below ran a tick in between: the node still
@@ -1541,6 +1724,30 @@ class Scheduler {
         `so it now runs ${lanesPerGpu} per card`
     })
     nodeManager.get(run.nodeId)?.emitChanged()
+  }
+
+  /**
+   * A run found this node's agent not running (see agentDown). Announced
+   * once, and written on the node, so the fleet view says why it idles.
+   */
+  agentDownOn(nodeId: string, reason: string): void {
+    if (this.agentDown.has(nodeId)) return
+    this.agentDown.set(nodeId, { since: Date.now(), reason })
+    nodeManager.get(nodeId)?.update({ last_error: reason })
+    emit('alert', {
+      level: 'error',
+      message:
+        `${this.nodeName(nodeId)}: ${reason}. Nothing more is sent to it, and it is ` +
+        'destroyed once it has been idle for the idle timeout.'
+    })
+  }
+
+  /**
+   * Why the scheduler sends this node nothing whatever is queued, or null:
+   * for the fleet view and the node supervisor (plan 1.7).
+   */
+  nodeUnfit(nodeId: string): string | null {
+    return this.agentDown.get(nodeId)?.reason ?? null
   }
 
   /**
@@ -1919,6 +2126,7 @@ class Scheduler {
       .filter((n) => ['ready', 'idle', 'rendering'].includes(n.state))
       .filter((n) => nodeManager.get(n.id)?.ssh)
       .filter((n) => !this.resting(n.id, now))
+      .filter((n) => this.nodeUnfit(n.id) == null)
 
     this.runSlotController(eligible)
     this.reserveForExclusive(ready, eligible)
@@ -2192,13 +2400,16 @@ class Scheduler {
    * node renders a chunk. Failures while it rests (runs dispatched before
    * it began) are one spell and extend nothing. Out of GPU memory is not
    * the node's to rest for: that is how many renders share a GPU (plan
-   * 1.11). Never throws.
+   * 1.11). A node that stopped answering mid-render (stage 'node') rests
+   * too; forgetNode's own rest, set first, covers the node going away.
+   * Never throws.
    */
   private rest(f: ChunkFailure): void {
     const restable =
       !f.fatal &&
       ((f.stage === 'dispatch' && budgetFor(f.c) === 'infra' && f.c.kind !== 'localFs') ||
-        (f.stage === 'render' && f.c.kind === 'machine' && f.c.rule !== 'agent-oom'))
+        (f.stage === 'render' && f.c.kind === 'machine' && f.c.rule !== 'agent-oom') ||
+        (f.stage === 'node' && f.c.kind === 'machine'))
     if (!restable) return
     try {
       const now = Date.now()
@@ -2369,7 +2580,9 @@ class Scheduler {
    * its own: forgetNode's alert covers them all. One that failed for good
    * does, since that alert counts only the chunks it requeued. One whose
    * every frame had already arrived is complete: nothing failed, and a
-   * node destroyed at the end of its render warned that it had.
+   * node destroyed at the end of its render warned that it had. A run that
+   * gave its chunk back because the node stopped answering has no such
+   * alert, and says so here.
    */
   private failureAlert(
     before: ChunkRow,
@@ -2379,7 +2592,7 @@ class Scheduler {
     waitMs: number,
     repeat: boolean
   ): AlertEvent | null {
-    if (f.stage === 'node' && r.outcome !== 'failed') return null
+    if (f.stage === 'node' && f.c.rule === 'node-gone' && r.outcome !== 'failed') return null
     const what = `${f.stage === 'dispatch' ? 'dispatch' : 'chunk'} ${before.id} failed`
     if (r.outcome === 'complete') {
       return {
@@ -2634,6 +2847,10 @@ class Scheduler {
     const pendingCount = pending.length
     const nodes = nodeManager.list()
     const usable = nodes.filter(isDispatchable)
+    // What the fleet can render with: not a node this scheduler sends nothing
+    // (nodeUnfit), whose lanes counted as free let the queue look covered
+    // while it waited for a node whose agent is down.
+    const working = usable.filter((n) => this.nodeUnfit(n.id) == null)
 
     // Shared and exclusive work draw on different supplies, so they need
     // separate demand tests. Shared chunks consume free SLOTS; an exclusive
@@ -2642,7 +2859,7 @@ class Scheduler {
     // had room for exclusive chunks that can never be placed on it.
     const pendingShared = pending.filter((c) => c.share_node === 1).length
     const pendingExclusive = pendingCount - pendingShared
-    const sharedCapacity = usable
+    const sharedCapacity = working
       // A node locked by an exclusive chunk, or being drained for one, will
       // not take shared work however many slots it nominally has.
       .filter((n) => !this.occupancy(n.id).hasExclusive && this.reservation?.nodeId !== n.id)
@@ -2661,7 +2878,7 @@ class Scheduler {
         : undefined
     // Free GPU lanes, not empty nodes: a 4-GPU node running one exclusive
     // chunk still has room for three more.
-    const exclusiveCapacity = usable.reduce(
+    const exclusiveCapacity = working.reduce(
       (a, n) => a + freeExclusiveLanes(this.occupancy(n.id, laneEngine)),
       0
     )
@@ -2706,7 +2923,7 @@ class Scheduler {
     }
     // The rate the fleet is measured rendering these jobs at: the runs on
     // usable nodes, from their progress polls.
-    const usableIds = new Set(usable.map((n) => n.id))
+    const usableIds = new Set(working.map((n) => n.id))
     const running = runs.filter((r) => usableIds.has(r.nodeId))
     const rates = running.map((r) => r.rate()).filter((v): v is number => v != null)
 
@@ -2724,9 +2941,9 @@ class Scheduler {
       booting,
       newNodeLanes: newNode.lanes,
       newNodeSharedSlots: Math.max(2, newNode.lanes),
-      usableNodes: usable.length,
-      usableLanes: usable.reduce((a, n) => a + this.lanePlanFor(n.id, laneEngine).lanes, 0),
-      usableSharedSlots: usable.reduce((a, n) => a + this.slotTargetFor(n.id), 0),
+      usableNodes: working.length,
+      usableLanes: working.reduce((a, n) => a + this.lanePlanFor(n.id, laneEngine).lanes, 0),
+      usableSharedSlots: working.reduce((a, n) => a + this.slotTargetFor(n.id), 0),
       pendingFrames: pending.reduce((a, c) => a + c.frames_left, 0),
       remainingExclusiveFrames,
       remainingSharedFrames,
@@ -2764,23 +2981,25 @@ class Scheduler {
     // `pendingCount`: during a local-disk hold tick() sends nothing, and the
     // pending chunks kept every idle node alive, billing, for as long as the
     // disk stayed full. frameDownloader's SINK_HOLD_MS is the bound on that.
-    if (opts.sendable === 0) {
-      for (const n of usable) {
-        if (n.state !== 'idle' && n.state !== 'ready') continue
-        if (this.hasRuns(n.id)) continue
-        // Never destroy a node we are deliberately holding empty for a
-        // waiting exclusive chunk.
-        if (this.reservation?.nodeId === n.id) continue
-        const idleSince = this.idleSince.get(n.id) ?? Date.now()
-        this.idleSince.set(n.id, idleSince)
-        if (Date.now() - idleSince > settings.idleTimeoutMinutes * 60_000) {
-          this.idleSince.delete(n.id)
-          emit('alert', { level: 'info', message: `destroying idle node ${n.gpuName}` })
-          void nodeManager.destroyNode(n.id)
-        }
+    // Nor for a node this scheduler sends nothing whatever is queued (its
+    // agent is down: nodeUnfit), which the queue otherwise kept billing.
+    for (const n of usable) {
+      if (opts.sendable > 0 && this.nodeUnfit(n.id) == null) {
+        this.idleSince.delete(n.id)
+        continue
       }
-    } else {
-      this.idleSince.clear()
+      if (n.state !== 'idle' && n.state !== 'ready') continue
+      if (this.hasRuns(n.id)) continue
+      // Never destroy a node we are deliberately holding empty for a
+      // waiting exclusive chunk.
+      if (this.reservation?.nodeId === n.id) continue
+      const idleSince = this.idleSince.get(n.id) ?? Date.now()
+      this.idleSince.set(n.id, idleSince)
+      if (Date.now() - idleSince > settings.idleTimeoutMinutes * 60_000) {
+        this.idleSince.delete(n.id)
+        emit('alert', { level: 'info', message: `destroying idle node ${n.gpuName}` })
+        void nodeManager.destroyNode(n.id)
+      }
     }
   }
 
