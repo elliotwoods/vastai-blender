@@ -6,6 +6,7 @@
 import Database from 'better-sqlite3'
 import { app } from 'electron'
 import { join } from 'path'
+import { MAX_INFRA_RETRIES, MAX_RETRIES } from '../scheduler/admission'
 import schemaSql from './schema.sql?raw'
 
 export type Db = Database.Database
@@ -41,9 +42,10 @@ export function applySchema(db: Db): void {
   migrate(db)
   backfillUsageLog(db)
   resetGpuLearning(db)
+  markCancelledChunks(db)
 }
 
-const SCHEMA_VERSION = 6
+const SCHEMA_VERSION = 7
 
 /**
  * Column additions, which `CREATE TABLE IF NOT EXISTS` in schema.sql cannot
@@ -228,6 +230,30 @@ function resetGpuLearning(db: Db): void {
     db.prepare('DELETE FROM gpu_perf').run()
     db.prepare('DELETE FROM gpu_slots').run()
     db.prepare("INSERT INTO history_meta (key, value) VALUES ('gpu_units_v1', ?)").run(
+      String(Date.now())
+    )
+  })()
+}
+
+/**
+ * Give cancelled jobs' chunks the 'cancelled' state (v7). Until then a cancel
+ * marked every open chunk 'failed', so a job's screen could not tell the
+ * chunks the user stopped from those that failed for good. A failed chunk of
+ * a cancelled job whose retries are spent (either budget) failed before the
+ * cancel, and keeps its verdict; the rest were open when it came. Guarded by
+ * a history_meta marker so it runs exactly once: after it, 'failed' is only
+ * ever written for a real failure.
+ */
+function markCancelledChunks(db: Db): void {
+  const done = db.prepare("SELECT value FROM history_meta WHERE key = 'cancelled_chunks_v1'").get()
+  if (done) return
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE chunks SET state = 'cancelled'
+        WHERE state = 'failed' AND retries < ? AND infra_retries < ?
+          AND job_id IN (SELECT id FROM jobs WHERE state = 'cancelled')`
+    ).run(MAX_RETRIES, MAX_INFRA_RETRIES)
+    db.prepare("INSERT INTO history_meta (key, value) VALUES ('cancelled_chunks_v1', ?)").run(
       String(Date.now())
     )
   })()

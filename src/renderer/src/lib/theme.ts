@@ -126,5 +126,6 @@ export const CHUNK_TONE: Record<ChunkState, StatusTone> = {
   encoding: 'running',
   downloading: 'running',
   complete: 'done',
-  failed: 'error'
+  failed: 'error',
+  cancelled: 'dead'
 }

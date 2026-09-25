@@ -63,7 +63,7 @@ export function retryMissingOffer(job: JobDetail): RetryOffer | null {
     if (missing <= 0) return null
     return { label: `re-render missing (${plural(missing, 'frame')})`, confirmLabel, title }
   }
-  const failed = job.chunks.filter((c) => c.state === 'failed').length
+  const failed = job.chunks.filter((c) => c.state === 'failed' || c.state === 'cancelled').length
   if (failed === 0) return null
   return {
     label: `re-render missing (${plural(failed, 'failed chunk')})`,

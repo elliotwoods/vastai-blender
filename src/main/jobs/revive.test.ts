@@ -185,6 +185,7 @@ describe('reviveFailedChunks', () => {
     download(jobId, 1, 2, 3, 4)
     await app.scheduler.cancelJob(jobId)
     expect(jobState(jobId)).toBe('cancelled')
+    expect(chunksOf(jobId).map((c) => c.state)).toEqual(['cancelled', 'cancelled'])
 
     expect(await revive(jobId)).toEqual({ frames: 4, chunks: 1 })
     expect(chunksOf(jobId).map((c) => [c.id, c.frame_start, c.frame_end, c.state])).toEqual([
@@ -193,6 +194,24 @@ describe('reviveFailedChunks', () => {
       [b.id, 5, 8, 'pending']
     ])
     expect(jobState(jobId)).toBe('running')
+  })
+
+  it('narrows a cancelled chunk as it does a failed one, and revives both', async () => {
+    const app = await w.boot({ start: false })
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 8, chunkSize: 4 })
+    const [a, b] = chunksOf(jobId)
+    // a failed for good before the cancel; b had frames 5 and 6 land.
+    fail(a.id)
+    download(jobId, 5, 6)
+    await app.scheduler.cancelJob(jobId)
+    expect(chunksOf(jobId).map((c) => c.state)).toEqual(['failed', 'cancelled'])
+
+    expect(await revive(jobId)).toEqual({ frames: 6, chunks: 2 })
+    expect(chunksOf(jobId).map((c) => [c.id, c.frame_start, c.frame_end, c.state])).toEqual([
+      [a.id, 1, 4, 'pending'],
+      [b.id, 7, 8, 'pending']
+    ])
+    expect(jobState(jobId)).toBe('queued')
   })
 
   it('refuses a job the scheduler failed outright, writing nothing', async () => {

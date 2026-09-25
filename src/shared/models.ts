@@ -654,8 +654,22 @@ export interface HistorySummary {
 
 export type JobState = 'queued' | 'running' | 'complete' | 'partial' | 'failed' | 'cancelled'
 
+/**
+ * A chunk's lifecycle. 'failed' is a chunk that ran out of retries, or one a
+ * failed job settled; 'cancelled' is one the user's cancel stopped before it
+ * finished. Both are final until "re-render missing" reopens them
+ * (jobs/revive.ts). Frames carry no such state: a cancelled frame is one not
+ * yet downloaded whose chunk is cancelled.
+ */
 export type ChunkState =
-  'pending' | 'assigned' | 'rendering' | 'encoding' | 'downloading' | 'complete' | 'failed'
+  | 'pending'
+  | 'assigned'
+  | 'rendering'
+  | 'encoding'
+  | 'downloading'
+  | 'complete'
+  | 'failed'
+  | 'cancelled'
 
 export interface JobSubmission {
   blendPath: string
@@ -730,6 +744,8 @@ export interface JobSummary {
   state: JobState
   framesDone: number
   framesTotal: number
+  /** frames not downloaded whose chunk was cancelled (ChunkState 'cancelled') */
+  framesCancelled: number
   costSoFar: number
   /** epoch ms */
   submittedAt: number

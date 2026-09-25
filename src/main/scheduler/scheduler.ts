@@ -62,6 +62,8 @@ import {
   freeExclusiveLanes,
   hasRoom,
   JobBreaker,
+  MAX_INFRA_RETRIES,
+  MAX_RETRIES,
   NODE_REST_BASE_MS,
   nodeRestMs,
   renderOnMachine,
@@ -110,21 +112,6 @@ const STATE_POLL_MS = 5_000
 const SCALE_BACKOFF_AFTER = 2
 const SCALE_BACKOFF_BASE_MS = 60_000
 const SCALE_BACKOFF_MAX_MS = 15 * 60_000
-/**
- * Failed renders a chunk may have before it fails for good: the scene or
- * Blender failing, what `chunks.retries` counts (plan 1.17). A dispatch that
- * lost its SSH channel, a node that died or stalled, a download that failed
- * are the machines' failures and never charged here: they used to be, and
- * job 1d59516c's 16 chunks spent all four on two instances Vast had stopped.
- */
-const MAX_RETRIES = 4
-/**
- * Failed attempts a chunk may have for the machines' and the network's
- * reasons (`chunks.infra_retries`): larger, because none of them says the
- * render is wrong, but still a bound, because each one can cost a paid
- * render (a node that dies mid-chunk, a transfer that never lands).
- */
-const MAX_INFRA_RETRIES = 8
 
 /**
  * Per-node preparation mutex. With nodeSlots > 1 several ChunkRuns dispatch
@@ -1131,7 +1118,7 @@ class ChunkRun {
     // node. A cancel or a node death lands in that window routinely — and
     // `stopped` was previously only read once polling had started, so prep
     // resumed and handed the agent a chunk nobody wanted: the spec was written,
-    // the row flipped back to 'rendering' over the 'failed' cancelJob had just
+    // the row flipped back to 'rendering' over the 'cancelled' cancelJob had just
     // set, and a downloader was started whose stop() was already unreachable,
     // leaving it polling for the life of the process.
     if (this.abandoned('after node prep')) return
@@ -2286,13 +2273,13 @@ class Scheduler {
     return { jobIds: [], since: Date.now() }
   }
 
-  /** Jobs still queued or running with a chunk that is neither complete nor failed. */
+  /** Jobs still queued or running with a chunk that is not yet settled (complete, failed, cancelled). */
   private unfinishedJobIds(): string[] {
     return (
       getDb()
         .prepare(
           `SELECT DISTINCT c.job_id FROM chunks c JOIN jobs j ON j.id = c.job_id
-            WHERE j.state IN ('queued', 'running') AND c.state NOT IN ('complete', 'failed')`
+            WHERE j.state IN ('queued', 'running') AND c.state NOT IN ('complete', 'failed', 'cancelled')`
         )
         .all() as Array<{ job_id: string }>
     ).map((r) => r.job_id)
@@ -2322,7 +2309,7 @@ class Scheduler {
               .prepare(
                 `SELECT COUNT(*) AS n FROM chunks c JOIN jobs j ON j.id = c.job_id
                   WHERE c.job_id IN (${marks}) AND j.state IN ('queued', 'running')
-                    AND c.state NOT IN ('complete', 'failed')`
+                    AND c.state NOT IN ('complete', 'failed', 'cancelled')`
               )
               .get(...hold.jobIds) as { n: number }
           ).n
@@ -4326,19 +4313,25 @@ class Scheduler {
    * Everything up to the node cleanup is synchronous, and the rows are written
    * in one transaction. The old loop awaited a pkill per chunk and judged each
    * chunk by a snapshot read before the first of them. A run later in the list
-   * could finish during those awaits and have its 'complete' overwritten with
-   * 'failed'. A crash mid-loop left a cancelled job with live-looking chunks
+   * could finish during those awaits and have its 'complete' overwritten by
+   * the cancel. A crash mid-loop left a cancelled job with live-looking chunks
    * for the next start() to "recover".
    */
   async cancelJob(jobId: string): Promise<void> {
     const db = getDb()
     const settled = db.transaction((): string[] => {
       db.prepare("UPDATE jobs SET state = 'cancelled' WHERE id = ?").run(jobId)
+      // 'cancelled', not 'failed': the user stopped them, nothing went wrong,
+      // and the job screen shows the two apart. A chunk already failed for
+      // good keeps its verdict.
       const open = db
-        .prepare("SELECT id FROM chunks WHERE job_id = ? AND state NOT IN ('complete', 'failed')")
+        .prepare(
+          "SELECT id FROM chunks WHERE job_id = ? AND state NOT IN ('complete', 'failed', 'cancelled')"
+        )
         .all(jobId) as Array<{ id: string }>
       db.prepare(
-        "UPDATE chunks SET state = 'failed' WHERE job_id = ? AND state NOT IN ('complete', 'failed')"
+        `UPDATE chunks SET state = 'cancelled'
+          WHERE job_id = ? AND state NOT IN ('complete', 'failed', 'cancelled')`
       ).run(jobId)
       return open.map((c) => c.id)
     })()

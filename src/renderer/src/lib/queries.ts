@@ -547,7 +547,7 @@ export function useIpcEvents(): void {
         qc.invalidateQueries({ queryKey: qk.job(c.jobId) })
         if (c.nodeId) qc.invalidateQueries({ queryKey: qk.nodeChunks(c.nodeId) })
         else qc.invalidateQueries({ queryKey: ['nodeChunks'] })
-        if (c.state === 'complete' || c.state === 'failed') {
+        if (c.state === 'complete' || c.state === 'failed' || c.state === 'cancelled') {
           useProgressStore.getState().forget(c.chunkId)
         }
       },

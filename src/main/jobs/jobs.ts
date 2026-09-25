@@ -125,6 +125,14 @@ function rowToSummary(r: JobRow): JobSummary {
       .prepare("SELECT COUNT(*) AS n FROM frames WHERE job_id = ? AND state = 'downloaded'")
       .get(r.id) as { n: number }
   ).n
+  const cancelled = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM frames f JOIN chunks c ON c.id = f.chunk_id
+          WHERE f.job_id = ? AND f.state != 'downloaded' AND c.state = 'cancelled'`
+      )
+      .get(r.id) as { n: number }
+  ).n
   return {
     id: r.id,
     name: r.name,
@@ -136,6 +144,7 @@ function rowToSummary(r: JobRow): JobSummary {
     state: r.state,
     framesDone: done,
     framesTotal: total,
+    framesCancelled: cancelled,
     costSoFar: r.cost_so_far,
     submittedAt: r.submitted_at,
     outputDir: r.output_dir,
@@ -494,8 +503,9 @@ export function refreshJobState(jobId: string): void {
   const count = (s: ChunkState): number => chunks.find((c) => c.state === s)?.n ?? 0
   const total = chunks.reduce((a, c) => a + c.n, 0)
   let state: JobState
+  const stopped = count('failed') + count('cancelled')
   if (count('complete') === total) state = 'complete'
-  else if (count('failed') > 0 && count('complete') + count('failed') === total) state = 'partial'
+  else if (stopped > 0 && count('complete') + stopped === total) state = 'partial'
   else if (count('pending') === total) state = 'queued'
   else state = 'running'
   // Complete means every frame is on disk, not just that every chunk says so.

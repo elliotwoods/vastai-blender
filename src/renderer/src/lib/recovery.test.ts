@@ -39,6 +39,7 @@ function job(patch: Partial<JobDetail>): JobDetail {
     state: 'partial',
     framesDone: 5,
     framesTotal: 8,
+    framesCancelled: 0,
     costSoFar: 0,
     submittedAt: 0,
     outputDir: '/renders/job-1',

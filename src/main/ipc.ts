@@ -254,6 +254,7 @@ function mockJobDetail(jobId: string): JobDetail | null {
       framesDone: c.framesDone,
       retries: c.retries
     }))
+  chunks.push(...mockSettledChunks(summary.id))
   return { ...summary, chunks, addonIds: [] }
 }
 
@@ -455,6 +456,7 @@ const mockJobs = (): JobSummary[] => [
     state: 'running',
     framesDone: 117,
     framesTotal: 250,
+    framesCancelled: 0,
     costSoFar: 1.24,
     submittedAt: Date.now() - 55 * 60_000,
     outputDir: 'C:/renders/job-1',
@@ -472,13 +474,65 @@ const mockJobs = (): JobSummary[] => [
     state: 'queued',
     framesDone: 0,
     framesTotal: 120,
+    framesCancelled: 0,
     costSoFar: 0,
     submittedAt: Date.now() - 4 * 60_000,
     outputDir: 'C:/renders/job-2',
     blenderVersion: '4.3.2',
     shareNode: true
+  },
+  // Cancelled part-way, with one chunk that had failed for good before the
+  // cancel: the job screen shows failed and cancelled chunks apart.
+  {
+    id: 'job-3',
+    name: 'fx_smoke_r3',
+    blendPath: 'C:/scenes/fx_smoke_r3.blend',
+    engine: 'cycles',
+    frameStart: 1,
+    frameEnd: 200,
+    frameStep: 1,
+    state: 'cancelled',
+    framesDone: 80,
+    framesTotal: 200,
+    framesCancelled: 100,
+    costSoFar: 0.61,
+    submittedAt: Date.now() - 3 * 3_600_000,
+    outputDir: 'C:/renders/job-3',
+    blenderVersion: '4.5.3',
+    shareNode: false
   }
 ]
+
+/** Chunks of the mock jobs that no mock node holds (job-3's, all settled). */
+const mockSettledChunks = (jobId: string): ChunkSnapshot[] => {
+  if (jobId !== 'job-3') return []
+  const chunk = (
+    frameStart: number,
+    frameEnd: number,
+    state: ChunkState,
+    framesDone: number,
+    retries = 0
+  ): ChunkSnapshot => ({
+    id: `job3abcd-${frameStart}-${frameEnd}`,
+    jobId,
+    frameStart,
+    frameEnd,
+    state,
+    nodeId: null,
+    framesDone,
+    retries,
+    ...(state === 'failed'
+      ? { errorClass: 'job' as const, lastError: 'blender exited with code 1 (out of GPU memory)' }
+      : {})
+  })
+  return [
+    chunk(1, 40, 'complete', 40),
+    chunk(41, 80, 'complete', 40),
+    chunk(81, 100, 'failed', 3, 4),
+    chunk(101, 150, 'cancelled', 12),
+    chunk(151, 200, 'cancelled', 0)
+  ]
+}
 
 /**
  * A mock fleet split across a dirty and a clean grid, so the CO2 breakdown has

@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS chunks (
   job_id TEXT NOT NULL REFERENCES jobs(id),
   frame_start INTEGER NOT NULL,
   frame_end INTEGER NOT NULL,
-  state TEXT NOT NULL,                -- pending | assigned | rendering | encoding | downloading | complete | failed
+  state TEXT NOT NULL,                -- pending | assigned | rendering | encoding | downloading | complete | failed | cancelled
   node_id TEXT,
   frames_done INTEGER NOT NULL DEFAULT 0,
   retries INTEGER NOT NULL DEFAULT 0,
@@ -255,9 +255,10 @@ CREATE TABLE IF NOT EXISTS balance_log (
 );
 
 -- One-shot markers for data migrations that can't be expressed as CREATE TABLE
--- IF NOT EXISTS: backfill_v1 (the cost_log → usage_log backfill) and
--- gpu_units_v1 (the per-GPU wipe of gpu_perf and gpu_slots). Value = epoch ms
--- the migration ran.
+-- IF NOT EXISTS: backfill_v1 (the cost_log → usage_log backfill),
+-- gpu_units_v1 (the per-GPU wipe of gpu_perf and gpu_slots) and
+-- cancelled_chunks_v1 (cancelled jobs' open chunks, once written 'failed',
+-- become 'cancelled'). Value = epoch ms the migration ran.
 CREATE TABLE IF NOT EXISTS history_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL

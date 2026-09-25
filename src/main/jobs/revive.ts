@@ -5,7 +5,8 @@
  * One copy of the SQL for both, moved out of index.ts.
  *
  * A chunk fails for good once its retries are spent, perhaps by a dispatch
- * bug fixed since, and a cancel fails every chunk still open. Either way it
+ * bug fixed since, and a cancel marks every chunk still open 'cancelled'.
+ * Either way it
  * keeps the range of its last attempt, frames that landed during it
  * included: requeue narrows a range only when it sends the chunk out again.
  * The spec sends the whole range, so a chunk revived as it stood rendered
@@ -13,7 +14,7 @@
  * that still had the chunk's folder). So each one is narrowed first, as
  * requeue does it (missingRanges over the frames table): it keeps its id for
  * its first run of missing frames, each further run becomes a new chunk, and
- * a failed chunk with nothing missing is complete.
+ * a failed or cancelled chunk with nothing missing is complete.
  *
  * "Missing" is every frame not yet downloaded that no live chunk (pending or
  * in flight) already covers, read from the frames table rather than the
@@ -45,6 +46,9 @@ import { getSettings } from '../settings'
 import { autoChunkSize, missingRanges, splitFrames, type FrameRange } from '../scheduler/chunker'
 import type { ChunkState, JobState, RetryMissingResult } from '../../shared/models'
 import { emitChunksChanged, refreshJobState } from './jobs'
+
+/** A chunk that stopped short of complete: out of retries, or cancelled. */
+const STOPPED: ReadonlySet<ChunkState> = new Set<ChunkState>(['failed', 'cancelled'])
 
 /** A chunk with a run to come or under way: its frames are already queued. */
 const LIVE: ReadonlySet<ChunkState> = new Set<ChunkState>([
@@ -125,8 +129,8 @@ export function reviveFailedChunks(jobId: string): RetryMissingResult {
       .map((r) => r.frame)
       .filter((f) => !covered(f))
   )
-  // Nothing to queue, and no failed chunk to settle as complete.
-  if (missing.size === 0 && !chunks.some((c) => c.state === 'failed')) {
+  // Nothing to queue, and no stopped chunk to settle as complete.
+  if (missing.size === 0 && !chunks.some((c) => STOPPED.has(c.state))) {
     return { frames: 0, chunks: 0 }
   }
 
@@ -178,7 +182,7 @@ export function reviveFailedChunks(jobId: string): RetryMissingResult {
     }
 
     for (const c of chunks) {
-      if (c.state !== 'failed' && c.state !== 'complete') continue
+      if (!STOPPED.has(c.state) && c.state !== 'complete') continue
       // Its frames still to render: missing, and not claimed by a chunk
       // before it.
       const have = new Set<number>()
@@ -187,7 +191,7 @@ export function reviveFailedChunks(jobId: string): RetryMissingResult {
       if (ranges.length === 0) {
         // Everything it was to deliver is on disk: complete, or the job
         // stays partial with no frame missing.
-        if (c.state === 'failed') {
+        if (STOPPED.has(c.state)) {
           complete.run(c.id)
           touched.push(c.id)
         }

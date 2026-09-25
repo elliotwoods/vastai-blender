@@ -103,7 +103,8 @@ function Overlay({
   const step = job?.frameStep ?? 1
   const chunk = job?.chunks.find((c) => c.id === target.chunkId) ?? null
   // Job mode only ever holds complete chunks, so nothing in it is "rendering".
-  const rendering = !jobMode && !!chunk && !['complete', 'failed'].includes(chunk.state)
+  const rendering =
+    !jobMode && !!chunk && !['complete', 'failed', 'cancelled'].includes(chunk.state)
   // Frames the job and this chunk cover. Declared up here because the transport
   // needs `chunkFrames` to convert `target.frame` (a job frame number) into a
   // clip-relative index; the still fallback below uses them too.

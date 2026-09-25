@@ -131,6 +131,13 @@ stalled the app).
 
 ### Changed
 
+- **Cancelled is not failed.** Cancelling a job used to mark its unfinished
+  chunks *failed*, so the job screen could not tell what the user stopped from
+  what ran out of retries. They are now *cancelled* (a new chunk state), jobs
+  report `framesCancelled`, and *re-render missing* reopens them as it does
+  failed ones. On upgrade, the failed chunks of cancelled jobs that still had
+  retries left become cancelled (schema v7, once).
+
 - **The next chunk no longer waits for the last one's encode and download
   (#180).** An exclusive chunk held its GPU lane until its frames were
   downloaded, and on the node until its previews were encoded, so the GPU sat

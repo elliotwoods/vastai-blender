@@ -19,6 +19,22 @@ import type { ErrorClass } from '../../shared/models'
  */
 export const PREFETCH = 2
 
+/**
+ * Failed renders a chunk may have before it fails for good: the scene or
+ * Blender failing, what `chunks.retries` counts (plan 1.17). A dispatch that
+ * lost its SSH channel, a node that died or stalled, a download that failed
+ * are the machines' failures and never charged here: they used to be, and
+ * job 1d59516c's 16 chunks spent all four on two instances Vast had stopped.
+ */
+export const MAX_RETRIES = 4
+/**
+ * Failed attempts a chunk may have for the machines' and the network's
+ * reasons (`chunks.infra_retries`): larger, because none of them says the
+ * render is wrong, but still a bound, because each one can cost a paid
+ * render (a node that dies mid-chunk, a transfer that never lands).
+ */
+export const MAX_INFRA_RETRIES = 8
+
 export interface NodeOccupancy {
   /** chunks in flight on the node (rendering, encoding, downloading, prefetched) */
   inFlight: number

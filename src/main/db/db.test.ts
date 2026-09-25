@@ -31,6 +31,8 @@ vi.mock('electron', () => ({
   }
 }))
 
+/** db.ts's SCHEMA_VERSION: what applySchema records. */
+const SCHEMA_VERSION = 7
 const NOW = 1_700_000_000_000
 const MINUTE = 60_000
 const T0 = NOW - 30 * 24 * 60 * MINUTE
@@ -305,9 +307,10 @@ describe('a fresh database', () => {
     // 1.3 install id, 1.9 recovery hold, 1.20 account hold
     expect(columnNames(db, 'app_state')).toEqual(['key', 'value', 'updated_at'])
 
-    expect(get(db, 'SELECT version FROM schema_meta')).toEqual({ version: 6 })
+    expect(get(db, 'SELECT version FROM schema_meta')).toEqual({ version: SCHEMA_VERSION })
     expect(all(db, 'SELECT key FROM history_meta ORDER BY key')).toEqual([
       { key: 'backfill_v1' },
+      { key: 'cancelled_chunks_v1' },
       { key: 'gpu_units_v1' }
     ])
   })
@@ -354,7 +357,7 @@ describe.each([
     const used = legacyDb(sql, version, seed)
     applySchema(used)
     expect(shape(used)).toEqual(fresh)
-    expect(get(used, 'SELECT version FROM schema_meta')).toEqual({ version: 6 })
+    expect(get(used, 'SELECT version FROM schema_meta')).toEqual({ version: SCHEMA_VERSION })
   })
 
   it('changes nothing more at the next launch', () => {
@@ -509,6 +512,50 @@ describe.each([
     expect(get(db, "SELECT value FROM history_meta WHERE key = 'gpu_units_v1'")).toEqual({
       value: String(NOW)
     })
+  })
+
+  it("marks a cancelled job's open chunks cancelled, once, keeping real failures (v7)", () => {
+    const db = legacyDb(sql, version, (d) => {
+      seed(d)
+      const job = d.prepare(
+        `INSERT INTO jobs (id, name, blend_path, engine, frame_start, frame_end, frame_step, state,
+           blender_version, addon_ids, chunk_size, output_dir, cost_so_far, submitted_at)
+         VALUES (?, ?, '/scenes/a.blend', 'cycles', 1, 40, 1, ?, '4.2.3', '[]', 10, ?, 0, ?)`
+      )
+      job.run('job-c', 'cancelled job', 'cancelled', '/renders/job-c', T0)
+      job.run('job-p', 'partial job', 'partial', '/renders/job-p', T0)
+      const chunk = d.prepare(
+        `INSERT INTO chunks (id, job_id, frame_start, frame_end, state, frames_done, retries)
+         VALUES (?, ?, ?, ?, ?, 0, ?)`
+      )
+      // A cancel before v7 wrote 'failed' over every open chunk.
+      chunk.run('c-1-10', 'job-c', 1, 10, 'complete', 0)
+      chunk.run('c-11-20', 'job-c', 11, 20, 'failed', 1)
+      chunk.run('c-21-30', 'job-c', 21, 30, 'failed', 0)
+      // Out of render retries before the cancel came: a real failure.
+      chunk.run('c-31-40', 'job-c', 31, 40, 'failed', 4)
+      // Not a cancelled job's: failed for good, whatever its retries.
+      chunk.run('p-1-10', 'job-p', 1, 10, 'failed', 0)
+    })
+    applySchema(db)
+    const states = (): Row[] =>
+      all(db, "SELECT id, state FROM chunks WHERE job_id IN ('job-c', 'job-p') ORDER BY id")
+    expect(states()).toEqual([
+      { id: 'c-1-10', state: 'complete' },
+      { id: 'c-11-20', state: 'cancelled' },
+      { id: 'c-21-30', state: 'cancelled' },
+      { id: 'c-31-40', state: 'failed' },
+      { id: 'p-1-10', state: 'failed' }
+    ])
+    expect(get(db, "SELECT value FROM history_meta WHERE key = 'cancelled_chunks_v1'")).toEqual({
+      value: String(NOW)
+    })
+
+    // A chunk this build fails after a cancel (none does; a hand edit might)
+    // is not touched by the next launch.
+    db.prepare("UPDATE chunks SET state = 'failed' WHERE id = 'c-21-30'").run()
+    applySchema(db)
+    expect(get(db, "SELECT state FROM chunks WHERE id = 'c-21-30'")).toEqual({ state: 'failed' })
   })
 })
 

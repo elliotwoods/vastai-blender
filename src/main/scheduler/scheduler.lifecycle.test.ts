@@ -184,17 +184,49 @@ describe('stale runs', () => {
     // The renderer hears the cancel: the Jobs list reads the job from job:changed.
     const announced = w.eventsOf('job:changed').slice(jobEventsBefore)
     expect(announced.filter((j) => j.id === jobId).map((j) => j.state)).toContain('cancelled')
-    expect(chunkRow(chunk.id).state).toBe('failed')
+    // Cancelled, not failed: the user stopped it, and the job screen says so.
+    expect(chunkRow(chunk.id).state).toBe('cancelled')
 
     // The drain's read now fails; the aborted run wakes up with nothing left to own.
     gate.reject(new Error('(SSH) Channel open failure'))
     await w.advance(2 * 60_000)
 
     expect(jobState(jobId)).toBe('cancelled')
-    expect(chunkRow(chunk.id)).toMatchObject({ state: 'failed', retries: 0 })
-    expect(chunkStates(chunk.id).at(-1)).toBe('failed')
+    expect(chunkRow(chunk.id)).toMatchObject({ state: 'cancelled', retries: 0 })
+    expect(chunkStates(chunk.id).at(-1)).toBe('cancelled')
     // Dispatched once, and never again.
     expect(chunkStates(chunk.id).filter((s) => s === 'assigned')).toHaveLength(1)
+  })
+
+  it("a cancel marks the job's open chunks cancelled, and re-render missing picks them up", async () => {
+    const { app, machine } = await oneNode()
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 2 })
+    app.scheduler.kick()
+    await w.until(
+      () =>
+        w.all<ChunkRow>("SELECT * FROM chunks WHERE job_id = ? AND state = 'rendering'", jobId)
+          .length === 1,
+      'a chunk rendering'
+    )
+
+    await w.invoke('job:cancel', jobId)
+    const states = (): string[] =>
+      w
+        .all<ChunkRow>('SELECT * FROM chunks WHERE job_id = ? ORDER BY frame_start', jobId)
+        .map((c) => c.state)
+    // The running chunk and the one still waiting alike: none of them failed.
+    expect(states()).toEqual(['cancelled', 'cancelled'])
+    expect(jobState(jobId)).toBe('cancelled')
+    const summary = (await w.invoke('jobs:list')).find((j) => j.id === jobId)!
+    expect(summary).toMatchObject({ framesDone: 0, framesTotal: 4, framesCancelled: 4 })
+
+    machine.agent.autoFinish()
+    expect(await w.invoke('job:retryMissing', jobId)).toEqual({ frames: 4, chunks: 2 })
+    expect(states()).not.toContain('cancelled')
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
+    expect((await w.invoke('jobs:list')).find((j) => j.id === jobId)?.framesCancelled).toBe(0)
   })
 
   it('a run whose node goes away mid-drain never writes over the chunk its successor now owns', async () => {
