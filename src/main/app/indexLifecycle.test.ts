@@ -475,7 +475,8 @@ describe('index.ts installs the quit lifecycle (plan 1.1, field incident A1)', (
     r.power.emit('suspend')
     expect(r.notifications).toEqual([
       'Going to sleep with 1 node billing $0.40/hr: it keeps billing while this computer ' +
-        'sleeps, and nothing renders or downloads until it wakes'
+        'sleeps, and nothing downloads until it wakes. After 30 minutes without the app, ' +
+        'a node with nothing left to render destroys itself'
     ])
   })
 

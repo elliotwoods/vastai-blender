@@ -318,7 +318,7 @@ def heartbeat_loop():
 # How long a node waits with no word from the app, and nothing to render,
 # before it destroys itself. Long enough for an app restart or update, a
 # short sleep or a network blip; short enough that a node left behind wastes
-# about $4 at an 8×4090's $8/h. nodeManager.ts's NODE_LEASE_TTL_MS mirrors it.
+# about $4 at an 8×4090's $8/h. The app renews the lease on every usage probe (nodeManager.ts, LEASE_RENEW).
 LEASE_TTL = 30 * 60
 # Seconds between the watchdog's looks at the lease.
 LEASE_CHECK_EVERY = 30.0

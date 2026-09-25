@@ -456,10 +456,11 @@ function GeneralSection(): React.JSX.Element {
           <option value="0">off — one render, all GPUs</option>
         </select>
         <span style={hintText}>
-          On a multi-GPU node, each GPU renders its own chunk (pinned with CUDA_VISIBLE_DEVICES), so
-          per-frame CPU work such as scene sync overlaps other GPUs&apos; sampling instead of idling
-          all of them. Two per GPU also overlaps it on the same GPU, at the cost of a second copy of
-          the scene in VRAM and RAM.
+          On a multi-GPU node, each GPU renders its own Cycles chunk (pinned with
+          CUDA_VISIBLE_DEVICES) while the queue has enough of them, so per-frame CPU work such as
+          scene sync overlaps other GPUs&apos; sampling instead of idling all of them. Two per GPU
+          also overlaps it on the same GPU, at the cost of a second copy of the scene in VRAM and
+          RAM.
         </span>
       </div>
       <FieldNote error={errorFor('slotsPerGpu')} />
@@ -928,8 +929,8 @@ function OffersSection(): React.JSX.Element {
           width={90}
         />
         <span style={hintText}>
-          blank = any. Each GPU renders its own chunk, so a 4-GPU node is four render slots on one
-          rental; ranking is per GPU either way.
+          blank = any. A Cycles chunk runs per GPU, so a 4-GPU node is up to four render slots on
+          one rental; ranking is per GPU either way.
         </span>
       </div>
       {note('minNumGpus')}

@@ -12,7 +12,7 @@
 export const HINTS = {
   rate: 'The on-demand price vast.ai quoted for this machine, fixed when it was rented.',
   spent:
-    'Estimated spend on this node. The app meters this itself — it adds a minute of the rate once a minute while running — so it is not vast.ai’s invoice and reads low if the app was closed or the computer slept.',
+    'Estimated spend on this node. The app meters this itself — it adds a minute of the rate once a minute while running — so it is not vast.ai’s invoice. Time asleep is added on waking; time with the app closed is not metered.',
   energy:
     'GPU energy this node has drawn since the app was opened, from its power readings. It is not kept across a restart.',
   actual:

@@ -33,7 +33,7 @@ export function ScaleStatusLine(): React.JSX.Element | null {
       {line.spendCap ? (
         <button
           style={{ ...btn({ variant: 'ghost', size: 'sm' }), padding: '1px 6px' }}
-          onClick={() => navigate({ screen: 'settings', section: 'api' })}
+          onClick={() => navigate({ screen: 'settings', section: 'general' })}
         >
           spend cap settings
         </button>

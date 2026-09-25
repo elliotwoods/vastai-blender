@@ -1172,7 +1172,8 @@ describe('sleep (plan 1.1, #45)', () => {
 
     const warning =
       'Going to sleep with 2 nodes billing $0.80/hr: they keep billing while this computer ' +
-      'sleeps, and nothing renders or downloads until it wakes'
+      'sleeps, and nothing downloads until it wakes. After 30 minutes without the app, ' +
+      'a node with nothing left to render destroys itself'
     expect(w.alerts('warn')).toContain(warning)
     expect(r.notes).toEqual([warning])
   })

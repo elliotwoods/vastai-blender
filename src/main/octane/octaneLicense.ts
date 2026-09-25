@@ -131,7 +131,7 @@ export class OctaneBlenderMissingError extends Error {
     super(
       octaneImage
         ? `Octane job, but the docker image set for Octane nodes has no OctaneBlender ` +
-            `(${OCTANE_BLENDER}): set one that has it (Settings → Docker image for Octane)`
+            `(${OCTANE_BLENDER}): set one that has it (Settings → Octane → Docker images)`
         : `Octane job, but OctaneBlender is not installed on this node (${OCTANE_BLENDER}): ` +
             'Octane chunks need a node rented from the docker image set for Octane nodes'
     )

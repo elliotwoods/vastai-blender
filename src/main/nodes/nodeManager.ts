@@ -111,7 +111,7 @@ export function rentalImageProblem(
   if (!image) {
     return engine === 'octane'
       ? 'no docker image is set for Octane nodes, and the built-in one has no OctaneBlender ' +
-          '(Settings → Docker image for Octane)'
+          '(Settings → Octane → Docker images)'
       : null
   }
   if (!isDockerImage(image)) {

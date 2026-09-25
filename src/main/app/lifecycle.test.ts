@@ -110,7 +110,13 @@ describe('the quit dialog', () => {
     expect(p.detail).toContain('so a chunk on its last retry fails')
     // Opening the app again stops nothing by itself.
     expect(p.detail).not.toContain('until you open')
-    expect(p.detail).toContain('idle scale-down once it is open again, or in the Vast.ai console')
+    expect(p.detail).toContain(
+      'destroys idle nodes once it is open again, or you can in the Vast.ai console'
+    )
+    // The node lease (plan 1.19) is named, with its cost.
+    expect(p.detail).toContain(
+      'destroys itself once it has had no word from the app for 30 minutes'
+    )
   })
 
   it('Enter destroys, Esc cancels, and an unknown response is Esc', () => {
@@ -188,7 +194,8 @@ describe('sleep', () => {
   it('warns that sleeping nodes keep billing', () => {
     expect(sleepWarning(billingFleet([node(), node({ id: 'b' })]))).toBe(
       'Going to sleep with 2 nodes billing $0.80/hr: they keep billing while this computer ' +
-        'sleeps, and nothing renders or downloads until it wakes'
+        'sleeps, and nothing downloads until it wakes. After 30 minutes without the app, ' +
+        'a node with nothing left to render destroys itself'
     )
   })
 

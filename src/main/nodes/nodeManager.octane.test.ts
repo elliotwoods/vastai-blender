@@ -444,7 +444,7 @@ describe('1.18: renting for Octane', () => {
     w.vast.addOffer()
     const why = nm.rentalImageProblem(w.settings, 'octane')
     expect(why).toMatch(
-      /^no docker image is set for Octane nodes.*Settings → Docker image for Octane/
+      /^no docker image is set for Octane nodes.*Settings → Octane → Docker images/
     )
     await expect(app.nodeManager.requestNodes(1, { engine: 'octane' })).rejects.toThrow(
       `${why}: nothing was rented`

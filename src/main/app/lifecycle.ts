@@ -263,9 +263,11 @@ export function quitPrompt(fleet: BillingFleet): Prompt<QuitChoice> {
       '\n\nDestroy all & quit: destroy every node, then quit. Renders in progress ' +
       'stop and go back in the queue for the next time you open the app. Each ' +
       'counts as a failed attempt, so a chunk on its last retry fails.' +
-      '\n\nLeave running: quit now. The nodes keep billing until they are ' +
-      "destroyed, by the app's idle scale-down once it is open again, or in " +
-      'the Vast.ai console.',
+      '\n\nLeave running: quit now. The nodes go on rendering and billing. A node ' +
+      'destroys itself once it has had no word from the app for 30 minutes and ' +
+      'has nothing left to render; frames not yet downloaded go with it and ' +
+      'render again next time. Otherwise the app destroys idle nodes once it is ' +
+      'open again, or you can in the Vast.ai console.',
     buttons: ['Destroy all && quit', 'Leave running', 'Cancel'],
     defaultId: 0,
     cancelId: 2,
@@ -341,7 +343,8 @@ export function sleepWarning(fleet: BillingFleet): string {
   return (
     `Going to sleep with ${plural(n, 'node')} billing ${fmtRate(fleet.perHour)}: ` +
     `${n === 1 ? 'it keeps' : 'they keep'} billing while this computer sleeps, ` +
-    'and nothing renders or downloads until it wakes'
+    'and nothing downloads until it wakes. After 30 minutes without the app, ' +
+    'a node with nothing left to render destroys itself'
   )
 }
 

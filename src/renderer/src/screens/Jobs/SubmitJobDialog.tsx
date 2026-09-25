@@ -135,7 +135,7 @@ export function SubmitJobDialog({ onClose }: { onClose: () => void }): React.JSX
               style={{ ...chip({ tone: 'warn' }), cursor: 'pointer' }}
               onClick={() => navigate({ screen: 'settings', section: 'octane' })}
             >
-              No Octane license configured — click to set up
+              Octane: sign in on each node over VNC, or set up a sign-in — Settings
             </button>
           </div>
         ) : null}
