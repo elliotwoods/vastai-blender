@@ -1808,6 +1808,12 @@ class ChunkRun {
         { timeoutMs: 30_000, label: 'retract spec' }
       )
       .catch(() => {})
+    // This run no longer queues its spec there. stopRelaunch skips its kill
+    // for a run of the chunk that is queueing one on the node, to spare a
+    // new dispatch's render; this run, draining its frames for longer than
+    // AGENT_RELAUNCH_MS (a manifest read that keeps failing), read as such
+    // a run, and a relaunched EEVEE render kept its lane (s3 review).
+    this.queueing = false
     scheduler.stopRelaunch(this.nodeId, this.chunkId)
   }
 

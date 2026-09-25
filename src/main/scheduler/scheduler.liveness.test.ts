@@ -704,6 +704,38 @@ describe('1.7: a hung Blender', () => {
   })
 })
 
+describe('1.7 s3 review: the relaunch kill after a retract', () => {
+  it('is still sent when the retracting run is still draining its frames 30 s later', async () => {
+    // The run that retracts its spec awaits its downloader's final pass. A
+    // manifest read that keeps failing held it registered past the 30 s,
+    // where stopRelaunch took it for a new dispatch queueing the chunk and
+    // spared the render the agent had relaunched.
+    w = await setup({ settings: { maxActiveNodes: 1, idleTimeoutMinutes: 60 } })
+    const app = await w.boot()
+    const held = await w.readyNode(app)
+    const machine = w.machineFor(held)
+    const kills: number[] = []
+    machine.onExec(/pkill -f '[^/]/, () => {
+      kills.push(Date.now())
+      return ''
+    })
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => machine.agent.inbox().length === 1, 'spec queued')
+    // Nothing of ours renders there: the spec is given up on at 15 min, and
+    // the final pass's manifest reads never answer.
+    machine.onExec(/manifest\.jsonl/, HANG)
+    await w.until(() => kills.length >= 1, 'the spec withdrawn', {
+      timeoutMs: 30 * 60_000,
+      stepMs: 5_000
+    })
+    await w.advance(3 * 60_000, 1_000)
+    expect(kills).toHaveLength(2)
+    expect(kills[1] - kills[0]).toBeGreaterThanOrEqual(30_000)
+    expect(chunksOf(jobId)[0].state).not.toBe('complete')
+  })
+})
+
 describe('1.8: a spec write with no answer', () => {
   it('fails at its deadline, and the chunk is sent again, charged to the machines', async () => {
     const { app, ids } = await fleet(1)
