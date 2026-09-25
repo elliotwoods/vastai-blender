@@ -24,7 +24,7 @@ import {
   refreshJobState
 } from '../jobs/jobs'
 import { installBlender, installExtension, REMOTE_ROOT } from '../nodes/provisioner'
-import { getAddon } from '../addons/addons'
+import { listAddons } from '../addons/addons'
 import { nodeManager } from '../nodes/nodeManager'
 import { getSettings } from '../settings'
 import { sftpRename, sftpWriteFile, uploadFileVerified } from '../ssh/sftp'
@@ -257,6 +257,18 @@ interface ChunkFailure {
 /** A failure the scheduler found itself, which it need not ask classify() about. */
 function own(kind: Classification['kind'], rule: string, reason: string): Classification {
   return { kind, rule, reason, retryable: kind !== 'localFs', outcomeUnknown: false }
+}
+
+/**
+ * Thrown in dispatch when a job needs an add-on and the registry lists none.
+ * addons.ts reads an unreadable registry.json as empty (EMFILE under a heavy
+ * download, EBUSY or EPERM on Windows while saveRegistry renames it), so an
+ * empty list says nothing about the add-on: this computer's failure, which
+ * waits and is tried again, and holds the job if it recurs (the breaker's
+ * localFs), never the job's failure.
+ */
+class AddonRegistryUnread extends Error {
+  override readonly name = 'AddonRegistryUnread'
 }
 
 /** Thrown in dispatch for a job no node can run as it stands. */
@@ -549,8 +561,17 @@ class ChunkRun {
       // 2. Extensions for this job (once per node+version+zip — cached; the
       //    bootstrap mechanism contributes a register() expression instead).
       const exprs: string[] = []
-      for (const addonId of JSON.parse(job.addon_ids) as string[]) {
-        const addon = getAddon(addonId)
+      const addonIds = JSON.parse(job.addon_ids) as string[]
+      // Read once: two reads could disagree, one failing and the next not.
+      const registry = addonIds.length > 0 ? listAddons() : []
+      for (const addonId of addonIds) {
+        const addon = registry.find((a) => a.id === addonId)
+        if (!addon && registry.length === 0) {
+          throw new AddonRegistryUnread(
+            `the job needs the add-on ${addonId}, and the add-on registry could not be read ` +
+              'or lists no add-ons'
+          )
+        }
         if (!addon) {
           // Rendering on without it was skipping it: unless the scene guards
           // against that itself, every frame renders wrong and the job
@@ -1847,6 +1868,9 @@ class Scheduler {
         nodeId,
         fatal: e.kind
       }
+    }
+    if (e instanceof AddonRegistryUnread) {
+      return { c: own('localFs', 'addon-registry', e.message), stage: 'dispatch', nodeId }
     }
     let c = classify(e, { via: 'ssh' })
     const node = nodeManager.get(nodeId)

@@ -1,5 +1,7 @@
-import { promises as fsp, type StatsFs } from 'fs'
+import { mkdirSync, promises as fsp, writeFileSync, type StatsFs } from 'fs'
+import { join } from 'path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { AddonInfo } from '../../shared/models'
 import { FakeSshConnection } from '../test/fakeSsh'
 import {
   setup,
@@ -89,6 +91,13 @@ function nodeState(nodeId: string): string {
 function attentionOf(jobId: string): string | null {
   return w.get<{ attention: string | null }>('SELECT attention FROM jobs WHERE id = ?', jobId)!
     .attention
+}
+
+/** addons.ts's registry.json, under the harness's userData, as `text`. */
+function writeRegistry(text: string): void {
+  const dir = join(w.dir, 'electron', 'userData', 'addons')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'registry.json'), text)
 }
 
 /** Every command any machine of the world was sent that matches. */
@@ -312,6 +321,16 @@ describe('1.16: a job no node can render fails once, with the reason', () => {
 
   it('A12: an add-on gone from the registry fails the job; it never renders without it', async () => {
     const { app, ids } = await nodes(1)
+    // The registry reads, and lists add-ons, just not this one.
+    const other: AddonInfo = {
+      id: 'still-registered',
+      name: 'Still registered',
+      version: '1.0.0',
+      zipPath: join(w.dir, 'still-registered.zip'),
+      zipHash: 'a'.repeat(64),
+      mechanism: 'install'
+    }
+    writeRegistry(JSON.stringify([other]))
     const specs: AgentSpec[] = []
     w.machineFor(ids[0]).onSpec = (spec) => void specs.push(spec)
     const jobId = await w.submitJob(app, { addonIds: ['gone-from-the-registry'] })
@@ -327,6 +346,38 @@ describe('1.16: a job no node can render fails once, with the reason', () => {
     })
     expect(chunksOf(jobId)[0]).toMatchObject({ state: 'failed', retries: 0 })
     expect(w.alerts().filter((a) => a.includes('skipped'))).toEqual([])
+  })
+
+  it('A12: a registry that cannot be read is not an add-on gone: the job is held, never failed', async () => {
+    const { app, ids } = await nodes(1)
+    // What loadRegistry makes of an EMFILE, or of an EBUSY while Windows
+    // renames the file under it: nothing, the same as no add-ons at all.
+    writeRegistry('{ "half-written')
+    const specs: AgentSpec[] = []
+    w.machineFor(ids[0]).onSpec = (spec) => void specs.push(spec)
+    const jobId = await w.submitJob(app, { addonIds: ['my-addon'] })
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => attentionOf(jobId) !== null, 'job held')
+
+    // Tried again after a wait, then held on the second: this computer's
+    // registry is the same whichever node asks.
+    expect(jobState(jobId)).not.toBe('failed')
+    expect(specs).toEqual([])
+    expect(chunkRow(chunk.id)).toMatchObject({
+      state: 'pending',
+      retries: 0,
+      infra_retries: 2,
+      error_kind: 'localFs'
+    })
+    const job = await w.invoke('job:get', jobId)
+    expect(job?.attention).toMatchObject({
+      kind: 'repeatedFailure',
+      errorClass: 'localFs',
+      message: expect.stringContaining('add-on registry could not be read')
+    })
+    // The node was not the problem: nothing rests it or marks it.
+    expect(nodeError(ids[0])).toBeNull()
   })
 })
 
