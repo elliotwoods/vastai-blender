@@ -225,10 +225,11 @@ export const SCENE_SNAPSHOT = 'scene.blend'
  * every chunk of the job renders it, so a save over the original mid-render
  * cannot change what the rest of the frames are rendered from (#53 #148).
  *
- * A clone where the file system makes them (APFS, ReFS, Btrfs), which is
- * instant and takes no room until one of the two files changes; a plain copy
- * elsewhere. The copy is what is hashed, never the original, which may be
- * saved over at any moment.
+ * A clone where Node's copy makes one (APFS on a Mac; Btrfs or XFS on
+ * Linux), which is instant and takes no room until one of the two files
+ * changes; a plain copy elsewhere, Windows included, and across volumes. The
+ * copy is what is hashed, never the original, which may be saved over at any
+ * moment.
  *
  * The copy keeps the original's modification time, whatever the platform's
  * copy did with it: that is what sceneDiffers compares a later save against.
