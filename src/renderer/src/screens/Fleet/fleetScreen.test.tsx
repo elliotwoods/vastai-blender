@@ -320,10 +320,22 @@ describe('1.18: Octane sign-in by hand', () => {
     expect(html).toContain('octane sign-in needed')
   })
 
-  it('offers nothing on a licensed node, and never opens a tunnel by itself', async () => {
-    const { ipc } = await import('../../lib/ipc')
+  it('offers nothing on a licensed node', () => {
     const html = withCache(() => {}, <NodeDetail node={node({ octaneState: 'licensed' })} />)
     expect(html).not.toContain('Open VNC login')
+  })
+
+  // An open tunnel tells main someone is at the desktop, and ends its hold
+  // on Octane rentals, so only a click may open one. A server render runs
+  // no effects: this catches an open called while rendering, NOT one in a
+  // useEffect on mount. That needs a DOM (jsdom and @testing-library/react,
+  // not installed yet): mount VncLogin, flush effects, expect no invoke,
+  // then click and expect exactly one.
+  it('opens no tunnel while rendering the login it offers', async () => {
+    const { ipc } = await import('../../lib/ipc')
+    vi.mocked(ipc.invoke).mockClear()
+    const html = withCache(() => {}, <NodeDetail node={node({ octaneState: 'needsLogin' })} />)
+    expect(html).toContain('Open VNC login')
     expect(vi.mocked(ipc.invoke).mock.calls.some(([c]) => c === 'node:openVncTunnel')).toBe(false)
   })
 })
