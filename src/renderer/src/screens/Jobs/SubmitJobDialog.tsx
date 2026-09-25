@@ -1,4 +1,5 @@
 import { useState, type CSSProperties } from 'react'
+import { ChipRemoveButton } from '../../components/ChipRemoveButton'
 import { btn, chip, input, mono, panel, sectionLabel, segmented } from '../../lib/controls'
 import { basename } from '../../lib/format'
 import { ipc } from '../../lib/ipc'
@@ -90,12 +91,10 @@ export function SubmitJobDialog({ onClose }: { onClose: () => void }): React.JSX
             {files.map((f) => (
               <span key={f} style={chip({ tone: 'accent' })} title={f}>
                 {basename(f)}
-                <button
-                  style={{ cursor: 'pointer', color: TOKENS.textMuted, marginLeft: 4 }}
+                <ChipRemoveButton
+                  label={basename(f)}
                   onClick={() => setFiles(files.filter((x) => x !== f))}
-                >
-                  ×
-                </button>
+                />
               </span>
             ))}
             <button

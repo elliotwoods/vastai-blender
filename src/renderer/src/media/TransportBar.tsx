@@ -1,4 +1,5 @@
 import { useState, useSyncExternalStore } from 'react'
+import { Icon } from '../components/Icon'
 import { iconBtn, mono, panel, quietField } from '../lib/controls'
 import { SCALE, TOKENS } from '../lib/theme'
 import type { ClipSyncController } from './ClipSyncController'
@@ -8,7 +9,7 @@ import { useTransportKeys } from './useTransportKeys'
 
 /**
  * The docked transport bar:
- * ⏮ ⏪ ▶/⏸ ⏩ ⏭ │ MM:SS:FF │ [frame]/total │ ═ FrameRuler ═ │ quality readout
+ * first · back 10 · play/pause · fwd 10 · last │ MM:SS:FF │ [frame]/total │ ═ FrameRuler ═ │ quality readout
  * Keyboard (bound while mounted): Space, ←/→, Shift±10, Home/End.
  */
 export function TransportBar({
@@ -72,38 +73,43 @@ export function TransportBar({
       <span style={{ display: 'inline-flex', gap: 4 }}>
         <button
           title="First (Home)"
+          aria-label="First frame"
           style={iconBtn({ size: 'sm' })}
           onClick={() => controller.first()}
         >
-          ⏮
+          <Icon name="skipStart" />
         </button>
         <button
           title="Back 10 (Shift+←)"
+          aria-label="Back 10 frames"
           style={iconBtn({ size: 'sm' })}
           onClick={() => controller.step(-10)}
         >
-          ⏪
+          <Icon name="rewind" />
         </button>
         <button
           title="Play/Pause (Space)"
+          aria-label={playing ? 'Pause' : 'Play'}
           style={iconBtn({ size: 'sm', active: playing })}
           onClick={() => controller.toggle()}
         >
-          {playing ? '⏸' : '▶'}
+          <Icon name={playing ? 'pause' : 'play'} />
         </button>
         <button
           title="Fwd 10 (Shift+→)"
+          aria-label="Forward 10 frames"
           style={iconBtn({ size: 'sm' })}
           onClick={() => controller.step(10)}
         >
-          ⏩
+          <Icon name="fastForward" />
         </button>
         <button
           title="Last (End)"
+          aria-label="Last frame"
           style={iconBtn({ size: 'sm' })}
           onClick={() => controller.last()}
         >
-          ⏭
+          <Icon name="skipEnd" />
         </button>
       </span>
 

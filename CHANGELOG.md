@@ -166,6 +166,15 @@ stalled the app).
 - **Why scale-up is (not) renting** is a line on the Fleet screen: at max
   nodes, spend cap, the tail, or what it is short of.
 - The Settings key test says which of the app's permissions the API key has.
+- **Preview playback speed.** The preview's transport bar has 0.25×, 0.5×,
+  1×, 2× and 4× buttons, and `<` / `>` step between them. The choice is
+  remembered. Compared clips stay in sync at any speed.
+- **A zoomable film strip** (built, not yet on the job page): a minimap of the
+  whole job, coloured by chunk state, with a window you drag, resize and
+  Ctrl/⌘-scroll to zoom, over a row of thumbnails that never scrolls. When the
+  window holds more frames than fit, the row shows every Nth frame and a chip
+  says so ("every 12th frame · 1–5000") with a *zoom to all frames* button.
+  Thumbnails of cancelled chunks are hatched grey.
 
 ### Changed
 
@@ -176,6 +185,13 @@ stalled the app).
   failed ones. On upgrade, the failed chunks of cancelled jobs that still had
   retries left become cancelled (schema v7, once).
 
+- **One icon set for the buttons.** The transport bar, preview overlay, log
+  autoscroll, tile inspect and chip remove buttons drew Unicode glyphs
+  (⏮ ⏪ ▶ ◑ ✕ ⇣ ⤢ ×) that each font rendered at a different size and weight;
+  they now use the app's SVG icons and carry `aria-label`s. The text "reveal"
+  and "open output" buttons became the folder button, whose tooltip names the
+  platform's file manager: "Show in Finder" on macOS, "Show in Explorer" on
+  Windows.
 - **The next chunk no longer waits for the last one's encode and download
   (#180).** An exclusive chunk held its GPU lane until its frames were
   downloaded, and on the node until its previews were encoded, so the GPU sat

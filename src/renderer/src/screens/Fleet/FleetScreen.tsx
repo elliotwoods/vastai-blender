@@ -94,11 +94,19 @@ function MaxNodesStepper(): React.JSX.Element {
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
       <span style={sectionLabel()}>max nodes</span>
-      <button style={btn({ size: 'sm' })} onClick={() => set(value - 1)}>
+      <button
+        aria-label="Fewer max nodes"
+        style={btn({ size: 'sm' })}
+        onClick={() => set(value - 1)}
+      >
         −
       </button>
       <span style={{ ...mono, minWidth: 18, textAlign: 'center' }}>{value}</span>
-      <button style={btn({ size: 'sm' })} onClick={() => set(value + 1)}>
+      <button
+        aria-label="More max nodes"
+        style={btn({ size: 'sm' })}
+        onClick={() => set(value + 1)}
+      >
         +
       </button>
     </span>

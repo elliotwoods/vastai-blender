@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
+import { Icon } from '../../components/Icon'
 import { OpenInExplorerButton } from '../../components/OpenInExplorerButton'
 import {
   btn,
@@ -137,10 +138,12 @@ function LogPanel({ nodeIds }: { nodeIds: string[] }): React.JSX.Element {
         <span style={{ flex: 1 }} />
         <button
           title="Autoscroll"
+          aria-label="Autoscroll"
+          aria-pressed={autoscroll}
           style={iconBtn({ size: 'sm', active: autoscroll })}
           onClick={() => setAutoscroll(!autoscroll)}
         >
-          ⇣
+          <Icon name="autoscroll" />
         </button>
       </div>
       <div
@@ -219,12 +222,7 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
                 <span style={{ color: TOKENS.textFaint }}>·</span>
                 <span style={mono}>{fmtMoney(job.costSoFar)}</span>
               </span>
-              <button
-                style={btn({ size: 'sm' })}
-                onClick={() => void ipc.invoke('shell:openPath', job.outputDir)}
-              >
-                open output
-              </button>
+              <OpenInExplorerButton path={job.outputDir} mode="open" title="Open output folder" />
               <JobActions
                 job={job}
                 onResume={onResume}

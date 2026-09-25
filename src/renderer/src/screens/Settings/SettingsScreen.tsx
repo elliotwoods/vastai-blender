@@ -1,5 +1,6 @@
 import { useState, type CSSProperties } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
+import { ChipRemoveButton } from '../../components/ChipRemoveButton'
 import { NumberField } from '../../components/NumberField'
 import { OpenInExplorerButton } from '../../components/OpenInExplorerButton'
 import { InfoHint } from '../../components/Tooltip'
@@ -858,12 +859,10 @@ function OffersSection(): React.JSX.Element {
           {f.gpuNames.map((g) => (
             <span key={g} style={chip({ tone: 'accent' })}>
               {g}
-              <button
-                style={{ cursor: 'pointer', color: TOKENS.textMuted, marginLeft: 4 }}
+              <ChipRemoveButton
+                label={g}
                 onClick={() => setFilters({ gpuNames: f.gpuNames.filter((x) => x !== g) })}
-              >
-                ×
-              </button>
+              />
             </span>
           ))}
           <input
