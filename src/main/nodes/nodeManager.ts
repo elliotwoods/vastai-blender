@@ -1112,6 +1112,9 @@ class ManagedNode {
     getDb()
       .prepare(`UPDATE nodes SET ${sets} WHERE id = ?`)
       .run(...keys.map((k) => patch[k as keyof NodeRow]), this.id)
+    // Whichever path destroyed it: its VNC login's local listener, which
+    // only a destroy over a live connection used to close, goes with it.
+    if (patch.state === 'destroyed') forgetOctaneNode(this.id)
     emit('node:changed', this.snapshot)
   }
 
@@ -3077,6 +3080,8 @@ export class NodeManager {
   ): Promise<boolean> {
     const { node } = opts
     if (node) {
+      // Its VNC login first, connection or none (plan 1.18 review).
+      forgetOctaneNode(node.id)
       // Best effort: nothing about the license may stand between the
       // instance and its DELETE.
       await this.stopOctane(node).catch(() => {})
@@ -3132,7 +3137,6 @@ export class NodeManager {
   private async stopOctane(node: ManagedNode): Promise<void> {
     const ssh = node.ssh
     if (!ssh || !node.sshEverAnswered) return
-    forgetOctaneNode(node.id)
     await stopOctaneServer(ssh, { timeoutMs: OCTANE_STOP_BUDGET_MS, onlyIfStarted: true })
   }
 

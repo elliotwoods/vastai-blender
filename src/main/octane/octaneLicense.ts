@@ -153,6 +153,13 @@ const vncSessions = new Map<
   string,
   { server: Server; port: number; password: string; ssh: SshConnection }
 >()
+/** A tunnel being opened (openVncTunnel); `dropped.now` once the node is forgotten meanwhile. */
+interface VncOpening {
+  ssh: SshConnection
+  done: Promise<VncTunnelInfo>
+  dropped: { now: boolean }
+}
+const vncOpening = new Map<string, VncOpening>()
 /** The VNC password this session set on each node (start-vnc). */
 const vncPasswords = new Map<string, string>()
 /** When each node's server was first seen running with no licence line, this session. */
@@ -616,11 +623,44 @@ export async function setupOctane(
  * or, after a restart, a new one: the viewer always gets a password that
  * works, and a VNC server that died is started again. A VNC session already
  * open is kept as it is. A node whose display :0 is not VNC's has no sign-in
- * by hand, and says so.
+ * by hand, and says so. Opening one, or opening it again, is the user
+ * acting: it ends a missed sign-in's hold (octaneSignInHold).
  */
 export async function openVncTunnel(ssh: SshConnection, nodeId: string): Promise<VncTunnelInfo> {
+  // A second call while one opens (a double click) shares it. Each used to
+  // open a listener of its own, and the first, overwritten in vncSessions,
+  // was never closed. One opening over another connection is let finish,
+  // and then replaced.
+  for (;;) {
+    const opening = vncOpening.get(nodeId)
+    if (!opening) break
+    if (opening.ssh === ssh) return opening.done
+    await opening.done.catch(() => {})
+  }
+  const dropped = { now: false }
+  const done: Promise<VncTunnelInfo> = tunnelFor(ssh, nodeId, dropped).finally(() => {
+    if (vncOpening.get(nodeId)?.done === done) vncOpening.delete(nodeId)
+  })
+  vncOpening.set(nodeId, { ssh, done, dropped })
+  return done
+}
+
+/** The user is at the node's desktop: a sign-in missed before is theirs to make now. */
+function userAtDesktop(nodeId: string): void {
+  signInMissed = null
+  // And this node's next Octane chunk may wait for it again.
+  loginWaited.delete(nodeId)
+}
+
+async function tunnelFor(
+  ssh: SshConnection,
+  nodeId: string,
+  dropped: VncOpening['dropped']
+): Promise<VncTunnelInfo> {
   const existing = vncSessions.get(nodeId)
   if (existing && existing.ssh === ssh) {
+    // Opening it again is the user acting as much as the first time was.
+    userAtDesktop(nodeId)
     return { localPort: existing.port, password: existing.password }
   }
   // A tunnel over a connection the node has since replaced leads nowhere.
@@ -632,10 +672,7 @@ export async function openVncTunnel(ssh: SshConnection, nodeId: string): Promise
       'no VNC sign-in on this node: its display :0 is held by an X server that is not VNC'
     )
   }
-  // The user is at the node's desktop: a sign-in missed before is theirs to
-  // make now, and this node's next Octane chunk may wait for it again.
-  signInMissed = null
-  loginWaited.delete(nodeId)
+  userAtDesktop(nodeId)
 
   const server = createServer((socket) => {
     void ssh
@@ -655,6 +692,12 @@ export async function openVncTunnel(ssh: SshConnection, nodeId: string): Promise
       else reject(new Error('no address'))
     })
   })
+  // The node went away while this opened (forgetOctaneNode): kept, the
+  // listener would outlive it, leading nowhere.
+  if (dropped.now) {
+    server.close()
+    throw new Error('no VNC login: the node is going away')
+  }
   vncSessions.set(nodeId, { server, port, password, ssh })
   return { localPort: port, password }
 }
@@ -667,8 +710,18 @@ export function closeVncTunnel(nodeId: string): void {
   }
 }
 
-/** A node going away: its tunnel closed and everything kept for it here dropped. */
+/**
+ * A node going away: its tunnel closed, one still opening dropped, and
+ * everything kept for it here dropped. nodeManager calls it on every path
+ * that sets a node 'destroyed', and at the start of every destroy, whether
+ * or not the node still has a connection.
+ */
 export function forgetOctaneNode(nodeId: string): void {
+  const opening = vncOpening.get(nodeId)
+  if (opening) {
+    opening.dropped.now = true
+    vncOpening.delete(nodeId)
+  }
   closeVncTunnel(nodeId)
   vncPasswords.delete(nodeId)
   unlicensedSince.delete(nodeId)

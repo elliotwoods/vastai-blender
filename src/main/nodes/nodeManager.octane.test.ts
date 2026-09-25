@@ -1,3 +1,4 @@
+import { connect } from 'net'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { OctaneState, SettingsPublic } from '../../shared/models'
 import type { CreateInstanceOptions } from '../vast/vastClient'
@@ -22,6 +23,18 @@ afterEach(() => w.dispose())
 
 const SEC = 1_000
 const MIN = 60 * SEC
+
+/** Whether nothing listens on 127.0.0.1:`port` any more (a connection is refused). */
+function refused(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = connect(port, '127.0.0.1')
+    socket.once('connect', () => {
+      socket.destroy()
+      resolve(false)
+    })
+    socket.once('error', () => resolve(true))
+  })
+}
 
 function octaneStates(nodeId: string): Array<OctaneState | undefined> {
   return w
@@ -223,6 +236,35 @@ describe('1.18: Octane on a node, as the fleet sees it', () => {
     expect(await app.nodeManager.requestNodes(1, { engine: 'octane' })).toEqual([])
     expect(w.vast.count('searchOffers')).toBe(searches)
     expect(w.vast.count('createInstance')).toBe(2)
+  })
+
+  it('1.18 (review 2): a node destroyed with no connection left takes its VNC login with it', async () => {
+    const app = await w.boot()
+    const lic = await import('../octane/octaneLicense')
+    const id = await w.readyNode(app)
+    const node = app.nodeManager.get(id)!
+    const { localPort } = await lic.openVncTunnel(node.ssh!, id)
+    expect(await refused(localPort)).toBe(false)
+    // Unreachable: its connection closed, as recoverUnreachable does.
+    node.closeSsh()
+    await app.nodeManager.destroyNode(id)
+    expect(app.nodeManager.get(id)!.state).toBe('destroyed')
+    expect(await refused(localPort)).toBe(true)
+  })
+
+  it('1.18 (review 2): a node Vast says is gone takes its VNC login with it, whoever destroyed it', async () => {
+    const app = await w.boot()
+    const lic = await import('../octane/octaneLicense')
+    const id = await w.readyNode(app)
+    const { localPort } = await lic.openVncTunnel(app.nodeManager.get(id)!.ssh!, id)
+    // Destroyed from the Vast.ai console: the app hears of it from Vast.
+    const { instance_id } = w.get<{ instance_id: number }>(
+      'SELECT instance_id FROM nodes WHERE id = ?',
+      id
+    )!
+    await app.nodeManager.ensureInstanceGone(instance_id)
+    expect(app.nodeManager.get(id)!.state).toBe('destroyed')
+    expect(await refused(localPort)).toBe(true)
   })
 
   it('1.18: a node that never ran Octane is never asked about it', async () => {

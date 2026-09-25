@@ -15,6 +15,7 @@
  * The node here is scripted by hand; octaneLicense.script.test.ts runs the
  * same calls against the real setup_octane.sh.
  */
+import { connect } from 'net'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { OctaneState, SettingsPublic } from '../../shared/models'
 import type { Db } from '../db/db'
@@ -117,6 +118,18 @@ function octaneNode(state: { now: OctaneState }): ReturnType<typeof node> {
     }
     if (/setup_octane\.sh status/.test(c)) return ok(`OCTANE_STATE ${state.now}\n`)
     return ok()
+  })
+}
+
+/** Whether nothing listens on 127.0.0.1:`port` any more (a connection is refused). */
+function refused(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = connect(port, '127.0.0.1')
+    socket.once('connect', () => {
+      socket.destroy()
+      resolve(false)
+    })
+    socket.once('error', () => resolve(true))
   })
 }
 
@@ -372,6 +385,68 @@ describe('setupOctane: credentials (1.18, #40 #156)', () => {
     try {
       const sent = inner.calls.filter((c) => /start-vnc/.test(c.command)).map((c) => c.opts.stdin)
       expect(sent).toEqual([`${tunnel.password}\n`, `${tunnel.password}\n`])
+    } finally {
+      octane.closeVncTunnel(NODE)
+    }
+  })
+
+  it('1.18 (review 2): a double click on Open VNC login opens one tunnel, and a node forgotten meanwhile keeps none', async () => {
+    vi.useRealTimers()
+    const { ssh, calls } = octaneNode({ now: 'needsLogin' })
+    const [one, two] = await Promise.all([
+      octane.openVncTunnel(ssh, NODE),
+      octane.openVncTunnel(ssh, NODE)
+    ])
+    try {
+      expect(two).toEqual(one)
+      expect(calls.filter((c) => /start-vnc/.test(c.command))).toHaveLength(1)
+    } finally {
+      octane.forgetOctaneNode(NODE)
+    }
+    // The one listener is closed with the node.
+    expect(await refused(one.localPort)).toBe(true)
+
+    // Destroyed while its tunnel opens: the open fails, and leaves nothing
+    // listening.
+    const held: Array<() => void> = []
+    const slow = {
+      ...ssh,
+      exec: (command: string, opts: Call['opts'] = {}): Promise<ExecResult> =>
+        new Promise((resolve) => held.push(() => void ssh.exec(command, opts).then(resolve)))
+    } as unknown as SshConnection
+    const opening = octane.openVncTunnel(slow, NODE)
+    await vi.waitFor(() => expect(held).toHaveLength(1))
+    octane.forgetOctaneNode(NODE)
+    held[0]()
+    await expect(opening).rejects.toThrow('no VNC login: the node is going away')
+    // And the next open is a fresh one, not the dropped one's.
+    const after = await octane.openVncTunnel(ssh, NODE)
+    octane.closeVncTunnel(NODE)
+    expect(await refused(after.localPort)).toBe(true)
+  })
+
+  it('1.18 (review 2): opening the VNC login again, with its tunnel still open, is the user acting too', async () => {
+    const NODE_B = 'node-2-bbbbbbbb'
+    h.db
+      .prepare(
+        `INSERT INTO nodes (id, instance_id, state, gpu_name) VALUES (?, 2, 'rendering', 'RTX 4090')`
+      )
+      .run(NODE_B)
+    const { ssh } = octaneNode({ now: 'needsLogin' })
+    vi.useRealTimers()
+    const tunnel = await octane.openVncTunnel(ssh, NODE)
+    try {
+      // Another node's sign-in is missed meanwhile.
+      vi.useFakeTimers()
+      const waited = octane
+        .setupOctane(octaneNode({ now: 'needsLogin' }).ssh, NODE_B)
+        .catch((e: unknown) => e)
+      await vi.advanceTimersByTimeAsync(octane.OCTANE_LOGIN_WAIT_MS + 10_000)
+      expect(await waited).toBeInstanceOf(octane.OctaneLoginNeededError)
+      expect(octane.octaneSignInHold()).not.toBeNull()
+      vi.useRealTimers()
+      expect(await octane.openVncTunnel(ssh, NODE)).toEqual(tunnel)
+      expect(octane.octaneSignInHold()).toBeNull()
     } finally {
       octane.closeVncTunnel(NODE)
     }
