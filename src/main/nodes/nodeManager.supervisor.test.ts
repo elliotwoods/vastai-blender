@@ -418,6 +418,40 @@ describe('1.7: liveness supervision', () => {
     expect(w.vast.count('destroyInstance')).toBe(0)
   })
 
+  it('1.7: a connection back but not answering yet is not taken for the node answering', async () => {
+    // ssh2 hands back a connection whose far end went silent as live until
+    // its keepalive gives up on it: the first command on it waits for nothing.
+    const { app, busy, jobId, chunkId, prov } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    dropOff(machine)
+    await w.until(() => app.nodeManager.get(busy)?.state === 'unreachable', 'unreachable')
+    machine.onExec(/^echo ok$|provision\.sh agent-status$/, HANG, 1)
+    comeBack(machine)
+
+    await w.until(() => app.nodeManager.get(busy)?.state === 'rendering', 'back in service', {
+      timeoutMs: 5 * MIN
+    })
+    expect(prov.get(busy)!.restarts).toEqual([])
+    expect(chunksOf(jobId)[0]).toMatchObject({ id: chunkId, node_id: busy, infra_retries: 0 })
+    expect(w.vast.count('destroyInstance')).toBe(0)
+  })
+
+  it('1.7: a node Vast stops while it is being reconnected is let go within minutes, not ten', async () => {
+    const { app, busy } = await renderingOnOne()
+    const instanceId = instanceOf(busy)
+    dropOff(w.machineFor(busy))
+    await w.until(() => app.nodeManager.get(busy)?.state === 'unreachable', 'unreachable')
+    w.vast.patchInstance(instanceId, { actual_status: 'exited', intended_status: 'stopped' })
+    const stoppedAt = Date.now()
+
+    await w.until(() => app.nodeManager.get(busy)?.state === 'destroyed', 'let go', {
+      timeoutMs: 15 * MIN,
+      stepMs: 5_000
+    })
+    expect(Date.now() - stoppedAt).toBeLessThanOrEqual(3 * MIN)
+    expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
+  })
+
   it('1.7: shutting down while a node is being recovered destroys nothing', async () => {
     // Quit with "leave running": the app closes every connection on its way
     // out, which a recovery under way must not take for the node failing.

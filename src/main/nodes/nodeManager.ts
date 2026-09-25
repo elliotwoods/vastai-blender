@@ -193,6 +193,19 @@ const UNREACHABLE_STRIKES = 3
 const UNREACHABLE_AFTER_MS = 30_000
 
 /**
+ * How long an 'unreachable' node gets to answer over SSH again before it is
+ * given up on while Vast says it runs (recoverUnreachable). It reconnects
+ * with backoff in RECONNECT_SLICE_MS rounds, and Vast is asked after each:
+ * an instance Vast stopped meanwhile, or lists on other ports, is not
+ * waited out. Between rounds that fail at once, a short pause. Once
+ * connected, a command must answer within ANSWER_TIMEOUT_MS.
+ */
+const RECONNECT_BUDGET_MS = 10 * 60_000
+const RECONNECT_SLICE_MS = 2 * 60_000
+const RECONNECT_PAUSE_MS = 5_000
+const ANSWER_TIMEOUT_MS = 15_000
+
+/**
  * A heartbeat older than this means a dead agent: provision.sh's
  * AGENT_STALE_S, six missed beats. The probe must see it AGENT_STALE_PROBES
  * times in a row, and restart-agent checks again under its lock, since a
@@ -3107,6 +3120,9 @@ export class NodeManager {
       if (fate.kind === 'up') node.retargetTo(sshEndpoints(fate.inst))
     }
     let ssh: SshConnection
+    // SSH gets RECONNECT_BUDGET_MS to answer again, counted afresh when Vast
+    // lists the instance on other ports or does not answer either.
+    let deadline = Date.now() + RECONNECT_BUDGET_MS
     for (;;) {
       try {
         ssh = node.ssh ?? (await node.connectSsh())
@@ -3116,11 +3132,22 @@ export class NodeManager {
           ssh.close()
           return
         }
-        await ssh.reconnectWithBackoff()
+        const left = Math.max(0, deadline - Date.now())
+        await ssh.reconnectWithBackoff(Math.min(RECONNECT_SLICE_MS, left))
         if (node.movedOn(held)) {
           ssh.close()
           return
         }
+        // Connected is not answering: ssh2 hands back a connection whose far
+        // end went silent as live until its keepalive gives up on it (about
+        // 30 s), and every command on it waits for nothing meanwhile.
+        const r = await ssh.exec('echo ok', {
+          timeoutMs: ANSWER_TIMEOUT_MS,
+          label: 'reconnect check'
+        })
+        if (node.movedOn(held)) return
+        if (!r.stdout.includes('ok'))
+          throw new Error(`no answer after reconnecting (exit ${r.code})`)
         break
       } catch (e) {
         // Destroyed meanwhile: destroyNode closed the connection the
@@ -3143,16 +3170,25 @@ export class NodeManager {
         if (fate.kind === 'gone' || fate.kind === 'stopped') {
           return this.lost(node, instanceId, fate, why)
         }
+        // Vast lists it on other ports now: the budget starts again, there.
+        if (fate.kind === 'up' && node.retargetTo(sshEndpoints(fate.inst))) {
+          deadline = Date.now() + RECONNECT_BUDGET_MS
+          continue
+        }
+        if (Date.now() < deadline) {
+          await sleep(RECONNECT_PAUSE_MS)
+          if (node.movedOn(held) || this.shutDown) return
+          continue
+        }
         if (fate.kind === 'silent') {
           node.update({
             last_error: `no answer over SSH (${why}), nor from Vast.ai (${fate.reason}): trying both again`
           })
           await sleep(RESUME_MAX_DELAY_MS)
           if (node.movedOn(held) || this.shutDown) return
+          deadline = Date.now() + RECONNECT_BUDGET_MS
           continue
         }
-        // Vast lists it on other ports now: once more, there.
-        if (node.retargetTo(sshEndpoints(fate.inst))) continue
         return abandon()
       }
     }
