@@ -321,15 +321,15 @@ describe('Destroy all that cannot confirm a destroy (plan 1.1)', () => {
 describe('Destroy all against what Vast is really like (plan 1.1)', () => {
   it("six nodes and Vast's 3 s DELETE limit: all destroyed on the first pass, none listed", async () => {
     // 1.1 review: every DELETE went out at once, and Vast takes one every
-    // 3 s. vastClient's 429 retry (3, 6, 9, 12 s, in the call) answered
-    // them one by one, and the last ran past the quit's budget.
+    // 3 s. vastClient's 429 retry, inside the call, got them through one by
+    // one, and the last ran past the quit's budget.
     w = await setup({ settings: { maxActiveNodes: 6, spendCapPerHour: 10 } })
     const engine = await w.boot()
     const ids: string[] = []
     for (let i = 0; i < 6; i++) ids.push(await w.readyNode(engine))
     const instances = ids.map(instanceOf)
-    const { VastError } = await import('../vast/vastClient')
-    const limit = rateLimitDestroys(w.vast, (m, status) => new VastError(m, status))
+    const client = await import('../vast/vastClient')
+    const limit = rateLimitDestroys(w.vast, client, (m, status) => new client.VastError(m, status))
     const r = await rig(engine)
     r.answers.push(DESTROY)
 

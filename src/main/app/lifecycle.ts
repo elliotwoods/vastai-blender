@@ -92,9 +92,9 @@ export const OCTANE_STOP_MS = 20_000
  * The gap between one node's destroy and the next. Vast allows one request
  * per endpoint every 3 s for each API key (its rate-limit docs; a DELETE's
  * 429 says "threshold=3.0"), and vastClient retries a 429 inside the call,
- * after 3, 6, 9 and 12 s. Six DELETEs sent at once were answered one by one
- * down that ladder, and the last were still waiting when their budget ran
- * out, reported as maybe billing.
+ * backing off, for up to 30 s. Six DELETEs sent at once got through one by
+ * one down that backoff, and the last were still refused when their budget
+ * ran out, reported as maybe billing.
  */
 export const DESTROY_STAGGER_MS = 3_000
 
