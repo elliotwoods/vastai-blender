@@ -377,6 +377,19 @@ function attentionKind(errorKind: 'scene' | 'job', message: string): JobAttentio
 const STATE_STALL_MS = 15 * 60_000
 
 /**
+ * A render that is alive (its state kept fresh) but has made no progress,
+ * no frame started or saved, for at least this long is taken as hung and
+ * stopped (ChunkRun.hungFor)...
+ */
+const HUNG_MIN_MS = 45 * 60_000
+/**
+ * ...and for at least this many times the slowest gap between progress the
+ * run has seen, since a heavy scene legitimately spends a long while on
+ * each frame.
+ */
+const HUNG_SLOWEST_FACTOR = 3
+
+/**
  * No state file for this long after the spec was queued, and the run asks
  * the node why (ChunkRun.checkMissingState). The agent writes one within
  * seconds of taking a spec, and the spec stays in its inbox until the render
@@ -441,6 +454,9 @@ class ChunkRun {
   /** Since when the state file has been missing / every read of it failed, in a row (epoch ms). */
   private missingSince: number | null = null
   private unreadSince: number | null = null
+  /** The latest lastProgressAt this run has seen (agent epoch s), and the longest gap between two. */
+  private progressAt: number | null = null
+  private slowestProgressS = 0
 
   /** EWMA of frames/sec while rendering; null until two progress samples land. */
   private framesPerSec: number | null = null
@@ -1106,9 +1122,58 @@ class ChunkRun {
           )
           return
         }
+        const hungMs = this.hungFor(state)
+        if (hungMs != null) {
+          // Stopped first: a hung Blender holds its GPU, and nothing else
+          // will stop it (the agent has no deadline on a render).
+          await this.retractSpec()
+          if (this.stopped) return
+          await this.downloader?.drain()
+          if (this.stopped) return
+          this.fail(
+            'render',
+            own(
+              'machine',
+              'render-hung',
+              `Blender made no progress (no frame started or saved) for ` +
+                `${Math.round(hungMs / 60_000)} min while it kept running, so it was stopped`
+            )
+          )
+          return
+        }
       }
       await new Promise((r) => setTimeout(r, STATE_POLL_MS))
     }
+  }
+
+  /**
+   * How long a render still running has gone without progress, when that
+   * is long enough to take it as hung; null otherwise.
+   *
+   * The agent refreshes updatedAt every 60 s while Blender lives, so a state
+   * kept fresh says the process is alive, not that it is working, and a
+   * hung Blender (a GPU or driver hang, a deadlocked kernel compile, a
+   * startup script that never returns) held its paid GPU for good: the stall
+   * watchdog above only fires on a state that stops changing (#77, #192).
+   * lastProgressAt moves only when Blender starts, and on each frame it
+   * starts or saves. Measured against updatedAt, both on the node's clock.
+   *
+   * A heavy scene's frames can take a long while, so the limit is the longer
+   * of HUNG_MIN_MS and HUNG_SLOWEST_FACTOR times the slowest gap between
+   * progress this run has seen. An agent that does not report
+   * lastProgressAt is never judged.
+   */
+  private hungFor(state: AgentState): number | null {
+    const at = state.lastProgressAt
+    if (typeof at !== 'number' || !Number.isFinite(at)) return null
+    if (this.progressAt != null && at > this.progressAt) {
+      this.slowestProgressS = Math.max(this.slowestProgressS, at - this.progressAt)
+    }
+    if (this.progressAt == null || at > this.progressAt) this.progressAt = at
+    if (state.status !== 'rendering' || typeof state.updatedAt !== 'number') return null
+    const idleMs = (state.updatedAt - at) * 1000
+    const limitMs = Math.max(HUNG_MIN_MS, HUNG_SLOWEST_FACTOR * this.slowestProgressS * 1000)
+    return idleMs > limitMs ? idleMs : null
   }
 
   /** finish('failed') for a failure this run found itself. */

@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { REMOTE_ROOT } from '../test/fakeSsh'
-import { setup, type App, type FakeMachine, type SetupOptions, type World } from '../test/harness'
+import {
+  setup,
+  type AgentSpec,
+  type AgentStateFile,
+  type App,
+  type FakeMachine,
+  type SetupOptions,
+  type World
+} from '../test/harness'
 
 // A run that has lost its render must let go of its chunk and its lane
 // (plan 1.7, the run's side of it), end to end on the lifecycle harness.
@@ -179,5 +187,101 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
     )
     // Withdrawn on the silent node, in case it answers again.
     expect(w.machineFor(silent).ran(new RegExp(`pkill -f '${chunk.id}'`))).not.toEqual([])
+  })
+})
+
+describe('1.7: a hung Blender', () => {
+  /**
+   * An agent whose render runs as scripted: the state rewritten every 60 s,
+   * as the agent's heartbeat does while Blender lives, with lastProgressAt
+   * wherever the last frame left it, as `progressAt()` says at each beat.
+   */
+  function heartbeat(
+    machine: FakeMachine,
+    chunkId: string,
+    progressAt: () => { at: number; frames: number }
+  ): () => void {
+    const beat = (): void => {
+      const p = progressAt()
+      machine.agent.writeState(chunkId, {
+        status: 'rendering',
+        framesDone: p.frames,
+        currentFrame: p.frames + 1,
+        lastProgressAt: p.at
+      } as Partial<AgentStateFile>)
+    }
+    beat()
+    const timer = setInterval(beat, 60_000)
+    return () => clearInterval(timer)
+  }
+
+  it('fresh heartbeat, no frame for 45 min: stopped, and only its missing frames render again', async () => {
+    const { app, ids } = await fleet(1)
+    const machine = w.machineFor(ids[0])
+    const specs: AgentSpec[] = []
+    let stop = (): void => {}
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      if (specs.length > 1) return machine.agent.finish(spec.chunkId)
+      // Frame 1 lands, then Blender hangs on frame 2, alive.
+      machine.agent.render(spec.chunkId, [1])
+      const stuckAt = Date.now() / 1000
+      stop = heartbeat(machine, spec.chunkId, () => ({ at: stuckAt, frames: 1 }))
+    }
+    // The heartbeat goes once Blender is killed, as the real one does.
+    machine.onExec(/pkill -f/, () => {
+      stop()
+      return ''
+    })
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    const startedAt = Date.now()
+    app.scheduler.kick()
+
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 90 * 60_000 })
+    stop()
+    // The node's failure the first time: charged to the machines, and the
+    // retry leaves out the frame that had already landed.
+    expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
+    expect(specs.map((s) => [s.frameStart, s.frameEnd])).toEqual([
+      [1, 4],
+      [2, 4]
+    ])
+    expect(machine.ran(new RegExp(`pkill -f '${chunk.id}'`))).not.toEqual([])
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /Blender made no progress \(no frame started or saved\) for 4\d min while it kept running/
+    )
+    expect(Date.now() - startedAt).toBeLessThan(55 * 60_000)
+  })
+
+  it('frames that take twenty minutes each, and one that takes fifty, are not taken for a hang', async () => {
+    const { app, ids } = await fleet(1)
+    const machine = w.machineFor(ids[0])
+    const specs: AgentSpec[] = []
+    let stop = (): void => {}
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      const start = Date.now() / 1000
+      // Saved at 20, 40, 90 and 95 minutes.
+      const saved = [20, 40, 90, 95].map((m) => start + m * 60)
+      stop = heartbeat(machine, spec.chunkId, () => {
+        const now = Date.now() / 1000
+        const done = saved.filter((t) => t <= now)
+        return { at: done.length ? done[done.length - 1] : start, frames: done.length }
+      })
+      setTimeout(() => {
+        stop()
+        machine.agent.finish(spec.chunkId)
+      }, 95 * 60_000)
+    }
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 120 * 60_000
+    })
+    stop()
+    expect(specs).toHaveLength(1)
+    expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 0 })
+    expect(w.alerts().join('\n')).not.toMatch(/no progress/)
   })
 })
