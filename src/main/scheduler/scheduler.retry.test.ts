@@ -488,6 +488,26 @@ describe('1.17: the machines and the network are not the render', () => {
 })
 
 describe('1.17: where a chunk the machines failed goes, and what it is told', () => {
+  it('1.17: a chunk whose node losses spent its infrastructure retries says it failed for good', async () => {
+    const { app, ids } = await nodes(1)
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    // Every attempt the machines' budget allows, already lost to them.
+    w.db.prepare('UPDATE chunks SET infra_retries = 8 WHERE id = ?').run(chunk.id)
+    app.scheduler.kick()
+    await w.until(() => chunkRow(chunk.id).state === 'rendering', 'chunk rendering')
+
+    let destroyed = false
+    void app.nodeManager.destroyNode(ids[0]).finally(() => (destroyed = true))
+    await w.until(() => destroyed && settled(jobId), 'destroyed, job settled')
+    expect(chunkRow(chunk.id)).toMatchObject({ state: 'failed', retries: 0, infra_retries: 8 })
+    expect(w.alerts('error').join('\n')).toMatch(
+      new RegExp(`chunk ${chunk.id} failed for good, it failed 8 more times.*node went away`)
+    )
+    // Not counted among the chunks requeued with their render retries intact.
+    expect(w.alerts().filter((a) => /requeued — node went away/.test(a))).toEqual([])
+  })
+
   it('1.17: a chunk goes back to the node it failed on when the only other node is busy', async () => {
     const { app, ids } = await nodes(2)
     const attempts = new Map<string, number>()

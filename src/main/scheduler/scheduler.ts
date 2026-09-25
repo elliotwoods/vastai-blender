@@ -1134,6 +1134,7 @@ class Scheduler {
     const orphaned = [...this.runsOn(nodeId)]
     this.byNode.delete(nodeId)
     if (orphaned.length === 0) return
+    let requeued = 0
     for (const run of orphaned) {
       run.abort()
       this.dropRun(run)
@@ -1144,18 +1145,24 @@ class Scheduler {
       // chunk that loses node after node still gives up eventually, and its
       // render retries are untouched. Never a throw from here: destroyNode
       // calls this before it destroys the instance.
-      this.requeueOrFail(run.chunkId, run.jobId, {
+      const outcome = this.requeueOrFail(run.chunkId, run.jobId, {
         c: own('machine', 'node-gone', 'the node went away mid-render'),
         stage: 'node',
         nodeId
       })
+      if (outcome === 'pending') requeued += 1
     }
-    emit('alert', {
-      level: 'warn',
-      message:
-        `${orphaned.length} chunk(s) requeued — node went away mid-render ` +
-        `(render retries unchanged)`
-    })
+    // Only the chunks that went back in the queue: one that had spent its
+    // infrastructure retries failed for good, and says so itself
+    // (failureAlert).
+    if (requeued > 0) {
+      emit('alert', {
+        level: 'warn',
+        message:
+          `${requeued} chunk(s) requeued — node went away mid-render ` +
+          `(render retries unchanged)`
+      })
+    }
     this.kick()
   }
 
@@ -1964,8 +1971,15 @@ class Scheduler {
    * throw there, after the requeue had committed, marked a chunk failed that
    * was already back in the queue: a job gone 'partial' for a failed write
    * of its state.
+   *
+   * Returns what became of the chunk, or null when nothing was written (a
+   * cancelled job's chunk).
    */
-  private requeueOrFail(chunkId: string, jobId: string, f: ChunkFailure): void {
+  private requeueOrFail(
+    chunkId: string,
+    jobId: string,
+    f: ChunkFailure
+  ): Resplit['outcome'] | null {
     this.rest(f)
     let settled: Settled
     try {
@@ -1984,9 +1998,10 @@ class Scheduler {
       } catch (e2) {
         console.warn(`[scheduler] could not fail chunk ${chunkId}: ${describeError(e2)}`)
       }
-      return
+      return 'failed'
     }
     this.announceRequeue(jobId, settled)
+    return settled.r?.outcome ?? null
   }
 
   /**
@@ -2085,8 +2100,9 @@ class Scheduler {
   /**
    * What the user is told about a failed attempt: the reason, with its code
    * (describeError; job 1d59516c's alerts ended at "failed: "), and what
-   * happens next. A chunk lost with its node says nothing of its own:
-   * forgetNode's alert covers them all.
+   * happens next. A chunk requeued after its node went away says nothing of
+   * its own: forgetNode's alert covers them all. One that failed for good
+   * does, since that alert counts only the chunks it requeued.
    */
   private failureAlert(
     before: ChunkRow,
@@ -2096,7 +2112,7 @@ class Scheduler {
     waitMs: number,
     repeat: boolean
   ): AlertEvent | null {
-    if (f.stage === 'node') return null
+    if (f.stage === 'node' && r.outcome === 'pending') return null
     const what = `${f.stage === 'dispatch' ? 'dispatch' : 'chunk'} ${before.id} failed`
     if (r.outcome === 'complete') {
       return {
