@@ -901,6 +901,39 @@ describe('Windows session end (plan 1.1)', () => {
     expect(r.app.exits).toHaveLength(1)
   })
 
+  it('1.1: a person closing the last window with nodes billing: kept for the dialog, which a shutdown then takes over', async () => {
+    // 1.1 review: the dialog came up with the window already gone, and with
+    // it what Windows asks before a shutdown or an update's restart.
+    const { engine, instances } = await twoNodes()
+    const r = await rig(engine)
+    const win = openWindow(r)
+    r.answers.push(deferred<number>().promise)
+
+    expect(r.lifecycle.holdWindowClose()).toBe(true)
+    await w.advance(1_000)
+    expect(r.dialogs.map((d) => d.message)).toEqual(['2 nodes are billing $0.80/hr'])
+    // Closed again while it asks: still kept, and asked only the once.
+    expect(r.lifecycle.holdWindowClose()).toBe(true)
+
+    expect(querySessionEnd(win)).toBe(true)
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+    expect(r.dialogs).toHaveLength(1)
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+  })
+
+  it('a window closing with nothing billing, or in a headless run, is let go', async () => {
+    w = await setup()
+    const engine = await w.boot()
+    const r = await rig(engine)
+    expect(r.lifecycle.holdWindowClose()).toBe(false)
+    expect(r.dialogs).toEqual([])
+
+    await w.readyNode(engine)
+    const headless = await rig(engine, { headless: 'destroy' })
+    expect(headless.lifecycle.holdWindowClose()).toBe(false)
+    expect(headless.app.exits).toEqual([])
+  })
+
   it('1.1: a session end nobody asked about: each destroy starts once the one before it is done, not 3 s apart', async () => {
     // 'session-end': the process may be ended at any moment.
     const { engine, instances } = await fleetOf(6)

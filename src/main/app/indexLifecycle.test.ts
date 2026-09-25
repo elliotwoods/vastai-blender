@@ -408,10 +408,51 @@ describe('index.ts installs the quit lifecycle (plan 1.1, field incident A1)', (
     expect(r.exits).toEqual([0])
   })
 
-  it("a person's window on Windows closes as it always did", async () => {
+  it("on Windows, a person's window closes as it always did with nothing billing", async () => {
     await onWindows(async () => {
-      await load([node()])
+      await load([node({ state: 'destroyed', destroyedAt: 1 })])
       expect(closeWindow(FakeWindow.all[0])).toBe(true)
+    })
+  })
+
+  it('on Windows, closing the window with a node billing: it stays for the dialog, and a shutdown still reaches it', async () => {
+    // 1.1 review: the window was gone by the time the dialog came up, and
+    // with it the only thing Windows asks before a shutdown. A dialog left
+    // unanswered overnight, then an update's restart, ended the app with
+    // the fleet billing.
+    await onWindows(async () => {
+      const r = await load([node()])
+      const [win] = FakeWindow.all
+
+      expect(closeWindow(win)).toBe(false)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(r.boxes).toHaveLength(1)
+      expect(r.boxes[0][0]).toBe(win)
+      expect(r.exits).toEqual([])
+
+      expect(querySessionEnd(win)).toBe(true)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(r.destroyed).toEqual(['node-1-abcdef'])
+      expect(r.exits).toEqual([0])
+    })
+  })
+
+  it('on Windows, Cancel keeps the window and the app; the next close asks again', async () => {
+    await onWindows(async () => {
+      const r = await load([node()])
+      const [win] = FakeWindow.all
+
+      expect(closeWindow(win)).toBe(false)
+      r.answer(2)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(r.exits).toEqual([])
+      expect(FakeWindow.all).toHaveLength(1)
+
+      expect(closeWindow(win)).toBe(false)
+      r.answer(1)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(r.boxes).toHaveLength(2)
+      expect(r.exits).toEqual([0])
     })
   })
 })

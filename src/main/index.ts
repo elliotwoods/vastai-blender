@@ -13,7 +13,13 @@ import { extname, join } from 'path'
 import { Readable } from 'stream'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
-import { fleetPort, installLifecycle, parseQuitPolicy, type Prompt } from './app/lifecycle'
+import {
+  fleetPort,
+  installLifecycle,
+  parseQuitPolicy,
+  type Lifecycle,
+  type Prompt
+} from './app/lifecycle'
 import { externalUrl, isAppPage, type AppPage } from './app/windowPolicy'
 import { resolveBlenderRelease } from './blender/blendInfo'
 import { closeDb, getDb } from './db/db'
@@ -218,6 +224,9 @@ function registerMediaProtocol(): void {
   })
 }
 
+/** app/lifecycle.ts, once whenReady has installed it: a closing window asks it. */
+let quitLifecycle: Lifecycle | null = null
+
 function createWindow(): void {
   // The one page this window ever shows: the dev server's, or the build's.
   const devUrl = is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined
@@ -265,6 +274,21 @@ function createWindow(): void {
     mainWindow.on('close', (event) => {
       event.preventDefault()
       mainWindow.minimize()
+    })
+  }
+
+  // A person closing the last window on Windows quits the app
+  // (window-all-closed), and the quit's dialog came up with the window
+  // already gone. With no window, nothing receives Windows' shutdown query
+  // or session end: a dialog left unanswered overnight, then an update's
+  // restart, ended the app with the fleet billing and the destroy never
+  // started (1.1 review). So with anything billing the window stays while
+  // the quit asks (the lifecycle's holdWindowClose), and goes with the
+  // app's exit on Destroy all or Leave running.
+  if (!headless && process.platform === 'win32') {
+    mainWindow.on('close', (event) => {
+      const last = BrowserWindow.getAllWindows().every((w) => w === mainWindow)
+      if (last && quitLifecycle?.holdWindowClose()) event.preventDefault()
     })
   }
 
@@ -439,6 +463,7 @@ app.whenReady().then(() => {
       }
     }
   })
+  quitLifecycle = lifecycle
   createWindow()
 
   // Headless batch driver: VR_JOB_SPEC=<path to .json> submits a whole campaign at boot.

@@ -12,7 +12,11 @@
  *   SIGTERM or a hangup from the terminal the app was started in). If any node
  *   may be billing, the quit waits on a dialog, "N nodes are billing $X/hr",
  *   with Destroy all & quit, Leave running and Cancel. It asks every time
- *   (Elliot, 2026-09-25). Destroy all stops the scheduler, destroys every
+ *   (Elliot, 2026-09-25). On Windows the window being closed stays open
+ *   while it asks, so that a shutdown still has a window to ask (below);
+ *   with it gone, a dialog left unanswered overnight, then an update's
+ *   restart, ended the app with the fleet billing and nothing destroyed
+ *   (1.1 review). Destroy all stops the scheduler, destroys every
  *   node, and quits only once each destroy is confirmed. Any it cannot
  *   confirm are listed with the Vast.ai console link, and the app stays up
  *   until the user retries or chooses to quit anyway.
@@ -665,9 +669,10 @@ export interface LifecycleDeps<W = unknown> {
   /** Bring the app forward for a dialog, and return the window to show it against. */
   frontWindow(): W | null
   /**
-   * After a cancelled quit: a window, when none is open. On Windows the last
+   * After a cancelled quit: a window, when none is open. On Linux the last
    * window has already closed by the time the quit asks, and the app would
-   * otherwise run on, billing, with nothing on screen.
+   * otherwise run on, billing, with nothing on screen. (On Windows it is
+   * kept open for the question: holdWindowClose.)
    */
   ensureWindow(): void
   fleet: FleetPort
@@ -698,6 +703,14 @@ export interface Lifecycle {
    * runs, and under `leave`.
    */
   watchCampaign(openJobs: () => number, unsubmitted?: readonly string[]): void
+  /**
+   * A person is closing the app's last window, where that quits it (index.ts
+   * asks on Windows). True keeps the window (the caller's preventDefault):
+   * with anything billing, the quit asks now, with the window still there,
+   * or it is already asking or destroying. The quit's own ending, app.exit,
+   * closes it. False lets it close. Always false for a headless run.
+   */
+  holdWindowClose(): boolean
 }
 
 /** A console line that cannot throw (a full disk under stdout: see events.ts). */
@@ -1016,6 +1029,15 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
   }
 
   return {
+    holdWindowClose(): boolean {
+      if (deps.headless || phase === 'exiting') return false
+      // The dialog, or Destroy all and its failure list, is up against it.
+      if (phase !== 'idle') return true
+      if (!fleet.list().some(holdsInstance)) return false
+      void askAndQuit().catch(fail('quit'))
+      return true
+    },
+
     watchCampaign(openJobs: () => number, unsubmitted: readonly string[] = []): void {
       if (deps.headless?.policy !== 'destroy') return
       // A campaign that never made it in has nothing to wait for and ends
