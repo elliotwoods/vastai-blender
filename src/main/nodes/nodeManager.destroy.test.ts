@@ -467,6 +467,22 @@ describe('1.2 at start-up: what the last run left', () => {
   })
 })
 
+describe('n1 review: an orphan claimed onto its row', () => {
+  it('reads as being destroyed while it goes, not as a node booting', async () => {
+    const app = await bootNodes()
+    const lost = seedRow('requested', { createUnknownSince: Date.now() - 60_000 })
+    w.vast.addInstance({ label: `vastai-blender ${lost.slice(0, 8)}` })
+    const gate = w.vast.hold('destroyInstance')
+    app.nodeManager.init()
+    await w.until(() => gate.reached, 'its DELETE sent')
+    const { isBooting } = await import('../../shared/nodeState')
+    expect(row(lost).state).toBe('destroying')
+    expect(app.nodeManager.list().filter(isBooting)).toEqual([])
+    gate.release()
+    await w.until(() => row(lost).destroyed_at != null, 'destroyed')
+  })
+})
+
 describe('1.2 (Phase 0 review): a create with no known outcome counts as billing', () => {
   it('a rental cancelled mid-create whose reply is lost fills its place under the cap until its label lookup finds it (plans 1.2, 1.4)', async () => {
     const app = await bootNodes()

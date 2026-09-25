@@ -1611,6 +1611,12 @@ export class NodeManager {
         })
         const node = this.claim(row, inst.id)
         this.unknownAtBoot.delete(row.id)
+        // 'destroying' while it goes: a last run's 'requested' row read as a
+        // node booting (isBooting) for the destroy's minute or more, and
+        // scale-up counted it as capacity on its way (n1 review).
+        if (node && !DESTROY_STATES.has(node.state)) {
+          node.setState('destroying', `orphaned instance ${inst.id}`)
+        }
         const gone = await this.ensureInstanceGone(inst.id, { node })
         // Claimed, it is its row's to retry and count. A row that holds
         // another instance could not take it: listed until it is gone.
