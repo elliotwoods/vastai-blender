@@ -12,6 +12,9 @@ import { validateSubmission } from '../../shared/jobValidation'
 import type {
   ChunkSnapshot,
   ChunkState,
+  ErrorClass,
+  JobAttention,
+  JobAttentionKind,
   JobDetail,
   JobState,
   JobSubmission,
@@ -34,6 +37,8 @@ interface JobRow {
   cost_so_far: number
   submitted_at: number
   share_node: number
+  /** JSON JobAttention, or null (plans 1.16, 1.17) */
+  attention: string | null
 }
 
 interface ChunkRow {
@@ -45,6 +50,61 @@ interface ChunkRow {
   node_id: string | null
   frames_done: number
   retries: number
+  infra_retries: number
+  not_before: number | null
+  error_kind: string | null
+}
+
+const ERROR_CLASSES: ReadonlySet<string> = new Set<ErrorClass>([
+  'transient',
+  'machine',
+  'account',
+  'job',
+  'localFs'
+])
+
+const ATTENTION_KINDS: ReadonlySet<string> = new Set<JobAttentionKind>([
+  'scene',
+  'repeatedFailure',
+  'engine',
+  'extension'
+])
+
+/**
+ * jobs.attention as the renderer reads it. The scheduler writes JobAttention
+ * as JSON; anything else in the column is shown as written, so a hand-edited
+ * or older value still reaches the user rather than vanishing.
+ */
+export function parseAttention(raw: string | null): JobAttention | null {
+  if (raw == null || raw.trim() === '') return null
+  try {
+    const v = JSON.parse(raw) as Partial<JobAttention>
+    if (v && typeof v.message === 'string' && ATTENTION_KINDS.has(String(v.kind))) {
+      return {
+        kind: v.kind as JobAttentionKind,
+        message: v.message,
+        since: typeof v.since === 'number' ? v.since : 0,
+        ...(v.errorClass && ERROR_CLASSES.has(v.errorClass) ? { errorClass: v.errorClass } : {})
+      }
+    }
+  } catch {
+    // not JSON: shown as written, below
+  }
+  return { kind: 'repeatedFailure', message: raw, since: 0 }
+}
+
+/**
+ * Why each chunk's last attempt failed, for ChunkSnapshot.lastError. Held in
+ * memory: chunks has no column for it yet, only error_kind for its class, so
+ * after a restart a chunk shows the class of its last failure and not the
+ * words. The alert that reported it carried them too.
+ */
+const lastErrors = new Map<string, string>()
+
+/** Record (or with null, forget) why a chunk's last attempt failed. */
+export function noteChunkError(chunkId: string, reason: string | null): void {
+  if (reason == null) lastErrors.delete(chunkId)
+  else lastErrors.set(chunkId, reason)
 }
 
 function rowToSummary(r: JobRow): JobSummary {
@@ -72,7 +132,8 @@ function rowToSummary(r: JobRow): JobSummary {
     submittedAt: r.submitted_at,
     outputDir: r.output_dir,
     blenderVersion: r.blender_version,
-    shareNode: r.share_node === 1
+    shareNode: r.share_node === 1,
+    attention: parseAttention(r.attention)
   }
 }
 
@@ -85,7 +146,12 @@ function rowToChunk(r: ChunkRow): ChunkSnapshot {
     state: r.state,
     nodeId: r.node_id,
     framesDone: r.frames_done,
-    retries: r.retries
+    retries: r.retries,
+    infraRetries: r.infra_retries,
+    notBefore: r.not_before,
+    errorClass:
+      r.error_kind != null && ERROR_CLASSES.has(r.error_kind) ? (r.error_kind as ErrorClass) : null,
+    lastError: lastErrors.get(r.id) ?? null
   }
 }
 
@@ -119,10 +185,10 @@ export function emitJobChanged(jobId: string): void {
  * Every chunk state write must go through here. They are in scheduler.ts
  * (dispatch, the render/encode/download transitions, finish, the re-split
  * shared by requeue and restart recovery, completing a chunk with nothing left
- * to render, cancel) and index.ts (the VR_JOB_SPEC revive), and the re-split
- * in particular INSERTs brand-new `-rN` rows mid-render — a consumer that only
- * heard about ChunkRun's own writes would keep showing requeued chunks as live
- * and never learn the retry ids exist.
+ * to render, failing a job, cancel) and index.ts (the VR_JOB_SPEC revive), and
+ * the re-split in particular INSERTs brand-new `-rN` rows mid-render — a
+ * consumer that only heard about ChunkRun's own writes would keep showing
+ * requeued chunks as live and never learn the retry ids exist.
  */
 export function emitChunkChanged(chunkId: string): void {
   const row = getDb()
@@ -256,16 +322,23 @@ function undownloadedFrameCount(jobId: string): number {
 /**
  * Recompute a job's state from its chunks, and announce the job.
  *
- * Always announces, a cancelled job included. A cancelled job's state is
+ * Always announces, a cancelled or failed job included. Both states are
  * final, so there is nothing to recompute, but the call still means something
  * about it changed. Returning before the emit meant a cancel itself was never
  * announced: the Jobs list kept showing the job as running.
+ *
+ * 'failed' is the scheduler's verdict that no node can render the job as it
+ * stands (a scene the preflight refused, an engine no node has; plan 1.16),
+ * with the reason in jobs.attention. Its chunks still in flight when that
+ * came settle afterwards, and recomputing from them would turn the job back
+ * into 'running' or 'partial' and hide the reason behind a state that says
+ * nothing is wrong.
  */
 export function refreshJobState(jobId: string): void {
   const db = getDb()
   const row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId) as JobRow | undefined
   if (!row) return
-  if (row.state === 'cancelled') {
+  if (row.state === 'cancelled' || row.state === 'failed') {
     emitJobChanged(jobId)
     return
   }
