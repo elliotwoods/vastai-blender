@@ -13,6 +13,13 @@ GitHub Releases with the notes from this file.
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-09-25
+
+Safety and security fixes from a full audit of the app
+([docs/AUDIT-2026-09.md](docs/AUDIT-2026-09.md)). **Upgrade from 2.2.0 or
+earlier:** a rented machine could write files anywhere on your computer, and
+several paths left instances billing unseen or finished jobs short of frames.
+
 ### Added
 
 - **Alerts reach you.** The main process raises alerts from about 25 places,
@@ -491,7 +498,8 @@ new on-node agent.
 - Energy totals are in-memory for the session; they reset when the app
   restarts. Cost totals are persisted in SQLite.
 
-[Unreleased]: https://github.com/elliotwoods/vastai-blender/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/elliotwoods/vastai-blender/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/elliotwoods/vastai-blender/releases/tag/v2.0.0

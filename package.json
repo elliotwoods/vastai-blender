@@ -1,6 +1,6 @@
 {
   "name": "vastai-blender",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Electron render-farm manager: Blender rendering on Vast.ai GPU fleets",
   "main": "./out/main/index.js",
   "author": "Elliot Woods",
