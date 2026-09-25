@@ -22,6 +22,15 @@ stalled the app).
 
 ### Added
 
+- **The Jobs list is the render queue.** Queued and running jobs come first
+  in the order they will render, then finished jobs, newest first. Drag a
+  job's grip (or press Alt+↑ / Alt+↓ on a row) to move it; drop it on the
+  middle of another job to share that job's priority. Grouped jobs are drawn
+  as one block with an unlink button on each. Each row shows the job's latest
+  frame, how long it has run, the time left and the ETA, and a bar that
+  greys out cancelled frames. A trash button cancels a live job, or removes
+  a finished one from the list (its files stay on disk). Both ask first.
+
 - **Fleet GPU history over the whole range, and per GPU.** `fleet:gpuHistory`
   returns a `summary` for the range asked for: mean utilisation over every
   reading of every GPU in it (so the Fleet screen's *mean util* can be the
