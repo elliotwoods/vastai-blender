@@ -147,7 +147,11 @@ const RESUME_MAX_DELAY_MS = 60_000
  * it: at 25 min it is destroyed like any other failed provision, and the
  * next rental goes to another machine. So inside onReady this deadline, not
  * the script's ceilings or provisioner.ts's per-step timeouts, is the one
- * that ends a slow node.
+ * that ends a slow node. The script's own fallbacks, the next Blender
+ * mirror after 30 min and apt's ffmpeg after about an hour, cannot happen
+ * within it: a link that would reach them is failed here instead. Fitting
+ * the script's per-download ceilings inside this deadline, when it runs from
+ * onReady, is provision.sh's to do.
  */
 const PROVISION_DEADLINE_MS = 25 * 60_000
 

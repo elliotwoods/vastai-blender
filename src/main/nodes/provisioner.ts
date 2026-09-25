@@ -39,10 +39,19 @@ const PROVISION = `${REMOTE_ROOT}/provision.sh`
 export const DEPS_TIMEOUT_MS = 75 * 60_000
 
 /**
- * The longest `provision.sh install-blender` may run: one pass over its four
- * mirrors at the 30-minute ceiling each, then the extraction. It also runs at
- * dispatch, inside the scheduler's per-node prep lock, whose caller can pass
- * a shorter `timeoutMs`.
+ * How long the app waits for `provision.sh install-blender`: one 30-minute
+ * attempt at each of its four mirrors, then the extraction. That is not the
+ * script's own worst case, which no billing node is left to: it goes round
+ * the mirrors twice, and curl may start a second 30-minute attempt at a URL
+ * just before its first 30 minutes are up, so about an hour a URL and some
+ * eight hours in all. Past this the command's channel is closed, but the
+ * script can go on running on the node until it next writes its output, and
+ * an install of the same version started meanwhile deletes the download it
+ * is still writing: only a lock in provision.sh keeps the two apart.
+ *
+ * At dispatch this is the step's own ceiling in the scheduler's per-node
+ * prep (withNodePrep); a caller can pass a shorter `timeoutMs`. Inside
+ * onReady, nodeManager's 25-minute provisioning deadline ends it first.
  */
 export const INSTALL_BLENDER_TIMEOUT_MS = 4 * 30 * 60_000 + 10 * 60_000
 

@@ -136,7 +136,7 @@ describe.skipIf(process.platform === 'win32')(
       ])
     }
 
-    it('1.7 81fe2875: restartAgent keeps a live, current agent with its renders, and says it kept it', async () => {
+    it('1.7/1.9: restartAgent keeps a live, current agent with its renders, and says it kept it', async () => {
       expect(await restartAgent(ssh.ssh, 'node-1')).toEqual({
         restarted: true,
         reason: 'no agent session'

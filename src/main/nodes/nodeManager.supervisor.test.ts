@@ -223,7 +223,7 @@ describe('1.7: liveness supervision', () => {
     expect(chunksOf(jobId)[0].state).not.toBe('rendering')
   })
 
-  it('1.7 81fe2875: a node back from a minute off the network with its agent alive keeps its render; Blender is not killed', async () => {
+  it('1.7: a node back from a minute off the network with its agent alive keeps its render; Blender is not killed', async () => {
     const { app, busy, jobId, chunkId, prov } = await renderingOnOne()
     const machine = w.machineFor(busy)
     dropOff(machine)
