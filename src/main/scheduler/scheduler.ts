@@ -804,6 +804,7 @@ class ChunkRun {
           this.gpu = gpu
           nodeManager.get(this.nodeId)?.emitChanged()
         }
+        if (state.pinFailed === true) scheduler.pinFailedOn(this.nodeId)
         emit('chunk:progress', {
           chunkId: this.chunkId,
           jobId: this.jobId,
@@ -908,6 +909,9 @@ class ChunkRun {
         if (state.status === 'failed') {
           await this.downloader?.drain()
           if (this.stopped) return
+          // Before the requeue, so the chunk is not sent back into the plan
+          // it ran out of memory in (#228).
+          if (state.oom === true) scheduler.outOfMemoryOn(this)
           this.finish('failed', agentFailure(state, this.nodeId))
           return
         }
@@ -1089,6 +1093,13 @@ class Scheduler {
   /** memory guard on each node's exclusive GPU lanes (see gpuLanes) */
   private laneGuards = new Map<string, LaneGuard>()
   /**
+   * The most lanes per GPU a node is planned with, below the setting, for
+   * the rest of its rental: 1 once a render ran out of GPU memory beside
+   * another on its card (outOfMemoryOn), 0 (one unpinned lane) once its
+   * agent could not pin (pinFailedOn).
+   */
+  private laneCeilings = new Map<string, number>()
+  /**
    * At most one node at a time may be held empty for a waiting exclusive
    * chunk. See reserveForExclusive.
    */
@@ -1191,6 +1202,7 @@ class Scheduler {
   forgetNode(nodeId: string): void {
     this.slots.delete(nodeId)
     this.laneGuards.delete(nodeId)
+    this.laneCeilings.delete(nodeId)
     if (this.reservation?.nodeId === nodeId) this.reservation = null
     // Sent nothing for a while. destroyNode forgets a node before it marks it
     // destroying, and the kick below ran a tick in between: the node still
@@ -1480,17 +1492,75 @@ class Scheduler {
     )
   }
 
-  /** What planLanes and the lane guard need to know about a node, or null when it is gone. */
+  /**
+   * What planLanes and the lane guard need to know about a node, or null
+   * when it is gone. Its lanes per GPU are the setting's, under what this
+   * node has shown it can take (laneCeilings).
+   */
   private laneContext(nodeId: string, engine?: EngineId | null): LaneGuardContext | null {
     const node = nodeManager.get(nodeId)?.laneInputs
     if (!node) return null
     const settings = getSettings()
     return {
       numGpus: node.numGpus,
-      slotsPerGpu: normaliseSlotsPerGpu(settings.slotsPerGpu),
+      slotsPerGpu: Math.min(
+        normaliseSlotsPerGpu(settings.slotsPerGpu),
+        this.laneCeilings.get(nodeId) ?? Number.POSITIVE_INFINITY
+      ),
       cap: hardCap(node.metrics, Math.max(0, settings.maxNodeSlots ?? 0)),
       engine
     }
+  }
+
+  /**
+   * A render on this node ran out of GPU memory (#228). When the plan it was
+   * sent with put more than one scene on its card (two lanes per GPU, or two
+   * lanes sharing a one-GPU node), the node drops a lane per GPU before the
+   * chunk is requeued. Sent back into the same plan, it ran out of memory
+   * beside the same neighbour, retry after retry, each a paid render.
+   *
+   * At one scene per card nothing lower frees VRAM (one process across every
+   * card loads the scene onto each of them too), so the plan stays and the
+   * retry policy decides (admission.ts chargeFor). Shared work is the slot
+   * controller's, and is left to it.
+   */
+  outOfMemoryOn(run: ChunkRun): void {
+    if (run.shareNode) return
+    const ctx = this.laneContext(run.nodeId, run.engine)
+    if (!ctx) return
+    const gpus = Math.max(1, Math.floor(ctx.numGpus || 1))
+    const perCard =
+      gpus === 1 ? run.lanes.lanes : run.lanes.pin ? Math.ceil(run.lanes.lanes / gpus) : 1
+    if (perCard <= 1 || ctx.slotsPerGpu <= 1) return
+    const lanesPerGpu = ctx.slotsPerGpu - 1
+    this.laneCeilings.set(run.nodeId, lanesPerGpu)
+    emit('alert', {
+      level: 'warn',
+      message:
+        `${this.nodeName(run.nodeId)}: out of GPU memory with ${perCard} renders on a card, ` +
+        `so it now runs ${lanesPerGpu} per card`
+    })
+    nodeManager.get(run.nodeId)?.emitChanged()
+  }
+
+  /**
+   * The agent was asked to pin a Cycles render to one GPU and could not: it
+   * sees fewer than two GPUs (nvidia-smi failed as it started, or found
+   * fewer cards than the offer listed), so it runs such renders one at a
+   * time, each on every card it can see (#230). Planned as N lanes, the node
+   * kept being sent specs that waited in its inbox while the app counted
+   * them in flight. From now on it is planned as one lane.
+   */
+  pinFailedOn(nodeId: string): void {
+    if (this.laneCeilings.get(nodeId) === 0) return
+    this.laneCeilings.set(nodeId, 0)
+    emit('alert', {
+      level: 'warn',
+      message:
+        `${this.nodeName(nodeId)}: its agent cannot pin renders to GPUs (it sees fewer than ` +
+        'two), so it runs one render at a time across every card'
+    })
+    nodeManager.get(nodeId)?.emitChanged()
   }
 
   /**

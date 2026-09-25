@@ -3,6 +3,7 @@ import type { EngineId } from '../../shared/models'
 import {
   setup,
   type AgentSpec,
+  type AgentStateFile,
   type App,
   type FakeMachine,
   type SetupOptions,
@@ -364,5 +365,73 @@ describe('1.11 #225: what a pinned run teaches gpu_perf', () => {
     expect(perf.samples).toBe(3)
     expect(perf.frames_per_hour).toBeGreaterThan(3_600_000 / (Date.now() - dispatchedAt) - 0.01)
     expect(perf.frames_per_hour).toBeLessThanOrEqual(6)
+  })
+})
+
+describe('1.11 #228 #230: what a node shows it can take', () => {
+  it('out of GPU memory at two renders a card drops the node to one a card before the requeue', async () => {
+    const { app, nodeId, machine } = await gpuNode(2, { slotsPerGpu: 2 })
+    const specs: Array<AgentSpec & { inFlight: number }> = []
+    let oomed = false
+    machine.onSpec = (spec) => {
+      specs.push({ ...spec, inFlight: inFlight(app, nodeId) })
+      if (!oomed) {
+        oomed = true
+        // What the agent reports for a render stopped out of GPU memory.
+        machine.agent.fail(spec.chunkId, 'out of GPU memory on GPU 0 (exit -15)', -15)
+        machine.agent.writeState(spec.chunkId, {
+          status: 'failed',
+          error: 'out of GPU memory on GPU 0 (exit -15): CUDA error: Out of memory in cuMemAlloc',
+          exitCode: -15,
+          errorKind: 'machine',
+          oom: true,
+          gpu: 0
+        } as Partial<AgentStateFile>)
+        return
+      }
+      setTimeout(() => machine.agent.finish(spec.chunkId), 60_000)
+    }
+    const jobId = await submit(app, 'cycles', 8)
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+
+    // Four lanes (two a card) at first; every spec after the OOM is two, and
+    // the node never ran more than two at once again.
+    expect(specs.slice(0, 4).map((s) => [s.lanes, s.pinGpus])).toEqual(
+      specs.slice(0, 4).map(() => [4, true])
+    )
+    const after = specs.slice(4)
+    expect(after.length).toBeGreaterThan(0)
+    expect(after.map((s) => [s.lanes, s.pinGpus])).toEqual(after.map(() => [2, true]))
+    expect(Math.max(...after.map((s) => s.inFlight))).toBeLessThanOrEqual(2)
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /out of GPU memory with 2 renders on a card, so it now runs 1 per card/
+    )
+    // The machine's failure, as before: no render retry spent.
+    expect(chunksOf(jobId).map((c) => c.retries)).toEqual(chunksOf(jobId).map(() => 0))
+  })
+
+  it('an agent that cannot pin has its node planned as one lane', async () => {
+    const { app, nodeId, machine } = await gpuNode(4)
+    const specs = recordSpecs(machine)
+    const jobId = await submit(app, 'cycles', 6)
+    app.scheduler.kick()
+    await w.until(() => specs.length === 4, 'four pinned lanes')
+    // nvidia-smi failed as the agent started: it runs these one at a time,
+    // unpinned, and says so in the state it writes.
+    machine.agent.writeState(specs[0].chunkId, {
+      status: 'rendering',
+      pinFailed: true
+    } as Partial<AgentStateFile>)
+    await w.until(() => w.alerts('warn').some((a) => /cannot pin renders/.test(a)), 'noticed')
+    for (const s of specs.slice(0, 4)) machine.agent.finish(s.chunkId)
+    await w.until(() => specs.length === 5, 'the next chunk')
+    await w.advance(20_000)
+    expect(specs).toHaveLength(5)
+    expect(specs[4]).toMatchObject({ lanes: 1, pinGpus: false })
+    expect(inFlight(app, nodeId)).toBe(1)
+    machine.onSpec = (spec) => machine.agent.finish(spec.chunkId)
+    machine.agent.finish(specs[4].chunkId)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
   })
 })
