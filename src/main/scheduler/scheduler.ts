@@ -39,6 +39,7 @@ import {
   budgetFor,
   chargeFor,
   chunkBackoffMs,
+  exclusiveLanesFor,
   freeExclusiveLanes,
   hasRoom,
   JobBreaker,
@@ -50,12 +51,13 @@ import {
   type RetryBudget
 } from './admission'
 import {
-  effectiveLanes,
+  guardedLanePlan,
   guardLanes,
   initialGuard,
   normaliseSlotsPerGpu,
   planLanes,
   type LaneGuard,
+  type LaneGuardContext,
   type LanePlan
 } from './gpuLanes'
 import { planScaling, type ScalingPlan } from './scaling'
@@ -142,6 +144,8 @@ interface ChunkRow {
 interface PendingChunk extends ChunkRow {
   /** 0 = exclusive (needs the node to itself), 1 = may co-run */
   share_node: number
+  /** the job's engine: what its lanes are planned for (gpuLanes.planLanes) */
+  engine: EngineId
   blender_version: string | null
   /** frames of its range not yet downloaded: what a node would render for it */
   frames_left: number
@@ -395,7 +399,13 @@ class ChunkRun {
     readonly nodeId: string,
     /** may this chunk share its node? (mirrors the job's share_node flag) */
     readonly shareNode: boolean,
-    private readonly ssh: SshConnection
+    private readonly ssh: SshConnection,
+    /**
+     * The lanes and pinning this chunk is sent with, planned when it was
+     * assigned (Scheduler.lanePlanFor): what the node's other runs are
+     * admitted beside (admission.ts exclusiveLanesFor).
+     */
+    readonly lanes: LanePlan
   ) {}
 
   /**
@@ -544,7 +554,7 @@ class ChunkRun {
     const node = nodeManager.get(this.nodeId)
     if (!node) throw new Error('node vanished')
     const slotTarget = this.shareNode ? scheduler.slotTargetFor(this.nodeId) : 1
-    const lanes = scheduler.lanePlanFor(this.nodeId)
+    const lanes = this.lanes
 
     this.setChunk({ state: 'assigned', node_id: this.nodeId, assigned_at: Date.now() })
     // State only: setState would also wipe the node's last error, which is how
@@ -1420,30 +1430,62 @@ class Scheduler {
   }
 
   /**
-   * This node's GPU lanes: how many exclusive chunks it may run at once and
-   * whether renders are pinned per GPU. Derived on demand from the node's GPU
-   * count, the setting and its hardware ceiling, then bounded by the memory
-   * guard — cheap, and never stale when the setting or metrics change.
+   * This node's GPU lanes for work of `engine`: how many exclusive chunks it
+   * may run at once and whether renders are pinned per GPU. Derived on
+   * demand from the node's GPU count, the setting and its hardware ceiling,
+   * under the memory guard — cheap, and never stale when the setting or
+   * metrics change.
+   *
+   * By engine: lanes are a Cycles idea, and EEVEE or Octane get one unpinned
+   * lane, the whole node (#229, #235). Without an engine, the Cycles plan:
+   * the most a node offers anything. The guard is a ceiling planLanes plans
+   * under (guardedLanePlan), so a limit below the GPU count is one process
+   * across every card, never a few pinned lanes with the other cards idle,
+   * as keeping the plan's `pin` while cutting its lanes was (#222).
    */
-  lanePlanFor(nodeId: string): LanePlan {
-    const node = nodeManager.get(nodeId)?.laneInputs
-    if (!node) return { lanes: 1, pin: false }
-    const settings = getSettings()
-    const plan = planLanes(
-      node.numGpus,
-      normaliseSlotsPerGpu(settings.slotsPerGpu),
-      hardCap(node.metrics, Math.max(0, settings.maxNodeSlots ?? 0))
+  lanePlanFor(nodeId: string, engine?: EngineId | null): LanePlan {
+    const ctx = this.laneContext(nodeId, engine)
+    if (!ctx) return { lanes: 1, pin: false }
+    return guardedLanePlan(
+      ctx.numGpus,
+      ctx.slotsPerGpu,
+      ctx.cap,
+      this.laneGuards.get(nodeId),
+      engine
     )
-    return { lanes: effectiveLanes(plan, this.laneGuards.get(nodeId)), pin: plan.pin }
+  }
+
+  /** What planLanes and the lane guard need to know about a node, or null when it is gone. */
+  private laneContext(nodeId: string, engine?: EngineId | null): LaneGuardContext | null {
+    const node = nodeManager.get(nodeId)?.laneInputs
+    if (!node) return null
+    const settings = getSettings()
+    return {
+      numGpus: node.numGpus,
+      slotsPerGpu: normaliseSlotsPerGpu(settings.slotsPerGpu),
+      cap: hardCap(node.metrics, Math.max(0, settings.maxNodeSlots ?? 0)),
+      engine
+    }
+  }
+
+  /**
+   * Exclusive lanes on a node for a chunk of `engine`, given the plans its
+   * exclusive runs were sent with (admission.ts exclusiveLanesFor).
+   */
+  private exclusiveLanes(nodeId: string, engine?: EngineId | null): number {
+    const running = [...this.runsOn(nodeId)].filter((r) => !r.shareNode).map((r) => r.lanes)
+    return exclusiveLanesFor(this.lanePlanFor(nodeId, engine), running)
   }
 
   /**
    * The slot count the UI shows for a node: its GPU lanes while it runs
-   * exclusive work (or sits empty), otherwise the shared-work target.
+   * exclusive work (or sits empty), otherwise the shared-work target. A
+   * node running an unpinned exclusive chunk (EEVEE, Octane, or a Cycles
+   * chunk across every card) is full at one.
    */
   displaySlotTarget(nodeId: string): number {
     const runs = this.runsOn(nodeId)
-    const lanes = this.lanePlanFor(nodeId).lanes
+    const lanes = this.exclusiveLanes(nodeId)
     if ([...runs].some((r) => !r.shareNode)) return lanes
     if (runs.size === 0) return Math.max(this.slotTargetFor(nodeId), lanes)
     return this.slotTargetFor(nodeId)
@@ -1464,7 +1506,7 @@ class Scheduler {
   private pendingChunks(): PendingChunk[] {
     const rows = getDb()
       .prepare(
-        `SELECT c.*, j.share_node, j.blender_version,
+        `SELECT c.*, j.share_node, j.engine, j.blender_version,
                 (SELECT COUNT(*) FROM ${UNDOWNLOADED_OF_C}) AS frames_left
            FROM chunks c JOIN jobs j ON j.id = c.job_id
           WHERE c.state = 'pending' AND j.state IN ('queued', 'running')
@@ -1578,14 +1620,19 @@ class Scheduler {
     if (this.previewSubs.has(chunkId)) await this.writePreviewFlag(nodeId, chunkId, true)
   }
 
-  private occupancy(nodeId: string): NodeOccupancy {
+  /**
+   * What the node is running, as admission reads it, for a chunk of `engine`
+   * (its exclusive lanes depend on it; see exclusiveLanes). Without an
+   * engine, the most lanes the node offers anything: the pre-filter's view.
+   */
+  private occupancy(nodeId: string, engine?: EngineId | null): NodeOccupancy {
     const runs = this.runsOn(nodeId)
     return {
       inFlight: runs.size,
       hasExclusive: [...runs].some((r) => !r.shareNode),
       reservedFor: this.reservation?.nodeId === nodeId ? this.reservation.chunkId : null,
       slotTarget: this.slotTargetFor(nodeId),
-      exclusiveLanes: this.lanePlanFor(nodeId).lanes
+      exclusiveLanes: this.exclusiveLanes(nodeId, engine)
     }
   }
 
@@ -1688,7 +1735,7 @@ class Scheduler {
     // Something is already free (an empty node, or a free GPU lane on a node
     // running exclusive work) — no need to hold a node back.
     const candidate = { id: head.id, sharesNode: false }
-    if (eligible.some((n) => admits(this.occupancy(n.id), candidate))) return
+    if (eligible.some((n) => admits(this.occupancy(n.id, head.engine), candidate))) return
     // Drain whichever node is closest to empty.
     let best: { id: string; size: number } | null = null
     for (const n of eligible) {
@@ -1749,7 +1796,8 @@ class Scheduler {
           chunk.job_id,
           node.id,
           chunk.share_node === 1,
-          managed.ssh
+          managed.ssh,
+          this.lanePlanFor(node.id, chunk.engine)
         )
         this.runs.set(chunk.id, run)
         this.nodeRunsMut(node.id).add(run)
@@ -1818,9 +1866,20 @@ class Scheduler {
     eligible: NodeSnapshot[]
   ): number {
     let fallback = -1
+    // The node's lanes depend on the engine asking (exclusiveLanes): an EEVEE
+    // chunk sees a node running pinned Cycles lanes as full.
+    const occFor = new Map<EngineId, NodeOccupancy>()
+    const occupancy = (engine: EngineId): NodeOccupancy => {
+      let o = occFor.get(engine)
+      if (!o) {
+        o = { ...occ, exclusiveLanes: this.exclusiveLanes(node.id, engine) }
+        occFor.set(engine, o)
+      }
+      return o
+    }
     for (let i = 0; i < pending.length; i++) {
       const c = pending[i]
-      if (!admits(occ, { id: c.id, sharesNode: c.share_node === 1 })) continue
+      if (!admits(occupancy(c.engine), { id: c.id, sharesNode: c.share_node === 1 })) continue
       const avoid = this.failedOn.get(c.id)?.nodes
       if (avoid?.has(node.id) && this.anotherTakes(c, avoid, eligible)) continue
       if (!c.blender_version || node.blenderVersions.includes(c.blender_version)) return i
@@ -1841,7 +1900,7 @@ class Scheduler {
     eligible: NodeSnapshot[]
   ): boolean {
     const cand = { id: c.id, sharesNode: c.share_node === 1 }
-    return eligible.some((n) => !avoid.has(n.id) && admits(this.occupancy(n.id), cand))
+    return eligible.some((n) => !avoid.has(n.id) && admits(this.occupancy(n.id, c.engine), cand))
   }
 
   /** Is this node resting after a failed dispatch? */
@@ -2429,10 +2488,19 @@ class Scheduler {
         (a, n) => a + Math.max(0, this.slotTargetFor(n.id) - (this.byNode.get(n.id)?.size ?? 0)),
         0
       )
+    // Lanes are counted for the engine the pending exclusive work renders
+    // with: one per node for EEVEE and Octane (#229, #235), which a 4-GPU node
+    // offered as four. Any Cycles among it sizes by Cycles' lanes, which errs
+    // toward capacity the fleet may not have, so toward renting less.
+    const exclusiveEngines = new Set(pending.filter((c) => c.share_node !== 1).map((c) => c.engine))
+    const laneEngine =
+      exclusiveEngines.size > 0 && !exclusiveEngines.has('cycles')
+        ? [...exclusiveEngines][0]
+        : undefined
     // Free GPU lanes, not empty nodes: a 4-GPU node running one exclusive
     // chunk still has room for three more.
     const exclusiveCapacity = usable.reduce(
-      (a, n) => a + freeExclusiveLanes(this.occupancy(n.id)),
+      (a, n) => a + freeExclusiveLanes(this.occupancy(n.id, laneEngine)),
       0
     )
 
@@ -2441,7 +2509,12 @@ class Scheduler {
     // pending chunks.
     const slotsPerGpu = normaliseSlotsPerGpu(settings.slotsPerGpu)
     const booting = nodes.filter(isBooting).map((n) => {
-      const lanes = planLanes(n.numGpus, slotsPerGpu, hardCap(null, settings.maxNodeSlots ?? 0))
+      const lanes = planLanes(
+        n.numGpus,
+        slotsPerGpu,
+        hardCap(null, settings.maxNodeSlots ?? 0),
+        laneEngine
+      )
       return { lanes: lanes.lanes, sharedSlots: Math.max(2, lanes.lanes) }
     })
     // What a node rented now is expected to bring. The GPU-count floor is the
@@ -2449,7 +2522,8 @@ class Scheduler {
     const newNode = planLanes(
       Math.max(1, settings.offerFilters.minNumGpus ?? 1),
       slotsPerGpu,
-      hardCap(null, settings.maxNodeSlots ?? 0)
+      hardCap(null, settings.maxNodeSlots ?? 0),
+      laneEngine
     )
 
     // The work left, in frames not yet downloaded: pending chunks, and the
@@ -2489,7 +2563,7 @@ class Scheduler {
       newNodeLanes: newNode.lanes,
       newNodeSharedSlots: Math.max(2, newNode.lanes),
       usableNodes: usable.length,
-      usableLanes: usable.reduce((a, n) => a + this.lanePlanFor(n.id).lanes, 0),
+      usableLanes: usable.reduce((a, n) => a + this.lanePlanFor(n.id, laneEngine).lanes, 0),
       usableSharedSlots: usable.reduce((a, n) => a + this.slotTargetFor(n.id), 0),
       pendingFrames: pending.reduce((a, c) => a + c.frames_left, 0),
       remainingExclusiveFrames,

@@ -32,7 +32,8 @@ export interface NodeOccupancy {
    * How many EXCLUSIVE chunks the node may run side by side — its GPU lanes
    * (see gpuLanes). Absent/1 = the historical rule: an exclusive chunk holds
    * the whole node. On a 4-GPU node with per-GPU slots it is 4: exclusivity is
-   * per GPU, and exclusive chunks still never mix with shared ones.
+   * per GPU, and exclusive chunks still never mix with shared ones. It
+   * depends on the chunk asking (exclusiveLanesFor): an EEVEE chunk gets 1.
    */
   exclusiveLanes?: number
 }
@@ -76,6 +77,30 @@ export function hasRoom(occ: NodeOccupancy): boolean {
   if (occ.hasExclusive) return occ.inFlight < lanesOf(occ)
   if (occ.reservedFor != null) return occ.inFlight === 0
   return occ.inFlight === 0 || occ.inFlight < nodeCapacity(occ.slotTarget)
+}
+
+/**
+ * The exclusive lanes a node offers a chunk (NodeOccupancy.exclusiveLanes):
+ * its lane plan for the chunk's engine, but one while any exclusive run on it
+ * went out unpinned.
+ *
+ * `plan` is gpuLanes' plan for the chunk's engine on this node: one unpinned
+ * lane, the whole node, for EEVEE and Octane (#229, #235). `running` is the
+ * plan each exclusive run already on the node was sent with. An unpinned
+ * render uses every card, so there is no lane beside it, and the agent does
+ * not know that: it starts a spec beside any run fewer than the spec's own
+ * `lanes`, so a pinned Cycles spec sent to a node running an EEVEE chunk, or
+ * a Cycles chunk sent across every card (#224), would have shared its cards.
+ * The other way round, an EEVEE spec sent beside pinned Cycles lanes is one
+ * the agent will not start, and it waits at the head of an inbox that is
+ * first come, first served, holding up every spec behind it.
+ */
+export function exclusiveLanesFor(
+  plan: { lanes: number },
+  running: ReadonlyArray<{ pin: boolean }>
+): number {
+  if (running.some((r) => !r.pin)) return 1
+  return Math.max(1, Math.floor(plan.lanes || 1))
 }
 
 /**

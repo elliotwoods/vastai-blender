@@ -6,6 +6,7 @@ import {
   budgetFor,
   chargeFor,
   chunkBackoffMs,
+  exclusiveLanesFor,
   freeExclusiveLanes,
   hasRoom,
   JobBreaker,
@@ -144,6 +145,30 @@ describe('GPU lanes — exclusive chunks on a multi-GPU node', () => {
     expect(freeExclusiveLanes(lanes4({ inFlight: 1, hasExclusive: true }))).toBe(3)
     expect(freeExclusiveLanes(lanes4({ inFlight: 1, hasExclusive: false }))).toBe(0)
     expect(freeExclusiveLanes(occ())).toBe(1)
+  })
+})
+
+describe('exclusiveLanesFor — the lanes a node offers one chunk (plan 1.11)', () => {
+  const pinned4 = { lanes: 4, pin: true }
+  const whole = { lanes: 1, pin: false }
+  const running = (lanes: number, inFlight: number): NodeOccupancy =>
+    occ({ inFlight, hasExclusive: true, exclusiveLanes: lanes })
+
+  it("is the chunk's own plan on an empty node", () => {
+    expect(exclusiveLanesFor(pinned4, [])).toBe(4)
+    expect(exclusiveLanesFor(whole, [])).toBe(1)
+  })
+
+  it('is the plan beside pinned lanes, so an EEVEE chunk sees them as full (#229)', () => {
+    expect(exclusiveLanesFor(pinned4, [pinned4, pinned4])).toBe(4)
+    expect(admits(running(exclusiveLanesFor(whole, [pinned4, pinned4]), 2), exclusive)).toBe(false)
+  })
+
+  it('is one beside an unpinned run, which has every card (#224, #229)', () => {
+    const o = running(exclusiveLanesFor(pinned4, [whole]), 1)
+    expect(o.exclusiveLanes).toBe(1)
+    expect(admits(o, exclusive)).toBe(false)
+    expect(freeExclusiveLanes(o)).toBe(0)
   })
 })
 
