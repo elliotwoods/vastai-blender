@@ -2050,8 +2050,26 @@ class Scheduler {
   }
 
   start(): void {
-    // nodeManager's account hold is one of fleet:holds (noteHolds).
+    // The tick and the hold listener come first. A throw in the recovery
+    // below (a database write on a full disk: job da68b61b's condition) left
+    // the scheduler with no timer at all, so nothing was dispatched and no
+    // idle node was ever let go while the fleet billed.
+    this.timer ??= setInterval(() => void this.tick(), TICK_MS)
     this.unsubscribeHolds ??= nodeManager.onHoldsChanged(() => this.noteHolds())
+    try {
+      this.recoverAtStart()
+    } catch (e) {
+      emit('alert', {
+        level: 'error',
+        message:
+          `Restart recovery failed (${describeError(e)}): chunks left in flight by the last ` +
+          'session may not be sent again until the app is restarted'
+      })
+    }
+  }
+
+  /** start()'s restart recovery: stranded chunks back in the queue, and the recovery hold. */
+  private recoverAtStart(): void {
     // Restart recovery: chunks stranded in transient states (their ChunkRun
     // died with the previous process) go back to pending, unassigned, each
     // re-split around the frames already downloaded, as requeue() does but
@@ -2112,7 +2130,6 @@ class Scheduler {
           `fleet scale-up is paused until you resume`
       })
     }
-    this.timer = setInterval(() => void this.tick(), TICK_MS)
   }
 
   /**
@@ -2144,7 +2161,12 @@ class Scheduler {
     }
     if (!stored && getSettings().maxActiveNodes <= 1) return null
     const hold: RecoveryHoldRecord = { jobIds, since: stored?.since ?? Date.now() }
-    writeAppState(db, 'recovery_hold', JSON.stringify(hold))
+    try {
+      writeAppState(db, 'recovery_hold', JSON.stringify(hold))
+    } catch {
+      // Held in memory for this session all the same: a hold that could not
+      // be written is still a hold.
+    }
     return hold
   }
 
@@ -3031,7 +3053,17 @@ class Scheduler {
   }
 
   async tick(): Promise<void> {
-    this.settleDownloadedPending()
+    // Guarded: a write that throws here (a full disk under the database)
+    // threw on every tick before scalePolicy, and idle nodes were never let
+    // go while they billed.
+    try {
+      this.settleDownloadedPending()
+    } catch (e) {
+      emit('alert', {
+        level: 'error',
+        message: `could not mark fully downloaded chunks complete: ${describeError(e)}`
+      })
+    }
     const pending = this.pendingChunks()
     const now = Date.now()
     // Chunks that may go out now: none while the local disk refuses frames

@@ -216,3 +216,52 @@ describe('1.21 no work, no rent (job da68b61b)', () => {
     expect(jobState(jobId)).toBe('complete')
   })
 })
+
+// Plan 1.21, the second half of da68b61b: with the Mac's disk full, a write
+// that throws must not stop the scheduler. The tick's first step, and
+// start()'s restart recovery, write to the database; a throw from either
+// left no idle scale-down (the tick threw before scalePolicy, every 15 s)
+// or no tick at all (start() threw before setInterval), while the fleet
+// billed (s1 review).
+describe('1.21 a database write that throws never stops the tick (job da68b61b)', () => {
+  /** Make the database refuse statements whose SQL matches, as SQLITE_FULL would. */
+  function refuse(pattern: RegExp): void {
+    const prepare = w.db.prepare.bind(w.db)
+    w.db.prepare = ((sql: string) => {
+      if (pattern.test(sql)) throw new Error('SQLITE_FULL: database or disk is full')
+      return prepare(sql)
+    }) as typeof w.db.prepare
+  }
+
+  it('the tick still lets an idle node go when marking downloaded chunks complete throws', async () => {
+    w = await setup({ settings: { maxActiveNodes: 1, idleTimeoutMinutes: 1 } })
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    refuse(/NOT EXISTS \(SELECT 1 FROM frames/)
+    await w.until(
+      () => app.nodeManager.get(nodeId)?.state === 'destroyed',
+      'the idle node let go',
+      {
+        timeoutMs: 5 * 60_000
+      }
+    )
+    expect(w.alerts('error').join('\n')).toMatch(/could not mark fully downloaded chunks complete/)
+  })
+
+  it("start()'s restart recovery throwing still leaves the scheduler ticking", async () => {
+    w = await setup({ settings: { maxActiveNodes: 1, idleTimeoutMinutes: 1 } })
+    const app = await w.boot({ start: false })
+    refuse(/WHERE state IN \('assigned', 'rendering', 'encoding', 'downloading'\)/)
+    app.nodeManager.init()
+    app.scheduler.start()
+    const nodeId = await w.readyNode(app)
+    await w.until(
+      () => app.nodeManager.get(nodeId)?.state === 'destroyed',
+      'the idle node let go',
+      {
+        timeoutMs: 5 * 60_000
+      }
+    )
+    expect(w.alerts('error').join('\n')).toMatch(/Restart recovery failed/)
+  })
+})
