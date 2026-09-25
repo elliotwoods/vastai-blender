@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { classify, describeError, GUARD_EXIT, type AgentFailure } from './errors'
+import { RetryAbortedError } from './ssh/connectRetry'
+import { TransferAbortedError, TransferStalledError } from './ssh/pipelinedGet'
+import { SftpTimeoutError } from './ssh/sftp'
+import { ExecTimeoutError, HostKeyMismatchError, SftpOpenTimeoutError } from './ssh/sshConnection'
 
 /** vastClient.ts's VastError, verbatim: its name stays 'Error', only `status` marks it. */
 class VastError extends Error {
@@ -311,14 +315,15 @@ describe('classify: what nothing recognises', () => {
 
   it("knows this app's own SSH and transfer failures, so none is charged to the job", () => {
     const infra: Array<[Error, string]> = [
-      [new Error('execStream timeout after 600000ms: provision.sh base'), 'transient'],
-      [new Error('SFTP readFile /work/state/c1.json: no answer for 30s'), 'transient'],
-      [new Error('SFTP channel open timed out after 20000ms'), 'transient'],
+      [new ExecTimeoutError('execStream', 'provision.sh base', 600_000), 'transient'],
+      [new ExecTimeoutError('exec', 'cat /work/state/c1.json', 30_000), 'transient'],
+      [new SftpTimeoutError('readFile /work/state/c1.json', 30_000), 'transient'],
+      [new SftpOpenTimeoutError(20_000), 'transient'],
       [new Error('unexpected EOF at 1048576 of 4194304 (/work/renders/c1/0001.exr)'), 'transient'],
       [new Error('size mismatch downloading /work/renders/c1/0001.exr: 10 != 20'), 'transient'],
       [new Error('hash mismatch downloading /work/renders/c1/0001.exr'), 'transient'],
       [new Error('upload verify failed for scene.blend'), 'transient'],
-      [new Error('transfer aborted (/work/renders/c1/0001.exr)'), 'transient'],
+      [new TransferAbortedError('/work/renders/c1/0001.exr'), 'transient'],
       [new Error('node vanished'), 'machine'],
       [new Error('no SSH endpoint yet'), 'machine'],
       // sshConnection's own words, even when the caller gave no source.
@@ -331,8 +336,176 @@ describe('classify: what nothing recognises', () => {
       expect(c.kind, `${e.message} → ${c.rule}`).toBe(kind)
       expect(c.rule).not.toBe('unclassified')
     }
-    const sftpTimeout = classify(new Error('SFTP writeFile /work/inbox/c1.json: no answer for 30s'))
+    const sftpTimeout = classify(new SftpTimeoutError('writeFile /work/inbox/c1.json', 30_000))
     expect(sftpTimeout.outcomeUnknown).toBe(true)
+  })
+
+  describe('a flaky node on the dispatch and download paths never spends render retries (job 1d59516c)', () => {
+    // ChunkRun.dispatch runs installBlender, setupOctane, installExtension and
+    // uploadFileVerified inside withNodePrep before anything renders, and the
+    // downloader runs pipelinedGet's stall guard. Charged to the job, one bad
+    // node's stalls and resets used up chunks' render retries, and the same
+    // class on a second node put the job in "needs attention" while the fleet
+    // billed. Each of these is the app's own error, thrown as it throws it.
+    const infra: Array<[string, unknown, string, string]> = [
+      [
+        'the download stall guard',
+        new TransferStalledError('/work/renders/c1/0001.exr', 61_000, 1_048_576),
+        'transient',
+        'transfer-stalled'
+      ],
+      [
+        'an SFTP open given up on',
+        new Error('SFTP channel given up on while it opened'),
+        'transient',
+        'sftp-open-reset'
+      ],
+      [
+        'an SFTP open reset under it',
+        new Error('SFTP channel reset while it opened'),
+        'transient',
+        'sftp-open-reset'
+      ],
+      [
+        'a connect retry the caller gave up on',
+        new RetryAbortedError(),
+        'transient',
+        'retry-aborted'
+      ],
+      // ssh2's words when the node's sshd refuses a request on a channel.
+      ['ssh2 refusing an exec', new Error('Unable to exec'), 'transient', 'ssh-request-refused'],
+      [
+        'ssh2 refusing the SFTP subsystem',
+        new Error('Unable to start subsystem: sftp'),
+        'transient',
+        'ssh-request-refused'
+      ],
+      [
+        'a channel already closed',
+        new Error('Channel is not open'),
+        'transient',
+        'ssh-request-refused'
+      ],
+      ['no channel left', new Error('No free channels available'), 'transient', 'ssh-channels'],
+      [
+        'SFTP end of file',
+        Object.assign(new Error('End of file'), { code: 1 }),
+        'transient',
+        'transfer-damaged'
+      ],
+      [
+        "sftp.ts's remote mkdir",
+        new Error(
+          "mkdir failed: mkdir: cannot create directory '/work/renders/c1': Read-only file system"
+        ),
+        'machine',
+        'node-setup'
+      ],
+      // provisioner's runLogged, for each step dispatch can run.
+      [
+        'provision.sh base',
+        new Error('provision.sh base failed (exit 1)'),
+        'machine',
+        'node-setup'
+      ],
+      [
+        'a Blender install whose every mirror failed',
+        new Error('install blender 4.5.3 failed (exit 22)'),
+        'machine',
+        'node-setup'
+      ],
+      [
+        'an extension install',
+        new Error('install extension my_addon failed (exit 1)'),
+        'machine',
+        'node-setup'
+      ],
+      [
+        'an extension extract',
+        new Error('extract extension my_addon failed (exit 2)'),
+        'machine',
+        'node-setup'
+      ],
+      [
+        'a step killed by a signal',
+        new Error('install blender 4.5.3 failed (exit null)'),
+        'machine',
+        'node-setup'
+      ],
+      // octaneLicense.setupOctane.
+      [
+        'the Octane install',
+        new Error('octane install failed: E: Unable to locate package'),
+        'machine',
+        'node-setup'
+      ],
+      ['the VNC start', new Error('vnc start failed: Xvfb exited'), 'machine', 'node-setup'],
+      [
+        'the OctaneServer launch',
+        new Error('OctaneServer launch failed: no display'),
+        'machine',
+        'node-setup'
+      ],
+      // nodeManager.driveToReady's first connection.
+      [
+        'a first connection that answered oddly',
+        new Error(
+          'unexpected echo result: bash: echo: write error (gave up after 4 attempts over 190s)'
+        ),
+        'machine',
+        'node-not-ready'
+      ],
+      ['a first echo', new Error('echo failed'), 'machine', 'node-not-ready'],
+      [
+        'an instance that never ran',
+        new Error('instance not running after 8 min (status: loading)'),
+        'machine',
+        'node-not-ready'
+      ],
+      // ssh2's own connection failures, with and without the caller's hint.
+      [
+        'a keepalive timeout',
+        Object.assign(new Error('Keepalive timeout'), { level: 'client-timeout' }),
+        'machine',
+        'ssh-lost'
+      ],
+      [
+        'a connection lost before its handshake',
+        Object.assign(new Error('Connection lost before handshake'), {
+          level: 'protocol',
+          fatal: true
+        }),
+        'machine',
+        'ssh-lost'
+      ],
+      [
+        'a host key that changed',
+        new HostKeyMismatchError('SHA256:a', 'SHA256:b'),
+        'machine',
+        'ssh-hostkey'
+      ]
+    ]
+    for (const [what, e, kind, rule] of infra) {
+      it(`${what} → ${kind}`, () => {
+        for (const via of [undefined, 'ssh'] as const) {
+          const c = classify(e, { via })
+          expect(c.kind, `${c.reason} → ${c.rule}`).toBe(kind)
+          expect(c.rule).toBe(rule)
+        }
+      })
+    }
+
+    it("a transfer the node stalled on is the machine side's, and says where", () => {
+      const c = classify(new TransferStalledError('/work/renders/c1/0001.exr', 61_000, 1_048_576))
+      expect(c).toMatchObject({ kind: 'transient', retryable: true, outcomeUnknown: false })
+      expect(c.reason).toMatch(/no data for 61s at 1048576 bytes/)
+      expect(c.reason).toMatch(/0001\.exr/)
+    })
+
+    it('a refused exec or subsystem never ran, so its outcome is known', () => {
+      expect(classify(new Error('Unable to exec'), { via: 'ssh' }).outcomeUnknown).toBe(false)
+      expect(classify(new Error('Unable to start subsystem: sftp')).outcomeUnknown).toBe(false)
+    })
   })
 })
 

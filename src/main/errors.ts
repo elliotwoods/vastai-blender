@@ -434,14 +434,30 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
   }
 
   // --- SSH messages without a system code. ---
-  if (/channel open failure/i.test(message)) {
+  if (/channel open failure|^No free channels available/i.test(message)) {
     return result('transient', 'ssh-channels', 'SSH channel limit on the node', e, true)
+  }
+  // ssh2's words when the node's sshd answers an exec or subsystem request
+  // with a refusal, or the channel closed before the request went out: the
+  // command never started.
+  if (/^Unable to (exec|start subsystem)\b|^Channel is not open\b/i.test(message)) {
+    return result('transient', 'ssh-request-refused', 'the node refused an SSH request', e, true)
   }
   if (/^exec(Stream)? timeout/i.test(message)) {
     return result('transient', 'ssh-exec-timeout', 'a command on the node timed out', e, true)
   }
   if (/^SFTP\b.*\bno answer for\b|^SFTP channel open timed out/i.test(message)) {
     return result('transient', 'sftp-timeout', 'the node did not answer a file transfer', e, true)
+  }
+  // sshConnection gives up on an SFTP open in flight when the connection is
+  // reset under it or the open is abandoned: nothing was done on the channel.
+  if (/^SFTP channel (given up on|reset) while it opened/i.test(message)) {
+    return result('transient', 'sftp-open-reset', 'the SFTP channel was reset', e, true)
+  }
+  // connectRetry's RetryAbortedError: the caller stopped waiting because the
+  // node was destroyed or replaced meanwhile. Nothing is wrong with the work.
+  if (name === 'RetryAbortedError' || /^aborted$/i.test(message.trim())) {
+    return result('transient', 'retry-aborted', 'stopped waiting for the node', e, true)
   }
   if (
     ssh &&
@@ -474,6 +490,10 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
   }
 
   // --- ssh2 SFTP statuses (numeric codes): the node's side of a transfer. ---
+  // 1 is SFTP's end of file: the node's file ended before the read did.
+  if (typeof e.code === 'number' && e.code === 1) {
+    return result('transient', 'transfer-damaged', 'a transfer arrived short or damaged', e, true)
+  }
   if (typeof e.code === 'number' && e.code >= 2 && e.code <= 8) {
     return result('machine', 'sftp-status', 'the node refused a file transfer', e, true)
   }
@@ -481,6 +501,12 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
   // --- Transfers this app checks itself (sftp.ts, pipelinedGet.ts). ---
   if (/^transfer aborted\b/i.test(message)) {
     return result('transient', 'transfer-aborted', 'the transfer was stopped', e, true)
+  }
+  // pipelinedGet's stall guard: the node sent nothing for a minute. The
+  // contract charges it to the machine side (ChunkSnapshot.infraRetries),
+  // never to the render.
+  if (/^transfer stalled\b/i.test(message)) {
+    return result('transient', 'transfer-stalled', 'a download stalled', e, true)
   }
   if (
     /^unexpected EOF at\b|^(size|hash) mismatch downloading\b|^upload verify failed\b/i.test(
@@ -493,6 +519,25 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
   // --- The node left the fleet under the caller (scheduler, nodeManager). ---
   if (/^node vanished\b|^no SSH endpoints?\b/i.test(message)) {
     return result('machine', 'node-gone', 'the node is no longer usable', e, true)
+  }
+
+  // --- Setting the node up (provisioner, octaneLicense, nodeManager). ---
+  // Every dispatch runs these first inside withNodePrep (a Blender install,
+  // Octane setup, an extension install, the scene upload), so a flaky node
+  // failing them must not spend the chunk's render retries. A step that
+  // fails the same way on a second node is more likely the job's (a Blender
+  // version no mirror has, an add-on that will not enable): the job breaker,
+  // counting this rule across nodes, is what says so.
+  if (
+    /^.+ failed \(exit (-?\d+|null)\)$/.test(message) ||
+    /^(octane install|vnc start|OctaneServer launch) failed:/i.test(message) ||
+    /^mkdir failed:/i.test(message)
+  ) {
+    return result('machine', 'node-setup', 'setting up the node failed', e, true)
+  }
+  // The first connection to a new instance (nodeManager.driveToReady).
+  if (/^unexpected echo result:|^echo failed\b|^instance not running after\b/i.test(message)) {
+    return result('machine', 'node-not-ready', 'the node never became usable', e, true)
   }
 
   // --- Vast replies with no status. ---
