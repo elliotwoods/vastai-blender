@@ -96,7 +96,20 @@ interface PendingChunk extends ChunkRow {
   /** 0 = exclusive (needs the node to itself), 1 = may co-run */
   share_node: number
   blender_version: string | null
+  /** frames of its range not yet downloaded: what a node would render for it */
+  frames_left: number
 }
+
+/**
+ * SQL (a FROM ... WHERE body, for `SELECT 1 FROM ${...}` or COUNT) for the
+ * frames of chunk `c`'s current range that have not landed on this
+ * computer. By job and range, never by frames.chunk_id: requeue()
+ * re-points only rows that were not yet downloaded, so a frame's chunk_id
+ * says which chunk last owned it, not which chunk covers it now.
+ */
+const UNDOWNLOADED_OF_C = `frames f
+  WHERE f.job_id = c.job_id AND f.frame BETWEEN c.frame_start AND c.frame_end
+    AND f.state != 'downloaded'`
 
 /**
  * What a requeue or re-split did, for announcing once it has committed.
@@ -330,6 +343,12 @@ class ChunkRun {
     // set, and a downloader was started whose stop() was already unreachable,
     // leaving it polling for the life of the process.
     if (this.abandoned('after node prep')) return
+    // pendingChunks offered this chunk with frames left, but prep takes
+    // minutes, and the last of them can land meanwhile (another run's
+    // download of a frame since moved to this chunk). Sent anyway, the node
+    // renders frames this computer already has and holds a lane for them:
+    // job da68b61b's leftover sub-chunk sat 'assigned' at 0% GPU.
+    if (this.nothingLeft('after node prep')) return
 
     // 4. Job spec — written atomically (agent ignores *.tmp.json).
     const spec = {
@@ -590,6 +609,27 @@ class ChunkRun {
   }
 
   /**
+   * Is every frame of the chunk's range already on this computer? Then there
+   * is nothing to send: the chunk is completed without a render, and the run
+   * lets go of its node. Not through finish(), which would teach gpu_perf a
+   * throughput from frames this run never rendered.
+   */
+  private nothingLeft(where: string): boolean {
+    if (this.undownloadedFrames().length > 0) return false
+    emit('render:logLine', {
+      nodeId: this.nodeId,
+      chunkId: this.chunkId,
+      line: `every frame already downloaded ${where}: complete, nothing sent to the node`,
+      ts: Date.now()
+    })
+    this.cleanup()
+    // As finish(): a cancelled job's chunks stay as cancelJob left them.
+    if (this.job().state !== 'cancelled') this.setChunk({ state: 'complete' })
+    scheduler.onChunkFinished(this)
+    return true
+  }
+
+  /**
    * True once this run has been abandoned (cancelled, or its node went away).
    *
    * Checked after every await in `dispatch`. Deliberately returns rather than
@@ -799,6 +839,8 @@ class Scheduler {
       refreshJobState(jobId)
       if (completed.has(jobId)) jobClips.schedule(jobId)
     }
+    // A pending chunk whose every frame had landed is complete, not work.
+    this.settleDownloadedPending()
     // Recovered work is real work, and the very next tick would buy a whole
     // fleet for it. That is right when you meant to resume and expensive when
     // you did not: a profile left with a day-old half-finished campaign starts
@@ -890,19 +932,68 @@ class Scheduler {
   }
 
   /**
-   * Pending chunks, oldest job first, carrying their job's sharing flag and
-   * blender version. Joining here rather than re-querying per candidate keeps
-   * the assignment loop to one query per tick instead of one per (node,
-   * candidate) pair.
+   * Pending chunks with frames left to render, oldest job first, carrying
+   * their job's sharing flag and blender version. Joining here rather than
+   * re-querying per candidate keeps the assignment loop to one query per tick
+   * instead of one per (node, candidate) pair.
+   *
+   * A chunk whose every frame is already downloaded is never offered:
+   * settleDownloadedPending completes it first.
    */
   private pendingChunks(): PendingChunk[] {
-    return getDb()
+    const rows = getDb()
       .prepare(
-        `SELECT c.*, j.share_node, j.blender_version FROM chunks c JOIN jobs j ON j.id = c.job_id
-         WHERE c.state = 'pending' AND j.state IN ('queued', 'running')
-         ORDER BY j.submitted_at, c.frame_start`
+        `SELECT c.*, j.share_node, j.blender_version,
+                (SELECT COUNT(*) FROM ${UNDOWNLOADED_OF_C}) AS frames_left
+           FROM chunks c JOIN jobs j ON j.id = c.job_id
+          WHERE c.state = 'pending' AND j.state IN ('queued', 'running')
+          ORDER BY j.submitted_at, c.frame_start`
       )
       .all() as PendingChunk[]
+    return rows.filter((c) => c.frames_left > 0)
+  }
+
+  /**
+   * Complete every pending chunk that has nothing left to render: each frame
+   * of its range is already on this computer.
+   *
+   * Job da68b61b: all 1903 frames had landed, yet a leftover 1-frame requeue
+   * sub-chunk still read 'pending'. It was dispatched, sat 'assigned' at 0%
+   * GPU, and as unfinished work it made the buy-ahead fleet rent two more
+   * 8×4090s (~$8/h) for it. A frame can land after its chunk was requeued (a
+   * download already under way, or the re-dispatch of the chunk that used to
+   * cover it), and nothing looked again before sending the chunk out.
+   */
+  private settleDownloadedPending(): void {
+    const db = getDb()
+    const done = db
+      .prepare(
+        `SELECT c.id, c.job_id FROM chunks c JOIN jobs j ON j.id = c.job_id
+          WHERE c.state = 'pending' AND j.state IN ('queued', 'running')
+            AND NOT EXISTS (SELECT 1 FROM ${UNDOWNLOADED_OF_C})`
+      )
+      .all() as Array<{ id: string; job_id: string }>
+    if (done.length === 0) return
+    const complete = db.prepare(
+      `UPDATE chunks SET state = 'complete' WHERE id = ? AND state = 'pending'`
+    )
+    db.transaction(() => {
+      for (const c of done) complete.run(c.id)
+    })()
+    emitChunksChanged(done.map((c) => c.id))
+    for (const jobId of new Set(done.map((c) => c.job_id))) {
+      refreshJobState(jobId)
+      jobClips.schedule(jobId)
+    }
+    emit('alert', {
+      level: 'info',
+      message:
+        `${done.length} queued chunk(s) had every frame downloaded already ` +
+        `(${done
+          .slice(0, 3)
+          .map((c) => c.id)
+          .join(', ')}${done.length > 3 ? ', …' : ''}) — marked complete, nothing rendered`
+    })
   }
 
   /** The node's current concurrency target; 1 until the controller has seen it. */
@@ -1086,6 +1177,7 @@ class Scheduler {
   }
 
   async tick(): Promise<void> {
+    this.settleDownloadedPending()
     const pending = this.pendingChunks()
 
     const eligible = nodeManager
@@ -1283,10 +1375,6 @@ class Scheduler {
     // A cancelled job's chunks stay as cancelJob left them. Requeueing one put
     // it back to 'pending' — work nobody wants, which then read as unfinished.
     if (job.state === 'cancelled') return null
-    if (chunk.retries >= MAX_RETRIES) {
-      db.prepare("UPDATE chunks SET state = 'failed' WHERE id = ?").run(chunkId)
-      return { outcome: 'failed', touched: [chunkId] }
-    }
     return this.resplitAroundDownloaded(chunkId, { burnRetry: true })
   }
 
@@ -1294,14 +1382,17 @@ class Scheduler {
    * Put a chunk back in the queue, narrowed to the frames of its range not
    * yet downloaded: the chunk keeps its id for the first missing run of
    * frames, and each further run becomes a new `-rN` chunk. A chunk with no
-   * frame missing is complete instead.
+   * frame missing is complete instead, whatever its retries: nothing is
+   * left to render, so it must neither be sent again nor fail the job.
    *
    * `burnRetry` charges the chunk a retry, as requeue() does for a failed
-   * render. restart recovery (start()) re-splits without one: the chunk did
-   * not fail, the process that was driving it went away.
+   * render, and a chunk that has none left is failed. restart recovery
+   * (start()) re-splits without one: the chunk did not fail, the process
+   * that was driving it went away.
    *
-   * Writes rows only, in one transaction; the caller announces the result
-   * (announceRequeue). Throws on a range or step missingRanges refuses.
+   * Downloaded frames are read by job and range, as UNDOWNLOADED_OF_C says
+   * why. Writes rows only, in one transaction; the caller announces the
+   * result (announceRequeue). Throws on a range or step missingRanges refuses.
    */
   private resplitAroundDownloaded(chunkId: string, opts: { burnRetry: boolean }): Resplit {
     const db = getDb()
@@ -1313,8 +1404,11 @@ class Scheduler {
     const downloaded = new Set(
       (
         db
-          .prepare("SELECT frame FROM frames WHERE chunk_id = ? AND state = 'downloaded'")
-          .all(chunkId) as Array<{ frame: number }>
+          .prepare(
+            `SELECT frame FROM frames
+              WHERE job_id = ? AND frame BETWEEN ? AND ? AND state = 'downloaded'`
+          )
+          .all(chunk.job_id, chunk.frame_start, chunk.frame_end) as Array<{ frame: number }>
       ).map((r) => r.frame)
     )
     const ranges = missingRanges(
@@ -1325,6 +1419,10 @@ class Scheduler {
     if (ranges.length === 0) {
       db.prepare("UPDATE chunks SET state = 'complete' WHERE id = ?").run(chunkId)
       return { outcome: 'complete', touched: [chunkId] }
+    }
+    if (opts.burnRetry && chunk.retries >= MAX_RETRIES) {
+      db.prepare("UPDATE chunks SET state = 'failed' WHERE id = ?").run(chunkId)
+      return { outcome: 'failed', touched: [chunkId] }
     }
     const retries = chunk.retries + (opts.burnRetry ? 1 : 0)
     const touched: string[] = [chunkId]
