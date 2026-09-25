@@ -12,6 +12,7 @@
  * is the difference between "not yet" and "went wrong".
  */
 
+import { useState } from 'react'
 import { CHUNK_TONE, SCALE, STATUS_VARS, TOKENS, type StatusTone } from '../lib/theme'
 import type { ChunkState } from '../../../shared/models'
 
@@ -56,6 +57,10 @@ export function Thumb({
   const tone = toneName ? STATUS_VARS[toneName] : null
   const working = !!state && (WORKING as string[]).includes(state)
   const failed = state === 'failed'
+  // A URL that failed to load (file moved, fixture missing) falls back to the
+  // placeholder rather than the browser's broken-image glyph.
+  const [brokenUrl, setBrokenUrl] = useState<string | null>(null)
+  const showImage = !!url && url !== brokenUrl
 
   return (
     <div
@@ -75,13 +80,14 @@ export function Thumb({
         cursor: onClick ? 'pointer' : 'default'
       }}
     >
-      {url ? (
+      {showImage ? (
         <img
           src={url}
           alt=""
           loading="lazy"
           decoding="async"
           draggable={false}
+          onError={() => setBrokenUrl(url)}
           style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
         />
       ) : (
