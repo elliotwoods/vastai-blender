@@ -1959,7 +1959,10 @@ class Scheduler {
     eligible: NodeSnapshot[]
   ): LanePlan {
     const plan = this.lanePlanFor(nodeId, chunk.engine)
-    if (!plan.pin) return plan
+    const nodeInFlight = this.runsOn(nodeId).size
+    // What dispatchLanePlan decides without the counts below, which cost a
+    // look at every node: the common case once a node has lanes running.
+    if (!plan.pin || nodeInFlight > 0) return plan
     const pins = new Map<EngineId, boolean>()
     const inLanes = (engine: EngineId): boolean => {
       let p = pins.get(engine)
@@ -1972,7 +1975,7 @@ class Scheduler {
     const waiting = pending.filter((c) => c.share_node !== 1 && inLanes(c.engine)).length
     return dispatchLanePlan({
       plan,
-      nodeInFlight: this.runsOn(nodeId).size,
+      nodeInFlight,
       freeLanes: eligible.reduce(
         (a, n) => a + freeExclusiveLanes(this.occupancy(n.id, chunk.engine)),
         0
