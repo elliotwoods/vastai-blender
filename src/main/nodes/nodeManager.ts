@@ -74,6 +74,7 @@ import {
   restartAgent,
   type AgentRestart
 } from './provisioner'
+import { prune as pruneMetrics, record as recordMetrics, runsPerGpu } from './metricsHistory'
 
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
 
@@ -1643,9 +1644,33 @@ export class NodeManager {
   private pollMetrics(): void {
     for (const node of this.nodes.values()) {
       const ssh = node.ssh
-      if (!ssh || !PROBED.has(node.state) || this.probing.has(node.id)) continue
+      if (!ssh || !PROBED.has(node.state)) {
+        // Not probed, and paid for all the same while it holds an instance
+        // (booting, unreachable, a destroy not yet confirmed): its GPUs are
+        // rented and unmeasured, a gap in the history (Feature G).
+        const facts = node.facts
+        if (facts.instanceId != null && holdsInstance(facts)) this.recordHistory(node, null)
+        continue
+      }
+      if (this.probing.has(node.id)) continue
       this.probing.add(node.id)
       void this.probe(node, ssh).finally(() => this.probing.delete(node.id))
+    }
+  }
+
+  /**
+   * One poll of a node into the GPU usage history (Feature G), with the
+   * runs the scheduler has on each of its GPUs now: `metrics` is the
+   * probe's sample, or null for a poll with no reading. The history is a
+   * view: nothing in it may stand in a probe's way.
+   */
+  private recordHistory(node: ManagedNode, metrics: NodeMetrics | null): void {
+    try {
+      const { numGpus } = node.laneInputs
+      const work = activeWorkProvider?.(node.id) ?? []
+      recordMetrics(node.id, metrics, runsPerGpu(work, numGpus), { numGpus })
+    } catch {
+      // A sample the history could not take is one missing point.
     }
   }
 
@@ -1675,6 +1700,7 @@ export class NodeManager {
       if (node.ssh !== ssh) return
       if (answered != null) this.probeSlow(node, answered)
       else this.probeFailed(node, c.reason)
+      this.recordHistory(node, null)
       return
     }
     clearTimeout(slow)
@@ -1685,27 +1711,33 @@ export class NodeManager {
     // node's strikes and stamped it as answering.
     if (exitStatus(r.code) === null && !r.stdout.trim()) {
       this.probeFailed(node, 'the connection dropped under the probe')
+      this.recordHistory(node, null)
       return
     }
     this.probeAnswered(node)
     this.slowProbes.delete(node.id)
     const [gpuPart, cpuPart, memPart, beatPart] = r.stdout.split('----')
     this.heartbeatSeen(node, heartbeatAge(beatPart))
+    let sample: NodeMetrics | null = null
     try {
-      this.recordSample(node, gpuPart, cpuPart, memPart)
+      sample = this.recordSample(node, gpuPart, cpuPart, memPart)
     } catch {
-      // A sample that does not parse is skipped.
+      // A sample that does not parse is skipped: a gap in the history.
     }
+    this.recordHistory(node, sample)
   }
 
-  /** Store one probe's usage sample, integrate its energy, and push it. */
+  /**
+   * Store one probe's usage sample, integrate its energy, and push it.
+   * Returns it, or null when the probe's output held no GPU reading.
+   */
   private recordSample(
     node: ManagedNode,
     gpuPart: string | undefined,
     cpuPart: string | undefined,
     memPart: string | undefined
-  ): void {
-    if (!gpuPart || !cpuPart) return
+  ): NodeMetrics | null {
+    if (!gpuPart || !cpuPart) return null
     // Only the first four columns must parse: cards that don't report
     // power give "[N/A]" and would otherwise drop the whole sample.
     const gpuRows = gpuPart
@@ -1713,7 +1745,7 @@ export class NodeManager {
       .split('\n')
       .map((line) => line.split(',').map((x) => parseFloat(x)))
       .filter((xs) => xs.length >= 4 && xs.slice(0, 4).every((x) => Number.isFinite(x)))
-    if (gpuRows.length === 0) return
+    if (gpuRows.length === 0) return null
     const sumCol = (i: number): number =>
       gpuRows.reduce((a, xs) => a + (Number.isFinite(xs[i]) ? xs[i] : 0), 0)
     const powerW = sumCol(4)
@@ -1736,7 +1768,7 @@ export class NodeManager {
     if (powerW > 0 && gapMs > 0 && gapMs < 10 * 60_000) {
       energyByNode.set(node.id, (energyByNode.get(node.id) ?? 0) + (powerW * gapMs) / 3_600_000)
     }
-    metricsByNode.set(node.id, {
+    const sample: NodeMetrics = {
       cpuUtil: cpuUtilFromStat(node.id, memPart ?? '', load1, cores),
       gpuUtil: gpuRows.reduce((a, xs) => a + xs[0], 0) / gpuRows.length,
       vramUsedGb: gpuRows.reduce((a, xs) => a + xs[1], 0) / 1024,
@@ -1757,8 +1789,10 @@ export class NodeManager {
         temp: xs[3],
         powerW: Number.isFinite(xs[4]) ? xs[4] : 0
       }))
-    })
+    }
+    metricsByNode.set(node.id, sample)
     emit('node:changed', node.snapshot)
+    return sample
   }
 
   // -- liveness supervision (plan 1.7) -------------------------------------------
@@ -3538,12 +3572,14 @@ export class NodeManager {
 
   /**
    * The cost timer's tick: accumulate $ cost from dph × elapsed, read the
-   * balance (and guard the credit), push the fleet totals, and run the
-   * reconcile when it is due (plan 1.3).
+   * balance (and guard the credit), push the fleet totals, run the
+   * reconcile when it is due (plan 1.3), and age the GPU usage history.
    */
   private async accrueCosts(): Promise<void> {
     const db = getDb()
     const ts = Date.now() // one timestamp for the tick, so buckets line up
+    // The GPU usage history's memory and its 7-day table (Feature G).
+    pruneMetrics(ts)
     const usage: UsageRow[] = []
     for (const node of this.nodes.values()) {
       const s = node.snapshot
