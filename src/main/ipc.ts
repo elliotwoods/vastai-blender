@@ -29,7 +29,7 @@ import type {
 import { localPathProblem } from '../shared/settingsSanitize'
 import { applySettingsPatch, describeFieldErrors, type GateOptions } from './app/settingsGate'
 import { jobMediaUrl } from './app/mediaProtocol'
-import { reprovisionNode, retryMissing } from './app/recovery'
+import { cancelJob, reprovisionNode, retryMissing } from './app/recovery'
 import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
 import { dismissAlerts, onAlertSurfaced, onEvent, recentAlerts } from './events'
 import { hostPathFlavour } from './paths'
@@ -880,7 +880,9 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
     scheduler.kick()
     return { jobId }
   })
-  handle('job:cancel', (id) => scheduler.cancelJob(id))
+  // Through app/recovery.ts, which notes the cancel until it has stopped the
+  // job's renders on the nodes: job:retryMissing waits for that (plan 1.15).
+  handle('job:cancel', (id) => cancelJob(id))
   handle('job:setShareNode', (id, shareNode) => {
     setJobShareNode(id, shareNode)
     // Newly shareable chunks may now fit alongside work already in flight.

@@ -93,6 +93,44 @@ describe('job:retryMissing', () => {
     await expect(w.invoke('job:retryMissing', jobId)).rejects.toThrow(/failed outright/)
     expect(w.all('SELECT state FROM chunks WHERE job_id = ?', jobId)).toEqual([{ state: 'failed' }])
   })
+
+  it('1.15: waits for a cancel still stopping its renders, so the clean-up cannot kill what it revived', async () => {
+    // The cancel settles the rows at once, then clears each run's spec and
+    // Blender on its node one run after another, 30 s allowed each, by chunk
+    // id. The revive keeps those ids: a chunk revived and sent out before
+    // the clean-up reached it had its new spec deleted and its render
+    // killed, paid for and lost.
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app, { num_gpus: 2 })
+    const machine = w.machineFor(nodeId)
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 2 })
+    app.scheduler.kick()
+    await w.until(() => machine.agent.inbox().length === 2, 'both chunks on the node')
+    const sentAgain = new Set<string>()
+    machine.onSpec = (spec) => sentAgain.add(spec.chunkId)
+    // What the clean-up does on the node: the first run's node does not
+    // answer until its 30 s are up, then the next run's spec and render go.
+    const hit: string[] = []
+    let cleanups = 0
+    machine.onExec(/^rm -f \S+\/jobs\/inbox\/(\S+)\.json; pkill -f /, (_c, m) => {
+      if (cleanups++ === 0) return HANG
+      const chunkId = m[1]
+      if (sentAgain.has(chunkId)) hit.push(chunkId)
+      machine.files.delete(`/root/vastai/jobs/inbox/${chunkId}.json`)
+      return ''
+    })
+
+    const cancel = w.invoke('job:cancel', jobId)
+    const retry = w.invoke('job:retryMissing', jobId)
+    await w.advance(60_000)
+    await cancel
+    expect(await retry).toEqual({ frames: 4, chunks: 2 })
+    await w.until(() => sentAgain.size === 2, 'both chunks sent again')
+
+    expect(cleanups).toBe(2)
+    expect(hit).toEqual([])
+    expect(machine.agent.inbox().sort()).toEqual([...sentAgain].sort())
+  })
 })
 
 describe('node:reprovision', () => {

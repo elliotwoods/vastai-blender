@@ -12,6 +12,8 @@
  * - reprovisionNode (node:reprovision, NodeDetail's "reprovision"): the
  *   node's work goes back in the queue and its agent is restarted on
  *   freshly shipped scripts.
+ * - cancelJob (job:cancel): the scheduler's cancel, noted until it has
+ *   stopped the job's renders on the nodes, which retryMissing waits for.
  */
 
 import { emit } from '../events'
@@ -25,6 +27,37 @@ import type { SshConnection } from '../ssh/sshConnection'
 import type { NodeState, ReprovisionResult, RetryMissingResult } from '../../shared/models'
 
 /**
+ * Jobs whose cancel is still stopping their renders, each with a promise
+ * that settles when it has. scheduler.cancelJob settles the rows at once,
+ * then runs `rm -f <spec>; pkill -f <chunkId>` on each run's node one after
+ * another, each under a 30 s deadline, so the last of them can go out
+ * minutes after the job reads as cancelled. A revived job keeps its chunk
+ * ids (jobs/revive.ts): a chunk revived and sent out in that time, to a
+ * node the cleanup has yet to reach, would have its spec deleted or its
+ * render killed by the cancel. That render is paid for and lost, and the
+ * chunk is charged a machine retry when the 1.7 watchdog finds the spec gone.
+ */
+const cancelling = new Map<string, Promise<void>>()
+
+/**
+ * Cancel `jobId` (scheduler.cancelJob), noting it in `cancelling` until its
+ * node cleanup is over. Resolves, or rejects, as the cancel does.
+ */
+export async function cancelJob(jobId: string): Promise<void> {
+  const done = scheduler.cancelJob(jobId)
+  const over = done.then(
+    () => {},
+    () => {}
+  )
+  cancelling.set(jobId, over)
+  try {
+    await done
+  } finally {
+    if (cancelling.get(jobId) === over) cancelling.delete(jobId)
+  }
+}
+
+/**
  * Queue again every frame of `jobId` not yet downloaded (see
  * reviveFailedChunks, whose refusals it passes on). A job the breaker held
  * (jobs.attention) is released once something is queued: "Re-render
@@ -32,8 +65,13 @@ import type { NodeState, ReprovisionResult, RetryMissingResult } from '../../sha
  * reason in front of them, which is what resumeJob waits for. With the hold
  * left on, what was queued would sit pending behind it and the button would
  * seem to do nothing.
+ *
+ * A cancel of the job still stopping its renders is waited for first (see
+ * `cancelling`), so nothing it revives can be hit by the cancel's clean-up.
+ * The button stays disabled while it waits.
  */
-export function retryMissing(jobId: string): RetryMissingResult {
+export async function retryMissing(jobId: string): Promise<RetryMissingResult> {
+  for (let c = cancelling.get(jobId); c; c = cancelling.get(jobId)) await c
   const result = reviveFailedChunks(jobId)
   if (result.frames > 0) {
     scheduler.resumeJob(jobId)
