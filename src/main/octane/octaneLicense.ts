@@ -32,7 +32,8 @@ function sq(s: string): string {
 export async function setupOctane(ssh: SshConnection, nodeId: string): Promise<void> {
   const script = `${REMOTE_ROOT}/octane/setup_octane.sh`
   const install = await ssh.exec(`chmod +x ${script} && bash ${script} install`, {
-    timeoutMs: 10 * 60_000
+    timeoutMs: 10 * 60_000,
+    label: 'install Octane'
   })
   if (install.code !== 0) throw new Error(`octane install failed: ${install.stderr.slice(0, 300)}`)
 
@@ -40,18 +41,24 @@ export async function setupOctane(ssh: SshConnection, nodeId: string): Promise<v
   // below (memory, not the node row), so an app restart loses it.
   const password = randomBytes(9).toString('base64url')
   getDb().prepare('UPDATE nodes SET octane_ready = 0 WHERE id = ?').run(nodeId)
-  const vnc = await ssh.exec(`bash ${script} start-vnc ${sq(password)}`, { timeoutMs: 60_000 })
+  const vnc = await ssh.exec(`bash ${script} start-vnc ${sq(password)}`, {
+    timeoutMs: 60_000,
+    label: 'start VNC'
+  })
   if (vnc.code !== 0) throw new Error(`vnc start failed: ${vnc.stderr.slice(0, 300)}`)
   vncPasswords.set(nodeId, password)
 
   // Launch OctaneServer, with credentials as env assignments at the front of
-  // the command text. exec's timeout error quotes the first 80 characters of
-  // that text, so a timeout here can put them in the dispatch-failed alert
-  // (plans 1.8 and 1.18).
+  // the command text (plan 1.18 moves them to stdin). An exec error names
+  // the label, never that text (plan 1.8), so a timeout here no longer puts
+  // them in the dispatch-failed alert.
   const user = getSecret('otoyUsername')
   const pass = getSecret('otoyPassword')
   const env = user && pass ? `OCTANE_USER=${sq(user)} OCTANE_PASS=${sq(pass)} ` : ''
-  const launch = await ssh.exec(`${env}bash ${script} start-server`, { timeoutMs: 60_000 })
+  const launch = await ssh.exec(`${env}bash ${script} start-server`, {
+    timeoutMs: 60_000,
+    label: 'start OctaneServer'
+  })
   if (launch.code !== 0)
     throw new Error(`OctaneServer launch failed: ${launch.stderr.slice(0, 300)}`)
 
@@ -59,9 +66,15 @@ export async function setupOctane(ssh: SshConnection, nodeId: string): Promise<v
   const deadline = Date.now() + 60_000
   let licensed = false
   while (Date.now() < deadline) {
-    const r = await ssh.exec(
-      `grep -iE 'license|logged in|activated' ${REMOTE_ROOT}/logs/octane-server.log 2>/dev/null | tail -3`
-    )
+    // Bounded: this runs inside the scheduler's per-node prep lock, and an
+    // exec on a wedged connection never returned. A read that fails is no
+    // answer yet; the loop's own deadline ends it.
+    const r = await ssh
+      .exec(
+        `grep -iE 'license|logged in|activated' ${REMOTE_ROOT}/logs/octane-server.log 2>/dev/null | tail -3`,
+        { timeoutMs: 30_000, label: 'read OctaneServer log' }
+      )
+      .catch(() => ({ code: null, stdout: '', stderr: '' }))
     if (/acquir|success|logged in|activated/i.test(r.stdout)) {
       licensed = true
       break
