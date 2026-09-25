@@ -386,11 +386,27 @@ export async function installExtension(
   return `import sys; sys.path.insert(0, '${srcDir}'); import ${addon.id}; ${addon.id}.register()`
 }
 
-/** Check the agent is alive (heartbeat fresh within 30s). */
+/**
+ * How old the agent's heartbeat may be before the agent counts as dead:
+ * provision.sh's AGENT_STALE_S, six missed beats, and the node supervisor's
+ * threshold. It was 30 s here, so a check made from a run could call an
+ * agent dead that restart-agent and the supervisor would keep, and a false
+ * "dead" costs a chunk and a node.
+ */
+export const AGENT_STALE_S = 60
+
+/**
+ * Is the agent alive: its heartbeat written within AGENT_STALE_S? Rejects
+ * when that could not be told (the exec failed, lost its connection, or
+ * answered neither way), rather than answer "dead" for a check that never
+ * ran.
+ */
 export async function agentAlive(ssh: SshConnection): Promise<boolean> {
   const r = await ssh.exec(
-    `python3 -c "import os,time;p='${REMOTE_ROOT}/state/heartbeat';print('alive' if os.path.exists(p) and time.time()-os.path.getmtime(p)<30 else 'dead')"`,
+    `python3 -c "import os,time;p='${REMOTE_ROOT}/state/heartbeat';print('alive' if os.path.exists(p) and time.time()-os.path.getmtime(p)<${AGENT_STALE_S} else 'dead')"`,
     { timeoutMs: 30_000, label: 'agent heartbeat' }
   )
-  return r.stdout.includes('alive')
+  if (/\balive\b/.test(r.stdout)) return true
+  if (/\bdead\b/.test(r.stdout)) return false
+  throw new Error(`agent heartbeat check did not answer (exit ${r.code})`)
 }

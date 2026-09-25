@@ -6,7 +6,9 @@
  * restart-agent's verdict and agent-status's line exactly as the script
  * writes them; and every step has a deadline.
  */
-import { writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ExecOptions, ExecResult, SshConnection } from '../ssh/sshConnection'
@@ -38,6 +40,7 @@ vi.mock('../ssh/sftp', () => ({
 
 const {
   AgentBusyError,
+  agentAlive,
   agentStatus,
   DEPS_TIMEOUT_MS,
   INSTALL_BLENDER_TIMEOUT_MS,
@@ -290,5 +293,48 @@ describe('provisioner.ts, what it makes of an answer', () => {
     expect(
       parseAgentStatus('noise\n{"restartNeeded":false,"blenderProcs":1,"inboxSpecs":0}\n')
     ).toMatchObject({ restartNeeded: false, blenderProcs: 1, inboxSpecs: 0, heartbeatStale: true })
+  })
+})
+
+describe.skipIf(process.platform === 'win32')('agentAlive', () => {
+  let home: string
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'vr-agent-alive-'))
+    mkdirSync(join(home, 'state'))
+  })
+  afterEach(() => rmSync(home, { recursive: true, force: true }))
+
+  /** Runs the check the app sends under bash, against `home` as the node's ~/vastai. */
+  const onNode = (): ScriptSsh => {
+    const s = new ScriptSsh(null as unknown as RemoteNode)
+    s.reply = (command) => {
+      const r = spawnSync('bash', ['-c', command.split(REMOTE_ROOT).join(home)], {
+        encoding: 'utf8'
+      })
+      return { code: r.status, stdout: r.stdout, stderr: r.stderr }
+    }
+    return s
+  }
+  const beatAgo = (seconds: number): void => {
+    const p = join(home, 'state', 'heartbeat')
+    writeFileSync(p, '')
+    const t = Date.now() / 1000 - seconds
+    utimesSync(p, t, t)
+  }
+
+  it('1.7: an agent is dead past provision.sh’s 60 s, as the supervisor and restart-agent judge it', async () => {
+    beatAgo(45)
+    expect(await agentAlive(onNode().ssh)).toBe(true)
+    beatAgo(75)
+    expect(await agentAlive(onNode().ssh)).toBe(false)
+    rmSync(join(home, 'state', 'heartbeat'))
+    expect(await agentAlive(onNode().ssh)).toBe(false)
+  })
+
+  it('1.7: a check that never ran is not a dead agent', async () => {
+    const dropped = new ScriptSsh(null as unknown as RemoteNode)
+    dropped.reply = () => ({ code: null, stdout: '', stderr: '' })
+    await expect(agentAlive(dropped.ssh)).rejects.toThrow(/did not answer/)
+    expect(dropped.calls[0].opts).toEqual({ timeoutMs: 30_000, label: 'agent heartbeat' })
   })
 })

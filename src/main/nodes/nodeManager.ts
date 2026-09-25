@@ -62,7 +62,7 @@ import {
   type NodeCostFacts
 } from '../../shared/nodeState'
 import type { RawInstance } from '../vast/types'
-import { agentStatus, provisionDeps, REMOTE_ROOT, restartAgent } from './provisioner'
+import { AGENT_STALE_S, agentStatus, provisionDeps, REMOTE_ROOT, restartAgent } from './provisioner'
 
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
 
@@ -206,12 +206,11 @@ const RECONNECT_PAUSE_MS = 5_000
 const ANSWER_TIMEOUT_MS = 15_000
 
 /**
- * A heartbeat older than this means a dead agent: provision.sh's
- * AGENT_STALE_S, six missed beats. The probe must see it AGENT_STALE_PROBES
- * times in a row, and restart-agent checks again under its lock, since a
- * false "dead" kills every render on the node.
+ * A heartbeat older than AGENT_STALE_S (provision.sh's, six missed beats)
+ * means a dead agent. The probe must see it AGENT_STALE_PROBES times in a
+ * row, and restart-agent checks again under its lock, since a false "dead"
+ * kills every render on the node.
  */
-const AGENT_STALE_S = 60
 const AGENT_STALE_PROBES = 2
 
 /**
