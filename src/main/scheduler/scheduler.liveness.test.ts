@@ -149,6 +149,41 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
     })
   })
 
+  it('an agent seen dead once and alive a minute later is not condemned: the chunk renders there', async () => {
+    // A restart-agent (a second launch re-provisioning the node, or the node
+    // supervisor) leaves the heartbeat stale for up to about 40 s. One stale
+    // read condemned the node for the rest of its rental.
+    const { app, ids } = await fleet(1, {}, { idleTimeoutMinutes: 60 })
+    const machine = w.machineFor(ids[0])
+    let restarting = false
+    let seenDeadAt: number | null = null
+    machine.onExec(/^python3 -c .*state\/heartbeat/, () => {
+      if (!restarting) return 'alive\n'
+      seenDeadAt ??= Date.now()
+      return 'dead\n'
+    })
+    const landed: number[] = []
+    machine.onSpec = (spec) => {
+      landed.push(Date.now())
+      if (landed.length > 1) return machine.agent.finish(spec.chunkId)
+      // The first spec is lost to the restart, which is over in 3.5 min.
+      restarting = true
+      setTimeout(() => (restarting = false), 3.5 * 60_000)
+    }
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 20 * 60_000,
+      stepMs: 5_000
+    })
+    expect(landed).toHaveLength(2)
+    expect(chunksOf(jobId)[0]).toMatchObject({ node_id: ids[0], retries: 0, infra_retries: 1 })
+    expect(w.alerts('error').join('\n')).not.toMatch(/agent is not running/)
+    expect(app.scheduler.nodeUnfit(ids[0])).toBeNull()
+    // Sent nothing until the second look.
+    expect(landed[1] - seenDeadAt!).toBeGreaterThanOrEqual(60_000)
+  })
+
   it('a node whose agent is dead is not counted as room for the queue', async () => {
     // Kept past the test, so only scale-up can make room.
     const { app, ids } = await fleet(2, {}, { maxActiveNodes: 3, idleTimeoutMinutes: 120 })

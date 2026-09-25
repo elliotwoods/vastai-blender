@@ -549,6 +549,14 @@ const STATE_UNREADABLE_MS = 10 * 60_000
 /** Deadline on the agentAlive heartbeat check, which has none of its own. */
 const AGENT_CHECK_TIMEOUT_MS = 30_000
 
+/**
+ * How long after a run found a node's agent not running it is asked again,
+ * before the node is taken as down (Scheduler.suspectAgentDown): longer
+ * than a restart-agent leaves the heartbeat stale (about 40 s: 10 s for the
+ * old agent to stop, 30 s for the new one's first beat).
+ */
+const AGENT_RECHECK_MS = 60_000
+
 /** A state read, as the run needs to tell them apart. */
 type StateRead =
   | { kind: 'state'; state: AgentState }
@@ -1078,7 +1086,7 @@ class ChunkRun {
    * - both: it is waiting its turn behind busy slots; wait on.
    * - the agent is not alive: nothing will ever take the spec. It is
    *   withdrawn, the chunk goes to another node, and the node is sent
-   *   nothing more (Scheduler.agentDownOn).
+   *   nothing more once a second look confirms it (Scheduler.suspectAgentDown).
    * - the spec is gone with nothing written for it: something else emptied
    *   the inbox, as a second launch of the app re-provisioning the node did
    *   (81fe2875). The chunk goes back in the queue.
@@ -1098,7 +1106,7 @@ class ChunkRun {
       if (this.stopped) return true
       const reason =
         "the node's agent is not running (no heartbeat), so nothing takes the chunks sent to it"
-      scheduler.agentDownOn(this.nodeId, reason)
+      scheduler.suspectAgentDown(this.nodeId, this.ssh, reason)
       this.fail('dispatch', own('machine', 'agent-down', reason))
       return true
     }
@@ -1546,14 +1554,20 @@ class Scheduler {
    */
   private laneCeilings = new Map<string, number>()
   /**
-   * Nodes whose agent a run found not running (ChunkRun.checkMissingState),
-   * and why. Each chunk sent to one waited STATE_MISSING_MS for nothing and
+   * Nodes whose agent a run found not running (ChunkRun.checkMissingState)
+   * and a second look confirmed (suspectAgentDown), and why. Each chunk sent to one waited STATE_MISSING_MS for nothing and
    * cost an infrastructure retry, and nothing brings the agent back by
    * itself, so such a node is sent nothing more and is let go of once idle
    * (scalePolicy). Restarting its agent is the node supervisor's (plan 1.7);
    * forgetNode clears the mark when a node comes back.
    */
   private agentDown = new Map<string, { since: number; reason: string }>()
+  /**
+   * Nodes a run found with a stale heartbeat, waiting for the second look
+   * that decides whether they go into agentDown (suspectAgentDown), each
+   * with its check's token. Sent nothing meanwhile.
+   */
+  private agentChecks = new Map<string, symbol>()
   /**
    * The longest a frame of each job has been seen to take, in seconds, by
    * the hardware one render of it had (frameTimeKey): what the hung-Blender
@@ -1667,6 +1681,7 @@ class Scheduler {
     this.laneGuards.delete(nodeId)
     this.laneCeilings.delete(nodeId)
     this.agentDown.delete(nodeId)
+    this.agentChecks.delete(nodeId)
     // A node that comes back (recoverUnreachable) is judged afresh. A step
     // still running from before only sets its own entry's `running`.
     prepTimeouts.delete(nodeId)
@@ -2044,7 +2059,32 @@ class Scheduler {
   }
 
   /**
-   * A run found this node's agent not running (see agentDown). Announced
+   * A run found this node's agent not running. Its chunk goes back to the
+   * queue at once, but one stale heartbeat does not condemn the node for
+   * the rest of its rental: a restart-agent (a second launch re-provisioning
+   * it, as in 81fe2875, or the node supervisor) leaves the heartbeat stale
+   * for up to about 40 s, and a heartbeat write can be slow under disk
+   * load. The node is sent nothing while AGENT_RECHECK_MS pass, then asked
+   * again: alive, it takes work again; not, or no answer, it is down
+   * (agentDownOn).
+   */
+  suspectAgentDown(nodeId: string, ssh: SshConnection, reason: string): void {
+    if (this.agentDown.has(nodeId) || this.agentChecks.has(nodeId)) return
+    const token = Symbol(nodeId)
+    this.agentChecks.set(nodeId, token)
+    setTimeout(() => {
+      void within(agentAlive(ssh), AGENT_CHECK_TIMEOUT_MS).then((alive) => {
+        // forgetNode, or a newer check, has it now.
+        if (this.agentChecks.get(nodeId) !== token) return
+        this.agentChecks.delete(nodeId)
+        if (alive === true) this.kick()
+        else this.agentDownOn(nodeId, reason)
+      })
+    }, AGENT_RECHECK_MS)
+  }
+
+  /**
+   * A node's agent is not running, seen twice (see agentDown). Announced
    * once, and written on the node, so the fleet view says why it idles.
    */
   agentDownOn(nodeId: string, reason: string): void {
@@ -2461,7 +2501,7 @@ class Scheduler {
       .filter((n) => ['ready', 'idle', 'rendering'].includes(n.state))
       .filter((n) => nodeManager.get(n.id)?.ssh)
       .filter((n) => !this.resting(n.id, now))
-      .filter((n) => this.nodeUnfit(n.id) == null)
+      .filter((n) => this.nodeUnfit(n.id) == null && !this.agentChecks.has(n.id))
 
     this.runSlotController(eligible)
     this.reserveForExclusive(ready, eligible)
