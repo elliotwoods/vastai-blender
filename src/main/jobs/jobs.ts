@@ -116,12 +116,13 @@ export function emitJobChanged(jobId: string): void {
  * Announce a chunk's lifecycle change, re-reading the row so the payload is
  * whatever actually landed rather than what the caller believed it wrote.
  *
- * Every chunk state write must go through here. There are eight of them across
- * scheduler.ts (dispatch, the render/encode/download transitions, finish,
- * restart recovery, requeue, cancel) and index.ts (the VR_JOB_SPEC revive), and
- * `requeue()` in particular INSERTs brand-new `-rN` rows mid-render — a
- * consumer that only heard about ChunkRun's own writes would keep showing
- * requeued chunks as live and never learn the retry ids exist.
+ * Every chunk state write must go through here. They are in scheduler.ts
+ * (dispatch, the render/encode/download transitions, finish, the re-split
+ * shared by requeue and restart recovery, completing a chunk with nothing left
+ * to render, cancel) and index.ts (the VR_JOB_SPEC revive), and the re-split
+ * in particular INSERTs brand-new `-rN` rows mid-render — a consumer that only
+ * heard about ChunkRun's own writes would keep showing requeued chunks as live
+ * and never learn the retry ids exist.
  */
 export function emitChunkChanged(chunkId: string): void {
   const row = getDb()
