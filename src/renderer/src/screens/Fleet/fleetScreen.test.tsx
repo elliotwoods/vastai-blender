@@ -293,6 +293,19 @@ describe('1.5: a manual rental at the spend cap asks first', () => {
     expect(html).toContain('bills $10.000/hr of its $10.000/hr spend cap')
   })
 
+  it('names the price it may go to past the cap: the offer filter’s', () => {
+    const withFilter = { ...settings, offerFilters: { maxDphTotal: 2.5 } } as SettingsPublic
+    const qc = new QueryClient()
+    qc.setQueryData(qk.settings, withFilter)
+    qc.setQueryData(qk.nodes, [node({ dphTotal: 10 })])
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={qc}>
+        <FleetScreen />
+      </QueryClientProvider>
+    )
+    expect(html).toContain('at no more than $2.500/hr')
+  })
+
   it('rents at one click under the cap', () => {
     const html = withCache((qc) => qc.setQueryData(qk.nodes, [node({})]), <FleetScreen />)
     expect(html).toContain('>+ request node</button>')

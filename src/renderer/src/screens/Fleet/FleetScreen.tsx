@@ -13,6 +13,7 @@ import { ipcErrorText } from '../../lib/recovery'
 import { DestroyNodeButton } from './NodeActions'
 import { NodeDetail } from './NodeDetail'
 import { FleetGpuStrip } from './FleetGpuStrip'
+import { overCapRequest } from './requestNode'
 import { ScaleStatusLine } from './ScaleStatusLine'
 import { UnclaimedPanel } from './UnclaimedPanel'
 import { MeterPair, MiniMeter } from './meters'
@@ -363,9 +364,12 @@ function RequestNodeButton({
     (budget?.headroomPerHour != null && budget.headroomPerHour <= 0) ||
     (message != null && /spend cap/i.test(message))
   const noCap = settings?.spendCapPerHour == null
+  const past = overCapRequest(settings)
+  const bound = past.maxPerHour ?? null
   const request = (overSpendCap: boolean): Promise<unknown> =>
     // The refusal is shown from the mutation's error; nothing to rethrow.
-    req.mutateAsync(overSpendCap ? { overSpendCap: true } : undefined).catch(() => undefined)
+    req.mutateAsync(overSpendCap ? past : undefined).catch(() => undefined)
+  const price = bound != null ? `at most ${fmtRate(bound)}` : 'at any price'
 
   return (
     <>
@@ -391,14 +395,17 @@ function RequestNodeButton({
           variant="default"
           confirmLabel={
             noCap
-              ? 'no spend cap set: rent anyway?'
-              : `past the ${fmtRate(budget?.spendCap ?? settings?.spendCapPerHour ?? 0)} cap?`
+              ? `no spend cap set: rent one, ${price}?`
+              : `past the ${fmtRate(budget?.spendCap ?? settings?.spendCapPerHour ?? 0)} cap, ${price}?`
           }
           title={
-            noCap
-              ? 'No spend cap is set, so scale-up rents nothing. Click twice to rent one node anyway.'
+            (noCap
+              ? 'No spend cap is set, so scale-up rents nothing. Click twice to rent one node anyway, '
               : `The fleet bills ${fmtRate(budget?.perHour ?? 0)} of its ${fmtRate(budget?.spendCap ?? 0)} spend cap. ` +
-                'A node rented now takes it past the cap: click twice to rent one anyway.'
+                'A node rented now takes it past the cap: click twice to rent one anyway, ') +
+            (bound != null
+              ? `at no more than ${fmtRate(bound)} (the offer filter's price).`
+              : 'at whatever the offer filters allow: they set no price.')
           }
           onConfirm={() => request(true)}
         />
