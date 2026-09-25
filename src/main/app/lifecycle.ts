@@ -1015,7 +1015,8 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
         if (consoleClosing(signal)) {
           // Windows ends the process 5 to 10 s from now: no time for the
           // dialog to be answered. As a session end: the fleet destroyed,
-          // taking over from a dialog that is up, every DELETE at once.
+          // taking over from a dialog that is up, each DELETE as soon as
+          // it can go (hurry).
           hurry.abort()
           if (phase === 'destroying') return
           void stopUnattended('the console window closed', sessionPolicy(), 1).catch(fail(signal))
