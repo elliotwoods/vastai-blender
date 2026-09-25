@@ -7,7 +7,7 @@
  * writes them; and every step has a deadline.
  */
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -21,9 +21,16 @@ const uploads: string[] = []
 vi.mock('electron', () => ({
   app: { getAppPath: () => new URL('../../../', import.meta.url).pathname }
 }))
+/** Every database write provisioner makes, as [sql, ...params]. */
+const writes: unknown[][] = []
 vi.mock('../db/db', () => ({
   getDb: () => ({
-    prepare: () => ({ get: () => undefined, run: () => undefined })
+    prepare: (sql: string) => ({
+      get: () => undefined,
+      run: (...params: unknown[]) => {
+        writes.push([sql, ...params])
+      }
+    })
   })
 }))
 vi.mock('../events', () => ({
@@ -48,6 +55,7 @@ const {
   installBlender,
   installExtension,
   parseAgentRestart,
+  provisionDeps,
   parseAgentStatus,
   probeEevee,
   provisionBase,
@@ -123,6 +131,7 @@ class ScriptSsh {
 beforeEach(() => {
   logged.length = 0
   uploads.length = 0
+  writes.length = 0
 })
 
 // Each test runs the script several times under bash: seconds of real time,
@@ -318,6 +327,16 @@ describe('provisioner.ts, what it makes of an answer', () => {
     }
   )
 
+  it.each(NO_EXIT)(
+    '1.7: an EEVEE probe with no exit status (%s) records nothing about EEVEE',
+    async (_what, code) => {
+      const dropped = stub({ code, stdout: '', stderr: '' })
+      expect(await probeEevee(dropped.ssh, 'node-1', '5.1.0')).toBe(false)
+      expect(writes).toEqual([])
+      expect(logged.at(-1)).toMatch(/no answer/)
+    }
+  )
+
   it('1.8: installBlender and probeEevee each pass a deadline and a label, never command text', async () => {
     const s = stub({ code: 0, stdout: 'PROBE_OK\n', stderr: '' })
     await installBlender(s.ssh, 'node-1', '5.1.0')
@@ -357,6 +376,44 @@ describe('provisioner.ts, what it makes of an answer', () => {
     expect((e as Error).message).toMatch(/is not a Python identifier/)
     expect(s.calls).toEqual([])
   })
+
+  // The subcommands this module sends and the ones provision.sh's dispatch
+  // takes are two lists in two languages; a rename on either side would fail
+  // every node at its first provision.
+  it.skipIf(process.platform === 'win32')(
+    "every provision.sh subcommand the app sends is one the script's dispatch takes",
+    async () => {
+      const script = readFileSync(new URL('../../../remote/provision.sh', import.meta.url), 'utf-8')
+      const dispatch = script.slice(script.lastIndexOf('case "${1:-}" in'))
+      const labels = new Set(
+        [...dispatch.matchAll(/^ {2}([a-z|\s-]+)\)/gm)].flatMap((m) =>
+          m[1].split('|').map((l) => l.trim())
+        )
+      )
+      const s = stub({ code: 0, stdout: 'PROBE_OK\nAGENT_KEPT\n', stderr: '' })
+      await provisionDeps(s.ssh, 'node-1')
+      await restartAgent(s.ssh, 'node-1')
+      await restartAgent(s.ssh, 'node-1', { force: true })
+      await agentStatus(s.ssh)
+      await installBlender(s.ssh, 'node-1', '5.1.0')
+      await probeEevee(s.ssh, 'node-1', '5.1.0')
+      // The last `provision.sh <args>` in each: `chmod +x … && bash … deps`.
+      const sent = s.calls.map((c) => shellWords(/.*provision\.sh (.+)$/.exec(c.command)![1]))
+      expect(sent.map((a) => a[0])).toEqual([
+        'deps',
+        'restart-agent',
+        'restart-agent',
+        'agent-status',
+        'install-blender',
+        'probe-eevee'
+      ])
+      for (const [sub, ...args] of sent) {
+        expect(labels).toContain(sub)
+        if (sub === 'deps' || sub === 'restart-agent')
+          expect(['', '--force']).toContain(args[0] ?? '')
+      }
+    }
+  )
 
   it('parses the verdict from the last line only', () => {
     expect(parseAgentRestart(['[provision] …', 'AGENT_KEPT', ''])).toEqual({

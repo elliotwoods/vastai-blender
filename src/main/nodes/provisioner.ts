@@ -391,6 +391,13 @@ export async function probeEevee(
     timeoutMs: 120_000,
     label: `EEVEE probe ${version}`
   })
+  // A link that dropped under the probe said nothing about EEVEE: recorded
+  // as FAILED, a node back from a blip was marked unable to render it for
+  // the rest of its rental (n4 review). Left unprobed instead.
+  if (exitStatus(r.code) === null) {
+    logLine(nodeId, 'EEVEE probe: no answer (the connection dropped); left unprobed')
+    return false
+  }
   const ok = r.stdout.includes('PROBE_OK')
   getDb()
     .prepare('UPDATE nodes SET eevee_capable = ? WHERE id = ?')
