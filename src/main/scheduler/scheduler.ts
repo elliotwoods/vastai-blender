@@ -34,8 +34,16 @@ import {
   REMOTE_ROOT
 } from '../nodes/provisioner'
 import { listAddons } from '../addons/addons'
-import { NoMatchingOffersError, nodeManager } from '../nodes/nodeManager'
-import { octaneSignInHold, releaseOctaneSignInHold } from '../octane/octaneLicense'
+import { NoMatchingOffersError, nodeManager, rentalImageProblem } from '../nodes/nodeManager'
+import {
+  OctaneBlenderMissingError,
+  octaneSignInHold,
+  octaneUnfit,
+  onOctaneState,
+  releaseOctaneSignInHold,
+  setupOctane,
+  waitForOctaneLicence
+} from '../octane/octaneLicense'
 import { getSettings } from '../settings'
 import { sha256File, uploadFileVerified, writeRemoteFileAtomic } from '../ssh/sftp'
 import { shq } from '../ssh/shq'
@@ -84,7 +92,8 @@ import type {
   FleetHolds,
   JobAttention,
   JobAttentionKind,
-  NodeSnapshot
+  NodeSnapshot,
+  OctaneState
 } from '../../shared/models'
 import { capacityBudget, isBooting, isDispatchable } from '../../shared/nodeState'
 
@@ -766,6 +775,8 @@ const RATE_ALPHA = 0.3
 
 class ChunkRun {
   private stopped = false
+  /** Aborted when the run stops: ends a wait it is in (the Octane licence's). */
+  private readonly aborter = new AbortController()
   private downloader: ChunkDownloader | null = null
   private stopTail: (() => void) | null = null
   private dispatchedAt = Date.now()
@@ -993,6 +1004,8 @@ class ChunkRun {
     const remoteBlend = scene ? `${scene.sha256}.blend` : `${this.jobId}.blend`
     // Each step is named with what bounds it (StepBound): its own ceiling,
     // its own stall guard, or the prep's shared budget.
+    // Octane's state once set up, when this dispatch set it up (1b below).
+    let octane: OctaneState | null = null
     const bootstrapExprs: string[] = await withNodePrep(this.nodeId, async (step) => {
       // 1. Blender version (idempotent, cheap when already installed). Its
       // ceiling is install-blender's own: every mirror at its 30-min limit.
@@ -1002,11 +1015,11 @@ class ChunkRun {
       }
 
       // 1b. Octane jobs need the X11/VNC + OctaneServer environment (and an
-      // OctaneBlender build on the node — see docs/OCTANE.md).
+      // OctaneBlender build on the node — see docs/OCTANE.md). Set up here,
+      // but its licence is waited for once the prep lock is let go (below).
       if (job.engine === 'octane' && !node.snapshot.octaneReady) {
         step('setting up Octane')
-        const { setupOctane } = await import('../octane/octaneLicense')
-        await setupOctane(this.ssh, this.nodeId)
+        octane = await setupOctane(this.ssh, this.nodeId, { wait: false })
       }
 
       // 2. Extensions for this job (once per node+version+zip — cached; the
@@ -1090,6 +1103,15 @@ class ChunkRun {
     // renders frames this computer already has and holds a lane for them:
     // job da68b61b's leftover sub-chunk sat 'assigned' at 0% GPU.
     if (this.nothingLeft('after node prep')) return
+
+    // Octane's licence, outside the node's prep lock (plan 1.18): a sign-in
+    // by hand may take ten minutes, and only this chunk waits for it. Under
+    // the lock every other dispatch to the node, Cycles included, waited
+    // too, on a node billing all the while. Ended at once if the run stops.
+    if (octane != null && octane !== 'licensed') {
+      await waitForOctaneLicence(this.ssh, this.nodeId, { signal: this.aborter.signal })
+      if (this.abandoned('after the Octane sign-in')) return
+    }
 
     // 4. Job spec — written atomically (agent ignores *.tmp.json).
     const spec = {
@@ -1830,6 +1852,7 @@ class ChunkRun {
 
   private cleanup(): void {
     this.stopped = true
+    this.aborter.abort()
     this.stopTail?.()
     this.downloader?.stop()
   }
@@ -1907,6 +1930,7 @@ class Scheduler {
   private holdsListeners = new Set<(holds: FleetHolds) => void>()
   private lastHolds = '{}'
   private unsubscribeHolds: (() => void) | null = null
+  private unsubscribeOctane: (() => void) | null = null
   /**
    * Nodes resting after an attempt failed for their own or their network's
    * reason (plan 1.17; see rest()): tick() sends them nothing new until
@@ -2062,6 +2086,10 @@ class Scheduler {
     // idle node was ever let go while the fleet billed.
     this.timer ??= setInterval(() => void this.tick(), TICK_MS)
     this.unsubscribeHolds ??= nodeManager.onHoldsChanged(() => this.noteHolds())
+    // A node signed in to Octane: jobs held for a sign-in go out again.
+    this.unsubscribeOctane ??= onOctaneState((_id, state) => {
+      if (state === 'licensed') this.releaseSignInHolds()
+    })
     try {
       this.recoverAtStart()
     } catch (e) {
@@ -2399,6 +2427,19 @@ class Scheduler {
     this.noteHolds()
   }
 
+  /** The Octane image problem last warned about, so each is said once. */
+  private octaneImageWarned: string | null = null
+
+  private warnOctaneImage(problem: string | null): void {
+    if (problem === this.octaneImageWarned) return
+    this.octaneImageWarned = problem
+    if (!problem) return
+    emit('alert', {
+      level: 'warn',
+      message: `Octane work is queued, but ${problem}: no node is rented for it`
+    })
+  }
+
   /**
    * Warn once when the fleet rents nothing only because no spend cap is set
    * and "no spend cap" is off: a settings.json from before that setting
@@ -2434,6 +2475,8 @@ class Scheduler {
     this.timer = null
     this.unsubscribeHolds?.()
     this.unsubscribeHolds = null
+    this.unsubscribeOctane?.()
+    this.unsubscribeOctane = null
   }
 
   kick(): void {
@@ -3207,6 +3250,7 @@ class Scheduler {
     }
     for (let i = 0; i < pending.length; i++) {
       const c = pending[i]
+      if (!this.takesEngine(node.id, c.engine)) continue
       if (!admits(occupancy(c.engine), { id: c.id, sharesNode: c.share_node === 1 })) continue
       const avoid = this.failedOn.get(c.id)?.nodes
       if (avoid?.has(node.id) && this.anotherTakes(c, avoid, eligible)) continue
@@ -3275,6 +3319,17 @@ class Scheduler {
     }
     if (e instanceof AddonRegistryUnread) {
       return { c: own('localFs', 'addon-registry', e.message), stage: 'dispatch', nodeId }
+    }
+    // The image set for Octane nodes has no OctaneBlender: every node rented
+    // from it lacks it too, so the job cannot render until that setting
+    // changes (plan 1.18). Held for the user rather than rented for again.
+    if (e instanceof OctaneBlenderMissingError && e.octaneImage) {
+      return {
+        c: own('job', 'octane-image', e.message),
+        stage: 'dispatch',
+        nodeId,
+        fatal: 'engine'
+      }
     }
     // The node's: a step that hangs there is no more the job's than one
     // that fails. Not node-setup, which the breaker counts across nodes:
@@ -3507,6 +3562,11 @@ class Scheduler {
     if (f.fatal) return this.failJob(chunk, job.name, f)
 
     const alerts: AlertEvent[] = []
+    // Nobody signed in to Octane (plan 1.18): the job waits for the user,
+    // who signs in over VNC or resumes it. Sent again meanwhile, it would
+    // fail again on the next node, and keep idle nodes billing while it
+    // stood pending. octaneLicense has told the user where to sign in.
+    if (f.c.rule === 'octane-login' && job.attention == null) this.holdForSignIn(chunk.job_id)
     const history = this.failedOn.get(chunkId)
     const repeat = renderOnMachine(f.c, f.stage) && history?.renderRules.has(f.c.rule) === true
     const budget = chargeFor(f.c, f.stage, repeat)
@@ -3666,6 +3726,67 @@ class Scheduler {
     }
   }
 
+  /**
+   * Hold an Octane job for a sign-in nobody made (plan 1.18): its attention
+   * says so, as an 'engine' hold the scheduler lets go of itself once a node
+   * reads licensed (releaseSignInHolds), or the user resumes it. Marked
+   * 'transient', which a job failed for its engine never is.
+   */
+  private holdForSignIn(jobId: string): void {
+    const attention: JobAttention = {
+      kind: 'engine',
+      message:
+        octaneSignInHold()?.reason ??
+        'Octane waits for a sign-in: sign in over VNC (Fleet → the node → Open VNC login)',
+      since: Date.now(),
+      errorClass: 'transient'
+    }
+    const r = getDb()
+      .prepare('UPDATE jobs SET attention = ? WHERE id = ? AND attention IS NULL')
+      .run(JSON.stringify(attention), jobId)
+    if (r.changes > 0) emitJobChanged(jobId)
+  }
+
+  /** A node read licensed: every job held for a sign-in goes out again. */
+  private releaseSignInHolds(): void {
+    const rows = getDb()
+      .prepare(
+        `SELECT id, attention FROM jobs
+          WHERE attention IS NOT NULL AND state IN ('queued', 'running')`
+      )
+      .all() as Array<{ id: string; attention: string }>
+    let released = false
+    for (const row of rows) {
+      let a: Partial<JobAttention> | null = null
+      try {
+        a = JSON.parse(row.attention) as Partial<JobAttention>
+      } catch {
+        continue
+      }
+      if (a?.kind !== 'engine' || a.errorClass !== 'transient') continue
+      getDb().prepare('UPDATE jobs SET attention = NULL WHERE id = ?').run(row.id)
+      emitJobChanged(row.id)
+      released = true
+    }
+    if (released) this.kick()
+  }
+
+  /**
+   * Whether an Octane chunk may go to this node (plan 1.18): not one the
+   * Octane setup found unfit (no OctaneBlender, a host the settings keep
+   * Octane from, a sign-in missed there), and not one scale-up rented for
+   * another engine, from that engine's image. A node rented for no engine
+   * in particular (by hand, where OctaneBlender may be installed by hand)
+   * or whose rental this session does not know (restored after a restart)
+   * may try: its setup says whether it can. Any other engine goes anywhere.
+   */
+  private takesEngine(nodeId: string, engine: EngineId): boolean {
+    if (engine !== 'octane') return true
+    if (octaneUnfit(nodeId) != null) return false
+    const rentedFor = nodeManager.rentalOf(nodeId)?.engine
+    return rentedFor == null || rentedFor === 'octane'
+  }
+
   /** A node as the user knows it: its GPU, and which one. */
   private nodeName(nodeId: string): string {
     const gpu = nodeManager.get(nodeId)?.snapshot.gpuName
@@ -3680,6 +3801,13 @@ class Scheduler {
    * released.
    */
   resumeJob(jobId: string): boolean {
+    // Resuming an Octane job is the user acting on a missed sign-in: each
+    // node may be waited on for a sign-in once more.
+    const engine = (
+      getDb().prepare('SELECT engine FROM jobs WHERE id = ?').get(jobId) as
+        { engine: EngineId } | undefined
+    )?.engine
+    if (engine === 'octane') releaseOctaneSignInHold()
     const r = getDb()
       .prepare(
         `UPDATE jobs SET attention = NULL
@@ -3809,15 +3937,31 @@ class Scheduler {
    * refuses frames. A chunk waiting out a backoff counts, since its wait is
    * short and bounded.
    */
-  private scalePolicy(pending: PendingChunk[], opts: { sendable: number }): void {
+  private scalePolicy(queued: PendingChunk[], opts: { sendable: number }): void {
     const settings = getSettings()
+    // Octane work with no image to rent its nodes from (plan 1.18): every
+    // rental for it would fail, or rent a node with no OctaneBlender to bill
+    // through its boot. It is not demand, so nothing is rented for it; a
+    // node that can take it (one rented by hand, say) still gets it. Said
+    // once for each problem.
+    const octaneProblem = queued.some((c) => c.engine === 'octane')
+      ? rentalImageProblem(settings, 'octane')
+      : null
+    this.warnOctaneImage(octaneProblem)
+    const pending = octaneProblem ? queued.filter((c) => c.engine !== 'octane') : queued
     const pendingCount = pending.length
     const nodes = nodeManager.list()
     const usable = nodes.filter(isDispatchable)
     // What the fleet can render with: not a node this scheduler sends nothing
     // (nodeUnfit), whose lanes counted as free let the queue look covered
-    // while it waited for a node whose agent is down.
-    const working = usable.filter((n) => this.nodeUnfit(n.id) == null)
+    // while it waited for a node whose agent is down. For a queue that is all
+    // Octane, not a node that cannot take Octane either (takesEngine).
+    const onlyEngine = new Set(pending.map((c) => c.engine))
+    const working = usable.filter(
+      (n) =>
+        this.nodeUnfit(n.id) == null &&
+        (onlyEngine.size !== 1 || this.takesEngine(n.id, [...onlyEngine][0]))
+    )
 
     // Shared and exclusive work draw on different supplies, so they need
     // separate demand tests. Shared chunks consume free SLOTS; an exclusive
@@ -3961,8 +4105,11 @@ class Scheduler {
     // disk stayed full. frameDownloader's SINK_HOLD_MS is the bound on that.
     // Nor for a node this scheduler sends nothing whatever is queued (its
     // agent is down: nodeUnfit), which the queue otherwise kept billing.
+    // Nor for work it cannot take: an Octane chunk queued kept a node rented
+    // for another engine, or one Octane's setup found unfit, alive for good.
+    const sendable = opts.sendable > 0 ? queued : []
     for (const n of usable) {
-      if (opts.sendable > 0 && this.nodeUnfit(n.id) == null) {
+      if (this.nodeUnfit(n.id) == null && sendable.some((c) => this.takesEngine(n.id, c.engine))) {
         this.idleSince.delete(n.id)
         continue
       }

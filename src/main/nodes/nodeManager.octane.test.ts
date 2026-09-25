@@ -130,6 +130,9 @@ describe('1.18: Octane on a node, as the fleet sees it', () => {
     // pending for ever, it kept every idle node billing, or, with the node
     // unfit, had it let go and another rented for another wait, with no end.
     w.settings.dockerImageByEngine = { octane: 'otoy/octane-blender:2025.2' }
+    // Room for a second node: scale-up rents for the Octane work by engine
+    // (the integration wave), and must still rent nothing in its place.
+    w.settings.maxActiveNodes = 2
     const app = await w.boot()
     const lic = await import('../octane/octaneLicense')
     const { holdsInstance } = await import('../../shared/nodeState')
@@ -148,15 +151,13 @@ describe('1.18: Octane on a node, as the fleet sees it', () => {
     app.scheduler.kick()
 
     // The licence wait, the one wait for a sign-in, and the idle timeout,
-    // plus five minutes: the scheduler as it stands charges each chunk's
-    // render retries, one dispatch per tick, before its job fails. Holding
-    // the job on the first OctaneLoginNeededError (the corrected handoff)
-    // takes that out.
+    // plus a minute: the job is held on the first OctaneLoginNeededError,
+    // so no chunk is sent to wait again, and the idle node goes.
     const bound =
       lic.OCTANE_LICENSE_WAIT_MS +
       lic.OCTANE_LOGIN_WAIT_MS +
       w.settings.idleTimeoutMinutes * MIN +
-      5 * MIN
+      1 * MIN
     await w.until(
       () =>
         w.get<{ destroyed_at: number | null }>(
@@ -306,12 +307,12 @@ describe('1.18 (review): the scripted sign-in, under secure cloud only', () => {
     )
   }
 
-  it('1.18 (review 2): an Octane chunk that reaches a node not rented through the filter asks nobody to sign in there, and sends no credential', async () => {
+  it('1.18 (review 2): an Octane chunk is not sent to a node not rented through the filter: nobody asked to sign in there, no credential sent', async () => {
     Object.assign(w.settings, { octane: { scriptedSignIn: true, secureCloudOnly: true } })
     const app = await w.boot()
     const nm = await import('./nodeManager')
     const lic = await import('../octane/octaneLicense')
-    // Rented with no engine, as scale-up rents today: any host could take it.
+    // Rented with no engine (by hand): any host could take it.
     const nodeId = await w.readyNode(app, { datacenter: false } as never)
     expect(app.nodeManager.rentalOf(nodeId)).toEqual({
       engine: null,
@@ -324,17 +325,14 @@ describe('1.18 (review): the scripted sign-in, under secure cloud only', () => {
     machine.onSpec = (spec) => specs.push(spec)
     const jobId = await w.submitJob(app, { engine: 'octane' })
     app.scheduler.kick()
-    await w.until(
-      () =>
-        w.all('SELECT id FROM chunks WHERE job_id = ? AND retries + infra_retries > 0', jobId)
-          .length > 0,
-      'the chunk refused',
-      { timeoutMs: 2 * MIN }
-    )
-    expect(JSON.stringify(w.events)).toContain(
-      'this node was not rented as a datacenter (secure cloud) host'
-    )
+    await w.advance(2 * MIN, 1_000)
+    // The scheduler asks octaneUnfit before it sends an Octane chunk (the
+    // integration wave's routing), so the chunk never reaches it: before,
+    // it was sent, refused there, and charged.
     expect(lic.octaneUnfit(nodeId)).toMatch(/not rented as a datacenter/)
+    expect(w.all('SELECT state, node_id FROM chunks WHERE job_id = ?', jobId)).toEqual([
+      { state: 'pending', node_id: null }
+    ])
     // Nothing of Octane started there, nobody asked to sign in at its
     // desktop, and no credential sent.
     expect(machine.ran(/setup_octane|OctaneBlender/)).toEqual([])

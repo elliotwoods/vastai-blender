@@ -88,6 +88,8 @@ export const GUARD_EXIT = 32
 
 interface ErrorLike {
   name?: unknown
+  /** OctaneBlenderMissingError: the node was rented from the Octane image. */
+  octaneImage?: unknown
   message?: unknown
   code?: unknown
   errno?: unknown
@@ -638,6 +640,32 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
     )
   ) {
     return result('transient', 'transfer-damaged', 'a transfer arrived short or damaged', e, true)
+  }
+
+  // --- Octane (plan 1.18), by the error's name: octaneLicense.ts. ---
+  // Nobody signed in by hand: the user's to fix, not the node's or the
+  // job's. The scheduler holds the job for the sign-in, and charges nothing.
+  if (name === 'OctaneLoginNeededError') {
+    return result('transient', 'octane-login', 'Octane is waiting for a sign-in', e, true)
+  }
+  // Rented without the secure-cloud filter the Octane settings ask for: only
+  // this node is unfit for Octane. Not counted by the breaker, no blacklist.
+  if (name === 'OctaneHostNotVettedError') {
+    return result('machine', 'octane-unvetted', 'this node may not be used for Octane', e, true)
+  }
+  if (name === 'OctaneBlenderMissingError') {
+    // Rented from the image set for Octane, which lacks OctaneBlender: every
+    // node from it would too, so the job cannot render until the setting
+    // changes. Otherwise only this node lacks it.
+    if (e.octaneImage === true) {
+      return result('job', 'octane-image', 'the Octane docker image has no OctaneBlender', e, false)
+    }
+    return result('machine', 'octane-no-blender', 'this node has no OctaneBlender', e, true)
+  }
+  // The Octane wait given up because the chunk was taken back: as a retry
+  // the caller aborted, nothing is wrong with the work.
+  if (/^Octane setup stopped: the chunk was taken back/.test(message)) {
+    return result('transient', 'retry-aborted', 'stopped waiting for the node', e, true)
   }
 
   // --- The node left the fleet under the caller (scheduler, nodeManager). ---

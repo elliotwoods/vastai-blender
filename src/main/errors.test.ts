@@ -737,3 +737,46 @@ describe('reasons never carry a secret', () => {
     expect(s).not.toContain(key.slice(0, 4))
   })
 })
+
+// Plan 1.18: Octane's own failures, by name (octaneLicense.ts). Unclassified
+// they read as the job's, spending render retries and counted by the
+// breaker, for a sign-in nobody made or a node the settings keep Octane
+// from (n5 review).
+describe('classify: Octane (plan 1.18)', () => {
+  const named = (name: string, extra: Record<string, unknown> = {}): Error =>
+    Object.assign(new Error(`${name} test`), { name, ...extra })
+
+  it.each([
+    ['a sign-in nobody made', named('OctaneLoginNeededError'), 'transient', 'octane-login', true],
+    [
+      'a host the settings keep Octane from',
+      named('OctaneHostNotVettedError'),
+      'machine',
+      'octane-unvetted',
+      true
+    ],
+    [
+      'no OctaneBlender on a node rented for another engine',
+      named('OctaneBlenderMissingError', { octaneImage: false }),
+      'machine',
+      'octane-no-blender',
+      true
+    ],
+    [
+      'no OctaneBlender in the image set for Octane',
+      named('OctaneBlenderMissingError', { octaneImage: true }),
+      'job',
+      'octane-image',
+      false
+    ],
+    [
+      'the licence wait given up as the chunk was taken back',
+      new Error('Octane setup stopped: the chunk was taken back'),
+      'transient',
+      'retry-aborted',
+      true
+    ]
+  ])('%s', (_what, e, kind, rule, retryable) => {
+    expect(classify(e, { via: 'ssh' })).toMatchObject({ kind, rule, retryable })
+  })
+})

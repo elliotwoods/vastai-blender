@@ -192,6 +192,11 @@ describe('retry policy (plan 1.17)', () => {
     it('charges nothing for frames this computer would not take', () => {
       expect(budgetFor(f('localFs', 'local-sink'))).toBe('none')
     })
+
+    it('1.18: charges nothing for an Octane sign-in nobody made; the job waits for it', () => {
+      expect(budgetFor(f('transient', 'octane-login'))).toBe('none')
+      expect(budgetFor(f('machine', 'octane-unvetted'))).toBe('infra')
+    })
   })
 
   describe('chargeFor: the same render failing on the machine again is the render', () => {

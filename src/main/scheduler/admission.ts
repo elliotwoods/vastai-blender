@@ -147,7 +147,10 @@ export interface FailureClass {
 
 export function budgetFor(c: FailureClass): RetryBudget {
   if (c.kind === 'job') return 'render'
-  if (c.rule === 'local-sink') return 'none'
+  // Waits on this computer's disk, or on the user signing in to Octane (the
+  // scheduler holds the job for the sign-in): no fault of the attempt's, and
+  // retried as often as it happens it would fail the chunk for good.
+  if (c.rule === 'local-sink' || c.rule === 'octane-login') return 'none'
   return 'infra'
 }
 
