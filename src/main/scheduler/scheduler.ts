@@ -7,8 +7,9 @@
  * Single loop, event-kicked + 15s timer. All chunk/job state lives in
  * SQLite, so a restart loses no bookkeeping. It does lose in-flight work:
  * nothing re-attaches to a render the previous process started. start()
- * sends each such chunk back to pending, and its next dispatch renders its
- * whole frame range again (see start()).
+ * sends each such chunk back to pending, narrowed around the frames already
+ * downloaded, so its next dispatch renders only what this computer lacks
+ * (see start()).
  */
 
 import { posix } from 'path'
@@ -753,36 +754,51 @@ class Scheduler {
 
   start(): void {
     // Restart recovery: chunks stranded in transient states (their ChunkRun
-    // died with the previous process) go back to pending, unassigned, with
-    // their range unchanged. Nothing narrows it around frames that already
-    // downloaded, and nothing re-attaches to the old render: resuming a node
-    // re-provisions it, which kills its Blender processes and clears its
-    // inbox (provision.sh `base`). (Except a node that was unreachable at
-    // launch and reconnects later: recoverUnreachable skips onReady, so its
-    // old agent and renders keep running.) So the re-dispatch renders the
-    // WHOLE range again, and is billed for it. The agent runs Blender over
-    // -s..-e and does not skip frames it has already manifested (Blender
-    // itself does only when the scene has Overwrite unchecked).
+    // died with the previous process) go back to pending, unassigned, each
+    // re-split around the frames already downloaded, as requeue() does but
+    // without charging a retry: a restart is no fault of the chunk's. A chunk
+    // whose every frame had landed is complete, and is never sent again.
     //
-    // It is worse on the node that had the chunk before. The manifest there
-    // keeps each re-rendered frame's OLD size and sha256, so a frame not yet
-    // downloaded when Blender re-renders over it no longer verifies and is
-    // lost. requeue() keeps this chunk id for the first missing range, and a
-    // dispatch of it to the same node meets the same stale entries again,
-    // possibly until the retry budget runs out. All a restart saves is
-    // transfer: a frame already on local disk with its manifest's size and
-    // hash is not fetched again (downloadFileVerified).
+    // Nothing re-attaches to the old render. Resuming a node still runs
+    // provision.sh `base`, which restarts its agent, killing its Blender and
+    // clearing its inbox. (Except a node that was unreachable at launch and
+    // reconnects later: recoverUnreachable skips onReady, so its old agent
+    // and renders keep running.) So a frame that was rendered but not yet
+    // downloaded is rendered again, and billed. Only that: the narrowed
+    // range leaves out every frame this computer has, and the agent renders
+    // with Overwrite off, so on the node that had the chunk before, Blender
+    // skips each frame still on its disk (51afb89).
     const db = getDb()
     const stranded = db
       .prepare(
-        `SELECT id FROM chunks WHERE state IN ('assigned', 'rendering', 'encoding', 'downloading')`
+        `SELECT id, job_id FROM chunks WHERE state IN ('assigned', 'rendering', 'encoding', 'downloading')`
       )
-      .all() as Array<{ id: string }>
-    db.prepare(
-      `UPDATE chunks SET state = 'pending', node_id = NULL
-       WHERE state IN ('assigned', 'rendering', 'encoding', 'downloading')`
-    ).run()
-    emitChunksChanged(stranded.map((c) => c.id))
+      .all() as Array<{ id: string; job_id: string }>
+    const touched: string[] = []
+    const completed = new Set<string>()
+    for (const c of stranded) {
+      try {
+        const r = this.resplitAroundDownloaded(c.id, { burnRetry: false })
+        touched.push(...r.touched)
+        if (r.outcome === 'complete') completed.add(c.job_id)
+      } catch (e) {
+        // A range or step missingRanges refuses (see requeueOrFail). Back to
+        // pending as it stands, which is what a restart always did.
+        db.prepare(`UPDATE chunks SET state = 'pending', node_id = NULL WHERE id = ?`).run(c.id)
+        touched.push(c.id)
+        emit('alert', {
+          level: 'warn',
+          message:
+            `chunk ${c.id} could not be narrowed to its missing frames after the restart, ` +
+            `so all of it renders again: ${(e as Error).message}`
+        })
+      }
+    }
+    emitChunksChanged(touched)
+    for (const jobId of new Set(stranded.map((c) => c.job_id))) {
+      refreshJobState(jobId)
+      if (completed.has(jobId)) jobClips.schedule(jobId)
+    }
     // Recovered work is real work, and the very next tick would buy a whole
     // fleet for it. That is right when you meant to resume and expensive when
     // you did not: a profile left with a day-old half-finished campaign starts
@@ -1252,15 +1268,18 @@ class Scheduler {
 
   /**
    * Requeue a failed chunk: re-split around already-downloaded frames so only
-   * missing work re-renders; give up after MAX_RETRIES. Writes rows only, and
-   * returns what it did for announceRequeue; null for a cancelled job, which
-   * it leaves alone. Throws on a range or step missingRanges refuses: call it
-   * through requeueOrFail.
+   * missing work re-renders, charging a retry; give up after MAX_RETRIES.
+   * Writes rows only, and returns what it did for announceRequeue; null for a
+   * cancelled job, which it leaves alone. Throws on a range or step
+   * missingRanges refuses: call it through requeueOrFail.
    */
   private requeue(chunkId: string): Resplit | null {
     const db = getDb()
     const chunk = db.prepare('SELECT * FROM chunks WHERE id = ?').get(chunkId) as ChunkRow
-    const job = db.prepare('SELECT * FROM jobs WHERE id = ?').get(chunk.job_id) as JobRow
+    const job = db.prepare('SELECT state FROM jobs WHERE id = ?').get(chunk.job_id) as Pick<
+      JobRow,
+      'state'
+    >
     // A cancelled job's chunks stay as cancelJob left them. Requeueing one put
     // it back to 'pending' — work nobody wants, which then read as unfinished.
     if (job.state === 'cancelled') return null
@@ -1268,6 +1287,29 @@ class Scheduler {
       db.prepare("UPDATE chunks SET state = 'failed' WHERE id = ?").run(chunkId)
       return { outcome: 'failed', touched: [chunkId] }
     }
+    return this.resplitAroundDownloaded(chunkId, { burnRetry: true })
+  }
+
+  /**
+   * Put a chunk back in the queue, narrowed to the frames of its range not
+   * yet downloaded: the chunk keeps its id for the first missing run of
+   * frames, and each further run becomes a new `-rN` chunk. A chunk with no
+   * frame missing is complete instead.
+   *
+   * `burnRetry` charges the chunk a retry, as requeue() does for a failed
+   * render. restart recovery (start()) re-splits without one: the chunk did
+   * not fail, the process that was driving it went away.
+   *
+   * Writes rows only, in one transaction; the caller announces the result
+   * (announceRequeue). Throws on a range or step missingRanges refuses.
+   */
+  private resplitAroundDownloaded(chunkId: string, opts: { burnRetry: boolean }): Resplit {
+    const db = getDb()
+    const chunk = db.prepare('SELECT * FROM chunks WHERE id = ?').get(chunkId) as ChunkRow
+    const job = db.prepare('SELECT frame_step FROM jobs WHERE id = ?').get(chunk.job_id) as Pick<
+      JobRow,
+      'frame_step'
+    >
     const downloaded = new Set(
       (
         db
@@ -1284,6 +1326,7 @@ class Scheduler {
       db.prepare("UPDATE chunks SET state = 'complete' WHERE id = ?").run(chunkId)
       return { outcome: 'complete', touched: [chunkId] }
     }
+    const retries = chunk.retries + (opts.burnRetry ? 1 : 0)
     const touched: string[] = [chunkId]
     db.transaction(() => {
       // Narrow the original chunk to the first missing range, add new chunks
@@ -1291,13 +1334,13 @@ class Scheduler {
       const first = ranges[0]
       db.prepare(
         `UPDATE chunks SET state='pending', node_id=NULL, frames_done=?, retries=?, frame_start=?, frame_end=?, assigned_at=NULL WHERE id = ?`
-      ).run(0, chunk.retries + 1, first.start, first.end, chunkId)
+      ).run(0, retries, first.start, first.end, chunkId)
       for (const range of ranges.slice(1)) {
-        const newId = `${chunk.job_id.slice(0, 8)}-${range.start}-${range.end}-r${chunk.retries + 1}`
+        const newId = `${chunk.job_id.slice(0, 8)}-${range.start}-${range.end}-r${retries}`
         db.prepare(
           `INSERT INTO chunks (id, job_id, frame_start, frame_end, state, frames_done, retries)
            VALUES (?, ?, ?, ?, 'pending', 0, ?)`
-        ).run(newId, chunk.job_id, range.start, range.end, chunk.retries + 1)
+        ).run(newId, chunk.job_id, range.start, range.end, retries)
         db.prepare(
           `UPDATE frames SET chunk_id = ? WHERE job_id = ? AND frame BETWEEN ? AND ? AND state != 'downloaded'`
         ).run(newId, chunk.job_id, range.start, range.end)
