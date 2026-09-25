@@ -111,11 +111,6 @@ function seedRow(
   return id
 }
 
-/** The orphan sweep, as init runs it. Private, and a world boots once. */
-function sweepOrphans(app: App): Promise<void> {
-  return (app.nodeManager as unknown as { reconcileOrphans(): Promise<void> }).reconcileOrphans()
-}
-
 describe('1.2 ensureInstanceGone: a destroy is done when Vast confirms it', () => {
   it('DELETE 503 twice, then 200: counted, metered and in the fleet $/hr until confirmed (#64 #194)', async () => {
     const app = await bootNodes()
@@ -415,43 +410,63 @@ describe('1.2 at start-up: what the last run left', () => {
 })
 
 describe('1.2 (Phase 0 review): a create with no known outcome counts as billing', () => {
-  it('a rental cancelled mid-create whose reply is lost fills its place under the cap until found (cancelledCreateUnknown)', async () => {
+  it('a rental cancelled mid-create whose reply is lost fills its place under the cap until its label lookup finds it (plans 1.2, 1.4)', async () => {
     const app = await bootNodes()
     app.nodeManager.init()
     w.settings.maxActiveNodes = 1
     w.vast.addOffer()
     w.vast.addOffer()
     const gate = w.vast.hold('createInstance')
-    const renting = app.nodeManager.requestNodes(1)
+    const renting = watch(app.nodeManager.requestNodes(1))
     await w.until(() => gate.reached, 'createInstance in flight')
     const [{ id }] = w.all<{ id: string }>('SELECT id FROM nodes')
+    const label = `vastai-blender ${id.slice(0, 8)}`
     await app.nodeManager.destroyNode(id)
+    // Vast rents it, the reply is lost, and Vast then stops answering the
+    // lookup too: for a minute and then some, nothing is known either way.
+    w.vast.fail(
+      'listInstances',
+      { status: 503, message: 'vast.ai GET /instances/?owner=me → 503: service unavailable' },
+      12
+    )
     gate.loseReply(new Error('read ECONNRESET'))
-    await renting
+    await w.until(() => renting.done, 'the batch gives up waiting', { stepMs: 1_000 })
+    expect(renting.value).toEqual([id])
     const [instanceId] = w.vast.created
 
-    expect(row(id)).toMatchObject({ state: 'failed', instance_id: null })
+    // Not 'destroyed', which would say nothing is billing: 'destroying',
+    // counted, until the lookup knows.
+    expect(row(id)).toMatchObject({ state: 'destroying', instance_id: null })
     expect(row(id).create_unknown_since).not.toBeNull()
     expect(app.nodeManager.activeCount()).toBe(1)
     expect(app.nodeManager.billingPerHour()).toBeCloseTo(0.4)
+    const errors = w.alerts('error')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain(label)
+    expect(errors[0]).toContain('Vast.ai console')
     // So the next rental waits: the instance may be billing under its label.
     await expect(app.nodeManager.requestNodes(1)).resolves.toEqual([])
     expect(w.vast.count('createInstance')).toBe(1)
-    // Nor can the row be hidden as destroyed: there is no id to destroy.
+    // Nor can the row be hidden as destroyed: there is no id to destroy yet.
     await app.nodeManager.destroyNode(id)
-    expect(row(id).state).toBe('failed')
+    expect(row(id).state).toBe('destroying')
     await expect(app.nodeManager.clearFailed()).resolves.toBe(0)
-    expect(row(id).state).toBe('failed')
 
-    // The sweep finds it by its label, records it on the row and destroys it.
-    await sweepOrphans(app)
+    // Vast answers again: the lookup finds it by its label, records it on
+    // the row and destroys it.
+    await w.until(() => row(id).state === 'destroyed', 'found and destroyed', {
+      timeoutMs: 10 * 60_000,
+      stepMs: 5_000
+    })
     expect(w.vast.live()).toEqual([])
+    expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
     expect(row(id)).toMatchObject({
       state: 'destroyed',
       instance_id: instanceId,
       create_unknown_since: null
     })
     expect(app.nodeManager.activeCount()).toBe(0)
+    expect(w.alerts('error')).toHaveLength(1)
   })
 
   it('a create Vast refused is known to have rented nothing, and does not count', async () => {

@@ -8,10 +8,11 @@ import { setup, type App, type World } from '../test/harness'
 // SSH, so a destroy can land in the middle of any step of driveToReady. What
 // must hold whenever it does: the instance is destroyed exactly once, the
 // node ends 'destroyed', and nothing reports it as a node failure. Unless the
-// instance may still be billing: the destroy's DELETE threw, or the create
-// ended with no answer as to whether it rented anything. Then the node ends
-// 'failed', the state that says so, and one alert tells the user. Either way
-// the cancelled rental is not replaced by another.
+// instance may still be billing: the destroy's DELETE threw. Then the node
+// ends 'failed', the state that says so, and one alert tells the user. A
+// create that ended with no answer as to whether it rented anything has its
+// instance looked for by its label, and destroyed when found (plan 1.4).
+// Either way the cancelled rental is not replaced by another.
 
 let w: World
 beforeEach(async () => {
@@ -78,15 +79,6 @@ async function rentsAgain(app: App, machineId: number): Promise<boolean> {
   w.vast.addOffer({ machine_id: machineId })
   const ids = await app.nodeManager.requestNodes(1).catch(() => [])
   return ids.length === 1
-}
-
-/**
- * The orphan sweep, as the next start runs it. It is private, and a world
- * boots once, so this is the only way to run it again; what it acts on (the
- * account's instances and the node rows) is all in the world already.
- */
-function sweepOrphans(app: App): Promise<void> {
-  return (app.nodeManager as unknown as { reconcileOrphans(): Promise<void> }).reconcileOrphans()
 }
 
 describe('destroy while createInstance is in flight (finding #110)', () => {
@@ -183,7 +175,7 @@ describe('destroy while createInstance is in flight (finding #110)', () => {
     expect(await rentsAgain(app, offer.machine_id)).toBe(true)
   })
 
-  it('a create that ends with no answer leaves the node failed and says it may be billing', async () => {
+  it('a create that ends with no answer: its instance is found by its label and destroyed (plan 1.4)', async () => {
     const app = await w.boot()
     w.vast.addOffer()
     w.vast.addOffer()
@@ -194,32 +186,26 @@ describe('destroy while createInstance is in flight (finding #110)', () => {
     await app.nodeManager.destroyNode(id)
 
     // Vast rents the instance, then the connection drops before the reply:
-    // the app never learns the instance id.
+    // the reply that named the instance never comes. It used to bill,
+    // unseen, until the next start's orphan sweep.
     gate.loseReply(new Error('read ECONNRESET'))
     await expect(renting).resolves.toEqual([id])
 
-    expect(w.vast.count('createInstance')).toBe(1)
     const [instanceId] = w.vast.created
-    const label = `vastai-blender ${id.slice(0, 8)}`
-    expect(w.vast.instance(instanceId)?.label).toBe(label)
-    expect(w.vast.live()).toEqual([instanceId])
-    // Not 'destroyed': that would say nothing is billing.
-    const row = w.get<{ state: string; instance_id: number | null; last_error: string }>(
-      'SELECT state, instance_id, last_error FROM nodes WHERE id = ?',
-      id
-    )
-    expect(row).toMatchObject({ state: 'failed', instance_id: null })
-    expect(row?.last_error).toContain('ECONNRESET')
-    const errors = w.alerts('error')
-    expect(errors).toHaveLength(1)
-    expect(errors[0]).toContain(label)
-    expect(errors[0]).toContain('Vast.ai console')
-
-    // The row is the evidence the next start's orphan sweep claims the
-    // instance by: its label carries the row's id.
-    await sweepOrphans(app)
+    expect(w.vast.instance(instanceId)?.label).toBe(`vastai-blender ${id.slice(0, 8)}`)
+    // Found under the row's label, recorded on the row, and destroyed.
     expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
     expect(w.vast.live()).toEqual([])
+    const row = w.get<{ state: string; instance_id: number | null; destroyed_at: number | null }>(
+      'SELECT state, instance_id, destroyed_at FROM nodes WHERE id = ?',
+      id
+    )
+    expect(row).toMatchObject({ state: 'destroyed', instance_id: instanceId })
+    expect(row?.destroyed_at).not.toBeNull()
+    expect(app.nodeManager.activeCount()).toBe(0)
+    expect(w.alerts('error')).toEqual([])
+    // A cancelled rental: not replaced by the second offer.
+    expect(w.vast.count('createInstance')).toBe(1)
   })
 })
 

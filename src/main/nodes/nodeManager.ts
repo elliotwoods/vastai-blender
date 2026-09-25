@@ -76,6 +76,24 @@ const DESTROY_RETRY_MS = 60_000
 const OCTANE_STOP_BUDGET_MS = 20_000
 
 /**
+ * Plan 1.4: how long the instance of a create that got no answer is looked
+ * for by its label before the create counts as having rented nothing. Vast
+ * lists an instance as soon as it exists, so a create it carried out shows up
+ * at the first look; the minute covers one it carried out after the app gave
+ * up waiting for the reply. The lookup backs off from 2 s to 15 s meanwhile.
+ */
+const CREATE_LOOKUP_MS = 60_000
+const LOOKUP_FIRST_DELAY_MS = 2_000
+const LOOKUP_MAX_DELAY_MS = 15_000
+
+/**
+ * How often the lookup asks once Vast has gone that whole minute without
+ * answering it. It never gives up: until Vast answers, the row counts as
+ * billing, and nothing else in this session would settle it.
+ */
+const LOOKUP_SLOW_MS = 60_000
+
+/**
  * How often a restart asks Vast again about an instance it has not answered
  * about: from 5 s, doubling to a minute, for as long as it takes.
  */
@@ -117,6 +135,15 @@ function vastDown(e: unknown): boolean {
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
 }
+
+/**
+ * How one rental ended, for requestNodes: the node it rented (or, cancelled,
+ * the row that stands for it), or why it rented nothing. `stop` ends the
+ * batch: its create got no answer, so an instance may exist that nothing has
+ * found yet (plan 1.4), or Vast refused it in a way the next offer would meet
+ * too.
+ */
+type Rental = ({ id: string } | { error: Error }) & { stop?: boolean }
 
 interface NodeRow {
   id: string
@@ -511,6 +538,12 @@ export class NodeManager {
   /** Nodes whose createInstance is in flight right now (rentOffer). */
   private creating = new Set<string>()
   /**
+   * Nodes whose create got no answer, whose instance is being looked for by
+   * its label right now (findLostCreate). The lookup settles the row, and
+   * adopts or destroys what it finds.
+   */
+  private lookingUp = new Set<string>()
+  /**
    * Rows the last run left with a create of unknown outcome. init's sweep
    * settles them against the account's instances (reconcileOrphans).
    */
@@ -597,9 +630,11 @@ export class NodeManager {
           continue
         }
         found.add(row.id)
-        // This session's rental, whose create has not answered yet: the
-        // instance is the rental's, and rentOffer takes it from here.
-        if (this.creating.has(row.id)) continue
+        // This session's rental, whose create has not answered yet, or whose
+        // instance is being looked for after a create that got no answer:
+        // the instance is the rental's, and rentOffer's lookup takes it
+        // from here.
+        if (this.creating.has(row.id) || this.lookingUp.has(row.id)) continue
         emit('alert', {
           level: 'warn',
           message: `destroying orphaned instance ${inst.id} (${inst.label})`
@@ -647,8 +682,8 @@ export class NodeManager {
    * a create whose reply was a 5xx) would hold a place under maxActiveNodes
    * and the spend cap for good. Only rows from before this session: the last
    * run is gone, so any create it sent has been answered by now. A create of
-   * this session with no known outcome keeps counting until plan 1.4's label
-   * lookup settles it.
+   * this session with no known outcome keeps counting until its own label
+   * lookup (findLostCreate) settles it.
    */
   private settleUnknownCreates(found: ReadonlySet<string>): void {
     for (const id of this.unknownAtBoot) {
@@ -809,6 +844,13 @@ export class NodeManager {
    * maxActiveNodes against the live count, and (unless told otherwise, for
    * the manual button) the spend cap against the running $/hr, allowing a
    * rental while the fleet is still under the cap, as scale-up always has.
+   *
+   * A create that gets no answer ends the batch (plan 1.4): the instance may
+   * exist, billing, under the row's label, and renting the next offer at once
+   * is how one lost reply became two instances (#223 #231). The batch waits
+   * for the label lookup to find it or confirm there is none, a minute at
+   * most. So does a refusal that is no fault of the offer's (a 429): the next
+   * offer would meet it too.
    */
   async requestNodes(count: number, opts: { respectSpendCap?: boolean } = {}): Promise<string[]> {
     if (count <= 0) return []
@@ -835,19 +877,28 @@ export class NodeManager {
       }
       if (usedMachines.has(offer.machineId) || this.blacklist.has(offer.machineId)) continue
       usedMachines.add(offer.machineId)
+      let r: Rental
       try {
-        ids.push(await this.rentOffer(offer, settings.offerFilters.minDiskGb))
+        r = await this.rentOffer(offer, settings.offerFilters.minDiskGb)
       } catch (e) {
-        lastErr = e as Error
-        failures++
+        // Not a failure rentOffer knows (those it returns): whatever it left
+        // behind, rent nothing more on top of it.
+        r = { error: e as Error, stop: true }
       }
+      if ('error' in r) {
+        lastErr = r.error
+        failures++
+      } else {
+        ids.push(r.id)
+      }
+      if (r.stop) break
     }
     if (ids.length === 0 && lastErr) throw lastErr
     return ids
   }
 
   /** Create an instance from one offer and start driving it to ready. */
-  private async rentOffer(offer: Offer, diskGb: number): Promise<string> {
+  private async rentOffer(offer: Offer, diskGb: number): Promise<Rental> {
     const id = randomUUID()
     const label = `vastai-blender ${id.slice(0, 8)}`
     getDb()
@@ -865,8 +916,9 @@ export class NodeManager {
     this.creating.add(id)
     emit('node:changed', node.snapshot)
 
+    let instanceId: number
     try {
-      const instanceId = await createInstance({
+      instanceId = await createInstance({
         offerId: offer.id,
         image: DOCKER_IMAGE,
         diskGb,
@@ -874,67 +926,235 @@ export class NodeManager {
         env: { NVIDIA_DRIVER_CAPABILITIES: 'all' },
         label
       })
-      node.update({ instance_id: instanceId, create_unknown_since: null })
-      // The row is in the Fleet, destroy button and all, from before the
-      // create; a destroy that landed while it was in flight found no
-      // instance id and so destroyed nothing (and nothing else would ever
-      // touch the instance: the orphan sweep leaves an instance its row
-      // holds alone). The instance is ours to kill.
-      if (node.gone) {
-        await this.ensureInstanceGone(instanceId, { node })
-        return id
-      }
-      void this.driveToReady(node, offer.machineId)
     } catch (e) {
-      // Vast answered, so the outcome is known: a refusal (a 4xx, a reply
-      // with a reason and no contract) rented nothing, and a create that was
-      // never sent (no API key) neither. Otherwise, a lost reply, a 5xx or a
-      // timeout, the row keeps create_unknown_since and so keeps counting as
-      // billing (the Phase 0 review's note on cancelledCreateUnknown).
-      const unknown = classify(e, { via: 'vast' }).outcomeUnknown
-      // Destroyed while the create was in flight, and the create then
-      // threw. The user cancelled this rental: that is no fault of the
-      // machine's (no blacklist), and it must not be replaced by the next
-      // offer (return, as the success path above does).
-      if (node.gone) {
-        if (unknown) this.cancelledCreateUnknown(node, e as Error)
-        else node.update({ create_unknown_since: null })
-        return id
-      }
-      node.update({
-        state: 'failed',
-        last_error: (e as Error).message,
-        ...(unknown ? {} : { create_unknown_since: null })
-      })
-      this.blacklist.add(offer.machineId)
-      throw e
-    } finally {
       this.creating.delete(id)
+      return this.createFailed(node, offer.machineId, e as Error)
     }
-    return id
+    this.creating.delete(id)
+    node.update({ instance_id: instanceId, create_unknown_since: null })
+    // The row is in the Fleet, destroy button and all, from before the
+    // create; a destroy that landed while it was in flight found no
+    // instance id and so destroyed nothing (and nothing else would ever
+    // touch the instance: the orphan sweep leaves an instance its row
+    // holds alone). The instance is ours to kill.
+    if (node.gone) {
+      await this.ensureInstanceGone(instanceId, { node })
+      return { id }
+    }
+    void this.driveToReady(node, offer.machineId)
+    return { id }
   }
 
   /**
-   * A cancelled rental whose create threw without a refusal from Vast: the
-   * instance may exist, billing under this node's label, with its id known
-   * to nobody (a lost reply). destroyNode had no id and ended the node
-   * 'destroyed', so nothing would ever look for it. The node goes back to
-   * 'failed', the state that says "may still be billing", and the user is
-   * told. Its create_unknown_since stays set, so it counts against the caps
-   * and in the fleet $/hr like the instance it may have made (plan 1.2).
-   * Its row, which the next start's orphan sweep matches that label against,
-   * is kept whatever its state. Finding the instance now, by the label, is
-   * plan 1.4.
+   * The create threw. What that means turns on whether Vast answered it
+   * (classify's outcomeUnknown):
+   *
+   * - No answer that says what happened (a lost reply, a 5xx, a timeout, a
+   *   reply that is not JSON): the instance may exist. findLostCreate looks
+   *   for it by its label, and the batch stops (plan 1.4).
+   * - Vast answered, or the create was never sent (no API key, a name that
+   *   did not resolve): nothing was rented, and the row stops counting as
+   *   billing.
+   *
+   * Destroyed while the create was in flight: the user cancelled this
+   * rental. That is no fault of the machine's (no blacklist), and it must not
+   * be replaced by the next offer (its row is returned, as the success path
+   * returns it).
    */
-  private cancelledCreateUnknown(node: ManagedNode, e: Error): void {
-    const label = `vastai-blender ${node.id.slice(0, 8)}`
-    node.setState(
-      'failed',
-      `cancelled while creating; the create's outcome is unknown: ${e.message}`
-    )
+  private async createFailed(node: ManagedNode, machineId: number, e: Error): Promise<Rental> {
+    const c = classify(e, { via: 'vast' })
+    if (c.outcomeUnknown) return this.createUnanswered(node, machineId, c.reason, e)
+    if (node.gone) {
+      node.update({ create_unknown_since: null })
+      return { id: node.id }
+    }
+    node.update({ state: 'failed', last_error: e.message, create_unknown_since: null })
+    // Refused before anything was done (a 429), or never sent (a name that
+    // did not resolve). Not this machine's doing, and the next offer would
+    // meet the same. Asking again once PUT /asks is refused is the next
+    // batch's call, never the client's (vastClient never repeats a create).
+    if (c.kind === 'transient') return { error: e, stop: true }
+    this.blacklist.add(machineId)
+    return { error: e }
+  }
+
+  /**
+   * Plan 1.4: the create got no answer (#223 #231). It used to be recorded
+   * as "not rented", and the batch rented the next offer at once, while an
+   * instance Vast had rented billed under the row's label, known to nobody
+   * until the next start's orphan sweep.
+   *
+   * Now the row keeps create_unknown_since, so it counts against the caps
+   * and in the fleet $/hr all along, and findLostCreate looks for the
+   * instance by its label. The batch waits for the answer, a minute at most
+   * (CREATE_LOOKUP_MS). If Vast has not answered by then the lookup goes on
+   * in the background, the row still counted, and the batch ends without it.
+   * Never a second PUT /asks: that would rent a second instance.
+   */
+  private async createUnanswered(
+    node: ManagedNode,
+    machineId: number,
+    reason: string,
+    e: Error
+  ): Promise<Rental> {
+    const id = node.id
+    const label = node.snapshot.label ?? `vastai-blender ${id.slice(0, 8)}`
+    this.lookingUp.add(id)
+    // Cancelled while the create was in flight: 'destroying', not the
+    // 'destroyed' destroyNode left it in, since there may be an instance to
+    // destroy, and the row shows so until the lookup knows.
+    if (node.gone) {
+      node.setState(
+        'destroying',
+        `cancelled while renting, and Vast did not answer the create (${reason})`
+      )
+    } else {
+      node.update({
+        last_error: `Vast did not answer the create (${reason}); looking for its instance by label`
+      })
+    }
+    let windowOver: () => void = () => {}
+    const unanswered = new Promise<'unanswered'>((r) => (windowOver = () => r('unanswered')))
+    const lookup = this.findLostCreate(node, label, machineId, reason, () => windowOver())
+    const outcome = await Promise.race([lookup, unanswered])
+    // Found and used, found and destroyed (cancelled), or cancelled and still
+    // looked for: its row stands for the rental, as in createFailed.
+    if (outcome === 'adopted' || outcome === 'destroyed' || node.gone) return { id, stop: true }
+    const error =
+      outcome === 'unanswered'
+        ? new Error(
+            `Vast.ai did not answer the create (${reason}), nor for a minute the search for its instance: "${label}" counts as billing while the app keeps looking`,
+            { cause: e }
+          )
+        : new Error(
+            `Vast.ai did not answer the create (${reason}), and no instance appeared under its label: nothing was rented`,
+            { cause: e }
+          )
+    return { error, stop: true }
+  }
+
+  /**
+   * Look for the instance of a create that got no answer, by its label, and
+   * settle its row by what is found. listInstances is asked from at once,
+   * backing off from 2 s to 15 s:
+   *
+   * - Listed: the create went through. The row takes the instance id
+   *   (claim), and the rental carries on to ready as if the reply had come
+   *   ('adopted'), unless it was cancelled meanwhile: then the instance is
+   *   destroyed ('destroyed').
+   * - Not listed by any answer asked for CREATE_LOOKUP_MS or more after the
+   *   lookup began: the create rented nothing ('absent'). The row stops
+   *   counting: 'failed' with the reason, or 'destroyed' if cancelled.
+   * - Vast not answering says nothing either way. After the window the user
+   *   is told once (`onUnanswered` too), and the lookup asks every
+   *   LOOKUP_SLOW_MS until Vast answers, the row counted as billing all the
+   *   while.
+   *
+   * Never rejects.
+   */
+  private async findLostCreate(
+    node: ManagedNode,
+    label: string,
+    machineId: number,
+    reason: string,
+    onUnanswered: () => void
+  ): Promise<'adopted' | 'destroyed' | 'absent'> {
+    const start = Date.now()
+    let delay = LOOKUP_FIRST_DELAY_MS
+    let unanswered = false
+    try {
+      for (;;) {
+        const asked = Date.now()
+        let listed: RawInstance[] | null = null
+        try {
+          listed = await listInstances()
+        } catch {
+          // No answer: nothing learned either way.
+        }
+        if (listed) {
+          const inst = listed.find((i) => i.label === label)
+          if (inst) return await this.adoptLostCreate(node, inst.id, machineId, unanswered)
+          if (asked - start >= CREATE_LOOKUP_MS) {
+            this.noLostCreate(node, label, reason, unanswered)
+            return 'absent'
+          }
+        } else if (!unanswered && Date.now() - start >= CREATE_LOOKUP_MS) {
+          unanswered = true
+          this.lostCreateUnanswered(node, label, reason)
+          onUnanswered()
+        }
+        // One look lands at the window's end, so absence is known then.
+        const toWindowEnd = start + CREATE_LOOKUP_MS - Date.now()
+        await sleep(
+          unanswered ? LOOKUP_SLOW_MS : toWindowEnd > 0 ? Math.min(delay, toWindowEnd) : delay
+        )
+        delay = Math.min(delay * 2, LOOKUP_MAX_DELAY_MS)
+      }
+    } finally {
+      this.lookingUp.delete(node.id)
+    }
+  }
+
+  /** The lost create's instance was found: the row takes it, and uses or destroys it. */
+  private async adoptLostCreate(
+    node: ManagedNode,
+    instanceId: number,
+    machineId: number,
+    toldUser: boolean
+  ): Promise<'adopted' | 'destroyed'> {
+    this.claim({ id: node.id, instance_id: null }, instanceId)
+    const label = node.snapshot.label
+    if (node.state === 'requested') {
+      node.update({ last_error: null })
+      emit('alert', {
+        level: 'info',
+        message: `Found instance ${instanceId} (${label}): Vast rented it although its create got no answer. Using it.`
+      })
+      void this.driveToReady(node, machineId)
+      return 'adopted'
+    }
+    if (toldUser) {
+      emit('alert', {
+        level: 'info',
+        message: `Found instance ${instanceId} (${label}), whose create got no answer: destroying it`
+      })
+    }
+    await this.ensureInstanceGone(instanceId, { node })
+    return 'destroyed'
+  }
+
+  /** Vast answered, a minute on, without the lost create's label: nothing was rented. */
+  private noLostCreate(node: ManagedNode, label: string, reason: string, toldUser: boolean): void {
+    if (node.state === 'requested') {
+      node.update({
+        state: 'failed',
+        create_unknown_since: null,
+        last_error: `Vast did not answer the create (${reason}), and no instance appeared under its label: nothing was rented`
+      })
+    } else {
+      node.update({ state: 'destroyed', create_unknown_since: null, last_error: null })
+    }
+    if (toldUser) {
+      emit('alert', {
+        level: 'info',
+        message: `No instance "${label}" on Vast: the create that got no answer rented nothing`
+      })
+    }
+  }
+
+  /**
+   * A minute gone and Vast has not answered the lookup: say so, once. A
+   * rental the user cancelled is a billing risk nothing may be managing if
+   * the app is closed now; one still wanted is counted, and the lookup keeps
+   * at it.
+   */
+  private lostCreateUnanswered(node: ManagedNode, label: string, reason: string): void {
+    const wanted = node.state === 'requested'
     emit('alert', {
-      level: 'error',
-      message: `A rental cancelled mid-create may be billing: Vast never said whether the create went through (${e.message}) — check the Vast.ai console for "${label}"!`
+      level: wanted ? 'warn' : 'error',
+      message: wanted
+        ? `Vast.ai has not said whether the rental "${label}" went through (${reason}). It counts as billing until the app finds its instance or finds there is none, and the app keeps looking — check the Vast.ai console if this lasts.`
+        : `A rental cancelled mid-create may be billing: Vast.ai has not said whether its create went through (${reason}). The app keeps looking for "${label}" to destroy it — check the Vast.ai console!`
     })
   }
 
@@ -1434,11 +1654,20 @@ export class NodeManager {
     // and a second DELETE would only be a 404.
     if (facts.state === 'destroyed' && !holdsInstance(facts)) return
     const instanceId = facts.instanceId
-    // A create that ended with no answer (cancelledCreateUnknown, or one
-    // that failed so): there is no id to destroy. The row stays 'failed',
-    // visible and counted as billing, until the instance is found by its
-    // label (plan 1.4, and the next start's orphan sweep). 'destroyed' would
-    // hide from the Fleet a row that still counts against the caps.
+    // A create that got no answer, whose instance is being looked for by its
+    // label (plan 1.4): there is no id to destroy yet. 'destroying' until the
+    // lookup knows: it destroys the instance if it finds one, and settles the
+    // row 'destroyed' if there is none.
+    if (instanceId == null && this.lookingUp.has(id)) {
+      forgetNodeProvider?.(id)
+      node.setState('destroying')
+      return
+    }
+    // A create the last run never heard back from, not yet looked for (the
+    // start-up sweep settles it): there is no id to destroy. The row stays
+    // as it is, visible and counted as billing, until the instance is found
+    // by its label. 'destroyed' would hide from the Fleet a row that still
+    // counts against the caps.
     if (instanceId == null && createOutcomeUnknown(facts) && !this.creating.has(id)) {
       emit('alert', {
         level: 'warn',
