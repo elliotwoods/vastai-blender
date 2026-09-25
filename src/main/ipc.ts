@@ -45,6 +45,7 @@ import { getDb } from './db/db'
 import { toMediaUrl } from './mediaUrl'
 import { resolveRange, summary as historySummary } from './history/history'
 import { REMOTE_ROOT } from './nodes/provisioner'
+import { shq } from './ssh/shq'
 import { openSshTerminal, sshTargetFor } from './ssh/sshTerminal'
 
 type Handler<C extends InvokeChannel> = (
@@ -959,6 +960,9 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
 
   // -- logs -----------------------------------------------------------------
   handle('logs:getTail', async ({ nodeId, chunkId, lines }) => {
+    // A chunk id names a file on the node: only one shaped like the ids this
+    // app makes (no '/', no '..'), whatever the renderer sent.
+    if (chunkId != null && !/^[\w-]+$/.test(chunkId)) return []
     let targetNodeId = nodeId
     if (!targetNodeId && chunkId) {
       const row = getDb().prepare('SELECT node_id FROM chunks WHERE id = ?').get(chunkId) as
@@ -969,7 +973,11 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
     const node = nodeManager.get(targetNodeId)
     if (!node?.ssh) return []
     const file = chunkId ? `${REMOTE_ROOT}/logs/${chunkId}.log` : `${REMOTE_ROOT}/logs/agent.log`
-    const r = await node.ssh.exec(`tail -n ${Math.min(lines, 5000)} '${file}' 2>/dev/null`)
+    const n = Math.max(1, Math.min(5000, Math.floor(Number(lines)) || 200))
+    const r = await node.ssh.exec(`tail -n ${n} ${shq(file)} 2>/dev/null`, {
+      timeoutMs: 30_000,
+      label: 'read log'
+    })
     return r.stdout.split('\n')
   })
 }

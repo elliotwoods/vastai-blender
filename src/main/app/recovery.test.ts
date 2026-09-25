@@ -112,7 +112,7 @@ describe('job:retryMissing', () => {
     // answer until its 30 s are up, then the next run's spec and render go.
     const hit: string[] = []
     let cleanups = 0
-    machine.onExec(/^rm -f \S+\/jobs\/inbox\/(\S+)\.json; pkill -f /, (_c, m) => {
+    machine.onExec(/^rm -f '?\S+\/jobs\/inbox\/([^'\s]+)\.json'?; pkill -f /, (_c, m) => {
       if (cleanups++ === 0) return HANG
       const chunkId = m[1]
       if (sentAgain.has(chunkId)) hit.push(chunkId)

@@ -13,6 +13,16 @@ import { basename, join } from 'path'
 import { inflateRawSync } from 'zlib'
 import type { AddonInfo } from '../../shared/models'
 
+/**
+ * What Blender takes as an extension id and a module name: a Python
+ * identifier. The id names the add-on's zip here and on the node, the module
+ * the node enables, and the expression that registers a bootstrap add-on
+ * (provisioner.installExtension), so nothing else is registered: a manifest
+ * id with a quote or a `/` in it ran as shell on the node, or wrote the zip's
+ * copy outside the add-ons folder.
+ */
+export const EXTENSION_ID = /^[A-Za-z_][A-Za-z0-9_]*$/
+
 function addonsDir(): string {
   return join(app.getPath('userData'), 'addons')
 }
@@ -105,6 +115,11 @@ export function registerAddon(zipPath: string): AddonInfo {
   if (manifestText) {
     const f = parseManifestFields(manifestText)
     if (!f.id) throw new Error('blender_manifest.toml has no id field')
+    if (!EXTENSION_ID.test(f.id)) {
+      throw new Error(
+        `blender_manifest.toml's id ${JSON.stringify(f.id)} is not a valid extension id (letters, digits and _ only, not starting with a digit)`
+      )
+    }
     id = f.id
     name = f.name ?? f.id
     version = f.version ?? '0.0.0'
@@ -114,6 +129,8 @@ export function registerAddon(zipPath: string): AddonInfo {
     id = basename(zipPath)
       .replace(/\.zip$/i, '')
       .replace(/[^a-zA-Z0-9_]/g, '_')
+    // A module name cannot start with a digit ("3dtools.zip").
+    if (!EXTENSION_ID.test(id)) id = `_${id}`
     name = id
     version = '0.0.0'
     mechanism = 'bootstrap'

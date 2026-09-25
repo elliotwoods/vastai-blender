@@ -438,7 +438,7 @@ describe("1.16: the engine a node reports is the node's word", () => {
     // agent could have relaunched it), and the job's other chunk never sent.
     expect(specs).toHaveLength(1)
     expect(
-      machine.ran(new RegExp(`inbox/${specs[0].chunkId}\\.json; pkill -f '${specs[0].chunkId}'`))
+      machine.ran(new RegExp(`inbox/${specs[0].chunkId}\\.json'; pkill -f '${specs[0].chunkId}'`))
     ).toHaveLength(1)
   })
 

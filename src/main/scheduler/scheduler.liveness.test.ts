@@ -183,9 +183,9 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
     expect(Date.now() - queuedAt).toBeLessThan(25 * 60_000)
     expect(chunksOf(jobId)[0]).toMatchObject({ node_id: other, retries: 0, infra_retries: 1 })
     expect(w.machineFor(held).agent.inbox()).toEqual([])
-    expect(w.machineFor(held).ran(new RegExp(`jobs/inbox/${chunk.id}\\.json; pkill`))).toHaveLength(
-      1
-    )
+    expect(
+      w.machineFor(held).ran(new RegExp(`jobs/inbox/${chunk.id}\\.json'; pkill`))
+    ).toHaveLength(1)
     expect(app.scheduler.nodeUnfit(held)).toMatch(
       /left a chunk in its inbox for 15 min with nothing of this app's rendering there/
     )
@@ -224,9 +224,9 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
     expect(chunksOf(jobId).some((c) => c.state === 'pending')).toBe(true)
     // Sent one chunk, never another, and that one withdrawn from its inbox.
     expect(assignedTo(dead)).toBe(1)
-    expect(w.machineFor(dead).ran(new RegExp(`jobs/inbox/${stranded}\\.json; pkill`))).toHaveLength(
-      1
-    )
+    expect(
+      w.machineFor(dead).ran(new RegExp(`jobs/inbox/${stranded}\\.json'; pkill`))
+    ).toHaveLength(1)
     expect(w.alerts('error').join('\n')).toMatch(/agent is not running.*Nothing more is sent to it/)
 
     await w.until(() => jobState(jobId) === 'complete', 'job complete', {
@@ -688,7 +688,7 @@ describe('1.7: a hung Blender', () => {
     await w.until(() => kills.length === 1, 'the spec withdrawn')
     await w.advance(40_000, 1_000)
     expect(kills.map((k) => k.command)).toEqual([
-      `rm -f ${REMOTE_ROOT}/jobs/inbox/${chunk.id}.json; pkill -f '${chunk.id}' || true`,
+      `rm -f '${REMOTE_ROOT}/jobs/inbox/${chunk.id}.json'; pkill -f '${chunk.id}' || true`,
       `pkill -f '${chunk.id}' || true`
     ])
     expect(kills[1].at - kills[0].at).toBeGreaterThanOrEqual(30_000)

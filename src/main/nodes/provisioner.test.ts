@@ -46,6 +46,7 @@ const {
   DEPS_TIMEOUT_MS,
   INSTALL_BLENDER_TIMEOUT_MS,
   installBlender,
+  installExtension,
   parseAgentRestart,
   parseAgentStatus,
   probeEevee,
@@ -55,6 +56,18 @@ const {
   RESTART_AGENT_TIMEOUT_MS
 } = await import('./provisioner')
 const { classify } = await import('../errors')
+
+/**
+ * The arguments /bin/sh makes of a command's tail, as the node's shell
+ * would: quoting undone, and nothing but the words themselves. A payload in
+ * a value only ever reaches printf.
+ */
+function shellWords(tail: string): string[] {
+  const out = spawnSync('/bin/sh', ['-c', `set -- ${tail}; for a; do printf '%s\\0' "$a"; done`], {
+    encoding: 'utf-8'
+  }).stdout
+  return out.split('\0').slice(0, -1)
+}
 
 interface Call {
   kind: 'exec' | 'execStream'
@@ -80,7 +93,7 @@ class ScriptSsh {
     // The last `provision.sh <args>` in the command: `chmod +x … && bash … deps`.
     const m = /.*provision\.sh (.+)$/.exec(command)
     if (!m) return { code: 0, stdout: '', stderr: '' }
-    const r = await this.n.provisionAsync(m[1].split(' '), { env: this.env })
+    const r = await this.n.provisionAsync(shellWords(m[1]), { env: this.env })
     return { code: r.code, stdout: r.stdout, stderr: r.stderr }
   }
 
@@ -315,6 +328,34 @@ describe('provisioner.ts, what it makes of an answer', () => {
       { timeoutMs: 60_000, label: 'install blender 5.1.0' },
       { timeoutMs: 120_000, label: 'EEVEE probe 5.1.0' }
     ])
+  })
+
+  // #99 #159: blenderVersionOverride reached the node's shell as it was
+  // typed, and so did a job row's blender_version. The sanitizer refuses
+  // anything but a version now; a row saved before it did must still reach
+  // provision.sh as one argument, and run nothing.
+  it.skipIf(process.platform === 'win32')(
+    '1.14: a Blender version reaches provision.sh as one argument, whatever it holds',
+    async () => {
+      const s = stub({ code: 0, stdout: 'PROBE_OK\n', stderr: '' })
+      const version = "5.1; echo INJECTED; echo '$(id)'"
+      await installBlender(s.ssh, 'node-1', version)
+      await probeEevee(s.ssh, 'node-1', version)
+      const tails = s.calls.map((c) => /provision\.sh (.+)$/.exec(c.command)?.[1] ?? '')
+      expect(shellWords(tails[0])).toEqual(['install-blender', version])
+      expect(shellWords(tails[1])).toEqual(['probe-eevee', version])
+    }
+  )
+
+  it('1.14: an add-on id that is not a Python identifier never reaches the node', async () => {
+    const s = stub({ code: 0, stdout: '', stderr: '' })
+    const e = await installExtension(s.ssh, 'node-1', '5.1.0', {
+      id: "x'); import os; os.system('id'); ('",
+      zipPath: '/nowhere.zip',
+      mechanism: 'install'
+    }).catch((err: unknown) => err)
+    expect((e as Error).message).toMatch(/is not a Python identifier/)
+    expect(s.calls).toEqual([])
   })
 
   it('parses the verdict from the last line only', () => {

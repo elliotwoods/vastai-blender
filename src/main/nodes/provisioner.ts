@@ -19,9 +19,11 @@
 import { app } from 'electron'
 import { existsSync } from 'fs'
 import { join } from 'path'
+import { EXTENSION_ID } from '../addons/addons'
 import { getDb } from '../db/db'
 import { emit } from '../events'
 import { uploadTree } from '../ssh/sftp'
+import { shq } from '../ssh/shq'
 import type { SshConnection } from '../ssh/sshConnection'
 
 export const REMOTE_ROOT = '/root/vastai'
@@ -355,10 +357,14 @@ export async function installBlender(
   version: string,
   opts: { timeoutMs?: number } = {}
 ): Promise<void> {
+  // Quoted: the version comes from settings (blenderVersionOverride) or the
+  // job row, and reached the node's shell as it was typed (#99 #159). The
+  // sanitizer refuses anything but a version now; a row saved before it
+  // did must still not run as a command.
   await runLogged(
     ssh,
     nodeId,
-    `bash ${PROVISION} install-blender ${version}`,
+    `bash ${PROVISION} install-blender ${shq(version)}`,
     `install blender ${version}`,
     opts.timeoutMs ?? INSTALL_BLENDER_TIMEOUT_MS
   )
@@ -381,7 +387,7 @@ export async function probeEevee(
   nodeId: string,
   version: string
 ): Promise<boolean> {
-  const r = await ssh.exec(`bash ${PROVISION} probe-eevee ${version}`, {
+  const r = await ssh.exec(`bash ${PROVISION} probe-eevee ${shq(version)}`, {
     timeoutMs: 120_000,
     label: `EEVEE probe ${version}`
   })
@@ -405,20 +411,32 @@ export async function installExtension(
   blenderVersion: string,
   addon: { id: string; zipPath: string; mechanism: 'install' | 'bootstrap' }
 ): Promise<string | null> {
+  // The id is the add-on's own (its manifest's, or its zip's name), and it
+  // goes into a path, a Python module name and the expression that enables
+  // it. A Python identifier is all Blender accepts for either, and nothing
+  // else may reach the node's shell as code.
+  if (!EXTENSION_ID.test(addon.id)) {
+    throw new Error(
+      `the add-on id ${JSON.stringify(addon.id)} is not a Python identifier, which Blender needs; register the add-on again`
+    )
+  }
   const { uploadFileVerified } = await import('../ssh/sftp')
   const remoteZip = `${REMOTE_ROOT}/work/extensions/${addon.id}.zip`
   const result = await uploadFileVerified(ssh, addon.zipPath, remoteZip)
   logLine(nodeId, `extension ${addon.id}: upload ${result}`)
 
-  const blender = `${REMOTE_ROOT}/blender/${blenderVersion}/blender`
+  const blender = shq(`${REMOTE_ROOT}/blender/${blenderVersion}/blender`)
   if (addon.mechanism === 'install') {
+    const enable =
+      `import bpy; bpy.ops.preferences.addon_enable(module='bl_ext.user_default.${addon.id}'); ` +
+      'bpy.ops.wm.save_userpref()'
     await runLogged(
       ssh,
       nodeId,
       // --python-exit-code: a failed addon_enable must fail the dispatch here,
       // not surface later as a scene-guard abort on every render attempt.
-      `${blender} --command extension install-file -r user_default --enable '${remoteZip}' && ` +
-        `${blender} -b -noaudio --python-exit-code 1 --python-expr "import bpy; bpy.ops.preferences.addon_enable(module='bl_ext.user_default.${addon.id}'); bpy.ops.wm.save_userpref()"`,
+      `${blender} --command extension install-file -r user_default --enable ${shq(remoteZip)} && ` +
+        `${blender} -b -noaudio --python-exit-code 1 --python-expr ${shq(enable)}`,
       `install extension ${addon.id}`,
       EXTENSION_TIMEOUT_MS
     )
@@ -429,7 +447,7 @@ export async function installExtension(
   await runLogged(
     ssh,
     nodeId,
-    `rm -rf '${srcDir}' && mkdir -p '${srcDir}' && python3 -m zipfile -e '${remoteZip}' '${srcDir}'`,
+    `rm -rf ${shq(srcDir)} && mkdir -p ${shq(srcDir)} && python3 -m zipfile -e ${shq(remoteZip)} ${shq(srcDir)}`,
     `extract extension ${addon.id}`,
     EXTENSION_TIMEOUT_MS
   )

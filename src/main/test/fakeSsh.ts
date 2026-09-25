@@ -199,9 +199,10 @@ const BUILTINS: Array<[RegExp, (m: RegExpMatchArray, machine: FakeMachine) => Re
   ],
   [
     // The per-chunk log tail: held open until stopped, like `tail -F`.
-    /^touch (\S+) && tail -n \+1 -F /,
+    /^touch ('[^']+'|\S+) && tail -n \+1 -F /,
     (m, machine) => {
-      if (!machine.files.has(m[1])) machine.files.set(m[1], Buffer.alloc(0))
+      const path = unquote(m[1])
+      if (!machine.files.has(path)) machine.files.set(path, Buffer.alloc(0))
       return HANG
     }
   ],

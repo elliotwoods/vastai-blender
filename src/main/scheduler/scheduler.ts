@@ -1109,7 +1109,7 @@ class ChunkRun {
     // watchdog read the dead attempt's frozen state and burned every retry.)
     this.queueing = true
     await this.ssh
-      .exec(`rm -f ${REMOTE_ROOT}/state/${this.chunkId}.json`, {
+      .exec(`rm -f ${shq(`${REMOTE_ROOT}/state/${this.chunkId}.json`)}`, {
         timeoutMs: 30_000,
         label: 'clear agent state'
       })
@@ -1177,8 +1177,9 @@ class ChunkRun {
 
   private async tailLog(): Promise<void> {
     try {
+      const log = shq(`${REMOTE_ROOT}/logs/${this.chunkId}.log`)
       const { stop } = await this.ssh.execStream(
-        `touch ${REMOTE_ROOT}/logs/${this.chunkId}.log && tail -n +1 -F ${REMOTE_ROOT}/logs/${this.chunkId}.log`,
+        `touch ${log} && tail -n +1 -F ${log}`,
         (line) =>
           emit('render:logLine', {
             nodeId: this.nodeId,
@@ -1205,10 +1206,13 @@ class ChunkRun {
     try {
       // Timed out: an exec on a wedged connection never returns, and this loop
       // is the only thing that notices a chunk finishing or failing.
-      const r = await this.ssh.exec(`cat ${REMOTE_ROOT}/state/${this.chunkId}.json 2>/dev/null`, {
-        timeoutMs: 30_000,
-        label: 'read agent state'
-      })
+      const r = await this.ssh.exec(
+        `cat ${shq(`${REMOTE_ROOT}/state/${this.chunkId}.json`)} 2>/dev/null`,
+        {
+          timeoutMs: 30_000,
+          label: 'read agent state'
+        }
+      )
       // cat's answer for no such file: exit 1 and nothing printed. Anything
       // else non-zero, null included (the channel closed under it), is a
       // read that did not happen.
@@ -1359,7 +1363,7 @@ class ChunkRun {
   private async specQueued(): Promise<boolean | null> {
     try {
       const r = await this.ssh.exec(
-        `cat ${REMOTE_ROOT}/jobs/inbox/${this.chunkId}.json 2>/dev/null`,
+        `cat ${shq(`${REMOTE_ROOT}/jobs/inbox/${this.chunkId}.json`)} 2>/dev/null`,
         { timeoutMs: 30_000, label: 'check agent inbox' }
       )
       if (r.code === 0) return true
@@ -1767,7 +1771,7 @@ class ChunkRun {
   private async retractSpec(): Promise<void> {
     await this.ssh
       .exec(
-        `rm -f ${REMOTE_ROOT}/jobs/inbox/${this.chunkId}.json; pkill -f '${this.chunkId}' || true`,
+        `rm -f ${shq(`${REMOTE_ROOT}/jobs/inbox/${this.chunkId}.json`)}; pkill -f ${shq(this.chunkId)} || true`,
         { timeoutMs: 30_000, label: 'retract spec' }
       )
       .catch(() => {})
@@ -2405,7 +2409,7 @@ class Scheduler {
       const ssh = nodeManager.get(nodeId)?.ssh
       if (!ssh) return
       void ssh
-        .exec(`pkill -f '${chunkId}' || true`, {
+        .exec(`pkill -f ${shq(chunkId)} || true`, {
           timeoutMs: 30_000,
           label: 'stop a relaunched render'
         })
@@ -2653,7 +2657,7 @@ class Scheduler {
       // Under a deadline: dispatch awaits this after the spec is live, and
       // on a wedged connection an exec never returns.
       await ssh.exec(
-        on ? `mkdir -p ${posix.dirname(path)} && touch '${path}'` : `rm -f '${path}'`,
+        on ? `mkdir -p ${shq(posix.dirname(path))} && touch ${shq(path)}` : `rm -f ${shq(path)}`,
         {
           timeoutMs: 30_000,
           label: 'preview flag'
@@ -3762,7 +3766,7 @@ class Scheduler {
         // the cancel, and every node after it, for good.
         await node.ssh
           .exec(
-            `rm -f ${REMOTE_ROOT}/jobs/inbox/${run.chunkId}.json; pkill -f '${run.chunkId}' || true`,
+            `rm -f ${shq(`${REMOTE_ROOT}/jobs/inbox/${run.chunkId}.json`)}; pkill -f ${shq(run.chunkId)} || true`,
             { timeoutMs: 30_000, label: 'cancel chunk' }
           )
           .catch(() => {})

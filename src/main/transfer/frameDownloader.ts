@@ -23,6 +23,7 @@ import {
   LOCAL_FREE_RESERVE_BYTES,
   LocalSinkError
 } from '../ssh/sftp'
+import { shq } from '../ssh/shq'
 import type { SshConnection } from '../ssh/sshConnection'
 import {
   manifestReject,
@@ -523,7 +524,7 @@ export class ChunkDownloader {
       // connection otherwise never returns — which is one way a chunk used to
       // sit in 'downloading' forever.
       const r = await this.target.ssh.exec(
-        `cat '${this.target.remoteChunkDir}/manifest.jsonl' 2>/dev/null`,
+        `cat ${shq(`${this.target.remoteChunkDir}/manifest.jsonl`)} 2>/dev/null`,
         { timeoutMs: MANIFEST_READ_TIMEOUT_MS, label: 'read manifest' }
       )
       // Exit 1 with nothing on stdout is cat's answer for a manifest the agent
