@@ -1254,8 +1254,34 @@ def test_out_of_memory():
             "exit": 1}}, engine="eevee")
         check("oom: no OpenGL retry, the backend was not the problem",
               "retrying" not in render_log() and state.get("oom") is True)
+    # Blender's other wordings, as its 5.1 binary holds them (the Vulkan line
+    # is only an error code in a line of that shape). Each is followed by a
+    # frame Blender still saves and announces, drawn wrong.
+    for line in (
+        "Error: System is out of GPU and shared host memory",
+        "Fra:2 Mem:9000M | Time:00:41.20 | System is out of GPU and shared host memory",
+        "Error: Could not allocate shadow atlas. Most likely out of GPU memory.",
+        "Error: Could not allocate 3D texture for volume.",
+        "Error: Could not allocate irradiance staging texture",
+        "Out of memory - couldn't allocate integrator state",
+        "Vulkan: VK_ERROR_OUT_OF_DEVICE_MEMORY in vkAllocateMemory",
+    ):
+        with fake_node() as tmp:
+            cdir = make_chunk(tmp)
+            state, entries = run_chunk(tmp, {"default": {"write": [
+                ["0001.exr", "good", True],
+                ["0002.exr", "wrong", True, line],
+            ], "exit": 0}}, engine="eevee" if "allocate" in line else "cycles")
+            check(f"oom: {line!r} fails the chunk, and the frame after it is not kept",
+                  state.get("errorKind") == "machine" and state.get("oom") is True
+                  and [e["file"] for e in entries] == ["frames/0001.exr"]
+                  and sorted(os.listdir(os.path.join(cdir, "frames"))) == ["0001.exr"])
     st = {}
     nr.scan_line("Fra:3 Mem:10M | Sample 12/128", st, {}, 1.0)
+    nr.scan_line("Error: Shadow buffer full, may result in missing shadows and lower"
+                 " performance. (512 / 512)", st, {}, 1.0)
+    nr.scan_line("Fra:3 Mem:10M | Time:00:01.02 | Mem:4096.00M, Peak:9000.00M | Scene, "
+                 "ViewLayer | Sample 64/128", st, {}, 1.0)
     nr.scan_line('VR_PREFLIGHT {"ok": true, "warnings": ["not on the node: //out of memory.png"]}',
                  st, {}, 1.0)
     check("oom: an ordinary line, or a script's report quoting a file name, is not an OOM",

@@ -142,12 +142,25 @@ SAVED_RE = re.compile(r"Saved: '(.+?)'")
 SAVE_FAILED_RE = re.compile(r"cannot save: '(.+?)'")
 # What `-o frames/####` produces: the zero-padded frame number and an extension.
 FRAME_NAME_RE = re.compile(r"^(\d+)\.\w+$")
-# Blender or Cycles running out of memory: "System is out of GPU memory",
-# "CUDA error: Out of memory in cuMemAlloc(...)", OptiX's own code. Cycles says
-# so only when an allocation has failed outright (a fallback to host memory is
-# silent), and the frame in flight is lost.
+# Blender running out of memory. Each of these is printed only when an
+# allocation failed outright (a fallback to host memory that works is silent),
+# and Blender may still save the frame in flight, black or drawn wrong, and
+# announce it with "Saved:". The wordings, from the Blender 5.1 binary and
+# Cycles' device code:
+#   Cycles  "System is out of GPU memory", "System is out of GPU and shared
+#           host memory" (the host fallback ran out too: the usual texture-heavy
+#           case), "CUDA error: Out of memory in cuMemAlloc_v2(...)", "Out of
+#           memory - couldn't allocate integrator state", and the error codes
+#           of OptiX, CUDA, Vulkan (*_ERROR_OUT_OF_[DEVICE_|HOST_]MEMORY) and HIP
+#   EEVEE   "Error: Could not allocate shadow atlas. Most likely out of GPU
+#           memory." and "Error: Could not allocate 3D texture for volume." (and
+#           the irradiance and rescaled-volume textures): it renders on without
+#           the shadows or the volume
+#   Blender "Failed allocate render result, out of memory"
 OOM_RE = re.compile(
-    r"out of memory|cuMemAlloc|OPTIX_ERROR_OUT_OF_MEMORY|System is out of GPU memory",
+    r"out of memory|out of (GPU|device)\b|shared host memory|cuMemAlloc"
+    r"|ERROR_OUT_OF_(DEVICE_|HOST_)?MEMORY|hipErrorOutOfMemory"
+    r"|could not allocate [^.!]*texture",
     re.IGNORECASE,
 )
 
