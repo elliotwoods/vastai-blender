@@ -37,6 +37,8 @@ export interface HeadlessDriverOptions {
   lifecycle: Pick<Lifecycle, 'watchCampaign' | 'endCampaign'>
   /** scheduler.kick */
   kick(): void
+  /** The scheduler's resumeRecovery and resumeJob, for a campaign submitted (jobSpec.ts). */
+  resume?: { recovery(): void; job(jobId: string): boolean }
 }
 
 /** Jobs a headless campaign still waits on. */
@@ -49,12 +51,12 @@ export function openJobs(): number {
 
 /** Start whichever drivers the environment asked for. A no-op for the app a person runs. */
 export function startHeadlessDrivers(opts: HeadlessDriverOptions): void {
-  const { jobSpecPath, e2eBlend, lifecycle, kick } = opts
+  const { jobSpecPath, e2eBlend, lifecycle, kick, resume } = opts
   if (jobSpecPath) {
     const unsubmitted: string[] = []
     let refused = false
     setTimeout(() => {
-      void runJobSpec(jobSpecPath, { kick, unsubmitted })
+      void runJobSpec(jobSpecPath, { kick, unsubmitted, resume })
         .catch((e) => {
           refused = e instanceof SpecSettingsRefused
           if (refused) console.error(`[spec] ${(e as Error).message}`)

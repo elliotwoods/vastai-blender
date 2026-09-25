@@ -501,7 +501,12 @@ app.whenReady().then(() => {
     jobSpecPath: process.env.VR_JOB_SPEC,
     e2eBlend: process.env.VR_E2E_BLEND,
     lifecycle,
-    kick: () => scheduler.kick()
+    kick: () => scheduler.kick(),
+    // A campaign submitted is the say-so a headless run has no button for.
+    resume: {
+      recovery: () => scheduler.resumeRecovery(),
+      job: (jobId) => scheduler.resumeJob(jobId)
+    }
   })
 
   app.on('activate', function () {

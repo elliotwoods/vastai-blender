@@ -48,6 +48,15 @@ export interface JobSpecDeps {
   unsubmitted: string[]
   /** Defaults to this process's. */
   overlay?: SettingsOverlay
+  /**
+   * The scheduler's holds a campaign submitted is the user's say-so to lift
+   * (index.ts passes the scheduler's): the recovery hold on a launch with
+   * unfinished work (plan 1.9), and a breaker's hold on a job the campaign
+   * names again (plan 1.17). A headless run has nobody to click Resume, so
+   * without these a re-run on a profile with unfinished jobs rented nothing
+   * new, and a held job waited for good.
+   */
+  resume?: { recovery(): void; job(jobId: string): boolean }
 }
 
 /**
@@ -256,11 +265,13 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
       // campaign that will not finish, and the exit status says so.
       try {
         const revived = reviveFailedChunks(existing.id)
+        const released = deps.resume?.job(existing.id) === true
         console.log(
           `[spec] skip (already active): ${blend.path}` +
             (revived.frames
               ? ` — ${revived.frames} missing frame(s) queued again in ${revived.chunks} chunk(s)`
-              : '')
+              : '') +
+            (released ? ' — its hold released' : '')
         )
       } catch (e) {
         console.error(
@@ -294,5 +305,6 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
     console.log(`[spec] job ${created}/${blends.length} ${jobId} ${blend.path}`)
   }
   console.log(`[spec] submitted ${created} job(s)`)
+  deps.resume?.recovery()
   deps.kick()
 }
