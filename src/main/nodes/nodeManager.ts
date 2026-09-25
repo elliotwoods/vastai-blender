@@ -68,6 +68,7 @@ import {
   AgentBusyError,
   agentStatus,
   ConnectionLostError,
+  exitStatus,
   provisionDeps,
   REMOTE_ROOT,
   restartAgent,
@@ -310,16 +311,17 @@ function instanceStopped(inst: RawInstance): boolean {
 /**
  * The link to the node failed under a command, rather than the node
  * answering it: the connection went under it (ConnectionLostError, or a step
- * that ended with no exit status, "failed (exit null)"), it timed out, the
- * node could not be reached, or anything else classify() calls transient
- * over SSH. That is no verdict on the node or its agent. A laptop's Wi-Fi
+ * that ended with no exit status, "failed (exit null)", or "exit undefined"
+ * from a caller that passed ssh2's code on unread; see exitStatus), it timed
+ * out, the node could not be reached, or anything else classify() calls
+ * transient over SSH. That is no verdict on the node or its agent. A laptop's Wi-Fi
  * flapping just after it wakes does exactly this, and a node brought back
  * from one drop used to be destroyed, renders and all, for the next.
  */
 function linkFailed(e: unknown): boolean {
   if (e instanceof ProvisionTimeout) return false
   if (e instanceof ConnectionLostError) return true
-  if (e instanceof Error && /\(exit null\)/.test(e.message)) return true
+  if (e instanceof Error && /\(exit (null|undefined)\)/.test(e.message)) return true
   const c = classify(e, { via: 'ssh' })
   return c.kind === 'transient' || c.rule === 'ssh-lost' || c.rule === 'ssh-unreachable'
 }
@@ -1604,8 +1606,10 @@ export class NodeManager {
     }
     if (node.ssh !== ssh) return
     // What ssh2 hands back for a channel whose connection went: no exit
-    // status and no output.
-    if (r.code === null && !r.stdout.trim()) {
+    // status (undefined; null for a signal) and no output. Only null was
+    // read so, and on real ssh2 a probe the link dropped under reset the
+    // node's strikes and stamped it as answering.
+    if (exitStatus(r.code) === null && !r.stdout.trim()) {
       this.probeFailed(node, 'the connection dropped under the probe')
       return
     }
@@ -1899,7 +1903,9 @@ export class NodeManager {
         })
         .join('; ') + '; true'
     const r = await ssh.exec(command, { timeoutMs: ANSWER_TIMEOUT_MS, label })
-    if (r.code === null) throw new ConnectionLostError(label)
+    // No exit status: the link went, and whether the renders were stopped is
+    // not known. Taken as done, they rendered on, paid for twice.
+    if (exitStatus(r.code) === null) throw new ConnectionLostError(label)
     emit('render:logLine', {
       nodeId: node.id,
       chunkId: null,
@@ -3301,7 +3307,7 @@ export class NodeManager {
         })
         if (node.movedOn(held)) return
         if (!r.stdout.includes('ok'))
-          throw new Error(`no answer after reconnecting (exit ${r.code})`)
+          throw new Error(`no answer after reconnecting (exit ${exitStatus(r.code)})`)
         answered = true
         lastContactByNode.set(node.id, Date.now())
         node.takeDrops()
