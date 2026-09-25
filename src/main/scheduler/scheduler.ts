@@ -1733,7 +1733,8 @@ class Scheduler {
    * the hardware one render of it had (frameTimeKey): what the hung-Blender
    * watchdog judges the job's runs by (ChunkRun.hungFor). Fed by every run
    * of the job; in memory only, so after a restart a job's first frames get
-   * HUNG_UNKNOWN_MS again.
+   * HUNG_UNKNOWN_MS again. Dropped once the job settles
+   * (forgetFrameTimesOnceSettled) or is cancelled.
    */
   private frameTimes = new Map<string, Map<string, number>>()
   private frameKeys = new WeakMap<ChunkRun, string>()
@@ -2218,6 +2219,18 @@ class Scheduler {
       this.frameKeys.set(run, key)
     }
     return key
+  }
+
+  /**
+   * A job no longer queued or running (complete, partial, failed or
+   * cancelled) has no runs left to judge by its frame times: they were kept
+   * for the session. A job revived later learns them afresh.
+   */
+  private forgetFrameTimesOnceSettled(jobId: string): void {
+    if (!this.frameTimes.has(jobId)) return
+    const job = getDb().prepare('SELECT state FROM jobs WHERE id = ?').get(jobId) as
+      Pick<JobRow, 'state'> | undefined
+    if (job?.state !== 'queued' && job?.state !== 'running') this.frameTimes.delete(jobId)
   }
 
   /** A run of the job saw a frame take `seconds` (ChunkRun.noteProgress). */
@@ -2951,6 +2964,7 @@ class Scheduler {
       if (outcome.rendered) this.rendered(run)
     }
     refreshJobState(run.jobId)
+    this.forgetFrameTimesOnceSettled(run.jobId)
     // After refreshJobState, so a job that just finished is built promptly.
     // A failed chunk schedules too: it may have ended the job as 'partial'.
     jobClips.schedule(run.jobId)

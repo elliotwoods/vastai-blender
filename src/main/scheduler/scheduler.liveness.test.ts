@@ -431,6 +431,9 @@ describe('1.7: a hung Blender', () => {
     )
     // Twenty minutes of frames and 45 without one, not three times ten.
     expect(Date.now() - startedAt).toBeLessThan(75 * 60_000)
+    // What its frames took goes with the job, rather than for the session.
+    const kept = (app.scheduler as unknown as { frameTimes: Map<string, unknown> }).frameTimes
+    expect(kept.has(jobId)).toBe(false)
   }, 20_000)
 
   it('a first frame of fifty minutes, then frames of twenty, is not taken for a hang', async () => {
