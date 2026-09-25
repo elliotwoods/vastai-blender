@@ -104,6 +104,15 @@ describe('the quit dialog', () => {
     expect(p.detail).not.toContain('still being rented')
   })
 
+  it('does not promise what it cannot keep (1.1 review)', () => {
+    const p = quitPrompt(billingFleet([node()]))
+    // forgetNode burns a retry on every chunk in flight.
+    expect(p.detail).toContain('so a chunk on its last retry fails')
+    // Opening the app again stops nothing by itself.
+    expect(p.detail).not.toContain('until you open')
+    expect(p.detail).toContain('idle scale-down once it is open again, or in the Vast.ai console')
+  })
+
   it('Enter destroys, Esc cancels, and an unknown response is Esc', () => {
     const p = quitPrompt(billingFleet([node()]))
     expect(choiceOf(p, p.defaultId)).toBe('destroy')

@@ -210,10 +210,14 @@ export function quitPrompt(fleet: BillingFleet): Prompt<QuitChoice> {
       (renting > 0
         ? ` (${renting} of them ${renting === 1 ? 'is' : 'are'} still being rented.)`
         : '') +
+      // "Counts as a failed attempt": forgetNode requeues each chunk in
+      // flight and burns one of its retries, as for a node that died.
       '\n\nDestroy all & quit: destroy every node, then quit. Renders in progress ' +
-      'stop, and their chunks render again the next time you open the app.' +
-      '\n\nLeave running: quit now. The nodes keep billing until you open ' +
-      'Vast Render again or destroy them in the Vast.ai console.',
+      'stop and go back in the queue for the next time you open the app. Each ' +
+      'counts as a failed attempt, so a chunk on its last retry fails.' +
+      '\n\nLeave running: quit now. The nodes keep billing until they are ' +
+      "destroyed, by the app's idle scale-down once it is open again, or in " +
+      'the Vast.ai console.',
     buttons: ['Destroy all && quit', 'Leave running', 'Cancel'],
     defaultId: 0,
     cancelId: 2,
