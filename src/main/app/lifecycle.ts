@@ -35,16 +35,22 @@
  *   confirmed (listed on stderr), or nodes left by `leave`. A second signal
  *   during the destroy exits at once, with 3.
  *
- * Destroy all has to outlast a scale-up that is already under way. The
- * scheduler rents in batches (requestNodes), and a batch reads the caps once,
- * before its first await, so every destroy frees room for its next rental
- * (Phase 0 review, carried into 1.1). scheduler.stop() only clears the tick
- * timer, and a kick still ticks. So destroyFleet works in rounds, each one
- * taking the nodes that are billing and have not been tried yet, until a
- * round finds none. The app then exits in the same synchronous run as that
- * last look at the fleet. That is enough: the row of a rental is written
- * before its create goes out, so a create that may have rented something is
- * always on a row, and a batch between two creates has nothing on Vast.
+ * Destroy all must rent nothing while it destroys. scheduler.stop() only
+ * clears the tick timer, and a kick still ticks. Every destroy kicks
+ * (forgetNode requeues the node's chunks), so a stopped scheduler sent the
+ * requeued chunks straight back to the dying nodes and rented into the room
+ * each destroy freed (1.1 review). And a scale-up batch already in
+ * requestNodes read the caps before its first await, so each destroy freed
+ * room for its next rental (Phase 0 review, carried into 1.1). So
+ * stopScheduling (fleetPort) stops both for good: the scheduler's tick does
+ * nothing, and requestNodes finds the fleet full before its next rental. A
+ * create already sent is waited for and what it rented destroyed
+ * (settleNode). destroyFleet still works in rounds, each one taking the
+ * nodes that are billing and have not been tried yet, until a round finds
+ * none, for anything that slips past. The app then exits in the same
+ * synchronous run as that last look at the fleet. That is enough: the row of
+ * a rental is written before its create goes out, so a create that may have
+ * rented something is always on a row.
  *
  * The decisions are pure functions. installLifecycle is the Electron adapter.
  * Every Electron object is passed in, and nothing here imports electron, so a
@@ -214,9 +220,8 @@ export type FailureChoice = 'retry' | 'console' | 'quitAnyway'
  * What Destroy all could not confirm. The quit stops here until the user
  * decides: try again, look in the Vast.ai console (the box comes back), or
  * quit knowing those instances bill. There is no way back into the app from
- * here: its scheduler is already stopped, and a stopped scheduler still
- * dispatches and rents on the next kick (see the header), so an app left
- * open would be half running.
+ * here: its scheduler is stopped for good (stopScheduling), so an app left
+ * open would render nothing and never scale down.
  */
 export function failurePrompt(failures: readonly DestroyFailure[]): Prompt<FailureChoice> {
   const n = failures.length
@@ -311,7 +316,11 @@ export interface FleetPort {
   snapshot(id: string): NodeSnapshot | undefined
   /** nodeManager.destroyNode, retrying transient failures for at most `budgetMs`. */
   destroyNode(id: string, budgetMs: number): Promise<void>
-  /** Stop dispatching and renting. */
+  /**
+   * Stop dispatching and renting, for good: only ever on the way out. After
+   * this nothing is sent to a node and no create goes out, whatever kicks
+   * the scheduler. A create already sent is not recalled.
+   */
   stopScheduling(): void
   /** Close every node connection and stop the node timers. */
   shutdown(): void
@@ -324,20 +333,41 @@ export interface FleetPort {
   reconcile?(): unknown
 }
 
-/** The parts of nodeManager and the scheduler that fleetPort reads. */
+/** The parts of nodeManager and the scheduler that fleetPort reads (and, to stop them, writes). */
 interface NodeManagerLike {
   list(): NodeSnapshot[]
   get(id: string): { snapshot: NodeSnapshot } | undefined
   destroyNode(id: string, opts: { budgetMs?: number }): Promise<void>
   shutdown(): void
+  activeCount(): number
 }
 
-export function fleetPort(nodes: NodeManagerLike, scheduler: { stop(): void }): FleetPort {
+interface SchedulerLike {
+  stop(): void
+  tick(): Promise<void>
+}
+
+export function fleetPort(nodes: NodeManagerLike, scheduler: SchedulerLike): FleetPort {
   return {
     list: () => nodes.list(),
     snapshot: (id) => nodes.get(id)?.snapshot,
     destroyNode: (id, budgetMs) => nodes.destroyNode(id, { budgetMs }),
-    stopScheduling: () => scheduler.stop(),
+    stopScheduling: () => {
+      scheduler.stop()
+      // A stopgap, on these two instances, until the scheduler has a stop
+      // that holds and requestNodes a way to be told to stop renting (see
+      // the header). The timer and every kick (a destroy's forgetNode, a
+      // finishing run, a job submitted) call tick, which dispatches and then
+      // rents (scalePolicy); from here it does nothing. requestNodes checks
+      // activeCount() against maxActiveNodes before each rental, and so does
+      // requestNode (the Fleet's button): a fleet that reads as full stops
+      // a batch already under way before its next create, and any batch
+      // after it. Nothing else reads activeCount. lifecycle.quit.test.ts's
+      // "rents nothing" and scale-up batch scenarios fail if either stops
+      // holding.
+      scheduler.tick = async () => {}
+      nodes.activeCount = () => Number.POSITIVE_INFINITY
+    },
     shutdown: () => nodes.shutdown()
   }
 }
@@ -419,8 +449,8 @@ async function settleNode(
 
 /**
  * Destroy every node that may be billing, in rounds, until a round finds no
- * billing node it has not tried (see the header: a scale-up already under
- * way keeps renting). Each round destroys its nodes in parallel, each within
+ * billing node it has not tried (see the header: anything that slips past
+ * stopScheduling). Each round destroys its nodes in parallel, each within
  * its budget. Returns what is still billing, with the reason where a destroy
  * was tried.
  *

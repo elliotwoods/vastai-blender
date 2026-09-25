@@ -342,9 +342,9 @@ describe('Destroy all while the fleet is still changing (plan 1.1; Phase 0 revie
     expect(w.vast.argsOf('destroyInstance')).toEqual([[instance]])
   })
 
-  it('a scale-up batch already under way: what it rents during the destroy is destroyed too', async () => {
+  it('a scale-up batch already under way: its create in flight is destroyed, and it rents nothing more', async () => {
     // requestNodes read the caps before its first await, so each destroy
-    // frees room for the batch's next rental.
+    // freed room for the batch's next rental, and it rented it.
     w = await setup({ settings: { maxActiveNodes: 3 } })
     const engine = await w.boot()
     const first = await w.readyNode(engine)
@@ -362,9 +362,75 @@ describe('Destroy all while the fleet is still changing (plan 1.1; Phase 0 revie
     await batch
     await w.until(() => r.app.exits.length > 0, 'the app to exit')
 
-    // Three instances rented in all, the last after Destroy all began.
-    expect(w.vast.created).toHaveLength(3)
+    // The first node, and the one create already out when Destroy all began.
+    expect(w.vast.count('createInstance')).toBe(2)
+    expect(w.vast.created).toHaveLength(2)
     expect(w.vast.created).toContain(instanceOf(first))
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: w.vast.created }])
+  })
+
+  it('1.1: Destroy all mid-render with room under maxActiveNodes rents nothing, and sends no chunk anywhere', async () => {
+    // 1.1 review: every destroy requeues its node's chunks and kicks the
+    // scheduler, and a stopped scheduler still ticked. The requeued chunks
+    // went straight back to the dying nodes, burning a retry each, and
+    // scalePolicy rented two more RTX 4090s into the room the destroys
+    // freed, drove them to ready and gave them work, all during the one
+    // action meant to stop spending.
+    w = await setup({ settings: { maxActiveNodes: 2 } })
+    const engine = await w.boot()
+    const ids = [await w.readyNode(engine), await w.readyNode(engine)]
+    const instances = ids.map(instanceOf)
+    const landed: string[] = []
+    for (const id of ids) {
+      w.machineFor(id).onSpec = (spec) => landed.push(`${id.slice(0, 8)} ${spec.chunkId}`)
+    }
+    // Four exclusive chunks: one on each node, two waiting for room.
+    await w.submitJob(engine, { frameStart: 1, frameEnd: 16, chunkSize: 4 })
+    engine.scheduler.kick()
+    await w.until(() => landed.length === 2, 'a chunk on each node')
+    await w.advance(5_000)
+    expect(w.vast.created).toEqual(instances)
+    const r = await rig(engine)
+    r.answers.push(DESTROY)
+
+    // Room for two more, and offers to fill it: what a tick would rent into.
+    w.settings.maxActiveNodes = 4
+    w.vast.addOffer()
+    w.vast.addOffer()
+    r.app.quit()
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+
+    expect(w.vast.created).toEqual(instances)
+    expect(landed).toHaveLength(2)
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+    expect(w.alerts('info').filter((m) => m.startsWith('scale-up'))).toEqual([])
+  })
+
+  it('1.1: Destroy all sends nothing: a chunk requeued off one dying node is not dispatched to the next', async () => {
+    // The first destroy's forgetNode requeued its chunk and kicked, and the
+    // tick sent it to the node still waiting its turn, which was destroyed
+    // next: the chunk was requeued, and charged, a second time.
+    w = await setup()
+    const engine = await w.boot()
+    const busy = await w.readyNode(engine, { dph_total: 0.5 })
+    const landed: string[] = []
+    w.machineFor(busy).onSpec = (spec) => landed.push(`busy ${spec.chunkId}`)
+    await w.submitJob(engine)
+    engine.scheduler.kick()
+    await w.until(() => landed.length === 1, 'the chunk on the first node')
+    const idle = await w.readyNode(engine)
+    w.machineFor(idle).onSpec = (spec) => landed.push(`idle ${spec.chunkId}`)
+    const r = await rig(engine)
+    r.answers.push(DESTROY)
+
+    r.app.quit()
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+
+    expect(landed).toHaveLength(1)
+    expect(w.alerts('warn').filter((m) => m.includes('requeued'))).toHaveLength(1)
+    expect(w.all('SELECT state, node_id FROM chunks')).toEqual([
+      { state: 'pending', node_id: null }
+    ])
     expect(r.app.exits).toEqual([{ code: 0, live: [], created: w.vast.created }])
   })
 
