@@ -224,8 +224,15 @@ describe('revealPath', () => {
     )
   })
 
-  it('reveals a UNC path only when it is one of the places, as a .blend the user chose', () => {
-    expect(reveal('\\\\nas\\projects\\shot020.blend')).toBe('\\\\nas\\projects\\shot020.blend')
+  it('a place on a network share reveals nothing: a scene saved before job:create checked it', () => {
+    // Phase 0 review, plans 1.12 and 1.14: every jobs.blend_path is a place,
+    // and a row from before the check, or a headless spec's scene, can name
+    // a share. Revealing it would connect Explorer to that host.
+    expect(reveal('\\\\nas\\projects\\shot020.blend')).toBeNull()
+    expect(revealPath('//nas/projects/x.png', ['//nas/projects'], posix)).toBeNull()
+    expect(
+      revealPath('\\\\?\\C:\\scenes\\x.blend', ['\\\\?\\C:\\scenes\\x.blend'], win32)
+    ).toBeNull()
   })
 
   // Explorer connects to the host of a UNC path it is asked to show, and a
@@ -346,6 +353,15 @@ describe('shell:showItemInFolder', () => {
       ['showItemInFolder', frame],
       ['showItemInFolder', blend]
     ])
+  })
+
+  it("refuses a job's .blend on a share, saved before job:create checked it (plans 1.12, 1.14)", async () => {
+    const jobId = await w.submitJob(app)
+    // As an older build, or a headless spec, saved it.
+    const share = '//nas/projects/shot020.blend'
+    w.db.prepare('UPDATE jobs SET blend_path = ? WHERE id = ?').run(share, jobId)
+    await w.invoke('shell:showItemInFolder', share)
+    expect(calls()).toEqual([])
   })
 
   it('refuses a UNC share, a relative path and anything the app never showed', async () => {

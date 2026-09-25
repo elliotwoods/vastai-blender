@@ -17,6 +17,7 @@ import { lstatSync, statSync } from 'fs'
 import * as nodePath from 'path'
 import type { PlatformPath } from 'path'
 import { fileURLToPath } from 'url'
+import { localPathProblem } from '../../shared/settingsSanitize'
 import { isInside } from '../paths'
 
 /**
@@ -206,8 +207,13 @@ export function openPathVerdict(
  * which can hand it the user's NTLM hash. So only what the app shows the user
  * is revealed: one of `places`, or anything inside one. The places are the
  * folders shell:openPath opens things in plus the files the app names (a
- * job's .blend, an addon's zip, the SSH key). One may be a UNC path the user
- * chose, a .blend on a NAS; the renderer cannot add another.
+ * job's .blend, an addon's zip, the SSH key).
+ *
+ * Nothing that is not on this computer is revealed, place or not
+ * (localPathProblem: a network share or a device path). A place used to
+ * count however it was spelled, so a job's .blend on a share was
+ * revealable. job:create now refuses such a scene (plan 1.14), but rows
+ * saved before it, and a headless spec's scenes, can still hold one.
  */
 export function revealPath(
   raw: unknown,
@@ -215,12 +221,13 @@ export function revealPath(
   path: PlatformPath = nodePath
 ): string | null {
   if (typeof raw !== 'string' || raw === '' || !path.isAbsolute(raw)) return null
+  const flavour = path.sep === '\\' ? 'win32' : 'posix'
   const abs = path.resolve(raw)
+  if (localPathProblem(abs, flavour) !== null) return null
   const known = places.some(
     (p) =>
       typeof p === 'string' &&
-      p !== '' &&
-      path.isAbsolute(p) &&
+      localPathProblem(p, flavour) === null &&
       (path.relative(path.resolve(p), abs) === '' || isInside(p, abs, path))
   )
   return known ? abs : null
