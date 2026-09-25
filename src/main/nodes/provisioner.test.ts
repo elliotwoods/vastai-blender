@@ -40,6 +40,7 @@ vi.mock('../ssh/sftp', () => ({
 
 const {
   AgentBusyError,
+  ConnectionLostError,
   agentAlive,
   agentStatus,
   DEPS_TIMEOUT_MS,
@@ -53,6 +54,7 @@ const {
   restartAgent,
   RESTART_AGENT_TIMEOUT_MS
 } = await import('./provisioner')
+const { classify } = await import('../errors')
 
 interface Call {
   kind: 'exec' | 'execStream'
@@ -257,7 +259,26 @@ describe('provisioner.ts, what it makes of an answer', () => {
     const missing = stub({ code: 127, stdout: '', stderr: 'No such file' })
     await expect(agentStatus(missing.ssh)).resolves.toBeNull()
     const dropped = stub({ code: null, stdout: '', stderr: '' })
-    await expect(agentStatus(dropped.ssh)).rejects.toThrow(/lost its connection/)
+    await expect(agentStatus(dropped.ssh)).rejects.toBeInstanceOf(ConnectionLostError)
+  })
+
+  it('1.7: a restart-agent or agent-status whose connection went reads as the link lost, not a verdict', async () => {
+    // What ssh2 hands back for a channel whose connection dropped: no exit
+    // status. Neither the restart's outcome nor the status is known, and the
+    // alert must not read "unrecognised error".
+    const dropped = stub({ code: null, stdout: '', stderr: '' })
+    const errors = await Promise.all([
+      restartAgent(dropped.ssh, 'node-1').catch((e: unknown) => e),
+      agentStatus(dropped.ssh).catch((e: unknown) => e)
+    ])
+    expect(dropped.calls).toHaveLength(2) // no second restart-agent on a dropped link
+    for (const e of errors) {
+      expect(e).toBeInstanceOf(ConnectionLostError)
+      expect(classify(e, { via: 'ssh' })).toMatchObject({ kind: 'machine', rule: 'ssh-lost' })
+      expect(classify(e)).toMatchObject({ rule: 'ssh-lost' })
+    }
+    expect((errors[0] as Error).message).toBe('connection closed under provision.sh restart-agent')
+    expect((errors[1] as Error).message).toBe('connection closed under provision.sh agent-status')
   })
 
   it('1.8: installBlender and probeEevee each pass a deadline and a label, never command text', async () => {

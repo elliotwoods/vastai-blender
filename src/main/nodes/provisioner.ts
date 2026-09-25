@@ -117,6 +117,23 @@ export interface AgentRestart {
 }
 
 /**
+ * A command whose connection went before it answered: ssh2 ends its channel
+ * with no exit status. What the command did on the node is not known, and
+ * nothing it would have answered was heard, so it is no verdict on the node,
+ * only on the link. Worded as sshConnection words a closed connection, so
+ * classify() reads it as the SSH connection lost (ssh-lost). It read as an
+ * unrecognised error, and a node brought back from a blip was destroyed for
+ * one more.
+ */
+export class ConnectionLostError extends Error {
+  override readonly name = 'ConnectionLostError'
+
+  constructor(label: string) {
+    super(`connection closed under ${label}`)
+  }
+}
+
+/**
  * restart-agent found another restart-agent running on the node, and gave up
  * waiting for it: the node is busy, not broken.
  */
@@ -155,7 +172,9 @@ export function parseAgentRestart(lines: readonly string[]): AgentRestart | null
  * up to 90 s, and then once more here: it may be ours, left running on the
  * node when a deadline gave up on it. An exit that gives no verdict counts as
  * a restart. Forgetting runs a live agent kept costs a re-render; keeping
- * runs a restart killed leaves them polling a render that is gone.
+ * runs a restart killed leaves them polling a render that is gone. For the
+ * same reason a caller must take a ConnectionLostError, a timeout or an
+ * AgentBusyError as a restart that may have happened.
  */
 export async function restartAgent(
   ssh: SshConnection,
@@ -173,6 +192,7 @@ export async function restartAgent(
       opts.timeoutMs ?? RESTART_AGENT_TIMEOUT_MS
     )
     if (code === 0) return parseAgentRestart(lines) ?? { restarted: true, reason: null }
+    if (code === null) throw new ConnectionLostError(label)
     const busy = code === 1 && lines.some((l) => l.includes('another restart-agent still running'))
     if (busy && attempt < 2) continue
     if (busy) throw new AgentBusyError()
@@ -287,14 +307,16 @@ export function parseAgentStatus(stdout: string): AgentStatus | null {
  * Ask the node's provision.sh about its agent, changing nothing. Null when
  * the node's tree has no agent-status (a build before the split provisioned
  * it, or the tree is gone): only a full provision puts that right. Rejects
- * when the command itself fails: the connection, or the deadline.
+ * when the command itself fails: the connection (ConnectionLostError), or the
+ * deadline.
  */
 export async function agentStatus(ssh: SshConnection): Promise<AgentStatus | null> {
+  const label = 'provision.sh agent-status'
   const r = await ssh.exec(`bash ${PROVISION} agent-status`, {
     timeoutMs: AGENT_STATUS_TIMEOUT_MS,
-    label: 'provision.sh agent-status'
+    label
   })
-  if (r.code === null) throw new Error('provision.sh agent-status lost its connection')
+  if (r.code === null) throw new ConnectionLostError(label)
   return r.code === 0 ? parseAgentStatus(r.stdout) : null
 }
 
