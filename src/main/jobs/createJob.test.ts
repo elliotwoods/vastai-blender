@@ -1,4 +1,14 @@
-import { existsSync, readdirSync } from 'fs'
+import { createHash } from 'crypto'
+import {
+  chmodSync,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  utimesSync,
+  writeFileSync
+} from 'fs'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { JobSubmission } from '../../shared/models'
@@ -66,4 +76,92 @@ describe('createJob', () => {
     expect(renderDirs()).toEqual([jobId])
     expect(w.eventsOf('job:changed').map((j) => j.id)).toEqual([jobId])
   })
+})
+
+function sha256(data: Buffer): string {
+  return createHash('sha256').update(data).digest('hex')
+}
+
+// Plan 1.12: a job renders the scene as it was submitted. Every dispatch used
+// to upload whatever was at blend_path at that moment, so an artist who went
+// on working and saved mid-render got a job whose later chunks rendered the
+// new revision, with nothing saying which frames came from which (#53 #148).
+describe('the scene as submitted (plan 1.12)', () => {
+  it('1.12 (#53 #148): the job keeps a copy of its scene and its hash, and a save over the original changes neither', async () => {
+    const app = await w.boot({ start: false })
+    const blend = w.blend('shot.blend')
+    const submitted = readFileSync(blend)
+
+    const jobId = await w.submitJob(app, { blendPath: blend })
+
+    const row = w.get<{ output_dir: string; blend_sha256: string; scene_path: string }>(
+      'SELECT output_dir, blend_sha256, scene_path FROM jobs WHERE id = ?',
+      jobId
+    )!
+    expect(row.scene_path).toBe(join(row.output_dir, 'scene.blend'))
+    expect(readFileSync(row.scene_path)).toEqual(submitted)
+    expect(row.blend_sha256).toBe(sha256(submitted))
+    expect((await w.invoke('job:get', jobId))?.blendSha256).toBe(sha256(submitted))
+
+    // The artist goes on working, and saves.
+    writeFileSync(blend, 'BLENDER-v402 edited after submit\n')
+
+    expect(readFileSync(row.scene_path)).toEqual(submitted)
+    expect(w.get('SELECT blend_sha256 FROM jobs WHERE id = ?', jobId)).toEqual({
+      blend_sha256: sha256(submitted)
+    })
+  })
+
+  it('1.12: sceneChanged says the original has been saved over, or moved, since submit', async () => {
+    const app = await w.boot({ start: false })
+    const sceneChanged = async (id: string): Promise<boolean | null | undefined> =>
+      (await w.invoke('job:get', id))?.sceneChanged
+    const saved = w.blend('saved.blend')
+    const moved = w.blend('moved.blend')
+    const savedJob = await w.submitJob(app, { blendPath: saved })
+    const movedJob = await w.submitJob(app, { blendPath: moved })
+
+    // Not known until the files have been looked at; the look is announced.
+    expect(await sceneChanged(savedJob)).toBeNull()
+    await w.until(async () => (await sceneChanged(savedJob)) === false, 'unchanged, once looked at')
+    expect(w.eventsOf('job:changed').filter((j) => j.id === savedJob)).toHaveLength(2)
+
+    // Saved again: the same bytes, a later time, as a save that changed nothing.
+    const later = new Date(statSync(saved).mtimeMs + 60_000)
+    utimesSync(saved, later, later)
+    await w.until(async () => (await sceneChanged(savedJob)) === true, 'changed, after a save')
+
+    renameSync(moved, `${moved}.old`)
+    await w.until(async () => (await sceneChanged(movedJob)) === true, 'changed, once moved')
+    expect(await app.jobs.checkSceneChanged(movedJob)).toBe(true)
+  })
+
+  it('1.12: a job from before snapshots has no scene hash, and nothing to say about its scene', async () => {
+    const app = await w.boot({ start: false })
+    const jobId = await w.submitJob(app)
+    w.db.prepare('UPDATE jobs SET blend_sha256 = NULL, scene_path = NULL WHERE id = ?').run(jobId)
+
+    const job = await w.invoke('job:get', jobId)
+
+    expect(job).toMatchObject({ blendSha256: null, sceneChanged: null })
+    expect(await app.jobs.checkSceneChanged(jobId)).toBeNull()
+  })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'refuses a scene it cannot copy, before any folder or row is left',
+    async () => {
+      const app = await w.boot({ start: false })
+      const blend = w.blend('locked.blend')
+      chmodSync(blend, 0o000)
+      try {
+        await expect(w.submitJob(app, { blendPath: blend })).rejects.toThrow(
+          /could not copy the scene into the job's folder/
+        )
+      } finally {
+        chmodSync(blend, 0o644)
+      }
+      expect([count('jobs'), count('chunks'), count('frames')]).toEqual([0, 0, 0])
+      expect(renderDirs()).toEqual([])
+    }
+  )
 })

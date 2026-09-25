@@ -1,12 +1,14 @@
 /** Job persistence + read models (the scheduler owns state transitions). */
 
 import { randomUUID } from 'crypto'
-import { mkdirSync, statSync } from 'fs'
+import { constants, mkdirSync, promises as fsp, statSync, type Stats } from 'fs'
 import { basename, join } from 'path'
 import { resolveJobBlenderVersion } from '../blender/blendInfo'
 import { getDb } from '../db/db'
+import { describeError } from '../errors'
 import { emit } from '../events'
 import { getSettings } from '../settings'
+import { sha256File } from '../ssh/sftp'
 import { autoChunkSize, framesIn, splitFrames } from '../scheduler/chunker'
 import { validateSubmission } from '../../shared/jobValidation'
 import type {
@@ -37,6 +39,10 @@ interface JobRow {
   cost_so_far: number
   submitted_at: number
   share_node: number
+  /** hex SHA-256 of the snapshot; null = submitted before plan 1.12 */
+  blend_sha256: string | null
+  /** absolute path of the snapshot (SCENE_SNAPSHOT in output_dir); null as above */
+  scene_path: string | null
   /** JSON JobAttention, or null (plans 1.16, 1.17) */
   attention: string | null
 }
@@ -133,7 +139,8 @@ function rowToSummary(r: JobRow): JobSummary {
     outputDir: r.output_dir,
     blenderVersion: r.blender_version,
     shareNode: r.share_node === 1,
-    attention: parseAttention(r.attention)
+    attention: parseAttention(r.attention),
+    blendSha256: r.blend_sha256
   }
 }
 
@@ -169,7 +176,8 @@ export function getJob(id: string): JobDetail | null {
   return {
     ...rowToSummary(row),
     chunks: chunks.map(rowToChunk),
-    addonIds: JSON.parse(row.addon_ids) as string[]
+    addonIds: JSON.parse(row.addon_ids) as string[],
+    sceneChanged: sceneChangedNow(row)
   }
 }
 
@@ -207,6 +215,121 @@ export function emitChunkChanged(chunkId: string): void {
 /** Bulk variant for the statements that touch many rows at once. */
 export function emitChunksChanged(chunkIds: readonly string[]): void {
   for (const id of chunkIds) emitChunkChanged(id)
+}
+
+/** The job's copy of its scene, in its output folder (plan 1.12). */
+export const SCENE_SNAPSHOT = 'scene.blend'
+
+/**
+ * Copy the scene into the job's folder as SCENE_SNAPSHOT, and hash the copy:
+ * every chunk of the job renders it, so a save over the original mid-render
+ * cannot change what the rest of the frames are rendered from (#53 #148).
+ *
+ * A clone where the file system makes them (APFS, ReFS, Btrfs), which is
+ * instant and takes no room until one of the two files changes; a plain copy
+ * elsewhere. The copy is what is hashed, never the original, which may be
+ * saved over at any moment.
+ *
+ * The copy keeps the original's modification time, whatever the platform's
+ * copy did with it: that is what sceneDiffers compares a later save against.
+ * Only if the folder takes it. One that will not still gets the job, and the
+ * copy's own time, when it was made, is then the mark, which only a later
+ * save of the original passes.
+ */
+async function snapshotScene(
+  src: string,
+  outputDir: string
+): Promise<{ path: string; sha256: string }> {
+  const path = join(outputDir, SCENE_SNAPSHOT)
+  const before = await fsp.stat(src)
+  await fsp.copyFile(src, path, constants.COPYFILE_EXCL | constants.COPYFILE_FICLONE)
+  await fsp.utimes(path, before.atime, before.mtime).catch(() => {})
+  return { path, sha256: await sha256File(path) }
+}
+
+/**
+ * How far past the snapshot's modification time the original's may be and
+ * still be the save that was copied. File systems keep times to different
+ * resolutions (FAT's two seconds is the coarsest a scene is likely to be on),
+ * and utimes sets them to the millisecond.
+ */
+const MTIME_SLACK_MS = 2_000
+
+/**
+ * Has the scene at `original` changed since it was copied to `snapshot`?
+ * Judged by size and modification time, never by reading either file (a
+ * multi-GB scene, perhaps on a network volume), so a save that changed
+ * nothing reads as a change too. True for an original that is gone. Null
+ * when it cannot be told: the snapshot is unreadable, or the original's
+ * folder will not say.
+ *
+ * Newer rather than different: a snapshot whose times could not be set
+ * carries the moment it was made, which no earlier save of the original is
+ * past.
+ */
+async function sceneDiffers(original: string, snapshot: string): Promise<boolean | null> {
+  let copy: Stats
+  try {
+    copy = await fsp.stat(snapshot)
+  } catch {
+    return null
+  }
+  let now: Stats
+  try {
+    now = await fsp.stat(original)
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException | null)?.code
+    return code === 'ENOENT' || code === 'ENOTDIR' ? true : null
+  }
+  return now.size !== copy.size || now.mtimeMs - copy.mtimeMs > MTIME_SLACK_MS
+}
+
+/**
+ * Has job `jobId`'s scene changed since it was submitted (plan 1.12)? Looks
+ * at both files now. Null for a job with no snapshot, submitted before
+ * snapshots, which renders `blend_path` as it is, and when it cannot be told.
+ */
+export async function checkSceneChanged(jobId: string): Promise<boolean | null> {
+  const row = getDb()
+    .prepare('SELECT blend_path, blend_sha256, scene_path FROM jobs WHERE id = ?')
+    .get(jobId) as Pick<JobRow, 'blend_path' | 'blend_sha256' | 'scene_path'> | undefined
+  if (!row?.blend_sha256 || !row.scene_path) return null
+  return sceneDiffers(row.blend_path, row.scene_path)
+}
+
+/** How long getJob shows a sceneChanged verdict before it looks at the files again. */
+const SCENE_RECHECK_MS = 5_000
+
+/** Per job: the last sceneChanged verdict, when it was reached, and whether a look is under way. */
+const sceneChecks = new Map<string, { changed: boolean | null; at: number; running: boolean }>()
+
+/**
+ * getJob's sceneChanged: the last verdict, with a fresh look started once it
+ * is SCENE_RECHECK_MS old. getJob answers at once and runs on every
+ * job:changed while the job is open, and a stat of a scene on a network
+ * volume that has gone away can take minutes, holding the main process with
+ * it. So it never waits for one: a verdict that changes is announced with
+ * job:changed, and the renderer asks again.
+ */
+function sceneChangedNow(r: JobRow): boolean | null {
+  if (!r.blend_sha256 || !r.scene_path) return null
+  const known = sceneChecks.get(r.id)
+  if (!known || (!known.running && Date.now() - known.at >= SCENE_RECHECK_MS)) {
+    void recheckScene(r.id, r.blend_path, r.scene_path)
+  }
+  return known?.changed ?? null
+}
+
+async function recheckScene(jobId: string, original: string, snapshot: string): Promise<void> {
+  const entry = sceneChecks.get(jobId) ?? { changed: null, at: 0, running: false }
+  sceneChecks.set(jobId, entry)
+  entry.running = true
+  const changed = await sceneDiffers(original, snapshot)
+  entry.running = false
+  entry.at = Date.now()
+  if (changed === entry.changed) return
+  entry.changed = changed
+  emitJobChanged(jobId)
 }
 
 function isFile(path: string): boolean {
@@ -255,13 +378,24 @@ export async function createJob(sub: JobSubmission): Promise<string> {
   mkdirSync(join(outputDir, 'frames'), { recursive: true })
   mkdirSync(join(outputDir, 'previews'), { recursive: true })
 
+  // The scene as submitted, which every chunk renders (plan 1.12). Taken
+  // before the job exists, so a scene that cannot be copied (the project
+  // folder full, the original unreadable) is a refusal, and leaves no folder.
+  let scene: { path: string; sha256: string }
+  try {
+    scene = await snapshotScene(sub.blendPath, outputDir)
+  } catch (e) {
+    await fsp.rm(outputDir, { recursive: true, force: true }).catch(() => {})
+    throw new Error(`could not copy the scene into the job's folder: ${describeError(e)}`)
+  }
+
   const db = getDb()
   const insertAll = db.transaction(() => {
     db.prepare(
       `INSERT INTO jobs (id, name, blend_path, engine, frame_start, frame_end, frame_step,
                          state, blender_version, addon_ids, chunk_size, output_dir, cost_so_far, submitted_at,
-                         share_node)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?, ?)`
+                         share_node, blend_sha256, scene_path)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?, ?, ?, ?)`
     ).run(
       id,
       name,
@@ -275,7 +409,9 @@ export async function createJob(sub: JobSubmission): Promise<string> {
       sub.chunkSize,
       outputDir,
       Date.now(),
-      sub.shareNode ? 1 : 0
+      sub.shareNode ? 1 : 0,
+      scene.sha256,
+      scene.path
     )
     const insChunk = db.prepare(
       `INSERT INTO chunks (id, job_id, frame_start, frame_end, state, frames_done, retries)
@@ -290,7 +426,13 @@ export async function createJob(sub: JobSubmission): Promise<string> {
       for (const f of framesIn(range, sub.frameStep)) insFrame.run(id, f, chunkId)
     }
   })
-  insertAll()
+  try {
+    insertAll()
+  } catch (e) {
+    // No job to render it: the copy of a large scene is not left behind.
+    await fsp.rm(outputDir, { recursive: true, force: true }).catch(() => {})
+    throw e
+  }
   emitJobChanged(id)
   return id
 }
