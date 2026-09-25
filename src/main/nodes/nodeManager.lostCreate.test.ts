@@ -22,6 +22,11 @@ beforeEach(async () => {
 })
 afterEach(() => w.dispose())
 
+/** The label a rental made this session carries (plan 1.3): this profile's install id, then the node's. */
+function labelOf(nodeId: string): string {
+  return `vastai-blender ${w.settings.installId!.slice(0, 8)}:${nodeId.slice(0, 8)}`
+}
+
 /** A promise's outcome, readable synchronously from inside w.until(). */
 function watch<T>(p: Promise<T>): { done: boolean; value?: T; error?: unknown } {
   const s: { done: boolean; value?: T; error?: unknown } = { done: false }
@@ -92,7 +97,7 @@ describe('1.4: a create with no answer is looked for by its label (#223 #231)', 
       expect(batch.value).toEqual([row.id])
       expect(w.vast.count('createInstance')).toBe(1)
       const [instanceId] = w.vast.created
-      expect(w.vast.instance(instanceId)?.label).toBe(`vastai-blender ${row.id.slice(0, 8)}`)
+      expect(w.vast.instance(instanceId)?.label).toBe(labelOf(row.id))
       expect(lookups(calls)).toBeGreaterThanOrEqual(1)
       expect(Date.now() - start).toBeLessThan(60_000)
       // Adopted: the row holds the instance, and the rental carries on.
@@ -165,7 +170,7 @@ describe('1.4: a create with no answer is looked for by its label (#223 #231)', 
     await w.until(() => batch.done, 'the batch gives up waiting', { stepMs: 1_000 })
     expect((batch.error as Error).message).toMatch(/keeps looking/)
     const [row] = rows()
-    const label = `vastai-blender ${row.id.slice(0, 8)}`
+    const label = labelOf(row.id)
     expect(row).toMatchObject({ state: 'requested', instance_id: null })
     expect(row.create_unknown_since).not.toBeNull()
     expect(app.nodeManager.activeCount()).toBe(1)

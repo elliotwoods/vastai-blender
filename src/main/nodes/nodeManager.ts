@@ -34,7 +34,9 @@ import type {
   NodeSnapshot,
   NodeState,
   NodeWorkRef,
-  Offer
+  Offer,
+  UnclaimedInstance,
+  UnclaimedOwner
 } from '../../shared/models'
 import {
   capUsage,
@@ -99,6 +101,54 @@ const LOOKUP_SLOW_MS = 60_000
  */
 const RESUME_FIRST_DELAY_MS = 5_000
 const RESUME_MAX_DELAY_MS = 60_000
+
+/**
+ * Plan 1.3: how often the account's instances are checked against this
+ * profile's rows, from the cost timer. The check used to run once, at start-
+ * up, so an orphan made mid-session (a create Vast carried out after its
+ * lookup gave up, a destroy an older build took on trust) billed until the
+ * next launch (#13 #93).
+ */
+const RECONCILE_EVERY_MS = 5 * 60_000
+
+/**
+ * An instance younger than this is left to the next reconcile, whoever's it
+ * is. Its create may not have answered yet: this session's rentals are
+ * guarded by name (creating, lookingUp), but a create in flight in another
+ * process on this profile (an older build without the single-instance lock)
+ * is not, and its row reads 'requested' with no instance id until then.
+ */
+const RECONCILE_MIN_AGE_MS = 2 * 60_000
+
+/** What every rental label starts with; nothing else marks a Vast Render rental. */
+const LABEL_PREFIX = 'vastai-blender'
+
+/**
+ * The label a rental is created under (plan 1.3): the first 8 characters of
+ * this profile's install id and of the node id, `vastai-blender
+ * <install8>:<node8>`. Without an install id it is the legacy
+ * `vastai-blender <node8>`, which rentals made before install ids carry.
+ */
+export function rentalLabel(nodeId: string, installId?: string | null): string {
+  const node = nodeId.slice(0, 8)
+  const install = installId ? installId.slice(0, 8) : ''
+  return install ? `${LABEL_PREFIX} ${install}:${node}` : `${LABEL_PREFIX} ${node}`
+}
+
+/**
+ * The parts of a Vast Render label: the install and node prefixes, or the
+ * node prefix alone for a legacy label. Null for anything else: no label, or
+ * one another tool or a person wrote.
+ */
+export function parseRentalLabel(
+  label: string | null | undefined
+): { install: string | null; node: string } | null {
+  if (!label?.startsWith(`${LABEL_PREFIX} `)) return null
+  const rest = label.slice(LABEL_PREFIX.length + 1).trim()
+  const colon = rest.indexOf(':')
+  if (colon < 0) return rest ? { install: null, node: rest } : null
+  return { install: rest.slice(0, colon), node: rest.slice(colon + 1) }
+}
 
 /**
  * The states in which the app wants a node's instance gone: it is being
@@ -166,6 +216,14 @@ interface NodeRow {
   label: string | null
   octane_state: string
   create_unknown_since: number | null
+}
+
+/** The columns the reconcile matches an instance to its row by. */
+interface ReconcileRow {
+  id: string
+  instance_id: number | null
+  state: NodeState
+  label: string | null
 }
 
 /** What the billing predicates (shared/nodeState.ts) read, from a row. */
@@ -544,10 +602,26 @@ export class NodeManager {
    */
   private lookingUp = new Set<string>()
   /**
-   * Rows the last run left with a create of unknown outcome. init's sweep
-   * settles them against the account's instances (reconcileOrphans).
+   * Rows the last run left with a create of unknown outcome. The reconcile
+   * settles them against the account's instances (reconcileOrphans): the
+   * first one after start-up, or the first that gets an answer from Vast.
    */
   private unknownAtBoot = new Set<string>()
+  /** The reconcile running now, and whether another was asked for meanwhile. */
+  private reconciling: Promise<void> | null = null
+  private reconcileAgain = false
+  /** When the cost timer next runs a reconcile (epoch ms). */
+  private nextReconcileAt = 0
+  /** Instances on the account that no row here holds, by id (plan 1.3). */
+  private unclaimed = new Map<number, UnclaimedInstance>()
+  /** When each listed instance was first seen, for one Vast gives no start date. */
+  private firstSeen = new Map<number, number>()
+  /** Instances of another install or profile already announced this session. */
+  private foreignAlerted = new Set<number>()
+  /** Why each unconfirmed destroy failed, by instance, until it is confirmed. */
+  private destroyErrors = new Map<number, string>()
+  private lastOrphanLine = ''
+  private unclaimedListeners = new Set<(list: UnclaimedInstance[]) => void>()
   /** Phase 3 hook: called when a node reaches SSH-reachable. */
   onReady: ((node: { id: string; ssh: SshConnection }) => Promise<void>) | null = null
 
@@ -574,77 +648,308 @@ export class NodeManager {
     this.metricsTimer = setInterval(() => void this.pollMetrics(), 15_000)
     this.destroyTimer = setInterval(() => void this.retryDestroys(0), DESTROY_RETRY_MS)
     void this.retryDestroys(DESTROY_BUDGET_MS)
-    void this.reconcileOrphans()
+    void this.reconcile()
   }
 
   /**
-   * Billing-leak protection: destroy any instance this profile rented that
-   * no node row holds (e.g. one whose create reply was lost, or created
-   * moments before a crash). An instance a row holds, in any state, is not
-   * the sweep's: a live node's, or one retryDestroys is destroying. Never
-   * touches instances without our label — the account may host unrelated
-   * workloads — nor labelled ones another installation or profile rented
-   * (below).
+   * Check the account's instances against this profile's rows now (plan
+   * 1.3): from init, every RECONCILE_EVERY_MS from the cost timer, and from
+   * the app shell on waking from sleep (powerMonitor 'resume') and after an
+   * API key is saved (onApiKeySaved). A call while one runs waits for it and
+   * then one more, so a key saved mid-pass is used. Never rejects.
    */
-  private async reconcileOrphans(): Promise<void> {
-    try {
-      // Before the list is asked for. An instance held when Vast answers is
-      // left alone even if its row is confirmed gone meanwhile: the list
-      // predates that destroy, and a second one here would be announced as
-      // an orphan.
-      const held = new Set<number>()
-      for (const n of this.nodes.values()) {
-        const f = n.facts
-        if (f.instanceId != null && holdsInstance(f)) held.add(f.instanceId)
+  reconcile(): Promise<void> {
+    if (this.reconciling) {
+      this.reconcileAgain = true
+      return this.reconciling
+    }
+    const run = async (): Promise<void> => {
+      try {
+        do {
+          this.reconcileAgain = false
+          await this.reconcileOrphans().catch(() => {})
+        } while (this.reconcileAgain)
+      } finally {
+        this.reconciling = null
       }
-      const instances = await listInstances()
-      const rows = getDb().prepare('SELECT id, instance_id FROM nodes').all() as Array<{
-        id: string
-        instance_id: number | null
-      }>
-      // Labels carry the first 8 chars of OUR node id, and the node row is
-      // written before the instance is created, so every instance this profile
-      // ever rented has a row here. One without is another installation's —
-      // a packaged app and a dev build, or a second profile, on the same
-      // account — and destroying it would kill that app's live render.
-      const ours = new Map(rows.map((r) => [r.id.slice(0, 8), r]))
-      const labelled = instances.filter((i) => i.label?.startsWith('vastai-blender'))
-      // One stdout line so a scripted run can confirm what the sweep saw.
-      console.log(
-        `[orphans] ${labelled.length} vastai-blender instance(s) on the account, ` +
-          `${labelled.filter((i) => held.has(i.id)).length} tracked here: ` +
-          labelled.map((i) => `${i.id}(${i.label})`).join(', ')
+    }
+    this.reconciling = run()
+    return this.reconciling
+  }
+
+  /**
+   * The app shell calls this once a Vast API key is saved: the account may be
+   * another one now, and the last reconcile may have had no key to ask with.
+   * Reconciles at once.
+   */
+  async onApiKeySaved(): Promise<void> {
+    await this.reconcile()
+  }
+
+  /**
+   * The instances on the account that no node of this profile holds, with
+   * what they cost (plan 1.3), as the last reconcile found them. The Fleet
+   * lists them until they are gone.
+   */
+  listUnclaimed(): UnclaimedInstance[] {
+    return [...this.unclaimed.values()]
+      .sort((a, b) => a.firstSeenAt - b.firstSeenAt || a.instanceId - b.instanceId)
+      .map((u) => ({ ...u }))
+  }
+
+  /**
+   * Called with the whole list whenever a reconcile, or a destroy of one,
+   * changes it (for fleet:unclaimed). Returns the unsubscribe function.
+   */
+  onUnclaimedChanged(listener: (list: UnclaimedInstance[]) => void): () => void {
+    this.unclaimedListeners.add(listener)
+    return () => {
+      this.unclaimedListeners.delete(listener)
+    }
+  }
+
+  /**
+   * Destroy one unclaimed instance, on the user's explicit, confirmed say-so
+   * (fleet:destroyUnclaimed). Only an id the last reconcile listed as
+   * unclaimed: an instance a node of this profile holds is destroyed through
+   * that node, never from here, and nothing outside the list is touched.
+   */
+  async destroyUnclaimed(instanceId: number): Promise<{ ok: boolean; message: string }> {
+    const entry = this.unclaimed.get(instanceId)
+    if (!entry) {
+      return { ok: false, message: `instance ${instanceId} is not an unclaimed instance` }
+    }
+    // A row may have taken it since the list was made (a create that just
+    // answered, or a lookup that found it).
+    if (this.heldInstances().has(instanceId)) {
+      this.unclaimed.delete(instanceId)
+      this.unclaimedChanged()
+      return {
+        ok: false,
+        message: `instance ${instanceId} belongs to a node of this profile now: destroy that node instead`
+      }
+    }
+    const gone = await this.ensureInstanceGone(instanceId)
+    const now = this.unclaimed.get(instanceId)
+    if (gone) {
+      this.unclaimed.delete(instanceId)
+      this.unclaimedChanged()
+      return { ok: true, message: `instance ${instanceId} destroyed` }
+    }
+    const reason = this.destroyErrors.get(instanceId) ?? 'Vast has not confirmed it gone'
+    if (now) {
+      now.destroyError = reason
+      this.unclaimedChanged()
+    }
+    return {
+      ok: false,
+      message: `instance ${instanceId} may still be billing (${reason}): check the Vast.ai console`
+    }
+  }
+
+  private unclaimedChanged(): void {
+    const list = this.listUnclaimed()
+    for (const l of [...this.unclaimedListeners]) {
+      try {
+        l(list)
+      } catch {
+        // A listener's failure is its own.
+      }
+    }
+  }
+
+  /**
+   * Instance ids a row here holds unconfirmed, read from the database rather
+   * than the managed nodes, so a row another process on this profile wrote
+   * counts too. So does one confirmed gone within RECONCILE_MIN_AGE_MS: Vast
+   * may list an instance for a moment after the destroy it confirmed, and a
+   * second destroy then would be announced as an orphan's.
+   */
+  private heldInstances(): Set<number> {
+    const rows = getDb()
+      .prepare(
+        'SELECT instance_id FROM nodes WHERE instance_id IS NOT NULL AND (destroyed_at IS NULL OR destroyed_at > ?)'
       )
-      // Rows a listed instance's label names: their create went through.
-      const found = new Set<string>()
-      for (const inst of labelled) {
-        if (!inst.label?.startsWith('vastai-blender')) continue
-        if (held.has(inst.id) || this.goneChecks.has(inst.id)) continue
-        const prefix = inst.label.slice('vastai-blender '.length).trim()
-        const row = ours.get(prefix)
-        if (!row) {
-          emit('alert', {
-            level: 'warn',
-            message: `instance ${inst.id} (${inst.label}) was not rented by this profile — left running; destroy it from its own app or the Vast.ai console if it is stray`
-          })
+      .all(Date.now() - RECONCILE_MIN_AGE_MS) as Array<{ instance_id: number }>
+    return new Set(rows.map((r) => r.instance_id))
+  }
+
+  /**
+   * Plan 1.3: every instance on the account, checked against this profile's
+   * rows. Billing-leak protection that used to run once, at start-up.
+   *
+   * - An instance a row holds, in any state, is that row's: a live node's,
+   *   or one retryDestroys is destroying.
+   * - An orphan, whose label names a row of this profile that does not hold
+   *   it (a create whose reply was lost, one a crash cut short, one Vast
+   *   carried out after its lookup gave up, a destroy an older build took on
+   *   trust), is claimed by that row and destroyed.
+   * - Anything else is unclaimed, listed with its rate and never destroyed
+   *   here: another install's or profile's rental (a packaged app and a dev
+   *   build on one account; destroying it would kill that app's live render),
+   *   or no Vast Render rental at all. Only the user destroys one
+   *   (destroyUnclaimed).
+   *
+   * Left for a later pass: an instance younger than RECONCILE_MIN_AGE_MS,
+   * and one whose row's create may still answer: in flight or being looked
+   * for in this session, or a row 'requested' with no instance id that the
+   * last run did not leave (another process's create in flight).
+   *
+   * Returns whether Vast answered.
+   */
+  private async reconcileOrphans(): Promise<boolean> {
+    const started = Date.now()
+    this.nextReconcileAt = started + RECONCILE_EVERY_MS
+    // Before the list is asked for, as well as after. An instance held when
+    // Vast answers is left alone even if its row is confirmed gone meanwhile:
+    // the list predates that destroy.
+    const heldBefore = this.heldInstances()
+    let instances: RawInstance[]
+    try {
+      instances = await listInstances()
+    } catch {
+      // No key, offline, Vast down: the next pass asks again.
+      return false
+    }
+    const now = Date.now()
+    // Asked afresh for each instance: destroying an orphan awaits Vast, and
+    // meanwhile a create can answer and its row take its instance.
+    const held = (id: number): boolean => heldBefore.has(id) || this.heldInstances().has(id)
+    const rows = getDb()
+      .prepare('SELECT id, instance_id, state, label FROM nodes')
+      .all() as ReconcileRow[]
+    // The row an instance belongs to is the one whose own label it carries:
+    // rentOffer writes the row, label and all, before it asks Vast to rent.
+    // A row an older build wrote has no label column, and only ever rented
+    // under the legacy label, so it is found by its id.
+    const byLabel = new Map<string, ReconcileRow>()
+    const byPrefix = new Map<string, ReconcileRow>()
+    for (const r of rows) {
+      if (r.label) byLabel.set(r.label, r)
+      else byPrefix.set(r.id.slice(0, 8), r)
+    }
+    const rowFor = (label: string | undefined): ReconcileRow | undefined => {
+      if (!label) return undefined
+      const exact = byLabel.get(label)
+      if (exact) return exact
+      const parts = parseRentalLabel(label)
+      return parts && parts.install == null ? byPrefix.get(parts.node) : undefined
+    }
+    const listed = new Set(instances.map((i) => i.id))
+    for (const id of [...this.firstSeen.keys()]) if (!listed.has(id)) this.firstSeen.delete(id)
+    const unclaimed = new Map<number, UnclaimedInstance>()
+    // Rows a listed instance's label names: their create went through.
+    const found = new Set<string>()
+    let tracked = 0
+    for (const inst of instances) {
+      if (!this.firstSeen.has(inst.id)) this.firstSeen.set(inst.id, now)
+      if (held(inst.id)) {
+        tracked++
+        continue
+      }
+      // Being destroyed now (the retry timer, or the user's destroy of an
+      // unclaimed one): that destroy settles it. Listed as it was meanwhile.
+      if (this.goneChecks.has(inst.id)) {
+        const prev = this.unclaimed.get(inst.id)
+        if (prev) unclaimed.set(inst.id, prev)
+        continue
+      }
+      const bornAt =
+        inst.start_date != null && Number.isFinite(inst.start_date)
+          ? inst.start_date * 1000
+          : this.firstSeen.get(inst.id)!
+      const young = now - bornAt < RECONCILE_MIN_AGE_MS
+      if (young) {
+        // Looked at again as soon as it is old enough, not five minutes on.
+        this.nextReconcileAt = Math.min(this.nextReconcileAt, bornAt + RECONCILE_MIN_AGE_MS)
+      }
+      const named = rowFor(inst.label)
+      if (named) {
+        found.add(named.id)
+        // As it is now, not as it was when the list came.
+        const row =
+          (getDb()
+            .prepare('SELECT id, instance_id, state, label FROM nodes WHERE id = ?')
+            .get(named.id) as ReconcileRow | undefined) ?? named
+        // The rental's own create may still answer with this instance: in
+        // flight (creating), being looked for (lookingUp), or another
+        // process's (a 'requested' row with no instance id the last run did
+        // not leave). It is that create's to take.
+        if (this.creating.has(row.id) || this.lookingUp.has(row.id)) continue
+        if (
+          row.state === 'requested' &&
+          row.instance_id == null &&
+          !this.unknownAtBoot.has(row.id)
+        ) {
           continue
         }
-        found.add(row.id)
-        // This session's rental, whose create has not answered yet, or whose
-        // instance is being looked for after a create that got no answer:
-        // the instance is the rental's, and rentOffer's lookup takes it
-        // from here.
-        if (this.creating.has(row.id) || this.lookingUp.has(row.id)) continue
+        if (young) continue
         emit('alert', {
           level: 'warn',
           message: `destroying orphaned instance ${inst.id} (${inst.label})`
         })
-        await this.ensureInstanceGone(inst.id, { node: this.claim(row, inst.id) })
+        const node = this.claim(row, inst.id)
+        this.unknownAtBoot.delete(row.id)
+        const gone = await this.ensureInstanceGone(inst.id, { node })
+        // Claimed, it is its row's to retry and count. A row that holds
+        // another instance could not take it: listed until it is gone.
+        if (!gone && !node) {
+          unclaimed.set(inst.id, this.unclaimedEntry(inst, 'thisProfile', now))
+        }
+        continue
       }
-      this.settleUnknownCreates(found)
-    } catch {
-      // no key / offline — retried implicitly on next app start
+      if (young) continue
+      const owner: UnclaimedOwner = inst.label?.startsWith(LABEL_PREFIX)
+        ? 'otherVastRender'
+        : 'unlabelled'
+      unclaimed.set(inst.id, this.unclaimedEntry(inst, owner, now))
+      if (owner === 'otherVastRender' && !this.foreignAlerted.has(inst.id)) {
+        this.foreignAlerted.add(inst.id)
+        emit('alert', { level: 'warn', message: this.foreignMessage(inst) })
+      }
     }
+    this.settleUnknownCreates(found)
+    const before = JSON.stringify(this.listUnclaimed())
+    this.unclaimed = unclaimed
+    if (JSON.stringify(this.listUnclaimed()) !== before) this.unclaimedChanged()
+    // One stdout line, when what it says changes, so a scripted run can
+    // confirm what the reconcile saw.
+    const line =
+      `[orphans] ${instances.length} instance(s) on the account, ${tracked} tracked here, ` +
+      `${unclaimed.size} unclaimed: ` +
+      instances.map((i) => `${i.id}(${i.label ?? 'no label'})`).join(', ')
+    if (line !== this.lastOrphanLine) {
+      this.lastOrphanLine = line
+      console.log(line)
+    }
+    return true
+  }
+
+  /** One unclaimed instance as the Fleet lists it, keeping when it was first found and why a destroy failed. */
+  private unclaimedEntry(inst: RawInstance, owner: UnclaimedOwner, now: number): UnclaimedInstance {
+    const prev = this.unclaimed.get(inst.id)
+    return {
+      instanceId: inst.id,
+      label: inst.label ?? null,
+      owner,
+      gpuName: inst.gpu_name ?? null,
+      numGpus: inst.num_gpus ?? 1,
+      dphTotal: inst.dph_total ?? null,
+      status: inst.actual_status ?? null,
+      startedAt: inst.start_date != null ? Math.round(inst.start_date * 1000) : null,
+      firstSeenAt: prev?.firstSeenAt ?? now,
+      destroyError: this.destroyErrors.get(inst.id) ?? prev?.destroyError ?? null
+    }
+  }
+
+  /**
+   * The one alert for a Vast Render rental of another install or profile.
+   * Its label may carry this profile's install id with no row here to name
+   * it: the id is only a claim (a settings file copied from here carries
+   * it too), and only a row says this database rented it.
+   */
+  private foreignMessage(inst: RawInstance): string {
+    return `instance ${inst.id} (${inst.label}) was not rented by this profile — left running; destroy it from its own app or the Vast.ai console if it is stray`
   }
 
   /**
@@ -684,11 +989,15 @@ export class NodeManager {
    * run is gone, so any create it sent has been answered by now. A create of
    * this session with no known outcome keeps counting until its own label
    * lookup (findLostCreate) settles it.
+   *
+   * A row whose instance was found stays pending until the reconcile claims
+   * that instance: a young one is left to a later pass, and the row must
+   * stay counted, and claimable, until then.
    */
   private settleUnknownCreates(found: ReadonlySet<string>): void {
     for (const id of this.unknownAtBoot) {
-      this.unknownAtBoot.delete(id)
       if (found.has(id)) continue
+      this.unknownAtBoot.delete(id)
       const node = this.nodes.get(id)
       if (!node || !createOutcomeUnknown(node.facts)) continue
       const state = node.state
@@ -900,7 +1209,9 @@ export class NodeManager {
   /** Create an instance from one offer and start driving it to ready. */
   private async rentOffer(offer: Offer, diskGb: number): Promise<Rental> {
     const id = randomUUID()
-    const label = `vastai-blender ${id.slice(0, 8)}`
+    // This profile's install id and the node's (plan 1.3): the reconcile
+    // matches the instance back to this row by it.
+    const label = rentalLabel(id, getSettings().installId)
     getDb()
       .prepare(
         `INSERT INTO nodes (id, state, gpu_name, num_gpus, dph_total, accumulated_cost, blender_versions, geolocation, label, create_unknown_since)
@@ -998,7 +1309,7 @@ export class NodeManager {
     e: Error
   ): Promise<Rental> {
     const id = node.id
-    const label = node.snapshot.label ?? `vastai-blender ${id.slice(0, 8)}`
+    const label = node.snapshot.label ?? rentalLabel(id)
     this.lookingUp.add(id)
     // Cancelled while the create was in flight: 'destroying', not the
     // 'destroyed' destroyNode left it in, since there may be an instance to
@@ -1291,6 +1602,7 @@ export class NodeManager {
     for (const n of this.holders(instanceId)) {
       n.update({ state: 'destroyed', destroyed_at: now, last_error: lastError })
     }
+    this.destroyErrors.delete(instanceId)
     if (this.unconfirmedAlerted.delete(instanceId)) {
       emit('alert', {
         level: 'info',
@@ -1307,10 +1619,12 @@ export class NodeManager {
   private destroyUnconfirmed(instanceId: number, e: unknown, quiet: boolean): void {
     const reason =
       e instanceof InstanceStillListed ? e.message : classify(e, { via: 'vast' }).reason
+    this.destroyErrors.set(instanceId, reason)
     const holders = this.holders(instanceId)
     for (const n of holders) n.update({ state: 'failed', last_error: `destroy failed: ${reason}` })
     if (holders.length === 0) {
-      // Only the orphan sweep destroys an instance no row holds.
+      // Only the reconcile destroys an instance no row holds: an orphan no
+      // row could take, or an unclaimed one the user said to destroy.
       emit('alert', {
         level: 'error',
         message: `orphan destroy failed for ${instanceId}: ${reason} — check the Vast.ai console!`
@@ -1671,7 +1985,7 @@ export class NodeManager {
     if (instanceId == null && createOutcomeUnknown(facts) && !this.creating.has(id)) {
       emit('alert', {
         level: 'warn',
-        message: `Node ${id.slice(0, 8)} has no instance id to destroy: Vast never answered its create. Check the Vast.ai console for "${node.snapshot.label ?? `vastai-blender ${id.slice(0, 8)}`}".`
+        message: `Node ${id.slice(0, 8)} has no instance id to destroy: Vast never answered its create. Check the Vast.ai console for "${node.snapshot.label ?? rentalLabel(id)}".`
       })
       return
     }
@@ -1714,7 +2028,10 @@ export class NodeManager {
     return results.filter((r) => r.status === 'fulfilled' && r.value).length
   }
 
-  /** Accumulate $ cost from dph × elapsed and push the fleet totals. */
+  /**
+   * The cost timer's tick: accumulate $ cost from dph × elapsed, push the
+   * fleet totals, and run the reconcile when it is due (plan 1.3).
+   */
   private async accrueCosts(): Promise<void> {
     const db = getDb()
     const ts = Date.now() // one timestamp for the tick, so buckets line up
@@ -1758,6 +2075,7 @@ export class NodeManager {
       sessionCo2g: sessionCo2Grams(),
       balance: this.balance
     })
+    if (Date.now() >= this.nextReconcileAt) void this.reconcile()
   }
 }
 

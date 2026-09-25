@@ -20,6 +20,11 @@ beforeEach(async () => {
 })
 afterEach(() => w.dispose())
 
+/** The label a rental made this session carries (plan 1.3): this profile's install id, then the node's. */
+function labelOf(nodeId: string): string {
+  return `vastai-blender ${w.settings.installId!.slice(0, 8)}:${nodeId.slice(0, 8)}`
+}
+
 /** A promise's outcome, readable synchronously from inside w.until(). */
 function watch<T>(p: Promise<T>): { done: boolean; value?: T; error?: unknown } {
   const s: { done: boolean; value?: T; error?: unknown } = { done: false }
@@ -192,7 +197,7 @@ describe('destroy while createInstance is in flight (finding #110)', () => {
     await expect(renting).resolves.toEqual([id])
 
     const [instanceId] = w.vast.created
-    expect(w.vast.instance(instanceId)?.label).toBe(`vastai-blender ${id.slice(0, 8)}`)
+    expect(w.vast.instance(instanceId)?.label).toBe(labelOf(id))
     // Found under the row's label, recorded on the row, and destroyed.
     expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
     expect(w.vast.live()).toEqual([])

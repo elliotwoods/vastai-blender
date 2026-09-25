@@ -13,6 +13,11 @@ beforeEach(async () => {
 })
 afterEach(() => w.dispose())
 
+/** The label a rental made this session carries (plan 1.3): this profile's install id, then the node's. */
+function labelOf(nodeId: string): string {
+  return `vastai-blender ${w.settings.installId!.slice(0, 8)}:${nodeId.slice(0, 8)}`
+}
+
 describe('nodeManager lifecycle', () => {
   it('rents an offer and drives it through provisioning to ready', async () => {
     const app = await w.boot()
@@ -37,7 +42,7 @@ describe('nodeManager lifecycle', () => {
     const [[opts]] = w.vast.argsOf('createInstance') as Array<[{ offerId: number; label: string }]>
     expect(opts.offerId).toBe(offer.id)
     // The label is what the orphan sweep trusts to tell our instances apart.
-    expect(opts.label).toBe(`vastai-blender ${id.slice(0, 8)}`)
+    expect(opts.label).toBe(labelOf(id))
 
     const row = w.get<Record<string, unknown>>('SELECT * FROM nodes WHERE id = ?', id)!
     expect(row.state).toBe('ready')
@@ -127,7 +132,7 @@ describe('nodeManager lifecycle', () => {
     const [id] = await app.nodeManager.requestNodes(1)
     const live = w.vast.live()
     expect(live).toHaveLength(1)
-    expect(w.vast.instance(live[0])?.label).toBe(`vastai-blender ${id.slice(0, 8)}`)
+    expect(w.vast.instance(live[0])?.label).toBe(labelOf(id))
     await w.until(() => app.nodeManager.get(id)?.state === 'ready', 'node ready')
     expect(w.get('SELECT instance_id, create_unknown_since FROM nodes WHERE id = ?', id)).toEqual({
       instance_id: live[0],

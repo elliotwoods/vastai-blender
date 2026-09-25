@@ -5,6 +5,7 @@
  * the ESM/CJS packaging friction.
  */
 
+import { randomUUID } from 'crypto'
 import { app, safeStorage } from 'electron'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { join } from 'path'
@@ -78,7 +79,31 @@ function load(): SettingsFile {
   // The has* flags are derived, never trusted from disk.
   cache.public.hasVastApiKey = !!cache.secrets.vastApiKey
   cache.public.hasOtoyCredentials = !!cache.secrets.otoyUsername && !!cache.secrets.otoyPassword
+  ensureInstallId(cache)
   return cache
+}
+
+/**
+ * Plan 1.3: this profile's install id, made the first time settings are
+ * read and kept from then on. Every rental label carries its first 8
+ * characters (`vastai-blender <install8>:<node8>`), so the reconcile can
+ * tell this profile's instances from those of another install or profile on
+ * the same Vast account, whose destroy would kill that app's live render.
+ *
+ * Saved at once, so the next launch labels its rentals with the same id. A
+ * disk that will not take the file still gets an id for the session, and
+ * its rentals are still recognised later: the reconcile matches an instance
+ * to its node row by the label the row itself stores.
+ */
+function ensureInstallId(file: SettingsFile): void {
+  const id = file.public.installId
+  if (typeof id === 'string' && /^[0-9a-f-]{8,}$/.test(id)) return
+  file.public.installId = randomUUID()
+  try {
+    persist()
+  } catch {
+    // Kept in memory for this session; see above.
+  }
 }
 
 /**
@@ -111,9 +136,12 @@ export function getSettings(): SettingsPublic {
 export function updateSettings(patch: Partial<SettingsPublic>): SettingsPublic {
   const s = load()
   // has* flags are derived from secrets — strip them from inbound patches.
+  // So is the install id, which is main's and never changes (plan 1.3): a
+  // renderer that sends back the settings it was given cannot rewrite it.
   const rest = { ...patch }
   delete rest.hasVastApiKey
   delete rest.hasOtoyCredentials
+  delete rest.installId
   s.public = {
     ...s.public,
     ...rest,

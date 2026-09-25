@@ -23,6 +23,11 @@ beforeEach(async () => {
 })
 afterEach(() => w.dispose())
 
+/** The label a rental made this session carries (plan 1.3): this profile's install id, then the node's. */
+function labelOf(nodeId: string): string {
+  return `vastai-blender ${w.settings.installId!.slice(0, 8)}:${nodeId.slice(0, 8)}`
+}
+
 /** A promise's outcome, readable synchronously from inside w.until(). */
 function watch<T>(p: Promise<T>): { done: boolean; value?: T; error?: unknown } {
   const s: { done: boolean; value?: T; error?: unknown } = { done: false }
@@ -420,7 +425,7 @@ describe('1.2 (Phase 0 review): a create with no known outcome counts as billing
     const renting = watch(app.nodeManager.requestNodes(1))
     await w.until(() => gate.reached, 'createInstance in flight')
     const [{ id }] = w.all<{ id: string }>('SELECT id FROM nodes')
-    const label = `vastai-blender ${id.slice(0, 8)}`
+    const label = labelOf(id)
     await app.nodeManager.destroyNode(id)
     // Vast rents it, the reply is lost, and Vast then stops answering the
     // lookup too: for a minute and then some, nothing is known either way.
