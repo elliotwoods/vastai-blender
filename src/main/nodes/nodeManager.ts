@@ -392,6 +392,12 @@ export interface RequestNodesOptions {
   overSpendCap?: boolean
   /** The engine the rentals are for, which decides the lanes an offer brings. */
   engine?: EngineId | null
+  /**
+   * No rental above this $/hr, whatever the cap leaves: the bound an
+   * over-cap confirmation names ("past the cap, at most $X/hr"). Without it
+   * an overSpendCap request is bounded by the offer filter alone.
+   */
+  maxPerHour?: number | null
 }
 
 /** What the billing predicates (shared/nodeState.ts) read, from a row. */
@@ -1349,11 +1355,14 @@ export class NodeManager {
   /**
    * Rent the best matching offer and drive it to ready: the Fleet's button
    * (fleet:requestNode). It stops at the spend cap, as scale-up does, unless
-   * the user confirmed going past it (`overSpendCap`, plan 1.5). It used to
-   * ignore the cap altogether. It never goes past maxActiveNodes, nor rents
-   * while the account is on hold.
+   * the user confirmed going past it (`overSpendCap`, plan 1.5), and then
+   * rents nothing dearer than `maxPerHour` when the confirmation named one.
+   * It used to ignore the cap altogether. It never goes past maxActiveNodes,
+   * nor rents while the account is on hold.
    */
-  async requestNode(opts: RequestNodeOptions = {}): Promise<string> {
+  async requestNode(
+    opts: RequestNodeOptions & { maxPerHour?: number | null } = {}
+  ): Promise<string> {
     const held = this.accountHold()
     if (held) throw new Error(`Renting is paused: ${held.reason}`)
     const settings = getSettings()
@@ -1367,7 +1376,7 @@ export class NodeManager {
         throw new Error(spendCapReached(caps, settings))
       }
     }
-    const ids = await this.rentBatch(1, { overSpendCap }, true)
+    const ids = await this.rentBatch(1, { overSpendCap, maxPerHour: opts.maxPerHour }, true)
     if (ids.length > 0) return ids[0]
     // Vast refused for the account in this very request: its hold says why.
     const refused = this.accountHold()
@@ -1468,10 +1477,13 @@ export class NodeManager {
     const firstBudget = opts.budget ? withDemand(first, opts.budget) : first
     if (!budgetOpen(firstBudget)) return []
 
+    const bound = opts.maxPerHour != null && opts.maxPerHour >= 0 ? opts.maxPerHour : null
     const filterMax = settings.offerFilters.maxDphTotal
     const headroom = first.headroomPerHour
-    const maxDphTotal =
-      headroom != null && (filterMax == null || headroom < filterMax) ? headroom : filterMax
+    let maxDphTotal = filterMax
+    for (const c of [headroom, bound]) {
+      if (c != null && (maxDphTotal == null || c < maxDphTotal)) maxDphTotal = c
+    }
     const capBound = headroom != null && maxDphTotal === headroom
     const filters = JSON.stringify(settings.offerFilters)
     const lastEmpty = this.capEmpty
@@ -1497,6 +1509,9 @@ export class NodeManager {
           `no matching offers at or under ${money(headroom)}/hr, what the spend cap of ${money(first.spendCap ?? 0)}/hr leaves`
         )
       }
+      if (bound != null && maxDphTotal === bound) {
+        throw new Error(`no matching offers at or under ${money(bound)}/hr`)
+      }
       emit('alert', { level: 'warn', message: 'No matching Vast.ai offers found' })
       throw new Error('no matching offers')
     }
@@ -1520,6 +1535,7 @@ export class NodeManager {
       if (usedMachines.has(offer.machineId) || this.blacklist.has(offer.machineId)) continue
       // Too dear for what is left now; one further down the ranking may fit.
       if (!fitsBudget(budget, offer.dphTotal)) continue
+      if (bound != null && offer.dphTotal > bound) continue
       usedMachines.add(offer.machineId)
       let r: Rental
       try {

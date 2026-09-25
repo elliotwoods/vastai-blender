@@ -184,6 +184,28 @@ describe('1.5 manual requests and the cap', () => {
     expect(rentedPrices()).toEqual([1.95, 0.4])
   })
 
+  // Review of 3715efb: past the cap, the search had no price ceiling but the
+  // offer filter (often none), so a confirmed request could rent the top-
+  // ranked $8/h box. The confirmation can name a bound.
+  it('past the cap, a bound the user confirmed caps the price rented', async () => {
+    w = await setup({ settings: { spendCapPerHour: 2, maxActiveNodes: 4 } })
+    const app = await started()
+    await w.readyNode(app, { dph_total: 2 })
+    w.vast.addOffer({ dph_total: 8, num_gpus: 8, dlperf_per_dphtotal: 900 })
+    w.vast.addOffer({ dph_total: 0.4 })
+
+    await expect(
+      app.nodeManager.requestNode({ overSpendCap: true, maxPerHour: 0.5 })
+    ).resolves.toBeDefined()
+    expect(lastSearchCeiling()).toEqual({ lte: 0.5 })
+    expect(rentedPrices()).toEqual([2, 0.4])
+
+    await expect(
+      app.nodeManager.requestNode({ overSpendCap: true, maxPerHour: 0.5 })
+    ).rejects.toThrow('no matching offers at or under $0.50/hr')
+    expect(w.vast.count('createInstance')).toBe(2)
+  })
+
   it('at the cap it says so before searching', async () => {
     w = await setup({ settings: { spendCapPerHour: 2, maxActiveNodes: 4 } })
     const app = await started()
