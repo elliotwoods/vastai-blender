@@ -104,14 +104,25 @@ export class OctaneLoginNeededError extends Error {
  * (stock Blender renders an Octane scene with another engine, #85). Found
  * before anything is set up: a VNC sign-in on such a node, or a licence
  * taken by a scripted one, would be for nothing.
+ *
+ * Whose fault that is turns on how the node was rented. `octaneImage`: this
+ * session rented it for Octane, so from the docker image set for Octane
+ * nodes, and every node rented from that image will lack it too: the job
+ * cannot render until the setting changes. Otherwise (a node rented for
+ * another engine, or from before a restart) only this node is unfit for
+ * Octane (octaneUnfit), and a node rented from the Octane image may still
+ * render the job.
  */
 export class OctaneBlenderMissingError extends Error {
   override readonly name = 'OctaneBlenderMissingError'
 
-  constructor() {
+  constructor(readonly octaneImage = false) {
     super(
-      `Octane job, but OctaneBlender is not installed on this node (${OCTANE_BLENDER}): ` +
-        'rent Octane nodes from an image that has it (Settings → Docker image for Octane)'
+      octaneImage
+        ? `Octane job, but the docker image set for Octane nodes has no OctaneBlender ` +
+            `(${OCTANE_BLENDER}): set one that has it (Settings → Docker image for Octane)`
+        : `Octane job, but OctaneBlender is not installed on this node (${OCTANE_BLENDER}): ` +
+            'Octane chunks need a node rented from the docker image set for Octane nodes'
     )
   }
 }
@@ -144,6 +155,8 @@ const unlicensedSince = new Map<string, number>()
 const loginWaited = new Set<string>()
 /** Nodes whose needsLogin has been announced, while it lasts. */
 const loginAlerted = new Set<string>()
+/** Nodes the setup found without OctaneBlender, until a later check finds it. */
+const blenderMissing = new Set<string>()
 
 const stateListeners = new Set<(nodeId: string, state: OctaneState) => void>()
 
@@ -211,6 +224,19 @@ export function scriptedSignInFor(rental: OctaneRentalFacts | null): boolean {
 function signInWithheld(rental: OctaneRentalFacts | null): boolean {
   const o = getSettings().octane
   return o?.scriptedSignIn === true && o.secureCloudOnly === true && rental?.secureCloud !== true
+}
+
+/**
+ * Why no Octane chunk should go to this node now, or null: for the
+ * scheduler's dispatch and its idle scale-down, so a node that cannot render
+ * the Octane work queued is let go rather than kept for it. Found by this
+ * session's setups only.
+ */
+export function octaneUnfit(nodeId: string): string | null {
+  if (blenderMissing.has(nodeId)) {
+    return `OctaneBlender is not installed on this node (${OCTANE_BLENDER})`
+  }
+  return null
 }
 
 function storedState(nodeId: string): OctaneState {
@@ -418,7 +444,11 @@ export async function setupOctane(
     }),
     'check OctaneBlender'
   )
-  if (check.code !== 0) throw new OctaneBlenderMissingError()
+  if (check.code !== 0) {
+    blenderMissing.add(nodeId)
+    throw new OctaneBlenderMissingError(rentedAs(nodeId)?.engine === 'octane')
+  }
+  blenderMissing.delete(nodeId)
 
   const install = answered(
     await ssh.exec(`chmod +x ${SCRIPT} && bash ${SCRIPT} install`, {
@@ -565,6 +595,7 @@ export function forgetOctaneNode(nodeId: string): void {
   unlicensedSince.delete(nodeId)
   loginWaited.delete(nodeId)
   loginAlerted.delete(nodeId)
+  blenderMissing.delete(nodeId)
 }
 
 /** Where setup_octane.sh records the OctaneServer it launched ($VASTAI_HOME/state). */

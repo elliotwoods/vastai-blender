@@ -90,24 +90,48 @@ import {
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
 
 /**
- * The docker image to rent `engine`'s nodes with (plan 1.18): Settings'
- * image for the engine, or DOCKER_IMAGE. Octane needs one with OctaneBlender
- * in it, which DOCKER_IMAGE is not. The name goes to Vast's create call as
- * data, never to a shell. One that is not a well-formed image reference (a
- * settings.json edited by hand: sanitizeSettingsPatch refuses one) throws,
- * and nothing is rented: Vast would refuse every create with it, and each
- * refusal blacklists the machine it was for.
+ * Why `engine`'s nodes cannot be rented with the image Settings gives them,
+ * or null when they can (rentalImage). For the scheduler to hold a job for
+ * the user rather than try, and fail, a rental on every tick.
+ *
+ * - One that is not a well-formed image reference (a settings.json edited
+ *   by hand: sanitizeSettingsPatch refuses one): Vast would refuse every
+ *   create with it, and each refusal blacklists the machine it was for.
+ * - None for Octane: DOCKER_IMAGE has no OctaneBlender, so an Octane node
+ *   rented from it would bill through its boot and provisioning, then fail
+ *   its first chunk (plan 1.21: no work, no rent). A node for installing
+ *   OctaneBlender by hand is the Fleet's manual request, with no engine.
  */
-export function rentalImage(settings: SettingsPublic, engine?: EngineId | null): string {
+export function rentalImageProblem(
+  settings: SettingsPublic,
+  engine?: EngineId | null
+): string | null {
   const image = engine ? settings.dockerImageByEngine?.[engine]?.trim() : undefined
-  if (!image) return DOCKER_IMAGE
+  if (!image) {
+    return engine === 'octane'
+      ? 'no docker image is set for Octane nodes, and the built-in one has no OctaneBlender ' +
+          '(Settings → Docker image for Octane)'
+      : null
+  }
   if (!isDockerImage(image)) {
-    throw new Error(
+    return (
       `the docker image set for ${engine} nodes is not an image name ` +
-        `(${JSON.stringify(image.slice(0, 80))}): nothing was rented`
+      `(${JSON.stringify(image.slice(0, 80))})`
     )
   }
-  return image
+  return null
+}
+
+/**
+ * The docker image to rent `engine`'s nodes with (plan 1.18): Settings'
+ * image for the engine, or DOCKER_IMAGE for an engine with none set other
+ * than Octane. The name goes to Vast's create call as data, never to a
+ * shell. Throws, and nothing is rented, for rentalImageProblem's reasons.
+ */
+export function rentalImage(settings: SettingsPublic, engine?: EngineId | null): string {
+  const problem = rentalImageProblem(settings, engine)
+  if (problem) throw new Error(`${problem}: nothing was rented`)
+  return (engine ? settings.dockerImageByEngine?.[engine]?.trim() : undefined) || DOCKER_IMAGE
 }
 
 /** Minimal onstart — real provisioning is pushed over SSH by the app. */

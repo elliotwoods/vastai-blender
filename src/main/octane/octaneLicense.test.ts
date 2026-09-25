@@ -506,6 +506,37 @@ describe('setupOctane: the node and its state (1.18, #85)', () => {
     expect(calls.map((c) => c.opts.label)).toEqual(['check OctaneBlender'])
   })
 
+  it('1.18 (review): no OctaneBlender is the Octane image’s fault only on a node rented from it; any other node is unfit, not the job', async () => {
+    const missing = node((c) => (/^test -x/.test(c) ? { code: 1, stdout: '', stderr: '' } : ok()))
+    const rentals = new Map<string, import('./octaneLicense').OctaneRentalFacts>()
+    octane.setRentalFacts((id) => rentals.get(id) ?? null)
+
+    // Rented for Cycles, or not by this session: the node's, not the job's.
+    for (const rental of [{ engine: 'cycles' as const, secureCloud: false }, null]) {
+      if (rental) rentals.set(NODE, rental)
+      else rentals.delete(NODE)
+      const e = (await octane
+        .setupOctane(missing.ssh, NODE)
+        .catch((err: unknown) => err)) as import('./octaneLicense').OctaneBlenderMissingError
+      expect(e.octaneImage).toBe(false)
+      expect(e.message).toMatch(/not installed on this node .*rented from the docker image set/)
+      expect(octane.octaneUnfit(NODE)).toMatch(/OctaneBlender is not installed on this node/)
+    }
+
+    // Rented for Octane, so from the image set for it: that image lacks it.
+    rentals.set(NODE, { engine: 'octane', secureCloud: false })
+    const e = (await octane
+      .setupOctane(missing.ssh, NODE)
+      .catch((err: unknown) => err)) as import('./octaneLicense').OctaneBlenderMissingError
+    expect(e.octaneImage).toBe(true)
+    expect(e.message).toMatch(/the docker image set for Octane nodes has no OctaneBlender/)
+
+    // Installed by hand since: the node is fit again.
+    const { ssh } = octaneNode({ now: 'licensed' })
+    await expect(octane.setupOctane(ssh, NODE)).resolves.toBe('licensed')
+    expect(octane.octaneUnfit(NODE)).toBeNull()
+  })
+
   it('1.18: a start the script could not make says why, a busy lock included', async () => {
     const busy = node((c) =>
       /start-server/.test(c)

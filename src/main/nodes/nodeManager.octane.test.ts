@@ -209,7 +209,11 @@ describe('1.18: renting for Octane', () => {
   }
 
   function octaneSettings(o: Partial<SettingsPublic>): void {
-    Object.assign(w.settings, { maxActiveNodes: 4, ...o })
+    Object.assign(w.settings, {
+      maxActiveNodes: 4,
+      dockerImageByEngine: { octane: OCTANE_IMAGE },
+      ...o
+    })
   }
 
   it('1.18: each engine rents with its own docker image; one with none set, the built-in', async () => {
@@ -235,6 +239,29 @@ describe('1.18: renting for Octane', () => {
     expect(w.vast.count('searchOffers')).toBe(0)
     expect(w.vast.count('createInstance')).toBe(0)
     expect(w.all('SELECT id FROM nodes')).toEqual([])
+  })
+
+  it('1.18 (review, 1.21): with no image set for Octane nodes, no Octane node is rented from the built-in one, which cannot render it', async () => {
+    const app = await w.boot()
+    const nm = await import('./nodeManager')
+    octaneSettings({ dockerImageByEngine: {} })
+    w.vast.addOffer()
+    const why = nm.rentalImageProblem(w.settings, 'octane')
+    expect(why).toMatch(
+      /^no docker image is set for Octane nodes.*Settings → Docker image for Octane/
+    )
+    await expect(app.nodeManager.requestNodes(1, { engine: 'octane' })).rejects.toThrow(
+      `${why}: nothing was rented`
+    )
+    await expect(app.nodeManager.requestNode({ engine: 'octane' })).rejects.toThrow(why!)
+    expect(w.vast.count('searchOffers')).toBe(0)
+    expect(w.vast.count('createInstance')).toBe(0)
+    // The other engines keep the built-in, and a node with no engine named
+    // (the Fleet's request, to install OctaneBlender by hand) too.
+    expect(nm.rentalImageProblem(w.settings, 'cycles')).toBeNull()
+    expect(nm.rentalImageProblem(w.settings, null)).toBeNull()
+    await app.nodeManager.requestNodes(1, { engine: 'cycles' })
+    expect(images()).toEqual([nm.DOCKER_IMAGE])
   })
 
   it('1.18: with secure cloud only, an Octane rental takes a datacenter host and passes over the rest', async () => {
