@@ -38,6 +38,13 @@ describe.skipIf(process.platform === 'win32')('provision.sh', () => {
   const kills = (calls: string[]): string[] =>
     calls.filter((c) => c.startsWith('pkill') || c.startsWith('tmux kill-session'))
   const inbox = (name: string): string => join(n.vastai, 'jobs', 'inbox', name)
+  const agentProc = (): string => `python3 ${n.vastai}/agent/noderunner.py`
+  /** What a restart kills, in order: the agent (in tmux and out), then every Blender. */
+  const restartKills = (): string[] => [
+    'tmux kill-session -t vr-agent',
+    `pkill -f ${agentProc()}`,
+    `pkill -f ${n.vastai}/blender/`
+  ]
   const status = (): AgentStatus => {
     const r = n.provision(['agent-status'])
     expect(r.code).toBe(0)
@@ -156,10 +163,7 @@ describe.skipIf(process.platform === 'win32')('provision.sh', () => {
     const r = n.provision(['restart-agent'])
     expect(r.code).toBe(0)
     expect(r.stdout).toMatch(/^AGENT_RESTARTED agent code changed$/m)
-    expect(kills(since(mark))).toEqual([
-      'tmux kill-session -t vr-agent',
-      `pkill -f ${n.vastai}/blender/`
-    ])
+    expect(kills(since(mark))).toEqual(restartKills())
     expect(existsSync(inbox('job1-1-10.json'))).toBe(false)
     // The new agent is now the current one.
     expect(n.provision(['restart-agent']).stdout).toMatch(/^AGENT_KEPT$/m)
@@ -199,7 +203,7 @@ describe.skipIf(process.platform === 'win32')('provision.sh', () => {
     const mark = n.calls().length
     const r = n.provision(['restart-agent', '--force'])
     expect(r.stdout).toMatch(/^AGENT_RESTARTED forced$/m)
-    expect(kills(since(mark))).toHaveLength(2)
+    expect(kills(since(mark))).toEqual(restartKills())
     expect(existsSync(inbox('job1-1-10.json'))).toBe(false)
   })
 
@@ -215,10 +219,7 @@ describe.skipIf(process.platform === 'win32')('provision.sh', () => {
     // Its installs are stamped like deps: one apt run for two bases...
     expect(aptUpdates()).toBe(1)
     // ...but the agent, its renders and the inbox always go.
-    expect(kills(since(mark))).toEqual([
-      'tmux kill-session -t vr-agent',
-      `pkill -f ${n.vastai}/blender/`
-    ])
+    expect(kills(since(mark))).toEqual(restartKills())
     expect(existsSync(inbox('job1-1-10.json'))).toBe(false)
     expect(r.stdout).toMatch(/^AGENT_RESTARTED forced$/m)
     expect(r.stdout).toMatch(/base provisioning complete/)
@@ -229,6 +230,53 @@ describe.skipIf(process.platform === 'win32')('provision.sh', () => {
     expect(r.code).toBe(1)
     expect(r.stdout).toMatch(/agent exited at startup/)
     expect(r.stdout).toMatch(/fake crash/)
+    expect(r.stdout).not.toMatch(/AGENT_RESTARTED/)
+  })
+
+  it('1.9: restart-agent stops an agent running outside its tmux session', () => {
+    busyNode()
+    // The tmux socket was lost: no session, but noderunner still runs and
+    // would claim inbox specs beside the new agent.
+    n.endAgentSession()
+    n.setProcs([
+      { pid: 4001, name: 'python3', args: agentProc() },
+      { pid: 4101, name: 'blender', args: `${n.vastai}/blender/5.1.0/blender -b x.blend` }
+    ])
+    const mark = n.calls().length
+    const r = n.provision(['restart-agent'])
+    expect(r.stdout).toMatch(/^AGENT_RESTARTED no agent session$/m)
+    expect(kills(since(mark))).toEqual(restartKills())
+    expect(n.procs()).toEqual([])
+    // Stopped before the new one started.
+    const calls = since(mark)
+    expect(calls.indexOf(`pkill -f ${agentProc()}`)).toBeLessThan(
+      calls.findIndex((c) => c.startsWith('tmux new-session'))
+    )
+  })
+
+  it('1.9: an agent that ignores SIGTERM is killed before the new one starts', () => {
+    busyNode()
+    n.setProcs([{ pid: 4001, name: 'python3', args: agentProc(), ignoresTerm: true }])
+    const mark = n.calls().length
+    const r = n.provision(['restart-agent', '--force'], { env: { AGENT_STOP_WAIT_S: '1' } })
+    expect(r.code, r.stdout + r.stderr).toBe(0)
+    expect(r.stdout).toMatch(/agent did not exit 1s after SIGTERM/)
+    const calls = since(mark)
+    const killed = calls.indexOf(`pkill -KILL -f ${agentProc()}`)
+    expect(killed).toBeGreaterThan(calls.indexOf(`pkill -f ${agentProc()}`))
+    expect(killed).toBeLessThan(calls.findIndex((c) => c.startsWith('tmux new-session')))
+    expect(n.procs()).toEqual([])
+  })
+
+  it('1.9: a beat from before the restart does not vouch for a new agent that never beat', () => {
+    // The old agent's last beat lands after the heartbeat was cleared, and the
+    // new agent hangs at import. Taken for the new agent's, the node would go
+    // 'ready' and bill while every chunk sent to it waited forever.
+    const r = n.provision(['restart-agent'], {
+      env: { FAKE_AGENT: 'stale-beat', AGENT_START_WAIT_S: '1' }
+    })
+    expect(r.code).toBe(1)
+    expect(r.stdout).toMatch(/no heartbeat within 1s/)
     expect(r.stdout).not.toMatch(/AGENT_RESTARTED/)
   })
 

@@ -24,7 +24,8 @@ DEPS_STAMP="$STATE_DIR/deps.sha256"
 # can be newer: the app uploads its tree before every provision, while the
 # agent process keeps running what it loaded.
 AGENT_HASH_FILE="$STATE_DIR/agent.sha256"
-# Touched every 10 s by noderunner.py's heartbeat_loop.
+# Rewritten every 10 s by noderunner.py's heartbeat_loop, with the time it
+# was written (str(time.time())).
 HEARTBEAT="$STATE_DIR/heartbeat"
 # Six missed beats. A false "stale" kills paid renders, while a false "fresh"
 # only leaves a dead agent to the app's liveness checks, so err towards fresh.
@@ -32,6 +33,12 @@ AGENT_STALE_S=60
 # How long a restarted agent has to write its first heartbeat, which main()
 # does before anything else. (Tests shorten it.)
 AGENT_START_WAIT_S="${AGENT_START_WAIT_S:-30}"
+# How long a stopped agent has to exit before it is killed. (Tests shorten it.)
+AGENT_STOP_WAIT_S="${AGENT_STOP_WAIT_S:-10}"
+# The agent process as ps shows it. tmux runs the command below through sh,
+# which starts python3 with this path unquoted; neither the tmux server nor
+# that sh match, since their command lines quote it.
+AGENT_PROC="python3 $VASTAI_HOME/agent/noderunner.py"
 # Where the container's system libraries are, and ensure-optix installs the
 # OptiX ones. (Tests point it at a temp dir.)
 OPTIX_LIBDIR="${OPTIX_LIBDIR:-/usr/lib/x86_64-linux-gnu}"
@@ -100,6 +107,38 @@ heartbeat_age() {
 }
 
 agent_session() { tmux has-session -t vr-agent 2> /dev/null; }
+
+# Whether the heartbeat was written at or after epoch second $1. Its content
+# is the time noderunner wrote it, so a beat from before a restart (the old
+# agent's last, landing late) never vouches for a new agent that never beat.
+heartbeat_since() {
+  local beat=""
+  [ -f "$HEARTBEAT" ] || return 1
+  IFS= read -r beat < "$HEARTBEAT" || true
+  beat="${beat%%.*}"
+  case "$beat" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$beat" -ge "$1" ]
+}
+
+# Stop the agent, and be sure it is gone: tmux's SIGHUP and pkill's SIGTERM
+# both land in their own time. An agent outside the vr-agent session (its
+# tmux socket lost, or started by hand) is stopped too; left running, it
+# would go on claiming inbox specs beside the new one.
+stop_agent() {
+  local waited=0
+  tmux kill-session -t vr-agent 2>/dev/null || true
+  pkill -f "$AGENT_PROC" 2>/dev/null || true
+  while pgrep -f "$AGENT_PROC" > /dev/null 2>&1; do
+    if [ "$waited" -ge $((AGENT_STOP_WAIT_S * 2)) ]; then
+      log "agent did not exit ${AGENT_STOP_WAIT_S}s after SIGTERM — killing it"
+      pkill -KILL -f "$AGENT_PROC" 2>/dev/null || true
+      sleep 0.5
+      return 0
+    fi
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+}
 
 # Every Blender the agent starts, OctaneBlender included, runs a script from
 # $VASTAI_HOME/blender/: the pattern the restart below kills by.
@@ -228,7 +267,7 @@ start_ensure_optix() {
 # its runs on this node exactly when they were killed: a check it made
 # beforehand with agent-status can go stale in between.
 cmd_restart_agent() {
-  local reason waited=0
+  local reason started waited=0
   make_dirs
   if [ "${1:-}" = "--force" ]; then
     reason="forced"
@@ -241,7 +280,7 @@ cmd_restart_agent() {
     fi
   fi
   log "starting agent ($reason)…"
-  tmux kill-session -t vr-agent 2>/dev/null || true
+  stop_agent
   # Kill stray render processes from a previous agent (SIGHUP from the tmux
   # kill does not reliably reach detached blender children) — a zombie
   # blender writing into a chunk dir alongside the fresh agent's own render
@@ -261,14 +300,16 @@ cmd_restart_agent() {
   # producing frames the app never collects (observed: 44 specs queued on a
   # 12-slot node, slots burned on invisible duplicate work).
   rm -f "$VASTAI_HOME"/jobs/inbox/*.json
-  # The old agent's last beat must not vouch for the new one.
+  # The old agent's last beat must not vouch for the new one: it is removed,
+  # and a beat only counts if it was written after the launch.
   rm -f "$HEARTBEAT"
   content_hash list_agent > "$AGENT_HASH_FILE.tmp" && mv -f "$AGENT_HASH_FILE.tmp" "$AGENT_HASH_FILE"
+  started="$(date +%s)"
   tmux new-session -d -s vr-agent "python3 '$VASTAI_HOME/agent/noderunner.py' >> '$VASTAI_HOME/logs/agent.log' 2>&1"
   # An agent that cannot start must fail provisioning here. Otherwise the node
   # goes 'ready', bills, and every chunk sent to it waits on a state file
   # nothing will ever write.
-  while [ ! -f "$HEARTBEAT" ]; do
+  while ! heartbeat_since "$started"; do
     if ! agent_session; then
       log "agent exited at startup; logs/agent.log ends:"
       tail -5 "$VASTAI_HOME/logs/agent.log" 2>/dev/null || true

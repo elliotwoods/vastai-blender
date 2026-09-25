@@ -10,11 +10,16 @@
  * The stubs and what they model:
  *   tmux        one session, `vr-agent`, kept as a marker file. new-session
  *               starts a fake agent as FAKE_AGENT says: `beat` (default) writes
- *               state/heartbeat as noderunner.py's heartbeat_loop does at once,
- *               `crash` dies at startup (no session, a traceback in agent.log),
- *               `silent` keeps the session but never beats.
+ *               state/heartbeat as noderunner.py's heartbeat_loop does at once
+ *               (the time, str(time.time()), no newline), `crash` dies at
+ *               startup (no session, a traceback in agent.log), `silent` keeps
+ *               the session but never beats, and `stale-beat` is silent while
+ *               a beat stamped 30 s before the launch lands, as the old
+ *               agent's last one would.
  *   pgrep       answers from a fake process table (`setProcs`), never the real one
- *   pkill       recorded only: nothing on this machine is ever signalled by name
+ *   pkill       takes what it matched out of that table, except an entry that
+ *               ignores SIGTERM when not sent -KILL. Nothing on this machine is
+ *               ever signalled by name.
  *   apt-get     recorded; `install` marks the Octane packages installed
  *   dpkg-query  reports those packages installed once apt-get installed them
  *   curl        fails, as a node with no network would
@@ -85,14 +90,26 @@ exec /usr/bin/perl -MFcntl=:flock -MTime::HiRes=sleep,time -e '
     sleep 0.05;
   }
 ' -- "$@"`,
+  // procs: one "pid<TAB>name<TAB>args<TAB>flags" per line. -f matches args
+  // as a fixed string (the scripts only ever pass paths), -x matches the name
+  // exactly.
   pkill: `${RECORD}
-exit 0`,
-  // procs: one "pid<TAB>name<TAB>args" per line. -f matches args as a fixed
-  // string (the scripts only ever pass paths), -x matches the name exactly.
+sig=TERM; [ "$1" = -KILL ] && { sig=KILL; shift; }
+[ "$1" = -f ] || exit 2
+pat="$2"; found=1
+[ -f "$STUB_REC/procs" ] || exit 1
+: > "$STUB_REC/procs.left"
+while IFS=$'\\t' read -r pid name args flags; do
+  keep=1
+  case "$args" in *"$pat"*) found=0; [ "$sig" = TERM ] && [ "$flags" = ignores-term ] || keep=0 ;; esac
+  [ "$keep" = 1 ] && printf '%s\\t%s\\t%s\\t%s\\n' "$pid" "$name" "$args" "$flags" >> "$STUB_REC/procs.left"
+done < "$STUB_REC/procs"
+mv -f "$STUB_REC/procs.left" "$STUB_REC/procs"
+exit $found`,
   pgrep: `${RECORD}
 mode="$1"; pat="$2"; found=1
 [ -f "$STUB_REC/procs" ] || exit 1
-while IFS=$'\\t' read -r pid name args; do
+while IFS=$'\\t' read -r pid name args flags; do
   case "$mode" in
     -f) case "$args" in *"$pat"*) echo "$pid"; found=0 ;; esac ;;
     -x) [ "$name" = "$pat" ] && { echo "$pid"; found=0; } ;;
@@ -105,9 +122,10 @@ case "$1" in
   kill-session) rm -f "$STUB_REC/tmux-session" ;;
   new-session)
     case "\${FAKE_AGENT:-beat}" in
-      beat) touch "$STUB_REC/tmux-session"; mkdir -p "$VASTAI_HOME/state"; touch "$VASTAI_HOME/state/heartbeat" ;;
+      beat) touch "$STUB_REC/tmux-session"; mkdir -p "$VASTAI_HOME/state"; printf '%s.25' "$(date +%s)" > "$VASTAI_HOME/state/heartbeat" ;;
       crash) echo "Traceback (most recent call last): fake crash" >> "$VASTAI_HOME/logs/agent.log" ;;
       silent) touch "$STUB_REC/tmux-session" ;;
+      stale-beat) touch "$STUB_REC/tmux-session"; printf '%s.9' "$(( $(date +%s) - 30 ))" > "$VASTAI_HOME/state/heartbeat" ;;
     esac ;;
 esac`,
   vncpasswd: `${RECORD}
@@ -169,7 +187,9 @@ export interface RemoteNode {
   /** The agent's tmux session ends, as it does when noderunner.py exits. */
   endAgentSession(): void
   /** The fake process table pgrep answers from. */
-  setProcs(procs: Array<{ pid: number; name: string; args: string }>): void
+  setProcs(procs: Array<{ pid: number; name: string; args: string; ignoresTerm?: boolean }>): void
+  /** The fake process table as it now stands: what pkill left. */
+  procs(): Array<{ pid: number; name: string; args: string }>
   /** Each OctaneServer launch the stub saw, in order. */
   octaneLaunches(): OctaneLaunch[]
   /** As provision() and octane(), without waiting: for runs that overlap. */
@@ -372,8 +392,20 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
     setProcs: (procs) =>
       writeFileSync(
         join(rec, 'procs'),
-        procs.map((p) => `${p.pid}\t${p.name}\t${p.args}\n`).join('')
+        procs
+          .map((p) => `${p.pid}\t${p.name}\t${p.args}\t${p.ignoresTerm ? 'ignores-term' : ''}\n`)
+          .join('')
       ),
+    procs: () =>
+      existsSync(join(rec, 'procs'))
+        ? readFileSync(join(rec, 'procs'), 'utf8')
+            .split('\n')
+            .filter(Boolean)
+            .map((l) => {
+              const [pid, name, args] = l.split('\t')
+              return { pid: Number(pid), name, args }
+            })
+        : [],
     octaneLaunches: () => {
       const out: OctaneLaunch[] = []
       for (let n = 0; existsSync(join(rec, `octane-argv.${n}`)); n++) {
