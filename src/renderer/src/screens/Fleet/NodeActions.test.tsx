@@ -37,6 +37,16 @@ describe('ReprovisionButton', () => {
     expect(html).not.toContain('disabled=""')
   })
 
+  it('says what the requeue costs: a machine failure for each chunk, not a render retry', () => {
+    // scheduler.forgetNode charges each requeued chunk an infrastructure
+    // retry; the button used to let the user think it cost nothing, and a
+    // chunk already out of those fails for good when it is pressed.
+    const html = renderToStaticMarkup(
+      <ReprovisionButton node={{ state: 'rendering', sshHost: '1.2.3.4' }} onReprovision={noop} />
+    )
+    expect(html).toMatch(/title="[^"]*allowance for machine failures, not its render retries/)
+  })
+
   it('is disabled on a node main would refuse', () => {
     for (const node of [
       { state: 'provisioning' as const, sshHost: '1.2.3.4' },

@@ -49,7 +49,8 @@ export function ReprovisionButton({
       title={
         canReprovision(node)
           ? "Ship the scripts again and restart the node's agent. Every render on it is " +
-            'stopped and goes back to the queue.'
+            "stopped and goes back to the queue, counted against its chunk's allowance for " +
+            'machine failures, not its render retries.'
           : 'Only a node that is up can be reprovisioned'
       }
       onConfirm={onReprovision}
