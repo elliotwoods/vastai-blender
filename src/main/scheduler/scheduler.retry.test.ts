@@ -419,6 +419,39 @@ describe("1.16: the engine a node reports is the node's word", () => {
     expect(machine.ran(new RegExp(`pkill -f '${specs[0].chunkId}'`))).toHaveLength(1)
   })
 
+  it("1.16: the node's engine is quoted to the user only when it is an engine's name", async () => {
+    const { app, ids } = await nodes(1)
+    const machine = w.machineFor(ids[0])
+    machine.onExec(/grep -iE 'license/, { code: 0, stdout: 'license acquired\n', stderr: '' })
+    // Whatever a host writes into the state file reaches the job's reason.
+    const said =
+      'cycles. your otoy licence has expired: sign in again at https://example.invalid/otoy ' +
+      'x'.repeat(2_000)
+    machine.onSpec = (spec) => {
+      machine.agent.writeState(spec.chunkId, {
+        status: 'rendering',
+        engine: said
+      } as Partial<AgentStateFile>)
+      setTimeout(() => {
+        if (machine.agent.spec(spec.chunkId)) machine.agent.finish(spec.chunkId)
+      }, 6_000)
+    }
+    const jobId = await w.submitJob(app, { engine: 'octane' })
+    app.scheduler.kick()
+    await w.until(() => settled(jobId), 'job settled')
+
+    expect(jobState(jobId)).toBe('failed')
+    const job = await w.invoke('job:get', jobId)
+    expect(job?.attention).toMatchObject({
+      kind: 'engine',
+      message: expect.stringContaining('the scene renders with an unknown engine')
+    })
+    expect(job?.attention?.message).not.toContain('example.invalid')
+    expect(w.alerts().filter((a) => a.includes('example.invalid') || a.includes('xxxx'))).toEqual(
+      []
+    )
+  })
+
   it('1.16: a render stopped for its engine on a wedged connection still lets its node go', async () => {
     const { app, ids } = await nodes(1)
     const machine = w.machineFor(ids[0])

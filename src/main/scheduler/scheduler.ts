@@ -291,6 +291,16 @@ class JobCannotRun extends Error {
 const STOCK_ENGINES: ReadonlySet<string> = new Set<EngineId>(['cycles', 'eevee'])
 
 /**
+ * A node's engine report as the user may read it. The agent writes
+ * scene.render.engine lower-cased (noderunner ENGINE_NAMES), but the state
+ * file is the host's to write, and the engine went unclipped into the job's
+ * reason and its alert: any length, any words, "sign in again at …".
+ */
+function engineName(engine: string): string {
+  return /^[a-z0-9_]{1,32}$/.test(engine) ? engine : 'an unknown engine'
+}
+
+/**
  * What a failed agent state means for the retry policy. classify() reads
  * errorKind 'scene' and the exit code; the agent's errorKind 'job' and
  * 'machine' are read here too, because a job no node can run is not a crash
@@ -482,7 +492,7 @@ class ChunkRun {
         engine === 'octane'
           ? `the scene renders with Octane, but the job was submitted as ${asked}, ` +
             'which stock Blender renders with another engine: submit it again as an Octane job'
-          : `the job was submitted as Octane, but the scene renders with ${engine}: ` +
+          : `the job was submitted as Octane, but the scene renders with ${engineName(engine)}: ` +
             'submit it again with the engine the scene uses'
       return {
         c: own('job', 'engine-mismatch', message),
