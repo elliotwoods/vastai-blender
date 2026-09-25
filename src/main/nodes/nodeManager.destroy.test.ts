@@ -179,6 +179,23 @@ describe('1.2 ensureInstanceGone: a destroy is done when Vast confirms it', () =
     expect(app.nodeManager.activeCount()).toBe(0)
   })
 
+  it('a DELETE answered 410 is the instance gone too, as vastClient reads it (n2 review)', async () => {
+    const app = await bootNodes()
+    app.nodeManager.init()
+    const id = await w.readyNode(app)
+    // Vast destroys it and answers 410 Gone. Read as a refusal, it was
+    // 'failed', alerted, and retried every minute for an instance that was
+    // no more.
+    w.vast.loseReply('destroyInstance', { status: 410, message: 'gone' })
+
+    await app.nodeManager.destroyNode(id)
+
+    expect(row(id).state).toBe('destroyed')
+    expect(row(id).destroyed_at).not.toBeNull()
+    expect(w.vast.live()).toEqual([])
+    expect(w.alerts('error')).toEqual([])
+  })
+
   it('a DELETE Vast accepts while it still lists the instance is not a destroy (#140)', async () => {
     const app = await bootNodes()
     app.nodeManager.init()

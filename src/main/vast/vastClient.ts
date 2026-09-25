@@ -114,6 +114,40 @@ function scrub(text: string, key: string): string {
   return text.split(key).join('[redacted]')
 }
 
+/**
+ * What fetch threw, as a VastError's cause may keep it: each error of the
+ * chain copied with its name, errno fields and a scrubbed message. classify
+ * reads the errno; the original kept the URL, api_key and all, for any
+ * util.inspect or unhandled-rejection log of the cause chain to print (n2
+ * review). Four deep, as fetchFailure reads it.
+ */
+function scrubbedCause(e: unknown, key: string, depth = 0): unknown {
+  if (typeof e !== 'object' || e === null || depth >= 4) {
+    return typeof e === 'string' ? scrub(e, key) : e
+  }
+  const src = e as Record<string, unknown>
+  const message = typeof src.message === 'string' ? scrub(src.message, key) : ''
+  const cause = src.cause === undefined ? undefined : scrubbedCause(src.cause, key, depth + 1)
+  const copy = new Error(message, cause === undefined ? undefined : { cause })
+  if (typeof src.name === 'string') copy.name = src.name
+  for (const field of ['code', 'errno', 'syscall']) {
+    const v = src[field]
+    if (typeof v === 'string' || typeof v === 'number') {
+      ;(copy as unknown as Record<string, unknown>)[field] = v
+    }
+  }
+  copy.stack = `${copy.name}: ${message}`
+  return copy
+}
+
+/**
+ * The least a 429 is waited out when Vast sends no Retry-After, which its
+ * docs say it never does: the minimum interval its rate limit sets for a
+ * DELETE (a 429 reads "threshold=3.0"). The first backoff, 1.5 to 2.5 s,
+ * came inside it, so a rate-limited DELETE's first retry was refused again.
+ */
+export const RATE_LIMIT_FLOOR_MS = 3_000
+
 function isTimeout(e: unknown): boolean {
   return typeof e === 'object' && e !== null && (e as { name?: unknown }).name === 'TimeoutError'
 }
@@ -176,13 +210,14 @@ async function send<T>(
     text = await res.text()
   } catch (e) {
     const error = new VastError(`network error: ${scrub(fetchFailure(e), key)}`, undefined, {
-      cause: e
+      cause: scrubbedCause(e, key)
     })
     return { ok: false, error, retryAfterMs: null }
   }
   if (!res.ok) {
     const error = new VastError(
-      `vast.ai ${method} ${path} → ${res.status}: ${scrub(text.slice(0, 300), key)}`,
+      // Scrubbed before it is cut: a key across the cut kept its first part.
+      `vast.ai ${method} ${path} → ${res.status}: ${scrub(text, key).slice(0, 300)}`,
       res.status
     )
     return { ok: false, error, retryAfterMs: retryAfterMs(res) }
@@ -191,7 +226,7 @@ async function send<T>(
     return { ok: true, value: JSON.parse(text) as T }
   } catch {
     const error = new VastError(
-      `vast.ai ${method} ${path}: non-JSON response: ${scrub(text.slice(0, 300), key)}`
+      `vast.ai ${method} ${path}: non-JSON response: ${scrub(text, key).slice(0, 300)}`
     )
     return { ok: false, error, retryAfterMs: null }
   }
@@ -225,7 +260,8 @@ async function request<T>(
     // what says nothing about the request itself is asked again.
     if (!opts.idempotent || (kind !== 'unknown' && kind !== 'transient')) throw r.error
     const jittered = delay * (0.75 + Math.random() * 0.5)
-    const wait = Math.max(jittered, r.retryAfterMs ?? 0)
+    const floor = r.error.status === 429 ? RATE_LIMIT_FLOOR_MS : 0
+    const wait = Math.max(jittered, r.retryAfterMs ?? floor)
     if (Date.now() - start + wait > RETRY_BUDGET_MS) throw r.error
     await new Promise((resolve) => setTimeout(resolve, wait))
     delay = Math.min(delay * 2, RETRY_MAX_DELAY_MS)

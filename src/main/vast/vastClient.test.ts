@@ -1,3 +1,4 @@
+import { inspect } from 'util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 // Plan 1.6: the Vast client itself, against a scripted fetch. The lifecycle
@@ -133,6 +134,17 @@ describe('every request (plan 1.6)', () => {
     expect(calls[1].at - calls[0].at).toBe(9_000)
   })
 
+  it('a 429 with no Retry-After waits out the 3 s Vast sets between DELETEs', async () => {
+    // The first backoff, 1.5 to 2.5 s, came inside it: a rate-limited
+    // DELETE's first retry was refused again (n2 review).
+    replies.push(
+      { status: 429, body: 'API requests too frequent endpoint threshold=3.0' },
+      json(200, { success: true })
+    )
+    await run(destroyInstance(7))
+    expect(calls[1].at - calls[0].at).toBeGreaterThanOrEqual(3_000)
+  })
+
   it('a name that does not resolve is asked again: the network may be coming up', async () => {
     replies.push(noDns(), json(200, { instances: [] }))
     await expect(run(listInstances())).resolves.toEqual({ value: [] })
@@ -202,6 +214,28 @@ describe('every request (plan 1.6)', () => {
       expect(String(e)).not.toContain(KEY.slice(0, 16))
     }
     expect(fromFetch.message).toContain('api_key=[redacted]')
+  })
+
+  it('nor does its cause chain, nor a key a reply echoes across the cut (n2 review)', async () => {
+    // fetch's own error, kept as the cause so classify can read its errno,
+    // held the URL whole: util.inspect, or Electron's log of a rejected IPC
+    // handler, printed it. And a key cut in two by the 300-character slice
+    // kept its first part through the scrub.
+    replies.push(
+      new TypeError('fetch failed', {
+        cause: Object.assign(
+          new Error(`connect ECONNRESET https://console.vast.ai/api/v0/asks/1/?api_key=${KEY}`),
+          { code: 'ECONNRESET', syscall: 'connect' }
+        )
+      })
+    )
+    const dropped = failure(await run(createInstance(createOpts)))
+    expect(inspect(dropped, { depth: 10 })).not.toContain(KEY.slice(0, 16))
+    expect((dropped.cause as { cause?: { code?: string } }).cause?.code).toBe('ECONNRESET')
+
+    replies.push({ status: 400, body: `${'x'.repeat(290)}${KEY}` })
+    const echoed = failure(await run(createInstance(createOpts)))
+    expect(echoed.message).not.toContain(KEY.slice(0, 8))
   })
 })
 

@@ -26,6 +26,8 @@ export interface ClientRetry {
   RETRY_FIRST_DELAY_MS: number
   RETRY_MAX_DELAY_MS: number
   RETRY_BUDGET_MS: number
+  /** The least a 429 with no Retry-After is waited out (vastClient's RATE_LIMIT_FLOOR_MS). */
+  RATE_LIMIT_FLOOR_MS?: number
 }
 
 export interface RateLimit {
@@ -59,7 +61,8 @@ export function rateLimitDestroys(
         return send(id)
       }
       stats.refused++
-      if (Date.now() - start + delay > client.RETRY_BUDGET_MS) {
+      const wait = Math.max(delay, client.RATE_LIMIT_FLOOR_MS ?? 0)
+      if (Date.now() - start + wait > client.RETRY_BUDGET_MS) {
         stats.gaveUp++
         throw vastError(
           `vast.ai DELETE /instances/${id}/ → 429: {"error":"rate_limit_exceeded",` +
@@ -67,7 +70,7 @@ export function rateLimitDestroys(
           429
         )
       }
-      await new Promise((r) => setTimeout(r, delay))
+      await new Promise((r) => setTimeout(r, wait))
       delay = Math.min(delay * 2, client.RETRY_MAX_DELAY_MS)
     }
   }

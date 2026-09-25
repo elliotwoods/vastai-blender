@@ -36,7 +36,6 @@ import {
   listInstances,
   sshEndpoints,
   showInstance,
-  VastError,
   vastErrorKind
 } from '../vast/vastClient'
 import type {
@@ -3152,7 +3151,10 @@ export class NodeManager {
           try {
             await destroyInstance(instanceId)
           } catch (e) {
-            if (e instanceof VastError && e.status === 404) return
+            // Gone already: 404, or 410 (vastClient's notFound). A 410 read
+            // as a refusal was retried every minute with alerts, for an
+            // instance that no longer existed (n2 review).
+            if (vastErrorKind(e) === 'notFound') return
             last = e
             throw e
           }
