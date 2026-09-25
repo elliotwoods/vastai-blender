@@ -26,7 +26,12 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import type { OverlayFields, SettingsOverlay } from '../settingsOverlay'
 import { sessionOverlay } from '../settingsOverlay'
-import { SpecSettingsRefused, runJobSpec, type HeadlessResume } from './jobSpec'
+import {
+  SpecSettingsRefused,
+  runJobSpecFile,
+  trackCampaignSettings,
+  type HeadlessResume
+} from './jobSpec'
 
 /** What a VR_JOB_SPEC launch refused by the lock passes to the running app. */
 export interface HandoffRequest {
@@ -91,7 +96,7 @@ export async function acceptHandoff(
   let refused: string | undefined
   console.log(`[handoff] spec ${req.jobSpec} (request ${req.requestId}, from ${req.cwd})`)
   try {
-    await runJobSpec(req.jobSpec, {
+    await runJobSpecFile(req.jobSpec, {
       kick: deps.kick,
       unsubmitted,
       resume: deps.resume,
@@ -116,7 +121,12 @@ export async function acceptHandoff(
     settings: applied
   }
   writeResult(handoffResultPath(deps.userData, req.requestId), result)
-  if (Object.keys(applied).length > 0) releaseWhenDone(campaign, applied, overlay, deps)
+  trackCampaignSettings(campaign, applied, {
+    openJobs: (ids) => deps.openJobs(ids),
+    overlay,
+    pollMs: deps.pollMs,
+    tag: '[handoff]'
+  })
   return result
 }
 
@@ -126,28 +136,6 @@ function writeResult(path: string, result: HandoffResult): void {
   const tmp = `${path}.tmp`
   writeFileSync(tmp, JSON.stringify(result, null, 1))
   renameSync(tmp, path)
-}
-
-/** The campaign's settings were the app's for its sake only: give them back when it is done. */
-function releaseWhenDone(
-  campaign: readonly string[],
-  applied: OverlayFields,
-  overlay: SettingsOverlay,
-  deps: HandoffDeps
-): void {
-  const timer = setInterval(() => {
-    let open: number
-    try {
-      open = deps.openJobs(campaign)
-    } catch {
-      return
-    }
-    if (open > 0) return
-    clearInterval(timer)
-    const released = overlay.release(applied)
-    console.log(`[handoff] campaign done; its settings released: ${released.join(', ') || 'none'}`)
-  }, deps.pollMs ?? 30_000)
-  timer.unref?.()
 }
 
 /**

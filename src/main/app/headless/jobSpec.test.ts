@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SettingsPublic } from '../../../shared/models'
 import { SettingsOverlay } from '../settingsOverlay'
-import { SpecSettingsRefused, applySpecSettings, specSettingsPatch } from './jobSpec'
+import {
+  SpecSettingsRefused,
+  applySpecSettings,
+  inlineSpecProblems,
+  specSettingsPatch
+} from './jobSpec'
 
 // Plan 1.14: a VR_JOB_SPEC campaign's settings are its session's alone,
 // through the same sanitizer as the Settings screen's. Field: two sessions
@@ -175,5 +180,37 @@ describe('applySpecSettings (plan 1.14)', () => {
     const o = new SettingsOverlay()
     expect(applySpecSettings({ blends: ['/a.blend'] }, withOverlay(o), o)).toEqual({})
     expect(o.isEmpty()).toBe(true)
+  })
+})
+
+describe('inlineSpecProblems: a spec sent over main/api (B6)', () => {
+  it('takes full local paths, a name and a dedupe', () => {
+    expect(
+      inlineSpecProblems(
+        {
+          blends: ['/scenes/a.blend', { path: '/scenes/b.blend', name: 'B' }],
+          addonZips: ['/addons/x.zip'],
+          name: 'hero',
+          dedupe: 'never'
+        },
+        'posix'
+      )
+    ).toEqual([])
+    expect(inlineSpecProblems({ blendDir: 'C:\\scenes' }, 'win32')).toEqual([])
+  })
+
+  it.each([
+    [{ blends: ['scenes/a.blend'] }, /blends\[0\] must be a full path/],
+    [{ blends: ['//server/share/a.blend'] }, /blends\[0\] must be on this computer/],
+    [{ blends: [{ path: '\\\\server\\a.blend' }] }, /blends\[0\]\.path must be on this computer/],
+    [{ blends: ['/a/../b.blend'] }, /'\.\.'/],
+    [{ blendDir: 'relative' }, /blendDir must be a full path/],
+    [{ blends: ['/a.blend'], addonZips: ['x.zip'] }, /addonZips\[0\]/],
+    [{ blends: [] }, /needs "blends"/],
+    [{ blends: [7] }, /blends\[0\] must be a path/],
+    [{ blends: ['/a.blend'], name: 5 }, /name must be a non-empty string/],
+    [{ blends: ['/a.blend'], dedupe: 'always' }, /dedupe must be one of/]
+  ])('refuses %j', (spec, why) => {
+    expect(inlineSpecProblems(spec, 'posix').join('; ')).toMatch(why)
   })
 })

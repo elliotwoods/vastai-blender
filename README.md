@@ -340,7 +340,9 @@ at boot:
   "maxNodeSlots": 0, // 0/omitted = the app decides concurrency per node
   "slotsPerGpu": 1,  // renders per GPU on a node (0 = one process on all GPUs)
   "spendCapPerHour": 2,
-  "offerFilters": { "cpuBound": true, "minNumGpus": 4 }
+  "offerFilters": { "cpuBound": true, "minNumGpus": 4 },
+  "name": "hero pass", // names the job, or leads each job's name; a blend's own "name" wins
+  "dedupe": "campaign" // or "never": submit every blend as a new job
 }
 ```
 

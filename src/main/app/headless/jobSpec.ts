@@ -14,8 +14,15 @@
  *     "maxNodeSlots": 0,      // 0 = let the app judge concurrency per node
  *     "slotsPerGpu": 1,       // renders per GPU on a node (0 = one process, all GPUs)
  *     "eagerFleet": true,     // buy ahead: rent to maxActiveNodes while any chunk is open
- *     "offerFilters": { "minNumGpus": 4 }  // partial override of the stored filters
+ *     "offerFilters": { "minNumGpus": 4 },  // partial override of the stored filters
+ *     "name": "hero pass",    // names the job (one blend) or leads each job's name;
+ *                             // a blend entry's own "name" wins
+ *     "dedupe": "campaign"    // or "never": every blend a new job (see SpecDedupe)
  *   }
+ *
+ * runJobSpecFile reads a spec from a file (VR_JOB_SPEC, a hand-off);
+ * runJobSpec takes one already parsed (main/api's POST /v1/jobs, which checks
+ * it with inlineSpecProblems first).
  *
  * The spec's settings are this run's alone (plan 1.14). They used to go
  * through updateSettings, which saved them: two sessions of spec runs left
@@ -34,9 +41,9 @@
  * A value clamped to its limit is in force at the limit, said on stderr.
  */
 
-import { join, resolve } from 'path'
-import type { SettingsFieldError, SettingsPublic } from '../../../shared/models'
-import { sanitizeSettingsPatch } from '../../../shared/settingsSanitize'
+import { basename, join, resolve } from 'path'
+import type { EngineId, SettingsFieldError, SettingsPublic } from '../../../shared/models'
+import { localPathProblem, sanitizeSettingsPatch } from '../../../shared/settingsSanitize'
 import { hostPathFlavour } from '../../paths'
 import { acceptedFields } from '../settingsGate'
 import { sessionOverlay, type OverlayFields, type SettingsOverlay } from '../settingsOverlay'
@@ -81,6 +88,8 @@ export interface JobSpecDeps {
   openWork?: () => number
   /** Filled with the fields this spec put in the overlay, for the caller to release later. */
   applied?: OverlayFields
+  /** What the spec is called in messages: its file's path (runJobSpecFile), else "spec". */
+  source?: string
 }
 
 /** What a headless campaign may lift (JobSpecDeps.resume). */
@@ -255,22 +264,127 @@ function describeOutcome(e: SettingsFieldError): string {
   return `${e.outcome === 'clamped' ? 'clamped' : 'refused'}: ${e.message}`
 }
 
+/** A campaign spec, parsed: the shape in the header, typed on paper only. */
+export type JobSpec = Record<string, unknown>
+
 /**
- * Submit the campaign at `specPath`. Throws when the spec cannot be read or
- * parsed, and SpecSettingsRefused when its settings cannot all be put in
- * force, in each case before anything is submitted or kicked. Each blend
- * createJob refuses is collected in `deps.unsubmitted` instead, so one bad
- * blend does not cost the rest of the campaign.
+ * What to do with a blend a job on the profile already renders:
+ *   campaign  (the default, as it always was) skip a blend whose job with the
+ *             same frame range is complete, and heal an open one (its missing
+ *             frames queued again) rather than submit it twice
+ *   never     submit every blend as a new job
  */
-export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<void> {
+export type SpecDedupe = 'campaign' | 'never'
+
+const DEDUPE: readonly SpecDedupe[] = ['campaign', 'never']
+
+/** Longest job name a spec may give. */
+const NAME_MAX = 200
+const CONTROL = /[\u0000-\u001f\u007f]/ // eslint-disable-line no-control-regex
+
+function nameProblem(what: string, v: unknown): string | null {
+  if (v === undefined) return null
+  if (typeof v !== 'string' || v.trim() === '') return `${what} must be a non-empty string`
+  if (v.length > NAME_MAX) return `${what} must be at most ${NAME_MAX} characters`
+  if (CONTROL.test(v)) return `${what} must not contain control characters`
+  return null
+}
+
+/**
+ * Problems with the fields of a spec runJobSpec reads beyond its settings
+ * and what createJob checks: `name` (top level and per blend), `dedupe` and
+ * the shape of `blends`. Empty = ok.
+ */
+export function specFieldProblems(spec: JobSpec): string[] {
+  const problems: string[] = []
+  const top = nameProblem('name', spec.name)
+  if (top) problems.push(top)
+  if (spec.dedupe !== undefined && !DEDUPE.includes(spec.dedupe as SpecDedupe)) {
+    problems.push(`dedupe must be one of ${DEDUPE.join(', ')} (got ${JSON.stringify(spec.dedupe)})`)
+  }
+  if (spec.blends !== undefined && !Array.isArray(spec.blends)) {
+    problems.push('blends must be a list')
+  } else {
+    ;((spec.blends as unknown[] | undefined) ?? []).forEach((b, i) => {
+      if (typeof b === 'string') return
+      if (typeof b !== 'object' || b === null || Array.isArray(b)) {
+        problems.push(`blends[${i}] must be a path or {"path": ...}`)
+        return
+      }
+      const p = nameProblem(`blends[${i}].name`, (b as Record<string, unknown>).name)
+      if (p) problems.push(p)
+    })
+  }
+  return problems
+}
+
+/**
+ * A spec that came over the wire (main/api's POST /v1/jobs), not from a file
+ * on this computer: every path in it (each blend, blendDir, each addon zip)
+ * must be a full local path, as a job's scene must be (validateSubmission).
+ * There is no directory it was started in to take a relative one from, and a
+ * network path (\\server\share) is refused here as it is wherever a path may
+ * later be revealed in the file manager. Also specFieldProblems. Empty = ok.
+ */
+export function inlineSpecProblems(spec: JobSpec, flavour = hostPathFlavour()): string[] {
+  const problems = specFieldProblems(spec)
+  const pathProblem = (what: string, p: unknown): void => {
+    const why = localPathProblem(p, flavour)
+    if (why) problems.push(`${what} ${why}`)
+  }
+  if (Array.isArray(spec.blends)) {
+    spec.blends.forEach((b: unknown, i: number) => {
+      if (typeof b === 'string') pathProblem(`blends[${i}]`, b)
+      else if (typeof b === 'object' && b !== null) {
+        pathProblem(`blends[${i}].path`, (b as Record<string, unknown>).path)
+      }
+    })
+  }
+  if (spec.blendDir !== undefined) pathProblem('blendDir', spec.blendDir)
+  const hasBlends = Array.isArray(spec.blends) && spec.blends.length > 0
+  if (!hasBlends && spec.blendDir === undefined) {
+    problems.push('a spec needs "blends" (a list of .blend paths) or "blendDir"')
+  }
+  if (spec.addonZips !== undefined) {
+    if (!Array.isArray(spec.addonZips)) problems.push('addonZips must be a list')
+    else spec.addonZips.forEach((z: unknown, i: number) => pathProblem(`addonZips[${i}]`, z))
+  }
+  return problems
+}
+
+/**
+ * Submit the campaign in the spec file at `specPath`: runJobSpec on what it
+ * parses to. Throws when it cannot be read or parsed, before anything is
+ * submitted.
+ */
+export async function runJobSpecFile(specPath: string, deps: JobSpecDeps): Promise<void> {
+  const { readFileSync } = await import('fs')
+  const spec = JSON.parse(readFileSync(specPath, 'utf-8')) as unknown
+  if (typeof spec !== 'object' || spec === null || Array.isArray(spec)) {
+    throw new Error(`${specPath}: a spec must be a JSON object`)
+  }
+  await runJobSpec(spec as JobSpec, { source: specPath, ...deps })
+}
+
+/**
+ * Submit a campaign. Throws when the spec's own fields are wrong
+ * (specFieldProblems), and SpecSettingsRefused when its settings cannot all
+ * be put in force, in each case before anything is submitted or kicked.
+ * Each blend createJob refuses is collected in `deps.unsubmitted` instead, so
+ * one bad blend does not cost the rest of the campaign.
+ */
+export async function runJobSpec(spec: JobSpec, deps: JobSpecDeps): Promise<void> {
   const campaign = deps.campaign ?? []
-  const { readFileSync, readdirSync } = await import('fs')
+  const source = deps.source ?? 'spec'
+  const { readdirSync } = await import('fs')
   const { createJob, listJobs } = await import('../../jobs/jobs')
   const { reviveFailedChunks } = await import('../../jobs/revive')
   const { registerAddon } = await import('../../addons/addons')
   const { getSettings } = await import('../../settings')
 
-  const spec = JSON.parse(readFileSync(specPath, 'utf-8'))
+  const problems = specFieldProblems(spec)
+  if (problems.length) throw new Error(`${source}: ${problems.join('; ')}`)
+  const dedupe: SpecDedupe = (spec.dedupe as SpecDedupe | undefined) ?? 'campaign'
 
   const base = deps.cwd ?? process.cwd()
   const applied =
@@ -283,7 +397,7 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
   // file, so re-running after an extension rebuild replaces the stale entry even
   // when the version string is unchanged.
   const addonIds: string[] = []
-  for (const zip of spec.addonZips ?? []) {
+  for (const zip of (spec.addonZips as string[] | undefined) ?? []) {
     const info = registerAddon(resolve(base, zip))
     addonIds.push(info.id)
     console.log(`[spec] addon ${info.id} v${info.version} ${info.zipHash.slice(0, 12)}`)
@@ -300,11 +414,13 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
     frameStep?: number
     /** may co-run with other chunks on one node; falls back to spec.shareNode */
     shareNode?: boolean
+    /** the job's name; else from the spec's own name, else the scene's file name */
+    name?: string
   }
-  let blends: BlendEntry[] = (spec.blends ?? []).map((b: string | BlendEntry): BlendEntry =>
-    typeof b === 'string' ? { path: b } : b
+  let blends: BlendEntry[] = ((spec.blends as Array<string | BlendEntry> | undefined) ?? []).map(
+    (b): BlendEntry => (typeof b === 'string' ? { path: b } : b)
   )
-  if (!blends.length && spec.blendDir) {
+  if (!blends.length && typeof spec.blendDir === 'string') {
     const dir = resolve(base, spec.blendDir)
     blends = readdirSync(dir)
       .filter((f: string) => f.toLowerCase().endsWith('.blend'))
@@ -327,15 +443,25 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
     j.blendPath === b.path || j.blendPath === named.get(b)
   if (!blends.length) {
     console.error('[spec] no blends resolved — nothing submitted')
-    deps.unsubmitted.push(`${specPath}: no blends resolved`)
+    deps.unsubmitted.push(`${source}: no blends resolved`)
     return
+  }
+  // The spec's own name names its one job, or leads each of several.
+  const specName = typeof spec.name === 'string' ? spec.name.trim() : ''
+  const jobName = (b: BlendEntry): string | undefined => {
+    const own = typeof b.name === 'string' ? b.name.trim() : ''
+    if (own) return own
+    if (!specName) return undefined
+    if (blends.length === 1) return specName
+    return `${specName} · ${basename(b.path).replace(/\.blend$/i, '')}`
   }
 
   // 'partial' included: resubmitting a spec HEALS a half-done job
   // (its missing frames queued again below) instead of duplicating it.
   // Jobs the user removed from the list included: removing one must not
-  // have the next run of the campaign render it again.
-  const allJobs = listJobs({ includeHidden: true })
+  // have the next run of the campaign render it again. dedupe 'never'
+  // looks at none of them: every blend is a new job.
+  const allJobs = dedupe === 'campaign' ? listJobs({ includeHidden: true }) : []
   const active = allJobs.filter((j) => ['queued', 'running', 'partial'].includes(j.state))
   let created = 0
   for (const blend of blends) {
@@ -343,8 +469,8 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
     // range already completed — re-running the spec must not re-render
     // finished work. (Observed: complete jobs were re-created on every
     // respec because dedup only looked at ACTIVE jobs.)
-    const wantStart = blend.frameStart ?? spec.frameStart ?? 1
-    const wantEnd = blend.frameEnd ?? spec.frameEnd ?? 200
+    const wantStart = blend.frameStart ?? (spec.frameStart as number | undefined) ?? 1
+    const wantEnd = blend.frameEnd ?? (spec.frameEnd as number | undefined) ?? 200
     const satisfied = allJobs.find(
       (j) =>
         j.state === 'complete' &&
@@ -387,15 +513,17 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
     // kick() below that starts it.
     let jobId: string
     try {
+      const name = jobName(blend)
       jobId = await createJob({
         blendPath: blend.path,
-        engine: spec.engine ?? 'eevee',
-        frameStart: blend.frameStart ?? spec.frameStart ?? 1,
-        frameEnd: blend.frameEnd ?? spec.frameEnd ?? 200,
-        frameStep: blend.frameStep ?? spec.frameStep ?? 1,
+        engine: (spec.engine as EngineId | undefined) ?? 'eevee',
+        frameStart: wantStart,
+        frameEnd: wantEnd,
+        frameStep: blend.frameStep ?? (spec.frameStep as number | undefined) ?? 1,
         addonIds,
-        chunkSize: spec.chunkSize ?? null,
-        shareNode: blend.shareNode ?? spec.shareNode ?? false
+        chunkSize: (spec.chunkSize as number | null | undefined) ?? null,
+        shareNode: blend.shareNode ?? (spec.shareNode as boolean | undefined) ?? false,
+        ...(name ? { name } : {})
       })
     } catch (e) {
       console.error(`[spec] skip (${(e as Error).message}): ${blend.path}`)
@@ -409,4 +537,46 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
   console.log(`[spec] submitted ${created} job(s)`)
   deps.resume?.recovery(campaign)
   deps.kick()
+}
+
+export interface TrackCampaignOptions {
+  /** Open jobs of `ids` (drivers.openJobs). */
+  openJobs(ids: readonly string[]): number
+  overlay?: SettingsOverlay
+  /** How often to check whether the campaign is done (default 30 s). */
+  pollMs?: number
+  /** The log line's prefix (default "[spec]"). */
+  tag?: string
+}
+
+/**
+ * A campaign's settings were put in force for its sake only (a spec handed
+ * to a running app, or one submitted over main/api): give them back to the
+ * overlay once none of its jobs is queued or running. Returns a function
+ * that stops watching without releasing anything. A no-op when nothing was
+ * applied.
+ */
+export function trackCampaignSettings(
+  campaign: readonly string[],
+  applied: OverlayFields,
+  opts: TrackCampaignOptions
+): () => void {
+  if (Object.keys(applied).length === 0) return () => {}
+  const overlay = opts.overlay ?? sessionOverlay
+  const timer = setInterval(() => {
+    let open: number
+    try {
+      open = opts.openJobs(campaign)
+    } catch {
+      return
+    }
+    if (open > 0) return
+    clearInterval(timer)
+    const released = overlay.release(applied)
+    console.log(
+      `${opts.tag ?? '[spec]'} campaign done; its settings released: ${released.join(', ') || 'none'}`
+    )
+  }, opts.pollMs ?? 30_000)
+  timer.unref?.()
+  return () => clearInterval(timer)
 }

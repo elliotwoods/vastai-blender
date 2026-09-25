@@ -22,6 +22,17 @@ stalled the app).
 
 ### Added
 
+- **One command layer for jobs, the queue and the fleet.** The job and queue
+  IPC channels (and `fleet:cost`) now go through `main/commands`: each
+  checks its arguments with a small shared validator (`shared/validate.ts`)
+  before anything runs, and refuses malformed ones as `bad_request: …`; an
+  unknown job is `not_found: …`. The renderer sees the same answers and the
+  same error text as before. The same commands answer `{ ok, value }` or
+  `{ ok: false, code, message }` for the coming local API. Campaign specs
+  gain `name` (top level and per blend: a job's name) and
+  `dedupe: "campaign" | "never"` (`never` submits every blend as a new job),
+  and can be submitted as an object as well as a file.
+
 - **Fleet GPU history over the whole range, and per GPU.** `fleet:gpuHistory`
   returns a `summary` for the range asked for: mean utilisation over every
   reading of every GPU in it (so the Fleet screen's *mean util* can be the
