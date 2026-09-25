@@ -268,7 +268,12 @@ class JobCannotRun extends Error {
   }
 }
 
-const ENGINE_IDS: ReadonlySet<string> = new Set<EngineId>(['cycles', 'eevee', 'octane'])
+/**
+ * The engines a node's report may relabel a job between: both run in stock
+ * Blender, so the label changes nothing that is sent. Never into or out of
+ * Octane (see ChunkRun.noteEngine).
+ */
+const STOCK_ENGINES: ReadonlySet<string> = new Set<EngineId>(['cycles', 'eevee'])
 
 /**
  * What a failed agent state means for the retry policy. classify() reads
@@ -435,15 +440,40 @@ class ChunkRun {
    * 1.16): the submit dialog's engine is only a label, and the spec, the
    * Jobs list and History all go by it. Once per run; an engine that is not
    * one of the app's (workbench, a render add-on's) leaves the label alone.
+   *
+   * Only between Cycles and EEVEE. The report is the node's word, and an
+   * Octane job is sent the user's OTOY credentials at dispatch (setupOctane):
+   * a host that wrote "octane" into a Cycles job's state file had them on the
+   * job's next dispatch to it. When the report and the job disagree about
+   * Octane, the frames are not what the job asked for either way (stock
+   * Blender renders an Octane scene with another engine, #85), so the job
+   * keeps its engine and fails, with the reason: the returned failure.
    */
-  private noteEngine(engine: string | null | undefined): void {
-    if (this.engineNoted || typeof engine !== 'string' || engine === '') return
+  private noteEngine(engine: string | null | undefined): ChunkFailure | null {
+    if (this.engineNoted || typeof engine !== 'string' || engine === '') return null
     this.engineNoted = true
-    if (!ENGINE_IDS.has(engine)) return
+    const asked = this.job().engine
+    if ((engine === 'octane') !== (asked === 'octane')) {
+      const message =
+        engine === 'octane'
+          ? `the scene renders with Octane, but the job was submitted as ${asked}, ` +
+            'which stock Blender renders with another engine: submit it again as an Octane job'
+          : `the job was submitted as Octane, but the scene renders with ${engine}: ` +
+            'submit it again with the engine the scene uses'
+      return {
+        c: own('job', 'engine-mismatch', message),
+        stage: 'render',
+        nodeId: this.nodeId,
+        fatal: 'engine'
+      }
+    }
+    if (!STOCK_ENGINES.has(engine) || !STOCK_ENGINES.has(asked)) return null
     const r = getDb()
-      .prepare('UPDATE jobs SET engine = ? WHERE id = ? AND engine != ?')
+      .prepare(
+        `UPDATE jobs SET engine = ? WHERE id = ? AND engine != ? AND engine IN ('cycles', 'eevee')`
+      )
       .run(engine, this.jobId, engine)
-    if (r.changes === 0) return
+    if (r.changes === 0) return null
     emit('render:logLine', {
       nodeId: this.nodeId,
       chunkId: this.chunkId,
@@ -451,6 +481,7 @@ class ChunkRun {
       ts: Date.now()
     })
     emitJobChanged(this.jobId)
+    return null
   }
 
   /**
@@ -719,7 +750,15 @@ class ChunkRun {
         if (state.status === 'rendering') {
           this.sampleRate(state.framesDone, scheduler.slotsInUse(this.nodeId))
         }
-        this.noteEngine(state.engine)
+        const mismatch = this.noteEngine(state.engine)
+        if (mismatch) {
+          // Every frame from here is of an engine the job did not ask for,
+          // on a paid node: stop the render rather than drain it.
+          await this.retractSpec()
+          if (this.stopped) return
+          this.finish('failed', mismatch)
+          return
+        }
         if (state.status === 'encoding') this.setChunk({ state: 'encoding' })
         if (state.status === 'done') {
           this.setChunk({ state: 'downloading' })

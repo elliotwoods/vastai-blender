@@ -7,6 +7,7 @@ import {
   type AgentStateFile,
   type App,
   type FakeMachine,
+  type SetupOptions,
   type World
 } from '../test/harness'
 
@@ -70,8 +71,11 @@ function nodeError(nodeId: string): string | null {
     .last_error
 }
 
-async function nodes(n: number): Promise<{ app: App; ids: string[] }> {
-  w = await setup({ settings: { maxActiveNodes: n } })
+async function nodes(
+  n: number,
+  opts: Pick<SetupOptions, 'secrets'> = {}
+): Promise<{ app: App; ids: string[] }> {
+  w = await setup({ settings: { maxActiveNodes: n }, ...opts })
   const app = await w.boot()
   const ids: string[] = []
   for (let i = 0; i < n; i++) ids.push(await w.readyNode(app))
@@ -80,6 +84,11 @@ async function nodes(n: number): Promise<{ app: App; ids: string[] }> {
 
 function nodeState(nodeId: string): string {
   return w.get<{ state: string }>('SELECT state FROM nodes WHERE id = ?', nodeId)!.state
+}
+
+/** Every command any machine of the world was sent that matches. */
+function ranAnywhere(ids: string[], pattern: RegExp): string[] {
+  return ids.flatMap((id) => w.machineFor(id).ran(pattern))
 }
 
 /** The agent reports a failed chunk, with what the real one adds to a failure. */
@@ -304,6 +313,71 @@ describe('1.16: a job no node can render fails once, with the reason', () => {
     })
     expect(chunksOf(jobId)[0]).toMatchObject({ state: 'failed', retries: 0 })
     expect(w.alerts().filter((a) => a.includes('skipped'))).toEqual([])
+  })
+})
+
+describe("1.16: the engine a node reports is the node's word", () => {
+  const otoy = { secrets: { otoyUsername: 'someone@example.com', otoyPassword: 'hunter2' } }
+
+  it('1.16: a Cycles job whose node says Octane keeps its engine, fails, and no OTOY credential is sent', async () => {
+    const { app, ids } = await nodes(1, otoy)
+    const machine = w.machineFor(ids[0])
+    const specs: AgentSpec[] = []
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      // A host that wants the user's OTOY sign-in writes this, and finishes
+      // (unless the app has withdrawn the spec by then).
+      machine.agent.writeState(spec.chunkId, {
+        status: 'rendering',
+        engine: 'octane'
+      } as Partial<AgentStateFile>)
+      setTimeout(() => {
+        if (machine.agent.spec(spec.chunkId)) machine.agent.finish(spec.chunkId)
+      }, 6_000)
+    }
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 2 })
+    app.scheduler.kick()
+    await w.until(() => settled(jobId), 'job settled')
+    await w.advance(2 * 60_000)
+
+    expect(jobState(jobId)).toBe('failed')
+    expect(w.get('SELECT engine FROM jobs WHERE id = ?', jobId)).toEqual({ engine: 'cycles' })
+    const job = await w.invoke('job:get', jobId)
+    expect(job?.attention).toMatchObject({
+      kind: 'engine',
+      message: expect.stringContaining('renders with Octane')
+    })
+    // Nothing Octane ran anywhere, and no credential left this computer.
+    expect(ranAnywhere(ids, /setup_octane|OCTANE_USER|OCTANE_PASS|hunter2/)).toEqual([])
+    // The render was stopped, and the job's other chunk never sent.
+    expect(specs).toHaveLength(1)
+    expect(machine.ran(new RegExp(`pkill -f '${specs[0].chunkId}'`))).toHaveLength(1)
+  })
+
+  it('1.16: an Octane job whose node says Cycles keeps its engine and fails', async () => {
+    const { app, ids } = await nodes(1)
+    const machine = w.machineFor(ids[0])
+    machine.onExec(/grep -iE 'license/, { code: 0, stdout: 'license acquired\n', stderr: '' })
+    machine.onSpec = (spec) => {
+      machine.agent.writeState(spec.chunkId, {
+        status: 'rendering',
+        engine: 'cycles'
+      } as Partial<AgentStateFile>)
+      setTimeout(() => {
+        if (machine.agent.spec(spec.chunkId)) machine.agent.finish(spec.chunkId)
+      }, 6_000)
+    }
+    const jobId = await w.submitJob(app, { engine: 'octane' })
+    app.scheduler.kick()
+    await w.until(() => settled(jobId), 'job settled')
+
+    expect(jobState(jobId)).toBe('failed')
+    expect(w.get('SELECT engine FROM jobs WHERE id = ?', jobId)).toEqual({ engine: 'octane' })
+    const job = await w.invoke('job:get', jobId)
+    expect(job?.attention).toMatchObject({
+      kind: 'engine',
+      message: expect.stringContaining('scene renders with cycles')
+    })
   })
 })
 
