@@ -459,9 +459,11 @@ app.whenReady().then(() => {
   // the campaign being done (no job queued or running). `leave`: those exit
   // and leave the nodes as they are, and a finished campaign keeps running
   // for the idle scale-down. The exit status is 3 when instances may be left
-  // billing, else 0.
+  // billing, else 1 when part of the campaign was never submitted (each such
+  // part is collected in `unsubmitted`), else 0.
   const jobSpecPath = process.env.VR_JOB_SPEC
   if (jobSpecPath) {
+    const unsubmitted: string[] = []
     setTimeout(() => {
       void (async () => {
         const { readFileSync, readdirSync } = await import('fs')
@@ -525,6 +527,7 @@ app.whenReady().then(() => {
         }
         if (!blends.length) {
           console.error('[spec] no blends resolved — nothing submitted')
+          unsubmitted.push(`${jobSpecPath}: no blends resolved`)
           return
         }
 
@@ -593,6 +596,7 @@ app.whenReady().then(() => {
             })
           } catch (e) {
             console.error(`[spec] skip (${(e as Error).message}): ${blend.path}`)
+            unsubmitted.push(`${blend.path}: ${(e as Error).message}`)
             continue
           }
           created++
@@ -601,8 +605,11 @@ app.whenReady().then(() => {
         console.log(`[spec] submitted ${created} job(s)`)
         scheduler.kick()
       })()
-        .catch((e) => console.error('[spec] submission failed:', e))
-        .finally(() => lifecycle.watchCampaign(openJobs))
+        .catch((e) => {
+          console.error('[spec] submission failed:', e)
+          unsubmitted.push(`${jobSpecPath}: ${(e as Error)?.message ?? e}`)
+        })
+        .finally(() => lifecycle.watchCampaign(openJobs, unsubmitted))
     }, 3000)
   }
 
@@ -610,6 +617,7 @@ app.whenReady().then(() => {
   // boot; the scheduler then scales up, renders, downloads, and idles down.
   const e2eBlend = process.env.VR_E2E_BLEND
   if (e2eBlend) {
+    const unsubmitted: string[] = []
     setTimeout(() => {
       void (async () => {
         const { createJob, listJobs } = await import('./jobs/jobs')
@@ -634,8 +642,11 @@ app.whenReady().then(() => {
         console.log(`[e2e] job created: ${jobId}`)
         scheduler.kick()
       })()
-        .catch((e) => console.error('[e2e] job creation failed:', e))
-        .finally(() => lifecycle.watchCampaign(openJobs))
+        .catch((e) => {
+          console.error('[e2e] job creation failed:', e)
+          unsubmitted.push(`${e2eBlend}: ${(e as Error)?.message ?? e}`)
+        })
+        .finally(() => lifecycle.watchCampaign(openJobs, unsubmitted))
     }, 3000)
   }
 

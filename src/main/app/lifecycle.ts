@@ -35,10 +35,12 @@
  *     profile picks them back up. A finished campaign does not stop the run:
  *     it stays up, as it always did, and the idle scale-down retires the
  *     nodes.
- *   The exit status is 0 when nothing the run knows of is left billing, and
- *   EXIT_BILLING_LEFT (3) when something may be: a destroy that could not be
- *   confirmed (listed on stderr), or nodes left by `leave`. A second signal
- *   during the destroy exits at once, with 3.
+ *   The exit status is EXIT_BILLING_LEFT (3) when something the run knows of
+ *   may be left billing: a destroy that could not be confirmed (listed on
+ *   stderr), or nodes left by `leave`. Otherwise it is EXIT_NOT_SUBMITTED (1)
+ *   for a campaign that ended with part of it never submitted (a spec that
+ *   did not parse, a blend createJob refused), and 0 when all is well. A
+ *   second signal during the destroy exits at once, with 3.
  *
  * Destroy all must rent nothing while it destroys. scheduler.stop() only
  * clears the tick timer, and a kick still ticks. Every destroy kicks
@@ -98,6 +100,13 @@ export const DESTROY_STAGGER_MS = 3_000
 
 /** A headless run's exit status when instances it rented may still be billing. */
 export const EXIT_BILLING_LEFT = 3
+
+/**
+ * A headless run's exit status when its campaign ended with part of it never
+ * submitted, and nothing is left billing. The same as a launch refused for
+ * another instance on the profile: the run did not do what it was asked.
+ */
+export const EXIT_NOT_SUBMITTED = 1
 
 /** Headless destroy attempts before giving up. Nobody is there to press "Try again". */
 const HEADLESS_ATTEMPTS = 3
@@ -590,10 +599,13 @@ export interface Lifecycle {
   /**
    * A headless run's campaign is submitted: from now on, once no job is
    * queued or running (`openJobs`), the run destroys its fleet and exits
-   * (VR_QUIT_POLICY=destroy). A no-op for the app a person runs, and under
-   * `leave`.
+   * (VR_QUIT_POLICY=destroy). `unsubmitted` says what of the campaign never
+   * made it in (a spec that did not parse, a blend createJob refused): with
+   * any, the run still ends when the rest is done, but with
+   * EXIT_NOT_SUBMITTED, and says why on stderr. A no-op for the app a person
+   * runs, and under `leave`.
    */
-  watchCampaign(openJobs: () => number): void
+  watchCampaign(openJobs: () => number, unsubmitted?: readonly string[]): void
 }
 
 /** A console line that cannot throw (a full disk under stdout: see events.ts). */
@@ -690,16 +702,18 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
   /**
    * Stop without asking: a headless run, or a Windows session ending.
    * `policy` says what happens to the fleet, `attempts` how many destroy
-   * passes before giving up.
+   * passes before giving up, and `code` the exit status when nothing is left
+   * billing.
    */
   const stopUnattended = async (
     why: string,
     policy: QuitPolicy,
-    attempts: number
+    attempts: number,
+    code = 0
   ): Promise<void> => {
     phase = 'destroying'
     const billing = billingFleet(fleet.list())
-    if (billing.nodes.length === 0) return finish(0)
+    if (billing.nodes.length === 0) return finish(code)
     if (policy === 'leave') {
       deps.stderr(
         `[vast-render] ${why}: leaving ${plural(billing.nodes.length, 'node')} billing ` +
@@ -714,7 +728,7 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
       const tried = await destroyFleet(fleet, deps.destroy)
       if (phase !== 'destroying') return
       // In the same synchronous run as the exit: see destroyFleet.
-      if (!fleet.list().some(holdsInstance)) return finish(0)
+      if (!fleet.list().some(holdsInstance)) return finish(code)
       if (attempt >= attempts) {
         const still = failuresOf(
           fleet.list(),
@@ -851,8 +865,12 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
   }
 
   return {
-    watchCampaign(openJobs: () => number): void {
+    watchCampaign(openJobs: () => number, unsubmitted: readonly string[] = []): void {
       if (deps.headless?.policy !== 'destroy') return
+      // A campaign that never made it in has nothing to wait for and ends
+      // a check or two later. Exiting 0 for it told the script all went
+      // well (1.1 review).
+      const code = unsubmitted.length > 0 ? EXIT_NOT_SUBMITTED : 0
       // Done twice in a row, a check apart: a chunk requeued between two
       // states, or a job refreshed a moment late, is not the end.
       let doneBefore = false
@@ -870,7 +888,13 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
         }
         if (done && doneBefore) {
           clearInterval(timer)
-          void stopUnattended('campaign done', 'destroy', HEADLESS_ATTEMPTS).catch(
+          if (code !== 0) {
+            deps.stderr(
+              `[vast-render] campaign done, but not all of it was submitted:\n` +
+                unsubmitted.map((u) => `  ${u}\n`).join('')
+            )
+          }
+          void stopUnattended('campaign done', 'destroy', HEADLESS_ATTEMPTS, code).catch(
             fail('campaign end')
           )
         }

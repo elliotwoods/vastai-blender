@@ -111,8 +111,15 @@ function node(patch: Partial<NodeSnapshot> = {}): NodeSnapshot {
   }
 }
 
-/** Load index.ts as a launch with `env`, run its whenReady, with `nodes` in the fleet. */
-async function load(nodes: NodeSnapshot[], env: Record<string, string> = {}): Promise<Loaded> {
+/**
+ * Load index.ts as a launch with `env`, run its whenReady, with `nodes` in
+ * the fleet. `createJob` stands in for jobs.createJob (the drivers' submit).
+ */
+async function load(
+  nodes: NodeSnapshot[],
+  env: Record<string, string> = {},
+  opts: { createJob?: () => Promise<string> } = {}
+): Promise<Loaded> {
   for (const k of ['VR_JOB_SPEC', 'VR_E2E_BLEND', 'VR_SHOT', 'VR_USERDATA', 'VR_QUIT_POLICY']) {
     vi.stubEnv(k, env[k] ?? '')
   }
@@ -230,7 +237,7 @@ async function load(nodes: NodeSnapshot[], env: Record<string, string> = {}): Pr
     }
   }))
   vi.doMock('../transfer/jobClip', () => ({ jobClips: { catchUp: () => {} } }))
-  vi.doMock('../settings', () => ({ getSettings: () => ({}) }))
+  vi.doMock('../settings', () => ({ getSettings: () => ({}), updateSettings: () => {} }))
   vi.doMock('../db/db', () => ({
     closeDb: () => {
       out.closedDb++
@@ -240,7 +247,9 @@ async function load(nodes: NodeSnapshot[], env: Record<string, string> = {}): Pr
   }))
   vi.doMock('../jobs/jobs', () => ({
     listJobs: () => [],
-    createJob: async () => 'job-1'
+    createJob: opts.createJob ?? (async () => 'job-1'),
+    emitChunksChanged: () => {},
+    refreshJobState: () => {}
   }))
   vi.spyOn(process, 'on').mockImplementation(((event: string, fn: () => void) => {
     out.signals.set(event, fn)
@@ -442,6 +451,35 @@ describe('index.ts, headless (plan 1.1)', () => {
 
     expect(listening).toEqual(expect.arrayContaining(['stdout error', 'stderr error']))
     expect(r.signals.has('SIGHUP')).toBe(true)
+  })
+
+  it('a campaign that could not be submitted ends with exit 1, not 0 (1.1 review)', async () => {
+    const r = await load(
+      [],
+      { VR_E2E_BLEND: '/scenes/e2e.blend' },
+      {
+        createJob: async () => {
+          throw new Error('scene file not found')
+        }
+      }
+    )
+    await vi.advanceTimersByTimeAsync(3_000 + 61_000)
+
+    expect(r.exits).toEqual([1])
+    expect(r.stderr).toContain('not all of it was submitted')
+    expect(r.stderr).toContain('/scenes/e2e.blend: scene file not found')
+  })
+
+  it('a spec that cannot be read: the campaign ends with exit 1, and says which spec', async () => {
+    const spec = '/campaign/no-such-spec.json'
+    const r = await load([], { VR_JOB_SPEC: spec })
+    // The driver loads its modules (real imports) before it reads the spec.
+    await vi.advanceTimersByTimeAsync(3_000)
+    await vi.dynamicImportSettled()
+    await vi.advanceTimersByTimeAsync(61_000)
+
+    expect(r.exits).toEqual([1])
+    expect(r.stderr).toContain(`  ${spec}: ENOENT`)
   })
 
   it('the campaign done (after the driver submitted it): destroys the fleet and exits 0', async () => {

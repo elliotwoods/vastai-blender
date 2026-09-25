@@ -615,6 +615,24 @@ describe('headless runs follow VR_QUIT_POLICY, never a dialog (plan 1.1)', () =>
     expect(r.app.exits).toEqual([{ code: 0, live: [], created: [instance] }])
   })
 
+  it('a campaign with a part never submitted: ends when the rest is done, exit 1, and says why', async () => {
+    // 1.1 review: a spec that did not parse left no job open, so the run
+    // destroyed the fleet and exited 0, as if the campaign had rendered.
+    w = await setup()
+    const engine = await w.boot()
+    const nodeId = await w.readyNode(engine)
+    const instance = instanceOf(nodeId)
+    const r = await rig(engine, { headless: 'destroy' })
+    r.lifecycle.watchCampaign(openJobs, ['/scenes/missing.blend: no such file'])
+
+    await w.until(() => r.app.exits.length > 0, 'the run to exit')
+
+    expect(r.app.exits).toEqual([{ code: 1, live: [], created: [instance] }])
+    expect(r.stderr.join('')).toContain(
+      'campaign done, but not all of it was submitted:\n  /scenes/missing.blend: no such file\n'
+    )
+  })
+
   it('the campaign done, policy leave: the run stays up for the idle scale-down', async () => {
     w = await setup({ settings: { idleTimeoutMinutes: 5 } })
     const engine = await w.boot()
