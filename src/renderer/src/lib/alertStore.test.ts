@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AlertRecord, EventChannel } from '../../../shared/ipc'
+import type { AlertRecord, EventChannel, IpcEventMapPending } from '../../../shared/ipc'
 import type { AlertEvent } from '../../../shared/models'
 import {
   bannerOrder,
@@ -420,7 +420,7 @@ describe('useIpcEvents', () => {
 
   it('subscribes to every push channel, alert included', async () => {
     await mount()
-    const channels: EventChannel[] = [
+    const channels: Array<EventChannel | keyof IpcEventMapPending> = [
       'node:changed',
       'job:changed',
       'chunk:progress',
@@ -428,7 +428,12 @@ describe('useIpcEvents', () => {
       'render:logLine',
       'asset:added',
       'fleet:cost',
-      'alert'
+      'alert',
+      // Phase 1's, heard before main moves them into IpcEventMap, so its
+      // first emit lands.
+      'node:metricsSample',
+      'fleet:holds',
+      'fleet:unclaimed'
     ]
     expect([...listeners.keys()].sort()).toEqual([...channels].sort())
   })

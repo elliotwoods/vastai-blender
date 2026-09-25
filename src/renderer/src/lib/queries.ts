@@ -18,23 +18,38 @@ import type {
   AddonInfo,
   AssetIndex,
   FleetCost,
+  FleetGpuHistory,
+  FleetHoldKind,
+  FleetHolds,
   HistoryRange,
   HistorySummary,
   JobDetail,
   JobSubmission,
   JobSummary,
   NodeChunkView,
+  NodeMetricsHistory,
   NodeSnapshot,
+  RequestNodeOptions,
   RetryMissingResult,
   SettingsPatch,
   SettingsPatchResult,
-  SettingsPublic
+  SettingsPublic,
+  UnclaimedInstance
 } from '../../../shared/models'
-import type { EventChannel, IpcEventMap } from '../../../shared/ipc'
+import type { IpcEventMap, IpcEventMapPending } from '../../../shared/ipc'
+import { holdsInstance } from '../../../shared/nodeState'
 import { useAlertStore } from './alertStore'
 import { ipc } from './ipc'
 import { useLogStore } from './logStore'
+import {
+  NO_READINGS,
+  RING_MS,
+  readingsOfHistory,
+  useMetricsStore,
+  type MetricsReading
+} from './metricsStore'
 import { useProgressStore } from './progressStore'
+import { HISTORY_POINTS, rangeMs, type UsageRange } from './usageRange'
 
 export const qk = {
   settings: ['settings'] as const,
@@ -47,6 +62,11 @@ export const qk = {
   addons: ['addons'] as const,
   fleetCost: ['fleetCost'] as const,
   history: (range: HistoryRange) => ['history', range] as const,
+  holds: ['fleetHolds'] as const,
+  unclaimed: ['unclaimed'] as const,
+  fleetGpuHistory: (range: UsageRange) => ['fleetGpuHistory', range] as const,
+  nodeMetricsHistory: (nodeId: string, range: UsageRange) =>
+    ['nodeMetricsHistory', nodeId, range] as const,
   recoveryHold: ['recoveryHold'] as const
 }
 
@@ -70,6 +90,189 @@ export function useResumeRecovery(): UseMutationResult<void, Error, void> {
     mutationFn: () => ipc.invoke('scheduler:resumeRecovery'),
     onSuccess: () => qc.setQueryData(qk.recoveryHold, null)
   })
+}
+
+/**
+ * Main's reply for a channel it has no handler for. Phase 1's channels were
+ * declared before their handlers (shared/ipc.ts), and one that has not
+ * landed rejects with this.
+ */
+function noHandler(e: unknown): boolean {
+  return e instanceof Error && e.message.includes('No handler registered')
+}
+
+/**
+ * Every hold in force, for HoldsBanner. The recovery hold also answers on
+ * scheduler:recoveryHold, the channel RecoveryBanner read before FleetHolds
+ * gathered the holds in one place. While main has no fleet:holds handler it
+ * is read from there, so the banner that says "Resume rendering" never goes
+ * missing: without it, recovered work waits for a Resume nobody is offered.
+ */
+async function readHolds(): Promise<FleetHolds> {
+  try {
+    return await ipc.invoke('fleet:holds')
+  } catch (e) {
+    if (!noHandler(e)) throw e
+    const r = await ipc.invoke('scheduler:recoveryHold')
+    return r ? { recovery: r.chunks } : {}
+  }
+}
+
+/**
+ * Why the fleet is not renting (FleetHolds). Main pushes `fleet:holds` when
+ * one is set or released. The interval is a backstop for what changes
+ * without a push: recovery's count shrinks as its jobs finish, and main
+ * releases the hold itself when none is left.
+ */
+export function useFleetHolds(): UseQueryResult<FleetHolds> {
+  return useQuery({
+    queryKey: qk.holds,
+    queryFn: readHolds,
+    refetchInterval: 30_000,
+    retry: 1
+  })
+}
+
+/** Release one hold: "Resume rendering", "Try now", "Check again". */
+export function useReleaseHold(): UseMutationResult<FleetHolds, Error, FleetHoldKind> {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (kind: FleetHoldKind) => {
+      try {
+        return await ipc.invoke('fleet:releaseHold', kind)
+      } catch (e) {
+        // As readHolds: recovery's own channel, until fleet:releaseHold lands.
+        if (kind !== 'recovery' || !noHandler(e)) throw e
+        await ipc.invoke('scheduler:resumeRecovery')
+        return readHolds()
+      }
+    },
+    onSuccess: (holds) => qc.setQueryData(qk.holds, holds)
+  })
+}
+
+/**
+ * Instances on the Vast account that no node here holds (plan 1.3), each
+ * billing until someone destroys it. Main pushes `fleet:unclaimed` when a
+ * reconcile changes the list; the interval covers a push this window missed.
+ */
+export function useUnclaimed(): UseQueryResult<UnclaimedInstance[]> {
+  return useQuery({
+    queryKey: qk.unclaimed,
+    queryFn: () => ipc.invoke('fleet:unclaimed'),
+    refetchInterval: 60_000,
+    retry: 1
+  })
+}
+
+/**
+ * Destroy one unclaimed instance. Main answers `ok: false` with the reason
+ * when Vast has not confirmed it gone; either way the list is read again,
+ * so a row goes only when main has let it go.
+ */
+export function useDestroyUnclaimed(): UseMutationResult<
+  { ok: boolean; message: string },
+  Error,
+  number
+> {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (instanceId: number) => ipc.invoke('fleet:destroyUnclaimed', instanceId),
+    onSettled: () => qc.invalidateQueries({ queryKey: qk.unclaimed })
+  })
+}
+
+/**
+ * Rent one node by hand. `overSpendCap` is the user's confirmation that it
+ * may take the fleet past the spend cap (plan 1.5): main refuses without it.
+ */
+export function useRequestNode(): UseMutationResult<void, Error, RequestNodeOptions | undefined> {
+  return useMutation({
+    mutationFn: (opts?: RequestNodeOptions) => ipc.invoke('fleet:requestNode', opts)
+  })
+}
+
+/** How often each range's history is read again: about a bucket's width, at least 15 s. */
+function historyRefetchMs(range: UsageRange): number {
+  return Math.max(15_000, Math.min(60_000, rangeMs(range) / 60))
+}
+
+/**
+ * The whole fleet's GPU use over the last `range` (Feature G). The window
+ * is taken when the read runs, so a refetch slides it. The previous range's
+ * chart stays up while a new one loads.
+ */
+export function useFleetGpuHistory(range: UsageRange): UseQueryResult<FleetGpuHistory> {
+  return useQuery({
+    queryKey: qk.fleetGpuHistory(range),
+    queryFn: () => {
+      const toMs = Date.now()
+      return ipc.invoke('fleet:gpuHistory', {
+        fromMs: toMs - rangeMs(range),
+        toMs,
+        maxPoints: HISTORY_POINTS
+      })
+    },
+    refetchInterval: historyRefetchMs(range),
+    placeholderData: (prev) => prev,
+    retry: 1
+  })
+}
+
+/**
+ * One node's use over a range longer than the store's hour (6 h, 24 h),
+ * from main's history. Shorter ranges draw from the store, live.
+ */
+export function useNodeMetricsHistory(
+  nodeId: string,
+  range: UsageRange,
+  enabled: boolean
+): UseQueryResult<NodeMetricsHistory> {
+  return useQuery({
+    queryKey: qk.nodeMetricsHistory(nodeId, range),
+    queryFn: () => {
+      const toMs = Date.now()
+      return ipc.invoke('node:metricsHistory', {
+        nodeId,
+        fromMs: toMs - rangeMs(range),
+        toMs,
+        maxPoints: HISTORY_POINTS
+      })
+    },
+    enabled,
+    refetchInterval: historyRefetchMs(range),
+    placeholderData: (prev) => prev,
+    retry: 1
+  })
+}
+
+/** Buckets for a seed: the store's hour at main's narrowest bucket, 30 s. */
+const SEED_POINTS = RING_MS / 30_000
+
+/**
+ * One node's last hour of GPU use, live (lib/metricsStore): the stored array
+ * by reference, so only this node's samples re-render the caller. The first
+ * caller for a node seeds the store from node:metricsHistory, since a
+ * window opened mid-session has heard none of the hour.
+ */
+export function useNodeReadings(nodeId: string): readonly MetricsReading[] {
+  useEffect(() => {
+    if (!useMetricsStore.getState().beginSeed(nodeId)) return
+    const toMs = Date.now()
+    ipc
+      .invoke('node:metricsHistory', {
+        nodeId,
+        fromMs: toMs - RING_MS,
+        toMs,
+        maxPoints: SEED_POINTS
+      })
+      .then((h) => useMetricsStore.getState().seed(nodeId, readingsOfHistory(h), h.bucketMs))
+      .catch((e: unknown) => {
+        useMetricsStore.getState().seedFailed(nodeId)
+        console.warn(`node:metricsHistory for ${nodeId} failed`, e)
+      })
+  }, [nodeId])
+  return useMetricsStore((s) => s.byNode[nodeId] ?? NO_READINGS)
 }
 
 export function useSettings(): UseQueryResult<SettingsPublic> {
@@ -238,13 +441,31 @@ export function useRetryMissing(): UseMutationResult<RetryMissingResult | void, 
 }
 
 /**
+ * Every push channel: IpcEventMap's, and Phase 1's still waiting in
+ * IpcEventMapPending for main to emit them. They are handled here already,
+ * so the integration wave's move from one map to the other changes nothing
+ * on this side, and main's first emit lands.
+ */
+type PushEvents = IpcEventMap & IpcEventMapPending
+type PushChannel = keyof PushEvents
+
+/**
  * One handler per push channel, or null for a channel deliberately ignored.
- * A map over every EventChannel, so a channel added to IpcEventMap without a
+ * A map over every push channel, so a channel added to either map without a
  * decision here is a compile error. The `alert` channel went unsubscribed for
  * the app's whole life that way, and it carries the "Destroy failed ... check
  * the Vast.ai console!" warnings.
  */
-type EventHandlers = { [E in EventChannel]: ((payload: IpcEventMap[E]) => void) | null }
+type EventHandlers = { [E in PushChannel]: ((payload: PushEvents[E]) => void) | null }
+
+/**
+ * ipc.on widened to the pending channels. The preload's `on` subscribes to
+ * whatever channel it is given; only its type is limited to IpcEventMap.
+ */
+const onPush = ipc.on as <E extends PushChannel>(
+  channel: E,
+  listener: (payload: PushEvents[E]) => void
+) => () => void
 
 /**
  * Subscribe to main-process push events and fold them into the Query cache.
@@ -255,6 +476,10 @@ export function useIpcEvents(): void {
   useEffect(() => {
     const handlers: EventHandlers = {
       'node:changed': (node) => {
+        // Gone for good: its hour of readings with it.
+        if (node.state === 'destroyed' && !holdsInstance(node)) {
+          useMetricsStore.getState().forget(node.id)
+        }
         qc.setQueryData<NodeSnapshot[]>(qk.nodes, (prev) => {
           if (!prev) return prev
           const i = prev.findIndex((n) => n.id === node.id)
@@ -329,16 +554,27 @@ export function useIpcEvents(): void {
       // open, so a second one from the window would tell the user twice.
       alert: (a) => {
         useAlertStore.getState().receive(a)
+      },
+      // High rate (every node, every ~15 s), like chunk:progress: into the
+      // metrics store, never an invalidation.
+      'node:metricsSample': (sample) => {
+        useMetricsStore.getState().record(sample)
+      },
+      'fleet:holds': (holds) => {
+        qc.setQueryData(qk.holds, holds)
+      },
+      'fleet:unclaimed': (list) => {
+        qc.setQueryData(qk.unclaimed, list)
       }
     }
 
     // Generic over the channel, so each handler is checked against its own
     // payload type rather than the union of all of them.
-    const subscribe = <E extends EventChannel>(channel: E): (() => void) | null => {
+    const subscribe = <E extends PushChannel>(channel: E): (() => void) | null => {
       const handler = handlers[channel]
-      return handler ? ipc.on(channel, handler) : null
+      return handler ? onPush(channel, handler) : null
     }
-    const subs = (Object.keys(handlers) as EventChannel[]).map(subscribe)
+    const subs = (Object.keys(handlers) as PushChannel[]).map(subscribe)
 
     // Then replay what main raised before this window was listening: the
     // boot-time orphan sweep runs before the window exists. Subscribed first,
