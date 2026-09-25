@@ -25,7 +25,7 @@ import { learnedSlots } from '../scheduler/slotController'
 import { getSecret, getSettings } from '../settings'
 import { ensureKeyRegistered, readPrivateKey } from '../ssh/keys'
 import { FIRST_CONNECT_BUDGET_MS, retryWithBackoff } from '../ssh/connectRetry'
-import { SshConnection } from '../ssh/sshConnection'
+import { HostKeyMismatchError, SshConnection, type ExecResult } from '../ssh/sshConnection'
 import { findOffers } from '../vast/offers'
 import {
   createInstance,
@@ -62,6 +62,7 @@ import {
   type NodeCostFacts
 } from '../../shared/nodeState'
 import type { RawInstance } from '../vast/types'
+import { agentStatus, provisionDeps, REMOTE_ROOT, restartAgent } from './provisioner'
 
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
 
@@ -168,6 +169,122 @@ function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T>
       }
     )
   })
+}
+
+/**
+ * Plan 1.7: every connected node is sampled this often (pollMetrics), and
+ * the sample is its liveness probe too: an exec over the node's own
+ * connection, bounded so that a wedged one fails in PROBE_TIMEOUT_MS rather
+ * than hanging the probe.
+ */
+const PROBE_EVERY_MS = 15_000
+const PROBE_TIMEOUT_MS = 10_000
+
+/**
+ * Plan 1.7: a node whose probes have failed this many times in a row, over
+ * at least UNREACHABLE_AFTER_MS, is 'unreachable': 30 to 45 s after it went
+ * silent, with a probe every 15 s. A connection that drops (SshConnection's
+ * 'disconnected') counts as one more failure, unless the next probe gets
+ * through. Nothing used to notice a node dying mid-session: its chunks
+ * polled a dead connection for good while it billed, and its free slots
+ * took more work (#17 #36 #52 #169 #192).
+ */
+const UNREACHABLE_STRIKES = 3
+const UNREACHABLE_AFTER_MS = 30_000
+
+/**
+ * A heartbeat older than this means a dead agent: provision.sh's
+ * AGENT_STALE_S, six missed beats. The probe must see it AGENT_STALE_PROBES
+ * times in a row, and restart-agent checks again under its lock, since a
+ * false "dead" kills every render on the node.
+ */
+const AGENT_STALE_S = 60
+const AGENT_STALE_PROBES = 2
+
+/**
+ * How many times one node's agent may be restarted within
+ * AGENT_RESTART_WINDOW_MS before the node is given up on. An agent that
+ * keeps dying would otherwise send its chunks round and round, each lap
+ * charged to them, while the node bills.
+ */
+const AGENT_RESTARTS_MAX = 3
+const AGENT_RESTART_WINDOW_MS = 60 * 60_000
+
+/** The node states the probe samples. */
+const PROBED: ReadonlySet<NodeState> = new Set<NodeState>([
+  'ready',
+  'idle',
+  'rendering',
+  'encoding',
+  'provisioning'
+])
+
+/**
+ * The states in which a node is supervised (plan 1.7): the ones work is sent
+ * to. Not 'provisioning': onReady, or the recovery that set it, has a
+ * deadline of its own.
+ */
+const SUPERVISED: ReadonlySet<NodeState> = new Set<NodeState>([
+  'ready',
+  'idle',
+  'rendering',
+  'encoding'
+])
+
+const HEARTBEAT = `${REMOTE_ROOT}/state/heartbeat`
+
+/**
+ * The probe: GPU, CPU and RAM usage, then the agent's heartbeat age by the
+ * node's own clock, read the way provision.sh reads it.
+ */
+const PROBE_COMMAND =
+  // `index` goes LAST so the columns everything below reads by position
+  // keep their positions.
+  `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,index --format=csv,noheader,nounits; echo ----; cat /proc/loadavg; nproc; echo ----; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; head -1 /proc/stat; echo ----; ` +
+  `if [ -f ${HEARTBEAT} ]; then echo "heartbeat $(( $(date +%s) - $(date -r ${HEARTBEAT} +%s) ))"; else echo 'heartbeat none'; fi`
+
+/**
+ * The heartbeat age a probe reported, in seconds: null when the agent never
+ * beat, undefined when the probe said nothing about it.
+ */
+function heartbeatAge(part: string | undefined): number | null | undefined {
+  const m = /^heartbeat (\d+|none)$/m.exec(part ?? '')
+  if (!m) return undefined
+  return m[1] === 'none' ? null : Number(m[1])
+}
+
+/**
+ * What Vast says about an instance SSH no longer reaches: gone (Vast no
+ * longer knows it), stopped (Vast stops an account's instances at a $0
+ * balance, field incident 1d59516c; or its host went offline), up (running,
+ * or coming back from a restart), or silent (no answer: Vast is down, or
+ * this computer's network is).
+ */
+type InstanceFate =
+  | { kind: 'gone' }
+  | { kind: 'stopped'; inst: RawInstance }
+  | { kind: 'up'; inst: RawInstance }
+  | { kind: 'silent'; reason: string }
+
+/** Vast is not running this instance, and will not without being asked. */
+function instanceStopped(inst: RawInstance): boolean {
+  if (inst.intended_status === 'stopped' || inst.cur_state === 'stopped') return true
+  return ['exited', 'stopped', 'offline'].includes(inst.actual_status ?? '')
+}
+
+/** How reviveAgent left the agent of a node that answers again. */
+type AgentRevival =
+  | { kind: 'kept'; renders: number }
+  | { kind: 'restarted'; reason: string | null }
+  | { kind: 'reprovisioned' }
+
+/** A node's run of failed probes (plan 1.7). */
+interface Strikes {
+  count: number
+  /** When the first of them failed (epoch ms). */
+  since: number
+  /** Why the last one did. */
+  reason: string
 }
 
 /**
@@ -497,6 +614,13 @@ export function setForgetNodeProvider(fn: (nodeId: string) => void): void {
 /** Latest usage sample per node (in-memory — no need to persist). */
 const metricsByNode = new Map<string, NodeMetrics>()
 
+/**
+ * When a probe last got through to each node (epoch ms), this session:
+ * NodeSnapshot.lastContactAt, which says how long an 'unreachable' node has
+ * been silent (plan 1.7).
+ */
+const lastContactByNode = new Map<string, number>()
+
 /** Previous `/proc/stat` jiffie totals per node, for the CPU% delta. */
 const cpuStatByNode = new Map<string, { total: number; idle: number }>()
 
@@ -690,12 +814,19 @@ function rowToSnapshot(r: NodeRow): NodeSnapshot {
     // create of unknown outcome as not billing (shared/nodeState.ts).
     destroyedAt: r.destroyed_at,
     createUnknownSince: r.create_unknown_since,
-    label: r.label
+    label: r.label,
+    lastContactAt: lastContactByNode.get(r.id) ?? null
   }
 }
 
 class ManagedNode {
   ssh: SshConnection | null = null
+  /**
+   * Times the node's connection dropped (SshConnection's 'disconnected')
+   * since the supervisor last looked: each counts as a failed probe, unless
+   * the next probe gets through (plan 1.7).
+   */
+  private drops = 0
 
   constructor(public readonly id: string) {}
 
@@ -735,16 +866,19 @@ class ManagedNode {
   }
 
   /**
-   * For a lifecycle step (driveToReady, resumeNode, recoverUnreachable) back
-   * from an await: whether the node has left `held`, the state the step last
-   * found it in or put it in. While a step holds a node nothing but a destroy
-   * moves it: destroyNode ('destroying', then 'destroyed', or 'failed' when
-   * Vast never confirmed the instance gone and it may still be billing). The
-   * step must then stop without writing a state over the destroy's, or a
-   * node the user destroyed comes back into the fleet, and a destroyed one
-   * gets a second DELETE. Not `gone`: a 'failed' destroy is not gone. A row
-   * the last exit left 'destroying' is never held by a step: init destroys
-   * it instead. Plan 2.2 makes every transition a compare-and-set instead.
+   * For a lifecycle step (driveToReady, resumeNode, recoverUnreachable,
+   * restoreAgent) back from an await: whether the node has left `held`, the
+   * state the step last found it in or put it in. While a step holds a node
+   * nothing but a destroy moves it: destroyNode ('destroying', then
+   * 'destroyed', or 'failed' when Vast never confirmed the instance gone and
+   * it may still be billing). The step must then stop without writing a
+   * state over the destroy's, or a node the user destroyed comes back into
+   * the fleet, and a destroyed one gets a second DELETE. Not `gone`: a
+   * 'failed' destroy is not gone. A row the last exit left 'destroying' is
+   * never held by a step: init destroys it instead. The liveness supervisor
+   * only takes up a node in a state no step holds (SUPERVISED), and at most
+   * one recovery runs per node. Plan 2.2 makes every transition a
+   * compare-and-set instead.
    */
   movedOn(held: NodeState): boolean {
     return this.state !== held
@@ -794,17 +928,20 @@ class ManagedNode {
     if (!row.ssh_host || !row.ssh_port) throw new Error('no SSH endpoint yet')
     let ssh = this.ssh
     if (!ssh) {
-      ssh = new SshConnection({
+      const opened = new SshConnection({
         host: row.ssh_host,
         port: row.ssh_port,
         username: 'root',
         privateKey: readPrivateKey(),
         pinnedHostKey: row.host_key
       })
-      ssh.on('hostKey', (hash: string) => {
+      opened.on('hostKey', (hash: string) => {
         if (!this.row.host_key) this.update({ host_key: hash })
       })
-      this.ssh = ssh
+      opened.on('disconnected', () => {
+        if (this.ssh === opened) this.drops++
+      })
+      this.ssh = ssh = opened
     }
     await ssh.acquire()
     return ssh
@@ -813,6 +950,35 @@ class ManagedNode {
   closeSsh(): void {
     this.ssh?.close()
     this.ssh = null
+  }
+
+  /** The connection drops since the last call (see drops). */
+  takeDrops(): number {
+    const n = this.drops
+    this.drops = 0
+    return n
+  }
+
+  /**
+   * Point the node's connection at `endpoints` when the one it uses is no
+   * longer among them: a restarted container can come back on other ports.
+   * True if it moved.
+   */
+  retargetTo(endpoints: Array<{ host: string; port: number }>): boolean {
+    const row = this.row
+    const [ep] = endpoints
+    if (!ep || endpoints.some((e) => e.host === row.ssh_host && e.port === row.ssh_port)) {
+      return false
+    }
+    this.update({ ssh_host: ep.host, ssh_port: ep.port })
+    this.ssh?.setTarget({
+      host: ep.host,
+      port: ep.port,
+      username: 'root',
+      privateKey: readPrivateKey(),
+      pinnedHostKey: row.host_key
+    })
+    return true
   }
 }
 
@@ -879,6 +1045,31 @@ export class NodeManager {
   private holdListeners = new Set<(holds: FleetHolds) => void>()
   /** The last search the spend cap left empty, for CAP_EMPTY_BACKOFF_MS. */
   private capEmpty: { headroom: number; filters: string; at: number } | null = null
+  /** Each supervised node's run of failed probes, while it lasts (plan 1.7). */
+  private strikes = new Map<string, Strikes>()
+  /** Nodes with a probe in flight: the next round leaves them to it. */
+  private probing = new Set<string>()
+  /** Each node's stale heartbeats seen in a row. */
+  private staleBeats = new Map<string, number>()
+  /**
+   * Nodes a recovery is running for (recoverUnreachable, restoreAgent): one
+   * at a time per node.
+   */
+  private recovering = new Set<string>()
+  /**
+   * Nodes onReady has run to the end on this session. One resumed at
+   * start-up that SSH did not reach has not been, and nothing short of the
+   * whole of onReady makes it this build's.
+   */
+  private provisioned = new Set<string>()
+  /** When the supervisor restarted each node's agent (epoch ms), within AGENT_RESTART_WINDOW_MS. */
+  private agentRestarts = new Map<string, number[]>()
+  /**
+   * shutdown() has run. Its closing every connection is not the nodes
+   * failing: a recovery under way must not take it for that and destroy a
+   * node the user chose to leave running.
+   */
+  private shutDown = false
   /** Phase 3 hook: called when a node reaches SSH-reachable. */
   onReady: ((node: { id: string; ssh: SshConnection }) => Promise<void>) | null = null
 
@@ -903,7 +1094,7 @@ export class NodeManager {
       }
     }
     this.costTimer = setInterval(() => void this.accrueCosts(), 60_000)
-    this.metricsTimer = setInterval(() => void this.pollMetrics(), 15_000)
+    this.metricsTimer = setInterval(() => this.pollMetrics(), PROBE_EVERY_MS)
     this.destroyTimer = setInterval(() => void this.retryDestroys(0), DESTROY_RETRY_MS)
     void this.retryDestroys(DESTROY_BUDGET_MS)
     void this.reconcile()
@@ -1303,86 +1494,353 @@ export class NodeManager {
   }
 
   shutdown(): void {
+    this.shutDown = true
     if (this.costTimer) clearInterval(this.costTimer)
     if (this.metricsTimer) clearInterval(this.metricsTimer)
     if (this.destroyTimer) clearInterval(this.destroyTimer)
     for (const n of this.nodes.values()) n.closeSsh()
   }
 
-  /** Sample GPU/CPU/RAM usage on every SSH-connected node. */
-  private async pollMetrics(): Promise<void> {
+  /**
+   * Probe every SSH-connected node: sample its GPU/CPU/RAM usage and its
+   * agent's heartbeat, which is also how the supervisor (plan 1.7) learns
+   * that a node or its agent has stopped answering. One probe per node at a
+   * time, all nodes at once: they used to run one after another, so a dead
+   * node's timeouts held up everyone's samples and could stack up past the
+   * next round.
+   */
+  private pollMetrics(): void {
     for (const node of this.nodes.values()) {
-      if (
-        !node.ssh ||
-        !['ready', 'idle', 'rendering', 'encoding', 'provisioning'].includes(node.state)
-      )
-        continue
-      try {
-        const r = await node.ssh.exec(
-          // `index` goes LAST so the columns everything below reads by position
-          // keep their positions.
-          `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,index --format=csv,noheader,nounits; echo ----; cat /proc/loadavg; nproc; echo ----; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; head -1 /proc/stat`,
-          { timeoutMs: 10_000 }
-        )
-        const [gpuPart, cpuPart, memPart] = r.stdout.split('----')
-        if (!gpuPart || !cpuPart) continue
-        // Only the first four columns must parse: cards that don't report
-        // power give "[N/A]" and would otherwise drop the whole sample.
-        const gpuRows = gpuPart
-          .trim()
-          .split('\n')
-          .map((line) => line.split(',').map((x) => parseFloat(x)))
-          .filter((xs) => xs.length >= 4 && xs.slice(0, 4).every((x) => Number.isFinite(x)))
-        if (gpuRows.length === 0) continue
-        const sumCol = (i: number): number =>
-          gpuRows.reduce((a, xs) => a + (Number.isFinite(xs[i]) ? xs[i] : 0), 0)
-        const powerW = sumCol(4)
-        const cpuLines = cpuPart.trim().split('\n')
-        const load1 = parseFloat(cpuLines[0]?.split(' ')[0] ?? '0')
-        const cores = parseInt(cpuLines[1] ?? '0', 10)
-        // /proc/meminfo is in kB; "used" = total - available (the number that
-        // actually predicts an OOM, unlike total - free).
-        const meminfo = (key: string): number => {
-          const m = new RegExp(`^${key}:\\s+(\\d+)`, 'm').exec(memPart ?? '')
-          return m ? parseInt(m[1], 10) / (1024 * 1024) : 0
-        }
-        const ramTotalGb = meminfo('MemTotal')
-        const ramAvailGb = meminfo('MemAvailable')
-        // Energy: rectangle-integrate this power reading over the gap since
-        // the previous sample (skipping absurd gaps after a sleep/disconnect).
-        const now = Date.now()
-        const prevAt = metricsByNode.get(node.id)?.updatedAt
-        const gapMs = prevAt ? now - prevAt : 0
-        if (powerW > 0 && gapMs > 0 && gapMs < 10 * 60_000) {
-          energyByNode.set(node.id, (energyByNode.get(node.id) ?? 0) + (powerW * gapMs) / 3_600_000)
-        }
-        metricsByNode.set(node.id, {
-          cpuUtil: cpuUtilFromStat(node.id, memPart ?? '', load1, cores),
-          gpuUtil: gpuRows.reduce((a, xs) => a + xs[0], 0) / gpuRows.length,
-          vramUsedGb: gpuRows.reduce((a, xs) => a + xs[1], 0) / 1024,
-          vramTotalGb: gpuRows.reduce((a, xs) => a + xs[2], 0) / 1024,
-          gpuTemp: Math.max(...gpuRows.map((xs) => xs[3])),
-          powerW,
-          powerLimitW: sumCol(5),
-          cpuLoad1: Number.isFinite(load1) ? load1 : 0,
-          cpuCores: Number.isFinite(cores) ? cores : 0,
-          ramUsedGb: Math.max(0, ramTotalGb - ramAvailGb),
-          ramTotalGb,
-          updatedAt: now,
-          gpus: gpuRows.map((xs, i): GpuSample => ({
-            index: Number.isFinite(xs[6]) ? xs[6] : i,
-            util: xs[0],
-            vramUsedGb: xs[1] / 1024,
-            vramTotalGb: xs[2] / 1024,
-            temp: xs[3],
-            powerW: Number.isFinite(xs[4]) ? xs[4] : 0
-          }))
-        })
-        emit('node:changed', node.snapshot)
-      } catch {
-        // connection hiccup — skip this sample
-      }
+      const ssh = node.ssh
+      if (!ssh || !PROBED.has(node.state) || this.probing.has(node.id)) continue
+      this.probing.add(node.id)
+      void this.probe(node, ssh).finally(() => this.probing.delete(node.id))
     }
+  }
+
+  private async probe(node: ManagedNode, ssh: SshConnection): Promise<void> {
+    let r: ExecResult
+    try {
+      r = await ssh.exec(PROBE_COMMAND, { timeoutMs: PROBE_TIMEOUT_MS, label: 'node probe' })
+    } catch (e) {
+      // Closed under it by a destroy or a recovery: says nothing of the node.
+      if (node.ssh === ssh) this.probeFailed(node, classify(e, { via: 'ssh' }).reason)
+      return
+    }
+    if (node.ssh !== ssh) return
+    // What ssh2 hands back for a channel whose connection went: no exit
+    // status and no output.
+    if (r.code === null && !r.stdout.trim()) {
+      this.probeFailed(node, 'the connection dropped under the probe')
+      return
+    }
+    this.probeAnswered(node)
+    const [gpuPart, cpuPart, memPart, beatPart] = r.stdout.split('----')
+    this.heartbeatSeen(node, heartbeatAge(beatPart))
+    try {
+      this.recordSample(node, gpuPart, cpuPart, memPart)
+    } catch {
+      // A sample that does not parse is skipped.
+    }
+  }
+
+  /** Store one probe's usage sample, integrate its energy, and push it. */
+  private recordSample(
+    node: ManagedNode,
+    gpuPart: string | undefined,
+    cpuPart: string | undefined,
+    memPart: string | undefined
+  ): void {
+    if (!gpuPart || !cpuPart) return
+    // Only the first four columns must parse: cards that don't report
+    // power give "[N/A]" and would otherwise drop the whole sample.
+    const gpuRows = gpuPart
+      .trim()
+      .split('\n')
+      .map((line) => line.split(',').map((x) => parseFloat(x)))
+      .filter((xs) => xs.length >= 4 && xs.slice(0, 4).every((x) => Number.isFinite(x)))
+    if (gpuRows.length === 0) return
+    const sumCol = (i: number): number =>
+      gpuRows.reduce((a, xs) => a + (Number.isFinite(xs[i]) ? xs[i] : 0), 0)
+    const powerW = sumCol(4)
+    const cpuLines = cpuPart.trim().split('\n')
+    const load1 = parseFloat(cpuLines[0]?.split(' ')[0] ?? '0')
+    const cores = parseInt(cpuLines[1] ?? '0', 10)
+    // /proc/meminfo is in kB; "used" = total - available (the number that
+    // actually predicts an OOM, unlike total - free).
+    const meminfo = (key: string): number => {
+      const m = new RegExp(`^${key}:\\s+(\\d+)`, 'm').exec(memPart ?? '')
+      return m ? parseInt(m[1], 10) / (1024 * 1024) : 0
+    }
+    const ramTotalGb = meminfo('MemTotal')
+    const ramAvailGb = meminfo('MemAvailable')
+    // Energy: rectangle-integrate this power reading over the gap since
+    // the previous sample (skipping absurd gaps after a sleep/disconnect).
+    const now = Date.now()
+    const prevAt = metricsByNode.get(node.id)?.updatedAt
+    const gapMs = prevAt ? now - prevAt : 0
+    if (powerW > 0 && gapMs > 0 && gapMs < 10 * 60_000) {
+      energyByNode.set(node.id, (energyByNode.get(node.id) ?? 0) + (powerW * gapMs) / 3_600_000)
+    }
+    metricsByNode.set(node.id, {
+      cpuUtil: cpuUtilFromStat(node.id, memPart ?? '', load1, cores),
+      gpuUtil: gpuRows.reduce((a, xs) => a + xs[0], 0) / gpuRows.length,
+      vramUsedGb: gpuRows.reduce((a, xs) => a + xs[1], 0) / 1024,
+      vramTotalGb: gpuRows.reduce((a, xs) => a + xs[2], 0) / 1024,
+      gpuTemp: Math.max(...gpuRows.map((xs) => xs[3])),
+      powerW,
+      powerLimitW: sumCol(5),
+      cpuLoad1: Number.isFinite(load1) ? load1 : 0,
+      cpuCores: Number.isFinite(cores) ? cores : 0,
+      ramUsedGb: Math.max(0, ramTotalGb - ramAvailGb),
+      ramTotalGb,
+      updatedAt: now,
+      gpus: gpuRows.map((xs, i): GpuSample => ({
+        index: Number.isFinite(xs[6]) ? xs[6] : i,
+        util: xs[0],
+        vramUsedGb: xs[1] / 1024,
+        vramTotalGb: xs[2] / 1024,
+        temp: xs[3],
+        powerW: Number.isFinite(xs[4]) ? xs[4] : 0
+      }))
+    })
+    emit('node:changed', node.snapshot)
+  }
+
+  // -- liveness supervision (plan 1.7) -------------------------------------------
+
+  /**
+   * A probe got through: whatever run of failures the node had is over, a
+   * dropped connection included (it reconnected).
+   */
+  private probeAnswered(node: ManagedNode): void {
+    node.takeDrops()
+    this.strikes.delete(node.id)
+    lastContactByNode.set(node.id, Date.now())
+  }
+
+  /**
+   * A probe failed. Past UNREACHABLE_STRIKES in a row, over at least
+   * UNREACHABLE_AFTER_MS, the node is taken out of the fleet and looked
+   * into (nodeSilent). Only a node work is sent to is counted: one being
+   * provisioned or recovered has a deadline of its own.
+   */
+  private probeFailed(node: ManagedNode, reason: string): void {
+    if (!SUPERVISED.has(node.state) || this.recovering.has(node.id)) {
+      this.strikes.delete(node.id)
+      return
+    }
+    const now = Date.now()
+    const s = this.strikes.get(node.id) ?? { count: 0, since: now, reason }
+    s.count += 1 + node.takeDrops()
+    s.reason = reason
+    this.strikes.set(node.id, s)
+    if (s.count < UNREACHABLE_STRIKES || now - s.since < UNREACHABLE_AFTER_MS) return
+    this.strikes.delete(node.id)
+    this.nodeSilent(node, s)
+  }
+
+  /**
+   * The node has not answered a probe for UNREACHABLE_AFTER_MS or more: out
+   * of the fleet ('unreachable', which tick() sends nothing to), and then
+   * Vast is asked what became of it (recoverUnreachable).
+   *
+   * Its chunks are not given back yet. A node that comes back with its agent
+   * alive carries on with them, as if nothing happened; a node Vast has
+   * stopped or lost, or one that does not come back, gives them back then.
+   * Giving them back at once would have another node render them while this
+   * one, back a minute later, rendered them too, paid for twice.
+   */
+  private nodeSilent(node: ManagedNode, s: Strikes): void {
+    const last = lastContactByNode.get(node.id) ?? s.since
+    const secs = Math.max(0, Math.round((Date.now() - last) / 1000))
+    node.setState('unreachable', `no answer over SSH for ${secs}s: ${s.reason}`)
+    void this.recoverUnreachable(node, { askVast: true, why: s.reason })
+  }
+
+  /**
+   * What a probe said of the agent's heartbeat. Stale on AGENT_STALE_PROBES
+   * probes in a row, on a node work is sent to, and the agent is taken for
+   * dead (restoreAgent): SSH answers, but nothing takes the chunks sent to
+   * the node, and those it had stop where they were. A container restart
+   * does that, since nothing on the node starts the agent again.
+   */
+  private heartbeatSeen(node: ManagedNode, age: number | null | undefined): void {
+    const stale = age === null || (age !== undefined && age > AGENT_STALE_S)
+    if (!stale || !SUPERVISED.has(node.state) || this.recovering.has(node.id)) {
+      this.staleBeats.delete(node.id)
+      return
+    }
+    const seen = (this.staleBeats.get(node.id) ?? 0) + 1
+    this.staleBeats.set(node.id, seen)
+    if (seen < AGENT_STALE_PROBES) return
+    this.staleBeats.delete(node.id)
+    void this.restoreAgent(node, age == null ? 'no agent heartbeat' : `agent heartbeat ${age}s old`)
+  }
+
+  /**
+   * A node SSH answers whose agent looks dead: out of the fleet
+   * ('provisioning', sent nothing) while reviveAgent looks at the agent and
+   * restarts it if it is, then back. Given up on if that fails or passes
+   * PROVISION_DEADLINE_MS.
+   */
+  private async restoreAgent(node: ManagedNode, why: string): Promise<void> {
+    const ssh = node.ssh
+    if (!ssh || this.recovering.has(node.id)) return
+    this.recovering.add(node.id)
+    try {
+      node.setState('provisioning', `${why}: checking the agent`)
+      const held: NodeState = 'provisioning'
+      try {
+        const revival = await withDeadline(
+          this.reviveAgent(node, ssh),
+          PROVISION_DEADLINE_MS,
+          'bringing the agent back'
+        )
+        if (node.movedOn(held)) return
+        this.backInService(node, revival, why)
+      } catch (e) {
+        if (node.movedOn(held) || this.shutDown) return
+        await this.giveUp(
+          node,
+          `${why}, and the agent could not be brought back: ${classify(e, { via: 'ssh' }).reason}`,
+          { connected: true }
+        )
+      }
+    } finally {
+      this.recovering.delete(node.id)
+    }
+  }
+
+  /**
+   * Bring the agent of a node that answers over SSH to a known state before
+   * it takes work again. It used to be marked 'ready' on a bare reconnect,
+   * whatever its agent was doing, so the chunks of a restarted container
+   * waited for good on an agent nobody had started (#33 #139, audit A6).
+   *
+   * - A node this session never provisioned (resumed at start-up while SSH
+   *   was down) gets the whole of onReady, as resumeNode would have given
+   *   it. So does one whose tree has no agent-status.
+   * - A live agent running this build's code is kept, renders and all, as
+   *   long as the app still holds work on the node, or it has none: the
+   *   node carries on where it was.
+   * - A live agent rendering work the app no longer holds (the scheduler
+   *   gave the chunks back while the node was silent) is restarted: its
+   *   renders would be paid for with nobody to collect them.
+   * - A dead one is restarted (deps first if they are not this build's),
+   *   unless it has been AGENT_RESTARTS_MAX times within the hour already.
+   *
+   * The node's runs are forgotten exactly when the agent was restarted,
+   * since that killed their renders (restartAgent); never on a check made
+   * beforehand, which can go stale in between.
+   */
+  private async reviveAgent(node: ManagedNode, ssh: SshConnection): Promise<AgentRevival> {
+    if (!this.provisioned.has(node.id)) return this.reprovision(node, ssh)
+    const status = await agentStatus(ssh)
+    if (!status) return this.reprovision(node, ssh)
+    const held = activeWorkProvider?.(node.id).length ?? 0
+    const now = Date.now()
+    const recent = (this.agentRestarts.get(node.id) ?? []).filter(
+      (t) => now - t < AGENT_RESTART_WINDOW_MS
+    )
+    if (!status.restartNeeded) {
+      if (held > 0 || (status.blenderProcs === 0 && status.inboxSpecs === 0)) {
+        return { kind: 'kept', renders: status.blenderProcs }
+      }
+    } else {
+      if (recent.length >= AGENT_RESTARTS_MAX) {
+        throw new Error(
+          `its agent had to be restarted ${recent.length} times within the hour (now: ${status.restartReason})`
+        )
+      }
+      if (!status.depsCurrent) await provisionDeps(ssh, node.id)
+    }
+    const r = await restartAgent(ssh, node.id, { force: !status.restartNeeded })
+    if (!r.restarted) return { kind: 'kept', renders: status.blenderProcs }
+    forgetNodeProvider?.(node.id)
+    if (status.restartNeeded) this.agentRestarts.set(node.id, [...recent, Date.now()])
+    return {
+      kind: 'restarted',
+      reason: status.restartNeeded ? r.reason : 'it was rendering work the app no longer holds'
+    }
+  }
+
+  /**
+   * The whole of onReady on a node that answers again. It restarts the
+   * agent, so every run on the node goes first.
+   */
+  private async reprovision(node: ManagedNode, ssh: SshConnection): Promise<AgentRevival> {
+    forgetNodeProvider?.(node.id)
+    if (this.onReady) await this.onReady({ id: node.id, ssh })
+    this.provisioned.add(node.id)
+    return { kind: 'reprovisioned' }
+  }
+
+  /** A recovered node takes work again: 'rendering' if the scheduler still holds some on it. */
+  private backInService(node: ManagedNode, revival: AgentRevival, why: string): void {
+    const busy = (activeWorkProvider?.(node.id).length ?? 0) > 0
+    node.setState(busy ? 'rendering' : 'ready')
+    const done =
+      revival.kind === 'kept'
+        ? `its agent was alive and kept its ${revival.renders} render(s)`
+        : revival.kind === 'restarted'
+          ? `its agent was restarted${revival.reason ? ` (${revival.reason})` : ''}`
+          : 'it was provisioned again'
+    emit('render:logLine', {
+      nodeId: node.id,
+      chunkId: null,
+      line: `back in service after ${why}: ${done}`,
+      ts: Date.now()
+    })
+    if (revival.kind !== 'kept') {
+      emit('alert', {
+        level: 'info',
+        message: `Node ${nodeName(node.snapshot)} is back after ${why}: ${done}`
+      })
+    }
+  }
+
+  /** What Vast says about an instance SSH no longer reaches. Never rejects. */
+  private async askVast(instanceId: number): Promise<InstanceFate> {
+    try {
+      const inst = await showInstance(instanceId)
+      if (!inst) return { kind: 'gone' }
+      return instanceStopped(inst) ? { kind: 'stopped', inst } : { kind: 'up', inst }
+    } catch (e) {
+      return { kind: 'silent', reason: classify(e, { via: 'vast' }).reason }
+    }
+  }
+
+  /**
+   * A node SSH lost whose instance Vast has stopped or no longer knows: its
+   * chunks go back to the queue, and a stopped instance is destroyed. It
+   * still bills for its disk, and Vast will not start it again by itself.
+   * Not blacklisted: at a $0 balance Vast stops every instance of the
+   * account, whatever the machine (1d59516c).
+   */
+  private async lost(
+    node: ManagedNode,
+    instanceId: number,
+    fate: Extract<InstanceFate, { kind: 'gone' | 'stopped' }>,
+    why: string
+  ): Promise<void> {
+    const status =
+      fate.kind === 'gone'
+        ? 'Vast no longer knows its instance'
+        : `Vast reports its instance ${fate.inst.actual_status ?? fate.inst.intended_status ?? 'stopped'}`
+    const reason = `SSH stopped answering (${why}) and ${status}`
+    forgetNodeProvider?.(node.id)
+    emit('alert', {
+      level: 'warn',
+      message: `Node ${nodeName(node.snapshot)}: ${reason}. ${fate.kind === 'gone' ? 'It is gone.' : 'Destroying it.'}`
+    })
+    node.closeSsh()
+    if (fate.kind === 'gone') {
+      this.instanceGone(instanceId, reason)
+      return
+    }
+    node.setState('destroying', reason)
+    await this.ensureInstanceGone(instanceId, { node, reason })
   }
 
   list(): NodeSnapshot[] {
@@ -2134,11 +2592,12 @@ export class NodeManager {
    *   them again, and they hear when it is confirmed.
    *
    * Resolves true once the instance is confirmed gone; never rejects. A call
-   * for an instance already being destroyed waits on that one.
+   * for an instance already being destroyed waits on that one. `reason`, why
+   * the instance had to go, stays on its rows once it is confirmed gone.
    */
   ensureInstanceGone(
     instanceId: number,
-    opts: { node?: ManagedNode; budgetMs?: number; quiet?: boolean } = {}
+    opts: { node?: ManagedNode; budgetMs?: number; quiet?: boolean; reason?: string } = {}
   ): Promise<boolean> {
     const running = this.goneChecks.get(instanceId)
     if (running) return running
@@ -2151,7 +2610,7 @@ export class NodeManager {
 
   private async destroyUntilGone(
     instanceId: number,
-    opts: { node?: ManagedNode; budgetMs?: number; quiet?: boolean }
+    opts: { node?: ManagedNode; budgetMs?: number; quiet?: boolean; reason?: string }
   ): Promise<boolean> {
     const { node } = opts
     if (node) {
@@ -2195,7 +2654,7 @@ export class NodeManager {
       this.destroyUnconfirmed(instanceId, last ?? e, opts.quiet === true)
       return false
     }
-    this.instanceGone(instanceId)
+    this.instanceGone(instanceId, opts.reason ?? null)
     return true
   }
 
@@ -2431,6 +2890,7 @@ export class NodeManager {
       // Provisioning takes minutes, plenty of time to be destroyed in; a
       // node that was must not end 'ready', where the scheduler would use it.
       if (node.movedOn(held)) return
+      this.provisioned.add(node.id)
       node.setState('ready')
       emit('alert', { level: 'info', message: `Node ${node.snapshot.gpuName} ready` })
     } catch (e) {
@@ -2555,6 +3015,7 @@ export class NodeManager {
       // Destroyed while provisioning: not 'ready', where the scheduler would
       // dispatch to it and scale-down would destroy it a second time.
       if (node.movedOn(held)) return
+      this.provisioned.add(node.id)
       node.setState('ready')
     } catch (e) {
       // The destroy closed the connection under the connect, the echo or
@@ -2591,46 +3052,127 @@ export class NodeManager {
     const s = node.snapshot
     emit('alert', { level: 'warn', message: `Node ${nodeName(s)}: ${reason}. Destroying it.` })
     if (!opts.connected) node.closeSsh()
-    if (s.instanceId != null) await this.ensureInstanceGone(s.instanceId, { node })
+    if (s.instanceId != null) await this.ensureInstanceGone(s.instanceId, { node, reason })
   }
 
-  private async recoverUnreachable(node: ManagedNode): Promise<void> {
-    // 'unreachable', set by resumeNode just now. See movedOn.
-    const held = node.state
+  /**
+   * Bring an 'unreachable' node back, or let it go (plan 1.7). From
+   * resumeNode, for a node SSH did not reach at start-up, and from the
+   * supervisor (nodeSilent), with `askVast` since Vast has not been asked.
+   * One at a time per node.
+   *
+   * - Vast has stopped the instance or no longer knows it: let go (lost).
+   * - Otherwise the node's own connection reconnects with backoff, for up to
+   *   10 min, to the endpoint Vast now lists: a restarted container can come
+   *   back on other ports. Once SSH answers, the agent is checked and, if it
+   *   is dead, restarted, before the node takes work again (reviveAgent). It
+   *   used to go 'ready' on a bare reconnect.
+   * - SSH does not come back: Vast is asked again. Stopped or gone: let go.
+   *   Running: given up on and destroyed. No answer: this computer's network
+   *   may be what is down, not the node, so the node stays 'unreachable',
+   *   counted as billing and sent nothing, and both are tried again. A
+   *   laptop offline for ten minutes used to come back to a fleet destroyed.
+   *
+   * The chunks the node had are not given back until one of those settles
+   * it (see nodeSilent).
+   */
+  private async recoverUnreachable(
+    node: ManagedNode,
+    opts: { askVast?: boolean; why?: string } = {}
+  ): Promise<void> {
+    if (this.recovering.has(node.id)) return
+    this.recovering.add(node.id)
     try {
-      const ssh = node.ssh ?? (await node.connectSsh())
-      // Closed by destroyNode mid-connect, as in resumeNode: end the session
-      // the connect opened anyway.
-      if (node.movedOn(held)) {
-        ssh.close()
-        return
-      }
-      await ssh.reconnectWithBackoff()
-      if (node.movedOn(held)) {
-        ssh.close()
-        return
-      }
-      node.setState('ready')
-    } catch (e) {
-      // Destroyed meanwhile: destroyNode closed the connection the reconnect
-      // was retrying on, which is what ended it. The destroy is not this
-      // node failing, and destroying the instance again here would only
-      // join destroyNode's.
+      await this.recover(node, opts)
+    } finally {
+      this.recovering.delete(node.id)
+    }
+  }
+
+  private async recover(
+    node: ManagedNode,
+    opts: { askVast?: boolean; why?: string }
+  ): Promise<void> {
+    // 'unreachable', set by resumeNode or nodeSilent just now. See movedOn.
+    const held = node.state
+    const instanceId = node.facts.instanceId
+    let why = opts.why ?? node.snapshot.lastError ?? 'no answer over SSH'
+    if (opts.askVast && instanceId != null) {
+      const fate = await this.askVast(instanceId)
       if (node.movedOn(held)) return
-      node.setState('failed', (e as Error).message)
-      // A node that dies mid-render never reaches destroyNode, so the
-      // scheduler would otherwise keep polling a dead connection for chunks
-      // this node can no longer finish. Release them here too so they requeue
-      // onto a surviving node.
-      forgetNodeProvider?.(node.id)
-      // ...and then stop paying for it. Same guarantee as driveToReady's catch:
-      // nothing else destroys a node that fails this way, since scale-down
-      // takes only idle nodes. Its connection is the one that just died, so
-      // it is closed first: an Octane stop over it would only wait out its
-      // budget before the destroy.
-      const instanceId = node.snapshot.instanceId
-      node.closeSsh()
-      if (instanceId) await this.ensureInstanceGone(instanceId, { node })
+      if (fate.kind === 'gone' || fate.kind === 'stopped') {
+        await this.lost(node, instanceId, fate, why)
+        return
+      }
+      if (fate.kind === 'up') node.retargetTo(sshEndpoints(fate.inst))
+    }
+    let ssh: SshConnection
+    for (;;) {
+      try {
+        ssh = node.ssh ?? (await node.connectSsh())
+        // Closed by destroyNode mid-connect, as in resumeNode: end the session
+        // the connect opened anyway.
+        if (node.movedOn(held)) {
+          ssh.close()
+          return
+        }
+        await ssh.reconnectWithBackoff()
+        if (node.movedOn(held)) {
+          ssh.close()
+          return
+        }
+        break
+      } catch (e) {
+        // Destroyed meanwhile: destroyNode closed the connection the
+        // reconnect was retrying on, which is what ended it. The destroy is
+        // not this node failing, and destroying the instance again here
+        // would only join destroyNode's.
+        if (node.movedOn(held) || this.shutDown) return
+        why = classify(e, { via: 'ssh' }).reason
+        // Another machine answers at the endpoint (waiting will not change
+        // that), or Vast running the instance while SSH stays down: given up
+        // on. Nothing else destroys a node that fails this way, since
+        // scale-down takes only idle nodes. Its connection is the one that
+        // just died, so it is closed first: an Octane stop over it would only
+        // wait out its budget before the destroy.
+        const abandon = (): Promise<void> =>
+          this.giveUp(node, `SSH did not come back: ${why}`, { connected: false })
+        if (e instanceof HostKeyMismatchError || instanceId == null) return abandon()
+        const fate = await this.askVast(instanceId)
+        if (node.movedOn(held) || this.shutDown) return
+        if (fate.kind === 'gone' || fate.kind === 'stopped') {
+          return this.lost(node, instanceId, fate, why)
+        }
+        if (fate.kind === 'silent') {
+          node.update({
+            last_error: `no answer over SSH (${why}), nor from Vast.ai (${fate.reason}): trying both again`
+          })
+          await sleep(RESUME_MAX_DELAY_MS)
+          if (node.movedOn(held) || this.shutDown) return
+          continue
+        }
+        // Vast lists it on other ports now: once more, there.
+        if (node.retargetTo(sshEndpoints(fate.inst))) continue
+        return abandon()
+      }
+    }
+    lastContactByNode.set(node.id, Date.now())
+    node.takeDrops()
+    try {
+      const revival = await withDeadline(
+        this.reviveAgent(node, ssh),
+        PROVISION_DEADLINE_MS,
+        'bringing the agent back'
+      )
+      if (node.movedOn(held)) return
+      this.backInService(node, revival, why)
+    } catch (e) {
+      if (node.movedOn(held) || this.shutDown) return
+      await this.giveUp(
+        node,
+        `SSH answers again, but the agent could not be brought back: ${classify(e, { via: 'ssh' }).reason}`,
+        { connected: true }
+      )
     }
   }
 
