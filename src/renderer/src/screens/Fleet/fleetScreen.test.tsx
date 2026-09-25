@@ -2,12 +2,13 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { NodeSnapshot, SettingsPublic } from '../../../../shared/models'
+import type { NodeSnapshot, SettingsPublic, UnclaimedInstance } from '../../../../shared/models'
 
 // The Fleet as Phase 1 wires it, rendered from a seeded query cache with
 // the IPC bridge stubbed (window.api, which a test has no window for), as
 // recoveryWiring.test.tsx does:
-// - 1.2: a node that may still be billing is always listed, and counted.
+// - 1.2: a node that may still be billing is always listed, and counted;
+// - 1.3: instances nobody here holds are listed with their rate, destroy asks.
 
 vi.mock('../../lib/ipc', () => ({
   ipc: { invoke: vi.fn(() => new Promise(() => {})), on: vi.fn(() => () => {}) }
@@ -67,6 +68,20 @@ function node(patch: Partial<NodeSnapshot>): NodeSnapshot {
   }
 }
 
+const unclaimed = (patch: Partial<UnclaimedInstance>): UnclaimedInstance => ({
+  instanceId: 4242,
+  label: 'vastai-blender deadbeef:12345678',
+  owner: 'otherVastRender',
+  gpuName: 'RTX 3090',
+  numGpus: 1,
+  dphTotal: 0.25,
+  status: 'running',
+  startedAt: null,
+  firstSeenAt: 0,
+  destroyError: null,
+  ...patch
+})
+
 beforeEach(() => {
   for (const k of Object.keys(stored)) delete stored[k]
 })
@@ -114,5 +129,45 @@ describe('1.2: a node that may be billing is never out of sight', () => {
     expect(html).toContain('>2 / 4<')
     // Before the first fleet:cost push, not $0.000/hr (#96).
     expect(html).toContain('$0.750/hr')
+  })
+})
+
+describe('1.3: unclaimed instances', () => {
+  it('lists each with its rate and a destroy that asks, and what they bill together', () => {
+    const html = withCache(
+      (qc) => {
+        qc.setQueryData(qk.nodes, [])
+        qc.setQueryData(qk.unclaimed, [
+          unclaimed({}),
+          unclaimed({
+            instanceId: 99,
+            owner: 'unlabelled',
+            label: null,
+            dphTotal: 1.5,
+            status: 'exited'
+          })
+        ])
+      },
+      <FleetScreen />
+    )
+    expect(html).toContain('unclaimed instances')
+    expect(html).toContain('#4242')
+    expect(html).toContain('another Vast Render')
+    expect(html).toContain('not Vast Render')
+    // The exited one bills its storage only.
+    expect(html).toContain('billing <span')
+    expect(html).toContain('$0.250/hr</span>')
+    expect(html.match(/<span aria-live="polite">destroy<\/span>/g)).toHaveLength(2)
+  })
+
+  it('shows nothing when every instance is held', () => {
+    const html = withCache(
+      (qc) => {
+        qc.setQueryData(qk.nodes, [])
+        qc.setQueryData(qk.unclaimed, [])
+      },
+      <FleetScreen />
+    )
+    expect(html).not.toContain('unclaimed instances')
   })
 })

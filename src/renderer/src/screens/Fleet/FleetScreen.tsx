@@ -9,6 +9,7 @@ import { ipc } from '../../lib/ipc'
 import { useNav } from '../../lib/nav'
 import { DestroyNodeButton } from './NodeActions'
 import { NodeDetail } from './NodeDetail'
+import { UnclaimedPanel } from './UnclaimedPanel'
 import { MeterPair, MiniMeter } from './meters'
 import { pctOf, usageTone } from '../../lib/usage'
 import { useNodes, useSettings, useUpdateSettings } from '../../lib/queries'
@@ -372,7 +373,18 @@ export function FleetScreen(): React.JSX.Element {
           </span>
         }
       />
-      <div style={{ flex: 1, overflow: 'auto', padding: SCALE.space4 }}>
+      <div
+        style={{
+          flex: 1,
+          overflow: 'auto',
+          padding: SCALE.space4,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: SCALE.space3
+        }}
+      >
+        {/* Billing with no node here to show for it: above everything. */}
+        {settings && !settings.hasVastApiKey ? null : <UnclaimedPanel />}
         {settings && !settings.hasVastApiKey ? (
           <div
             style={{
