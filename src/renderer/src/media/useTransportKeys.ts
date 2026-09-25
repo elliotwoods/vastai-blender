@@ -5,10 +5,13 @@
  * mounted transports meant every arrow key stepped twice. Now the binding is
  * explicitly gated: the overlay claims the keys while it is open and the
  * screen behind it stands down, instead of "whoever mounted last wins".
+ *
+ * Space play/pause, ←/→ step (Shift ±10), Home/End, `<` / `>` speed preset.
  */
 
 import { useEffect } from 'react'
 import type { ClipSyncController } from './ClipSyncController'
+import { applySpeed, stepSpeed } from './speed'
 
 export function useTransportKeys(controller: ClipSyncController, enabled = true): void {
   useEffect(() => {
@@ -36,6 +39,14 @@ export function useTransportKeys(controller: ClipSyncController, enabled = true)
         case 'End':
           e.preventDefault()
           controller.last()
+          break
+        case '<':
+          e.preventDefault()
+          applySpeed(controller, stepSpeed(controller.rate, -1))
+          break
+        case '>':
+          e.preventDefault()
+          applySpeed(controller, stepSpeed(controller.rate, 1))
           break
       }
     }

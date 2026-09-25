@@ -5,7 +5,10 @@
  * - Playing: a rAF loop READS the leader's currentTime → derives the frame →
  *   notifies subscribers. Followers are corrected by seek only when drift
  *   exceeds one frame; inside that they converge via playbackRate nudging
- *   (0.98–1.02) so playback never stutters.
+ *   (base rate × 0.98–1.02) so playback never stutters.
+ * - Speed: a user base rate (`setRate`, 0.1–8×) that every clip plays at.
+ *   The nudge is relative to it, and pausing or a hard correct restores it
+ *   rather than 1×.
  * - Paused stepping / scrubbing: WRITES currentTime to clips. All-Intra
  *   encodes make this frame-exact. Mid-drag only the leader seeks (cheap
  *   preview); pointer-up fans the final frame out to everyone.
@@ -22,8 +25,12 @@ export interface TransportMeta {
 
 type Listener = (frame: number, playing: boolean) => void
 
-const RATE_MIN = 0.98
-const RATE_MAX = 1.02
+const NUDGE_MIN = 0.98
+const NUDGE_MAX = 1.02
+
+/** Bounds of the user base rate. Chromium mutes audio outside 0.25–4 but plays. */
+export const BASE_RATE_MIN = 0.1
+export const BASE_RATE_MAX = 8
 
 export class ClipSyncController {
   private videos: HTMLVideoElement[] = []
@@ -32,6 +39,7 @@ export class ClipSyncController {
   private raf: number | null = null
   private _playing = false
   private lastFrame = -1
+  private baseRate = 1
 
   constructor(public meta: TransportMeta) {}
 
@@ -62,6 +70,7 @@ export class ClipSyncController {
 
   register(el: HTMLVideoElement): () => void {
     this.videos.push(el)
+    this.applyBaseRate(el)
     /**
      * Re-apply the transport's position once the element can actually seek.
      *
@@ -121,6 +130,36 @@ export class ClipSyncController {
     }
   }
 
+  // -- speed ----------------------------------------------------------------
+
+  /** The user base playback rate (1 = real time). */
+  get rate(): number {
+    return this.baseRate
+  }
+
+  /**
+   * Set the base playback rate, clamped to 0.1–8. Applies to every clip and
+   * re-notifies subscribers, so `rate` is a valid external-store snapshot on
+   * the same `subscribe()` the frame and play state use.
+   */
+  setRate(r: number): void {
+    if (!Number.isFinite(r)) return
+    const next = Math.min(BASE_RATE_MAX, Math.max(BASE_RATE_MIN, r))
+    if (next === this.baseRate) return
+    this.baseRate = next
+    for (const v of this.videos) this.applyBaseRate(v)
+    this.notifyForce()
+  }
+
+  /**
+   * `defaultPlaybackRate` too: a `src` swap (a live clip rolling to a new
+   * version) runs the media load algorithm, which resets `playbackRate` to it.
+   */
+  private applyBaseRate(v: HTMLVideoElement): void {
+    v.defaultPlaybackRate = this.baseRate
+    v.playbackRate = this.baseRate
+  }
+
   // -- state ----------------------------------------------------------------
 
   get playing(): boolean {
@@ -138,7 +177,10 @@ export class ClipSyncController {
   play(): void {
     if (this._playing) return
     this._playing = true
-    for (const v of this.videos) void v.play().catch(() => {})
+    for (const v of this.videos) {
+      this.applyBaseRate(v)
+      void v.play().catch(() => {})
+    }
     this.startLoop()
     this.notifyForce()
   }
@@ -148,7 +190,7 @@ export class ClipSyncController {
     this._playing = false
     for (const v of this.videos) {
       v.pause()
-      v.playbackRate = 1
+      v.playbackRate = this.baseRate
     }
     this.stopLoop()
     // Align everyone on the leader's frame for a clean paused state.
@@ -234,11 +276,13 @@ export class ClipSyncController {
           if (drift < -dur / 2) drift += dur
           if (Math.abs(drift) > frameDur) {
             v.currentTime = leaderT // hard correct beyond one frame
-            v.playbackRate = 1
+            v.playbackRate = this.baseRate
           } else {
             // Nudge toward the leader: behind → speed up, ahead → slow down.
+            // Drift is in media seconds, so the nudge is relative to the base
+            // rate: ±2% of whatever speed the user picked.
             const nudge = 1 - drift / (frameDur * 4)
-            v.playbackRate = Math.min(RATE_MAX, Math.max(RATE_MIN, nudge))
+            v.playbackRate = this.baseRate * Math.min(NUDGE_MAX, Math.max(NUDGE_MIN, nudge))
           }
         }
       }
