@@ -1069,6 +1069,31 @@ export interface SettingsPatchResult {
 
 export type SecretKey = 'vastApiKey' | 'otoyUsername' | 'otoyPassword'
 
+/**
+ * The Vast.ai permission groups the app's key needs, as named in Vast's
+ * scoped-key JSON (docs.vast.ai/api-reference/permissions).
+ */
+export type VastPermission = 'user_read' | 'instance_read' | 'misc' | 'instance_write'
+
+/**
+ * One permission group as vast:testKey found it: `ok` true when a read-only
+ * call that needs it went through, false when it failed, null when it cannot
+ * be tested without renting or destroying something (instance_write).
+ */
+export interface VastPermissionCheck {
+  perm: VastPermission
+  ok: boolean | null
+  detail: string
+}
+
+export interface VastKeyTest {
+  /** Every testable permission passed. */
+  ok: boolean
+  /** One line: the account and its credit, or why the key failed. */
+  message: string
+  checks: VastPermissionCheck[]
+}
+
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------

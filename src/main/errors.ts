@@ -486,9 +486,17 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
   if (/No Vast\.ai API key/i.test(message)) {
     return result('account', 'vast-no-key', 'no Vast.ai API key', e, false)
   }
-  if (status === 401) return result('account', 'vast-401', 'Vast rejected the API key', e, false)
+  if (status === 401)
+    return result('account', 'vast-401', 'Vast rejected the API key (invalid or revoked)', e, false)
   if (status === 402) return result('account', 'vast-402', 'Vast wants payment', e, false)
-  if (status === 403) return result('account', 'vast-403', 'Vast refused access', e, false)
+  if (status === 403)
+    return result(
+      'account',
+      'vast-403',
+      'the Vast API key lacks a permission this needs (Settings → Vast.ai API)',
+      e,
+      false
+    )
 
   // --- Vast HTTP replies. ---
   if (status === 429) return result('transient', 'vast-429', 'Vast.ai rate limit', e, true)

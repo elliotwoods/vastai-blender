@@ -33,6 +33,8 @@ export const HINTS = {
 
   spendCap:
     'The most the fleet may bill per hour, counting every node that may still be billing. A machine is rented only if its own price still fits under the cap, and “+ request node” stops at it too. Tick “no spend cap” to rent without one.',
+  vastApiKey:
+    'Stored encrypted by your OS (Keychain / DPAPI) and used only by this app to talk to vast.ai — it is never copied to the rented machines. Vast has no sign-in for apps, so a key is the only way; a restricted one limits what it can do if it leaks.',
   maxDph:
     'Offer filter — only machines at or below this on-demand price are considered when renting.'
 } as const

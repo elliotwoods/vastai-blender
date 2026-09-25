@@ -35,7 +35,7 @@ import { dismissAlerts, onAlertSurfaced, onEvent, recentAlerts } from './events'
 import { hostPathFlavour } from './paths'
 import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
-import { currentUser } from './vast/vastClient'
+import { testVastKey } from './vast/keyTest'
 import { nodeManager } from './nodes/nodeManager'
 import { listAddons, registerAddon, removeAddon } from './addons/addons'
 import { createJob, getJob, listJobs, setJobShareNode } from './jobs/jobs'
@@ -799,18 +799,7 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   })
 
   // -- vast.ai --------------------------------------------------------------
-  handle('vast:testKey', async () => {
-    try {
-      const u = await currentUser()
-      const credit = u.credit ?? u.balance
-      return {
-        ok: true,
-        message: `OK — account ${u.email ?? u.user ?? u.id}${credit != null ? `, credit $${Number(credit).toFixed(2)}` : ''}`
-      }
-    } catch (e) {
-      return { ok: false, message: (e as Error).message }
-    }
-  })
+  handle('vast:testKey', () => testVastKey())
   handle('vast:searchOffers', (partial) => {
     const filters = { ...getSettings().offerFilters, ...partial }
     return findOffers(filters)

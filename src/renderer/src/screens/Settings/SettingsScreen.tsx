@@ -14,7 +14,9 @@ import type {
   OfferFilters,
   SettingsFieldError,
   SettingsPatch,
-  SettingsPublic
+  SettingsPublic,
+  VastKeyTest,
+  VastPermission
 } from '../../../../shared/models'
 import {
   blenderVersionPatch,
@@ -53,17 +55,38 @@ function FieldLabel({ text, hint }: { text: string; hint: string }): React.JSX.E
   )
 }
 
+/**
+ * The permission groups to tick when creating the app's key on Vast, as the
+ * JSON Vast's "create API key" takes (docs.vast.ai/api-reference/permissions).
+ */
+const VAST_KEY_PERMISSIONS = JSON.stringify({
+  api: { misc: {}, user_read: {}, instance_read: {}, instance_write: {} }
+})
+
+const PERMISSION_USE: Record<VastPermission, string> = {
+  user_read: 'account and credit',
+  instance_read: 'list nodes and SSH keys',
+  misc: 'search offers',
+  instance_write: 'rent and destroy nodes, register the SSH key'
+}
+
 function ApiSection(): React.JSX.Element {
   const { data: settings } = useSettings()
   const qc = useQueryClient()
   const [key, setKey] = useState('')
-  const [testResult, setTestResult] = useState<string | null>(null)
+  const [test, setTest] = useState<VastKeyTest | 'testing' | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  const runTest = (): void => {
+    setTest('testing')
+    void ipc.invoke('vast:testKey').then(setTest)
+  }
 
   return (
     <div>
       <div style={{ ...sectionLabel(), marginBottom: SCALE.space3 }}>Vast.ai API</div>
       <div style={formRow}>
-        <span style={label}>API key</span>
+        <FieldLabel text="API key" hint={HINTS.vastApiKey} />
         <input
           type="password"
           placeholder={settings?.hasVastApiKey ? '••••••••  (saved)' : 'paste your Vast.ai API key'}
@@ -75,10 +98,10 @@ function ApiSection(): React.JSX.Element {
           style={btn({ variant: 'primary', size: 'sm', disabled: !key })}
           disabled={!key}
           onClick={() => {
-            void ipc.invoke('settings:setSecret', 'vastApiKey', key).then(() => {
+            void ipc.invoke('settings:setSecret', 'vastApiKey', key.trim()).then(() => {
               setKey('')
-              setTestResult(null)
               void qc.invalidateQueries({ queryKey: qk.settings })
+              runTest()
             })
           }}
         >
@@ -87,16 +110,56 @@ function ApiSection(): React.JSX.Element {
         <button
           style={btn({ size: 'sm', disabled: !settings?.hasVastApiKey })}
           disabled={!settings?.hasVastApiKey}
-          onClick={() => {
-            setTestResult('testing…')
-            void ipc.invoke('vast:testKey').then((r) => setTestResult(r.message))
-          }}
+          onClick={runTest}
         >
           test
         </button>
       </div>
-      {testResult ? (
-        <div style={{ ...mono, fontSize: SCALE.textXs, color: TOKENS.textMuted }}>{testResult}</div>
+      <div style={{ ...formRow, alignItems: 'flex-start' }}>
+        <span style={label} />
+        <div style={{ ...hintText, maxWidth: 520, lineHeight: 1.5 }}>
+          Create a key just for this app on Vast&apos;s keys page, restricted to the permissions it
+          needs: <span style={mono}>misc, user_read, instance_read, instance_write</span>. Paste the
+          permissions JSON into Vast&apos;s key dialog, or tick the same groups.
+          <div style={{ display: 'flex', gap: SCALE.space2, marginTop: SCALE.space2 }}>
+            <button
+              style={btn({ size: 'sm' })}
+              onClick={() =>
+                void ipc.invoke('shell:openExternal', 'https://cloud.vast.ai/manage-keys/')
+              }
+            >
+              open Vast keys page…
+            </button>
+            <button
+              style={btn({ size: 'sm' })}
+              onClick={() => {
+                void ipc.invoke('clipboard:write', VAST_KEY_PERMISSIONS).then(() => {
+                  setCopied(true)
+                  setTimeout(() => setCopied(false), 1500)
+                })
+              }}
+            >
+              {copied ? 'copied' : 'copy permissions JSON'}
+            </button>
+          </div>
+        </div>
+      </div>
+      {test === 'testing' ? (
+        <div style={{ ...mono, fontSize: SCALE.textXs, color: TOKENS.textMuted }}>testing…</div>
+      ) : test ? (
+        <div style={{ ...mono, fontSize: SCALE.textXs, color: TOKENS.textMuted }}>
+          <div style={{ color: test.ok ? TOKENS.textMuted : TOKENS.danger }}>
+            {test.ok ? 'OK — ' : ''}
+            {test.message}
+          </div>
+          {test.checks.map((c) => (
+            <div key={c.perm} style={{ color: c.ok === false ? TOKENS.danger : TOKENS.textMuted }}>
+              {c.ok === true ? '✓' : c.ok === false ? '✗' : '–'} {c.perm.padEnd(15)}{' '}
+              {PERMISSION_USE[c.perm]}
+              {c.ok === true ? '' : ` — ${c.detail}`}
+            </div>
+          ))}
+        </div>
       ) : null}
     </div>
   )

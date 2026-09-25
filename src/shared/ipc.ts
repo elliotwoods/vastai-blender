@@ -47,6 +47,7 @@ import type {
   SettingsPublic,
   SshCommandInfo,
   UnclaimedInstance,
+  VastKeyTest,
   VncTunnelInfo
 } from './models'
 
@@ -65,7 +66,7 @@ export interface IpcInvokeMap {
   'settings:setSecret': { args: [SecretKey, string]; result: void }
 
   // vast.ai
-  'vast:testKey': { args: []; result: { ok: boolean; message: string } }
+  'vast:testKey': { args: []; result: VastKeyTest }
   'vast:searchOffers': { args: [Partial<OfferFilters> | undefined]; result: Offer[] }
 
   // fleet / nodes
