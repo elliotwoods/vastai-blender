@@ -312,6 +312,12 @@ export class ChunkDownloader {
    */
   private viewFrames = new Map<number, Map<string, { path: string; size: number }>>()
 
+  /**
+   * The view suffixes the manifest has listed for any of this chunk's frames
+   * (`_L`, `_R`), landed or not. See settleViewFrames.
+   */
+  private listedViews = new Set<string>()
+
   /** Resolves when stop() is called; polls + downloads in the background. */
   start(): void {
     live.add(this)
@@ -477,14 +483,20 @@ export class ChunkDownloader {
    * the whole frame, and a requeue after the other was lost, or never even
    * listed (a node that died, a final read that failed), would leave the
    * frame one view short for good. Here, after a final read that worked, a
-   * frame's views are every suffix any frame of this chunk landed with. That
-   * is at least two, since Blender adds a suffix only when there are two
-   * views or more, so a lone suffix means the other view reached us for no
-   * frame at all, and nothing is marked. A frame left unmarked renders again.
+   * frame's views are every suffix the manifest listed for any frame of this
+   * chunk, whether it landed or not. That is at least two, since Blender adds
+   * a suffix only when there are two views or more, so a lone suffix means
+   * the other view was listed for no frame at all, and nothing is marked. A
+   * frame left unmarked renders again.
+   *
+   * Listed, not landed: the set was every suffix a frame had landed with, so
+   * a view whose every file was lost (gone from the node, or given up on)
+   * dropped out of it, and with three views or more each frame's other two
+   * read as the whole frame. Marked downloaded, no requeue rendered the
+   * missing view again (Phase 0 review, plan 1.12).
    */
   private settleViewFrames(): void {
-    const views = new Set<string>()
-    for (const landed of this.viewFrames.values()) for (const v of landed.keys()) views.add(v)
+    const views = this.listedViews
     if (views.size < 2) return
     const mark = getDb().prepare(
       `UPDATE frames SET state='downloaded', local_path=?, size_bytes=? WHERE job_id=? AND frame=?`
@@ -548,6 +560,10 @@ export class ChunkDownloader {
       this.seen.add(entry.file)
       if (superseded) continue
       if (!this.isOurFrame(entry)) continue
+      if (entry.kind === 'frame') {
+        const view = parseFrameName(entry.file)?.view
+        if (view) this.listedViews.add(view)
+      }
       this.queue.push(entry)
     }
     this.pump()

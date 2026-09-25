@@ -329,6 +329,25 @@ describe('frames saved one file per view', () => {
     expect(downloaded(r.jobId)).toEqual([1, 3, 4])
   })
 
+  it('1.12 (Phase 0 review): with three views, one lost from every frame is still a view, and no frame is marked without it', async () => {
+    // A multiview scene: left, centre and right, one file each. Every centre
+    // view is listed, and none of them can be fetched.
+    const r = await rig()
+    for (const f of [1, 2, 3, 4]) {
+      const stem = `frames/000${f}`
+      saved(r, `${stem}_L.png`)
+      saved(r, `${stem}_C.png`, { onNode: false })
+      saved(r, `${stem}_R.png`)
+    }
+
+    const result = await drain(r)
+
+    expect(result.lost).toEqual([1, 2, 3, 4].map((f) => `frames/000${f}_C.png`))
+    // Taken from what landed, the views were left and right, and every frame
+    // had both: all four were marked downloaded, and none rendered again.
+    expect(downloaded(r.jobId)).toEqual([])
+  })
+
   it('marks nothing when only one view ever arrived', async () => {
     // Blender adds a suffix only with two views or more, so the other one is
     // missing from every frame.
