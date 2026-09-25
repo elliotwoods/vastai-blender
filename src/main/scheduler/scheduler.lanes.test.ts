@@ -332,10 +332,18 @@ describe('1.11 #225: what a pinned run teaches gpu_perf', () => {
     await w.until(() => specs.length === 4, 'four pinned lanes')
     // Each on its own card, as the agent reports.
     specs.forEach((s, gpu) => machine.agent.writeState(s.chunkId, { status: 'rendering', gpu }))
-    // One finishes at once (too soon to teach anything). The other three
-    // then render with a card each and nothing waiting for the fourth.
+    // One finishes at once. The other three then render with a card each
+    // and nothing waiting for the fourth.
     machine.agent.finish(specs[0].chunkId)
     await w.until(() => app.scheduler.activeWorkForNode(nodeId).length === 3, 'three left')
+    // Whether the first taught anything depends on how long its download
+    // took on this computer's clock: past 18 s of fake time it did, a much
+    // faster rate. Only the three pinned runs are under test.
+    const gpuName = w.get<{ gpu_name: string }>(
+      'SELECT gpu_name FROM nodes WHERE id = ?',
+      nodeId
+    )!.gpu_name
+    w.db.prepare('DELETE FROM gpu_perf WHERE gpu_name = ?').run(gpuName)
     await w.advance(10 * 60_000)
     const doneAt = Date.now()
     specs.slice(1).forEach((s, i) => {
@@ -353,10 +361,6 @@ describe('1.11 #225: what a pinned run teaches gpu_perf', () => {
 
     // One frame in about ten minutes on one card: ~6 frames/h per GPU. Scaled
     // by the node's runs over its GPUs it was 3/4 of that.
-    const gpuName = w.get<{ gpu_name: string }>(
-      'SELECT gpu_name FROM nodes WHERE id = ?',
-      nodeId
-    )!.gpu_name
     const perf = w.get<{ frames_per_hour: number; samples: number }>(
       'SELECT frames_per_hour, samples FROM gpu_perf WHERE gpu_name = ?',
       gpuName
