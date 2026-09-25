@@ -608,6 +608,14 @@ const AGENT_CHECK_TIMEOUT_MS = 30_000
  */
 const AGENT_RECHECK_MS = 60_000
 
+/**
+ * Looks, AGENT_RECHECK_MS apart, that a suspected agent gets while none of
+ * them can tell (no connection, or no answer) before the verdict is left to
+ * the node supervisor. Nothing told is no verdict: the node is sent nothing
+ * meanwhile, never condemned for it.
+ */
+const AGENT_RECHECK_LOOKS = 3
+
 /** A state read, as the run needs to tell them apart. */
 type StateRead =
   | { kind: 'state'; state: AgentState }
@@ -1175,7 +1183,7 @@ class ChunkRun {
       if (this.stopped) return true
       const reason =
         "the node's agent is not running (no heartbeat), so nothing takes the chunks sent to it"
-      scheduler.suspectAgentDown(this.nodeId, this.ssh, reason)
+      scheduler.suspectAgentDown(this.nodeId, reason)
       this.fail('dispatch', own('machine', 'agent-down', reason))
       return true
     }
@@ -2235,22 +2243,35 @@ class Scheduler {
    * it, as in 81fe2875, or the node supervisor) leaves the heartbeat stale
    * for up to about 40 s, and a heartbeat write can be slow under disk
    * load. The node is sent nothing while AGENT_RECHECK_MS pass, then asked
-   * again: alive, it takes work again; not, or no answer, it is down
-   * (agentDownOn).
+   * again: alive, it takes work again; not, it is down (agentDownOn).
    */
-  suspectAgentDown(nodeId: string, ssh: SshConnection, reason: string): void {
+  suspectAgentDown(nodeId: string, reason: string): void {
     if (this.agentDown.has(nodeId) || this.agentChecks.has(nodeId)) return
     const token = Symbol(nodeId)
     this.agentChecks.set(nodeId, token)
-    setTimeout(() => {
-      void within(agentAlive(ssh), AGENT_CHECK_TIMEOUT_MS).then((alive) => {
-        // forgetNode, or a newer check, has it now.
+    const look = (n: number): void => {
+      setTimeout(() => {
         if (this.agentChecks.get(nodeId) !== token) return
-        this.agentChecks.delete(nodeId)
-        if (alive === true) this.kick()
-        else this.agentDownOn(nodeId, reason)
-      })
-    }, AGENT_RECHECK_MS)
+        // On the node's connection as it is now. The run's may have been
+        // replaced since (the node reconnected), and a closed one answers
+        // nothing: a node whose agent was back was condemned for that.
+        const ssh = nodeManager.get(nodeId)?.ssh
+        const check = ssh ? within(agentAlive(ssh), AGENT_CHECK_TIMEOUT_MS) : Promise.resolve(null)
+        void check.then((alive) => {
+          // forgetNode, or a newer check, has it now.
+          if (this.agentChecks.get(nodeId) !== token) return
+          // Nothing could be told: no verdict on that. Asked again, and
+          // past AGENT_RECHECK_LOOKS left to the node supervisor, which
+          // owns a node that stops answering; a run that finds the agent
+          // dead again suspects it afresh.
+          if (alive == null && n + 1 < AGENT_RECHECK_LOOKS) return look(n + 1)
+          this.agentChecks.delete(nodeId)
+          if (alive === false) this.agentDownOn(nodeId, reason)
+          else this.kick()
+        })
+      }, AGENT_RECHECK_MS)
+    }
+    look(0)
   }
 
   /**

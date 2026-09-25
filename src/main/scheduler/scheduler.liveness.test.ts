@@ -276,6 +276,67 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
     expect(landed[1] - seenDeadAt!).toBeGreaterThanOrEqual(60_000)
   })
 
+  it("the second look is taken on the node's connection as it is then, not on the run's", async () => {
+    // Review round 2: the recheck used the connection the run had. Replaced
+    // within the minute (the node reconnected), that one was closed, the
+    // check could not run, and a node whose agent was back was condemned for
+    // the rest of its rental.
+    const { app, ids } = await fleet(1, {}, { idleTimeoutMinutes: 60 })
+    const machine = w.machineFor(ids[0])
+    let restarting = true
+    machine.onExec(/^python3 -c .*state\/heartbeat/, () => (restarting ? 'dead\n' : 'alive\n'))
+    const landed: AgentSpec[] = []
+    machine.onSpec = (spec) => {
+      landed.push(spec)
+      if (landed.length > 1) machine.agent.finish(spec.chunkId)
+    }
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => chunksOf(jobId)[0].infra_retries === 1, 'the chunk given back')
+    // Reconnected, and its agent back, before the second look.
+    const node = app.nodeManager.get(ids[0])!
+    node.closeSsh()
+    await node.connectSsh()
+    restarting = false
+
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 20 * 60_000,
+      stepMs: 5_000
+    })
+    expect(landed).toHaveLength(2)
+    expect(chunksOf(jobId)[0]).toMatchObject({ node_id: ids[0], retries: 0, infra_retries: 1 })
+    expect(w.alerts('error').join('\n')).not.toMatch(/agent is not running/)
+    expect(app.scheduler.nodeUnfit(ids[0])).toBeNull()
+  })
+
+  it('a second look that cannot tell is no verdict: the node is asked again, and takes work once its agent answers', async () => {
+    // Review round 2: a check that did not answer condemned the node for its
+    // rental, as a dead agent does.
+    const { app, ids } = await fleet(1, {}, { idleTimeoutMinutes: 60 })
+    const machine = w.machineFor(ids[0])
+    let checks = 0
+    machine.onExec(/^python3 -c .*state\/heartbeat/, () => {
+      checks += 1
+      // Dead to the run; no answer to the second look; alive to the third.
+      return checks === 1 ? 'dead\n' : checks === 2 ? HANG : 'alive\n'
+    })
+    const landed: AgentSpec[] = []
+    machine.onSpec = (spec) => {
+      landed.push(spec)
+      if (landed.length > 1) machine.agent.finish(spec.chunkId)
+    }
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 20 * 60_000,
+      stepMs: 5_000
+    })
+    expect(checks).toBe(3)
+    expect(landed).toHaveLength(2)
+    expect(w.alerts('error').join('\n')).not.toMatch(/agent is not running/)
+    expect(app.scheduler.nodeUnfit(ids[0])).toBeNull()
+  })
+
   it('a node whose agent is dead is not counted as room for the queue', async () => {
     // Kept past the test, so only scale-up can make room.
     const { app, ids } = await fleet(2, {}, { maxActiveNodes: 3, idleTimeoutMinutes: 120 })
