@@ -8,7 +8,14 @@ import { Icon } from './Icon'
 import { InfoDot, Tooltip } from './Tooltip'
 import { ipc } from '../lib/ipc'
 import { useNav } from '../lib/nav'
-import { useFleetCost, useNodes, useSettings } from '../lib/queries'
+import { useFleetCost, useNodes, useSettings, useUnclaimed } from '../lib/queries'
+import {
+  RUNWAY_HOLD_MIN,
+  accountPerHour,
+  fmtRunway,
+  runwayMinutes,
+  runwayTone
+} from '../lib/runway'
 import { capUsage } from '../../../shared/nodeState'
 import type { HistoryMetric } from '../../../shared/models'
 
@@ -63,6 +70,7 @@ function FleetReadouts(): React.JSX.Element {
   const { data: cost } = useFleetCost()
   const { data: nodes } = useNodes()
   const { data: settings } = useSettings()
+  const { data: unclaimed } = useUnclaimed()
   const navigate = useNav((s) => s.navigate)
   // The caps' own count and rate (nodeState.capUsage), the ones main's
   // maxActiveNodes and spend cap use: a failed node whose destroy Vast has
@@ -71,6 +79,13 @@ function FleetReadouts(): React.JSX.Element {
   // launch rather than $0.000/hr until the first fleet:cost a minute in (#96).
   const usage = nodes ? capUsage(nodes) : null
   const perHour = usage?.perHour ?? cost?.perHour ?? null
+  // How long the balance lasts at what the whole account bills, other
+  // instances on it included, as main's credit guard reckons it (plan 1.20).
+  const runway =
+    cost?.balance != null
+      ? runwayMinutes(cost.balance, accountPerHour(nodes ?? [], unclaimed ?? []).total)
+      : null
+  const runwayWarn = runway != null ? runwayTone(runway) : null
   // Every readout is a live number with a past — clicking one opens its series.
   const toHistory = (metric: HistoryMetric) => () => navigate({ screen: 'history', metric })
   const linked: CSSProperties = { ...readout(), cursor: 'pointer' }
@@ -122,13 +137,25 @@ function FleetReadouts(): React.JSX.Element {
       {/* The `+` already reads as an action, so this pill gets the tooltip
           without a second glyph competing with it. The pill itself opens the
           balance history; only the `+` leaves the app for the billing page. */}
-      <Tooltip text={HINTS.balance}>
+      <Tooltip
+        text={
+          runway != null && Number.isFinite(runway)
+            ? `${HINTS.balance}\n\nLasts ${fmtRunway(runway)} at what the account bills now.` +
+              (runwayWarn ? ` Renting pauses under ${RUNWAY_HOLD_MIN} minutes.` : '')
+            : HINTS.balance
+        }
+      >
         <button style={linked} onClick={toHistory('balance')}>
           <span style={{ color: TOKENS.textFaint }}>balance</span>
           <span
             style={{
               ...mono,
-              color: cost?.balance != null && cost.balance < 5 ? TOKENS.warn : TOKENS.text
+              color:
+                runwayWarn === 'danger'
+                  ? TOKENS.danger
+                  : runwayWarn === 'warn'
+                    ? TOKENS.warn
+                    : TOKENS.text
             }}
           >
             {cost?.balance != null ? `$${cost.balance.toFixed(2)}` : '—'}

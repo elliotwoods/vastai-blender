@@ -8,7 +8,8 @@ import type { NodeSnapshot, SettingsPublic, UnclaimedInstance } from '../../../.
 // the IPC bridge stubbed (window.api, which a test has no window for), as
 // recoveryWiring.test.tsx does:
 // - 1.2: a node that may still be billing is always listed, and counted;
-// - 1.3: instances nobody here holds are listed with their rate, destroy asks.
+// - 1.3: instances nobody here holds are listed with their rate, destroy asks;
+// - 1.20: the toolbar's balance turns amber and red by runway, not at $5.
 
 vi.mock('../../lib/ipc', () => ({
   ipc: { invoke: vi.fn(() => new Promise(() => {})), on: vi.fn(() => () => {}) }
@@ -169,5 +170,62 @@ describe('1.3: unclaimed instances', () => {
       <FleetScreen />
     )
     expect(html).not.toContain('unclaimed instances')
+  })
+})
+
+describe('1.20: the balance reads as a runway, not against a fixed $5', () => {
+  const balance = (html: string): string | undefined =>
+    html.match(/balance<\/span><span style="[^"]*color:([^;"]+)[^"]*">\$/)?.[1]
+
+  it('warns where main holds renting: $1 at $8/hr is under 10 minutes', () => {
+    const html = withCache(
+      (qc) => {
+        qc.setQueryData(qk.nodes, [node({ dphTotal: 8 })])
+        qc.setQueryData(qk.fleetCost, {
+          perHour: 8,
+          sessionTotal: 0,
+          sessionWh: 0,
+          sessionCo2g: 0,
+          balance: 1
+        })
+      },
+      <AppToolbar />
+    )
+    expect(balance(html)).toBe('var(--danger)')
+  })
+
+  it('counts the other instances on the account: $3 lasts 20 minutes, not 45', () => {
+    const html = withCache(
+      (qc) => {
+        qc.setQueryData(qk.nodes, [node({ dphTotal: 4 })])
+        qc.setQueryData(qk.unclaimed, [unclaimed({ dphTotal: 5 })])
+        qc.setQueryData(qk.fleetCost, {
+          perHour: 4,
+          sessionTotal: 0,
+          sessionWh: 0,
+          sessionCo2g: 0,
+          balance: 3
+        })
+      },
+      <AppToolbar />
+    )
+    expect(balance(html)).toBe('var(--warn)')
+  })
+
+  it('stays quiet for a small balance that lasts: $4 with nothing billing', () => {
+    const html = withCache(
+      (qc) => {
+        qc.setQueryData(qk.nodes, [])
+        qc.setQueryData(qk.fleetCost, {
+          perHour: 0,
+          sessionTotal: 0,
+          sessionWh: 0,
+          sessionCo2g: 0,
+          balance: 4
+        })
+      },
+      <AppToolbar />
+    )
+    expect(balance(html)).toBe('var(--text)')
   })
 })
