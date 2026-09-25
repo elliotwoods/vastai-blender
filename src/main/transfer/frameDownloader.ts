@@ -9,12 +9,19 @@
 import { rm } from 'fs/promises'
 import { join } from 'path'
 import { getDb } from '../db/db'
-import { emit } from '../ipc'
+import { emit } from '../events'
 import { toMediaUrl } from '../mediaUrl'
+import { isInside, resolveInside } from '../paths'
 import { getSettings } from '../settings'
 import { downloadFileVerified } from '../ssh/sftp'
 import type { SshConnection } from '../ssh/sshConnection'
-import { parseManifest, type ManifestEntry } from './manifest'
+import {
+  manifestReject,
+  parseFrameName,
+  parseManifest,
+  type ManifestEntry,
+  type ManifestReject
+} from './manifest'
 
 const POLL_MS = 5_000
 
@@ -26,6 +33,16 @@ const RETRY_BACKOFF_MS = 3_000
 
 /** A manifest read (a tiny `cat`) that takes longer than this has hung. */
 const MANIFEST_READ_TIMEOUT_MS = 30_000
+
+/**
+ * The final pass's manifest read is tried this many times before drain()
+ * reports it failed, backing off FINAL_READ_BACKOFF_MS, then twice that, and
+ * so on between tries (5 + 10 + 20 s). That rides out a burst of SSH channel
+ * contention or a reconnect, both routine on a busy node, while a node that
+ * really is unreachable still fails its chunk within a few minutes.
+ */
+const FINAL_READ_ATTEMPTS = 4
+const FINAL_READ_BACKOFF_MS = 5_000
 
 /**
  * Upper bound on the final download pass. Each transfer already has a stall
@@ -43,6 +60,20 @@ export interface ChunkDownloadTarget {
   ssh: SshConnection
   /** e.g. /root/vastai/renders/<chunkId> */
   remoteChunkDir: string
+  /** The frames this chunk renders: start..end, every `step`th. See isOurFrame. */
+  frames: { start: number; end: number; step: number }
+}
+
+/** What the final download pass (drain) managed. */
+export interface DrainResult {
+  /**
+   * Did the final manifest read succeed? When it did not, whatever the agent
+   * listed after the last successful background poll was never seen at all,
+   * so `lost` cannot name it: the chunk must not be taken as complete.
+   */
+  manifestRead: boolean
+  /** Frames that were listed but could not be fetched. */
+  lost: string[]
 }
 
 /** Local landing dir for a job: <projectRoot>/renders/<jobId>/ */
@@ -69,6 +100,12 @@ export class ChunkDownloader {
   /** Frames this downloader gave up on permanently. See drain(). */
   private lostFrames = new Set<string>()
 
+  /**
+   * Files landed for frames saved one file per view (0042_L.png, 0042_R.png):
+   * frame → view suffix → the file. See settleViewFrames.
+   */
+  private viewFrames = new Map<number, Map<string, { path: string; size: number }>>()
+
   /** Resolves when stop() is called; polls + downloads in the background. */
   start(): void {
     void this.poll()
@@ -81,26 +118,54 @@ export class ChunkDownloader {
   }
 
   /**
-   * One-shot: pull everything currently in the manifest, then return the
-   * FRAMES that could not be fetched at all.
+   * One-shot: pull everything currently in the manifest, then report whether
+   * that final read worked and which FRAMES could not be fetched at all.
    *
-   * This is the last download pass — the caller marks the chunk complete and
-   * stops the downloader immediately afterwards, so there is no later poll to
-   * pick anything up. A silently dropped frame here means a hole in the render
-   * that nothing else detects (job completion is decided from chunk states, and
-   * `job:retryMissing` is a stub), so the caller needs to know.
+   * This is the last download pass — the caller settles the chunk and stops
+   * the downloader immediately afterwards, so there is no later poll to pick
+   * anything up. A silently dropped frame here is a hole in the render, so the
+   * caller needs to know.
+   *
+   * The read is retried with backoff (FINAL_READ_ATTEMPTS). It used to be one
+   * poll whose failure was swallowed: with the background polls already caught
+   * up, the queue was empty, and a failed read looked exactly like "nothing
+   * left to fetch" — the chunk completed without the frames the agent had
+   * listed since the last good poll, and the node holding the only copy was
+   * later scaled down. Even when every try fails, what is already in flight is
+   * still waited for, so the requeue that follows re-renders as little as it can.
    *
    * Only frames count. A missing thumbnail or preview clip is cosmetic and is
    * not worth re-rendering a chunk over.
+   *
+   * After a final read that worked, it also marks the frames saved one file
+   * per view whose views have all landed (settleViewFrames).
+   *
+   * A downloader stopped mid-drain (its run was cancelled or its node went
+   * away) starts no further read, but returns only once what it is waiting on
+   * ends: a manifest read in flight (30 s at most) or a retry backoff (20 s at
+   * most). The result is then meaningless: the caller no longer owns the chunk
+   * and must not act on it.
    */
-  async drain(budgetMs = DRAIN_BUDGET_MS): Promise<string[]> {
+  async drain(budgetMs = DRAIN_BUDGET_MS): Promise<DrainResult> {
     const deadline = Date.now() + budgetMs
-    await this.poll()
-    while (this.inFlight > 0 || this.queue.length > 0 || this.retrying.size > 0) {
+    let manifestRead = false
+    let timedOut = false
+    for (let attempt = 1; ; attempt++) {
+      manifestRead = (await this.poll()).ok
+      if (manifestRead || this.stopped || attempt >= FINAL_READ_ATTEMPTS) break
+      const backoff = FINAL_READ_BACKOFF_MS * 2 ** (attempt - 1)
+      if (Date.now() + backoff > deadline) break
+      await new Promise((r) => setTimeout(r, backoff))
+    }
+    while (
+      !this.stopped &&
+      (this.inFlight > 0 || this.queue.length > 0 || this.retrying.size > 0)
+    ) {
       if (Date.now() > deadline) {
         // Give up on whatever is left. Frames count as lost (the caller
         // re-renders them); previews do not matter enough to hold a node.
         const left = [...this.queue, ...this.active, ...this.retrying]
+        timedOut = true
         this.stop()
         for (const e of left) if (e.kind === 'frame') this.lostFrames.add(e.file)
         emit('alert', {
@@ -111,11 +176,48 @@ export class ChunkDownloader {
       }
       await new Promise((r) => setTimeout(r, 250))
     }
-    return [...this.lostFrames]
+    // Stopped by the caller, not by the deadline: the chunk is no longer ours.
+    if (manifestRead && (!this.stopped || timedOut)) this.settleViewFrames()
+    return { manifestRead, lost: [...this.lostFrames] }
   }
 
-  private async poll(): Promise<void> {
-    if (this.stopped) return
+  /**
+   * Mark downloaded the frames saved one file per view whose every view has
+   * landed.
+   *
+   * These are not marked as each file lands, the way a one-file frame is.
+   * Nothing says how many views a frame has, so its first view would read as
+   * the whole frame, and a requeue after the other was lost, or never even
+   * listed (a node that died, a final read that failed), would leave the
+   * frame one view short for good. Here, after a final read that worked, a
+   * frame's views are every suffix any frame of this chunk landed with. That
+   * is at least two, since Blender adds a suffix only when there are two
+   * views or more, so a lone suffix means the other view reached us for no
+   * frame at all, and nothing is marked. A frame left unmarked renders again.
+   */
+  private settleViewFrames(): void {
+    const views = new Set<string>()
+    for (const landed of this.viewFrames.values()) for (const v of landed.keys()) views.add(v)
+    if (views.size < 2) return
+    const mark = getDb().prepare(
+      `UPDATE frames SET state='downloaded', local_path=?, size_bytes=? WHERE job_id=? AND frame=?`
+    )
+    for (const [frame, landed] of this.viewFrames) {
+      if (landed.size < views.size) continue
+      // One file stands for the frame, as for any other: the first view's.
+      const first = [...landed.keys()].sort()[0]
+      const file = landed.get(first)!
+      mark.run(file.path, file.size, this.target.jobId, frame)
+    }
+  }
+
+  /**
+   * Read the manifest and queue whatever is new. `ok` says whether the read
+   * worked; the background polls ignore it (the next one retries anyway), but
+   * drain() cannot.
+   */
+  private async poll(): Promise<{ ok: boolean }> {
+    if (this.stopped) return { ok: false }
     let text: string
     try {
       // Timed out: drain() awaits this poll, and an exec on a wedged
@@ -125,11 +227,23 @@ export class ChunkDownloader {
         `cat '${this.target.remoteChunkDir}/manifest.jsonl' 2>/dev/null`,
         { timeoutMs: MANIFEST_READ_TIMEOUT_MS }
       )
+      // Exit 1 with nothing on stdout is cat's answer for a manifest the agent
+      // has not written yet: nothing is listed, and that IS the manifest. A
+      // chunk that failed before its first frame lands here, and must not sit
+      // through drain()'s retries first. (cat says the same for a read error;
+      // on a 'done' chunk the scheduler's check of the frames table catches
+      // anything that was therefore never fetched.) Anything else non-zero,
+      // including null — the channel closed under the command, which resolves
+      // rather than throws — means the read did not happen, and whatever
+      // stdout did arrive may be cut short.
+      const missing = r.code === 1 && r.stdout === ''
+      if (r.code !== 0 && !missing) return { ok: false }
       text = r.stdout
     } catch {
-      return // connection down — reconnect logic lives with the node
+      return { ok: false } // connection down — reconnect logic lives with the node
     }
-    const entries = parseManifest(text)
+    const { entries, rejected } = parseManifest(text, this.target.chunkId)
+    this.noteRejected(rejected)
 
     // Of all the live-clip versions in this read, only the newest is worth
     // fetching — earlier ones are superseded and the node prunes them, so
@@ -146,9 +260,67 @@ export class ChunkDownloader {
         entry.kind === 'clip' && entry.meta.kindKey === 'live' && entry.file !== newestLive
       this.seen.add(entry.file)
       if (superseded) continue
+      if (!this.isOurFrame(entry)) continue
       this.queue.push(entry)
     }
     this.pump()
+    return { ok: true }
+  }
+
+  /**
+   * Is this entry for one of this chunk's frames? Clips always are. A frame or
+   * thumbnail for any other frame is skipped: never fetched, and not lost.
+   *
+   * Frame files share the job's folder, and a frame's row is keyed by job and
+   * frame number, so fetching another chunk's frame overwrote that chunk's
+   * file and marked the frame downloaded, and nothing ever noticed. They do
+   * not count as lost because such lines are routine: a requeue keeps the
+   * chunk id for its first missing range, and a retry on the same node reads
+   * a manifest that still lists the wider attempt's frames, each already
+   * downloaded or now another chunk's to render.
+   */
+  private isOurFrame(entry: ManifestEntry): boolean {
+    if (entry.kind === 'clip') return true
+    const frame = parseFrameName(entry.file)?.frame
+    // parseManifest passes no frame or thumb name without a number. Should one
+    // ever get through, it is not this check's to judge: download() still
+    // holds it to the job folder.
+    if (frame == null) return true
+    const { start, end, step } = this.target.frames
+    return frame >= start && frame <= end && (frame - start) % step === 0
+  }
+
+  /**
+   * Manifest lines that failed validation (manifest.ts); none of them is
+   * fetched. A refused FRAME still counts as lost, or its frame would be a
+   * hole nothing notices: counting it fails the final pass, and requeue()
+   * re-renders whatever did not land. A stray line for a frame that did land
+   * costs one trip through requeue(), which then finds nothing missing.
+   *
+   * One alert per chunk. The whole manifest is re-read every poll, so the same
+   * bad line comes back every few seconds, and again on every attempt.
+   */
+  private noteRejected(rejected: ManifestReject[]): void {
+    if (rejected.length === 0) return
+    let frames = 0
+    for (const r of rejected) {
+      if (r.kind !== 'frame') continue
+      frames++
+      this.lostFrames.add(`refused ${r.file}`)
+    }
+    const { chunkId } = this.target
+    if (rejectAlerted.has(chunkId)) return
+    rejectAlerted.add(chunkId)
+    const r = rejected[0]
+    const n = rejected.length
+    emit('alert', {
+      level: 'error',
+      message:
+        `chunk ${chunkId}: refused ${n} manifest entr${n === 1 ? 'y' : 'ies'} from the node,` +
+        ` e.g. ${r.kind} ${r.file} (${r.reason}). Nothing was downloaded for ${n === 1 ? 'it' : 'them'}` +
+        `${frames > 0 ? ', and any frame still missing will re-render' : ''}.` +
+        ' Further refusals from this chunk are not reported.'
+    })
   }
 
   /**
@@ -251,16 +423,30 @@ export class ChunkDownloader {
     const remotePath = `${remoteChunkDir}/${entry.file}`
     // Frame numbers are globally unique within a job, and preview clips are
     // chunk-labelled — chunks can safely share the job's local tree.
-    const localPath = join(jobLocalDir(jobId), entry.file)
+    //
+    // `file` is the node's word, so it only ever lands inside the job folder.
+    // parseManifest already holds it to the names the agent writes; this is
+    // the backstop that still holds if those patterns are ever loosened.
+    const localPath = resolveInside(jobLocalDir(jobId), entry.file)
+    if (!localPath) {
+      this.noteRejected([manifestReject(entry.kind, entry.file, 'outside the job folder')])
+      return
+    }
     await downloadFileVerified(ssh, remotePath, localPath, entry)
 
     const db = getDb()
     if (entry.kind === 'frame') {
-      const frame = frameNumberFromName(entry.file)
-      if (frame != null) {
+      const name = parseFrameName(entry.file)
+      const frame = name?.frame ?? null
+      if (name && name.view === '') {
         db.prepare(
           `UPDATE frames SET state='downloaded', local_path=?, size_bytes=? WHERE job_id=? AND frame=?`
-        ).run(localPath, entry.size, jobId, frame)
+        ).run(localPath, entry.size, jobId, name.frame)
+      } else if (name) {
+        // One view of several: the frame is marked by settleViewFrames.
+        const landed = this.viewFrames.get(name.frame) ?? new Map()
+        landed.set(name.view, { path: localPath, size: entry.size })
+        this.viewFrames.set(name.frame, landed)
       }
       db.prepare(
         `INSERT OR IGNORE INTO assets (job_id, chunk_id, kind, abs_path, created_at) VALUES (?, ?, 'frame', ?, ?)`
@@ -274,7 +460,7 @@ export class ChunkDownloader {
       // Deliberately NOT an `assets` row: that would be ~2000 rows per job in
       // a table assets:index scans whole, for something the frames table
       // already has a row for.
-      const frame = entry.meta.frame ?? frameNumberFromName(entry.file)
+      const frame = entry.meta.frame ?? parseFrameName(entry.file)?.frame ?? null
       if (frame != null) {
         db.prepare(`UPDATE frames SET thumb_path=? WHERE job_id=? AND frame=?`).run(
           localPath,
@@ -370,19 +556,28 @@ export class ChunkDownloader {
 /** Definitive renditions — their arrival retires the live clip. */
 const CLIP_KINDS_FINAL: string[] = ['previewSdr', 'previewHdr', 'proxy']
 
+/** Chunks that have already raised their refused-entry alert. See noteRejected. */
+const rejectAlerted = new Set<string>()
+
 /**
  * Delete after a grace period, so a renderer still holding the old URL has
  * time to swap to the new one rather than losing its source mid-frame.
+ *
+ * Only ever inside the project's renders folder. The paths come from assets
+ * rows, which were built from node-supplied names, and a row written before
+ * those names were validated could point anywhere.
  */
 export function unlinkLater(paths: string[], delayMs = 30_000): void {
+  const root = join(getSettings().projectRoot, 'renders')
+  const safe = paths.filter((p) => {
+    if (isInside(root, p)) return true
+    console.warn(`[download] not deleting ${JSON.stringify(p)}: not inside ${root}`)
+    return false
+  })
+  if (safe.length === 0) return
   setTimeout(() => {
-    for (const p of paths) {
+    for (const p of safe) {
       rm(p, { force: true }).catch(() => {})
     }
   }, delayMs).unref?.()
-}
-
-function frameNumberFromName(file: string): number | null {
-  const m = /(\d+)\.\w+$/.exec(file)
-  return m ? parseInt(m[1], 10) : null
 }

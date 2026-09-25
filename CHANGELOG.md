@@ -13,6 +13,169 @@ GitHub Releases with the notes from this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Alerts reach you.** The main process raises alerts from about 25 places,
+  every "destroy failed — check the Vast.ai console" among them, and nothing
+  in the window listened. Info and warnings now show as toasts. Errors and
+  billing risks (a failed destroy, an instance left running) stay in a banner
+  until dismissed, billing risks first, with a link to the Vast.ai console.
+  Errors and billing risks raised before the window opened, or while it was
+  closed, are shown when it opens, as are info and warnings from the last
+  minute. An alert that repeats every tick is one entry. Errors and billing
+  risks also raise an OS notification when no window is in front, even with
+  the window closed; errors are paced to one every 20 s plus a summary, billing
+  risks never. Dismissals survive closing and reopening the window.
+- **CI.** Every push and pull request runs both typechecks, eslint, vitest, the
+  node agent's self-check, and `py_compile` / `bash -n` over `remote/`, which
+  is uploaded verbatim to nodes and was never checked before. `npm test` now
+  runs the self-check before vitest (skipped with a note where there is no
+  Python).
+- **Tests for the code that spends money.** A lifecycle harness
+  (`src/main/test/harness.ts`) runs the real node manager and scheduler against
+  an in-memory database built by the real migrations, a scriptable fake Vast.ai
+  API, fake machines behind a fake SSH connection, and fake timers. Renting,
+  provisioning, dispatch, download and destroy had no tests before. To make
+  that possible the event bus moved out of `ipc.ts` into `events.ts`, which
+  does not import Electron.
+
+### Changed
+
+- **Docs and tooltips say what the app does.** The README gains a *Safety
+  model* section (quitting and sleep, restarts, the spend cap, instance labels,
+  one app per profile, alerts), and its scene-preparation advice now covers
+  linked libraries and simulations, not only textures. Claims corrected there
+  and in tooltips: `VR_MOCK` mocks only reads, and its actions reach the real
+  fleet; the spend cap limits only automatic scale-up, and checks the fleet's
+  current rate, not the next machine's price; the node panel's *actual* $/hr,
+  now labelled *metered ÷ uptime*, settles at about the quote but reads up to
+  about a third over when it first shows, since the meter charges whole
+  minutes; the toolbar's spend is all-time, so its pill now reads *total*
+  rather than *session*, while its energy counts since launch; and an app
+  restart re-renders each in-flight chunk's whole range rather than
+  re-attaching to it. `docs/OCTANE.md` no longer points to a VNC tunnel button
+  the node panel does not have, and says that saved OTOY credentials can be
+  read by the machine's host.
+- **Two earlier entries overclaimed.** 2.1.0's fix for "a node that went
+  unreachable mid-render kept billing" covers only a node found unreachable
+  when the app starts: nothing checks a node's reachability during a session
+  yet. 2.0.0's "realised $/hr" is the node panel's metered spend ÷ uptime, an
+  estimate from the quoted rate, not a rate vast.ai billed.
+- The Octane settings no longer say OTOY credentials never reach a node's
+  disk: they travel in the setup command and OctaneServer's environment, where
+  the host can read them. The unlicensed-node alert no longer points to a VNC
+  sign-in the app doesn't have yet.
+
+### Removed
+
+- `electron-store`, `react-window` and `@electron-toolkit/preload`. Nothing
+  imported them, but they were packed into `app.asar`.
+
+### Fixed
+
+- **A crashed or killed Blender could deliver a truncated frame.** After
+  Blender exited, whatever its exit code, the agent adopted any size-stable
+  file in `frames/`. The frame a crashed, out-of-memory or `pkill`ed Blender
+  was writing went into the manifest with a hash over the truncated bytes, the
+  app verified the download against that same hash, and the frame shipped as
+  part of a "complete" job. Unannounced files are now adopted only after a
+  clean exit, only on the chunk's frame grid, and only if this attempt wrote
+  them. Before each attempt, files the manifest does not list are deleted.
+  A frame Blender reports it could not save (a full disk, say) is never
+  manifested either, even when Blender exits 0.
+- **Destroying a node while it was being rented left the instance billing,
+  unseen.** A destroy before Vast.ai returned the instance id marked the node
+  destroyed, and the instance then billed with nothing showing it until the
+  next launch. A destroy during the first SSH connection or provisioning could
+  be overwritten: the node was marked `failed` and its healthy machine
+  blacklisted, or it came back as `provisioning`. The instance is now destroyed
+  whichever step the destroy lands in. If that destroy fails, the node is left
+  `failed` with a "check the Vast.ai console" alert, for Fleet's *clear
+  failed* or the launch sweep to retry. One case remains: a destroy while the
+  rent request is in flight, when that request then fails without a clear
+  refusal (a timeout, a 5xx), may have created an instance whose id never
+  came back. The node is left `failed` with a billing-risk alert, and only the
+  launch sweep finds that instance (plan 1.4 resolves it by label).
+- **Chunks were rendered twice.** Destroying a node while a chunk was being
+  prepared on it (a Blender download, a scene upload) requeued the chunk, which
+  was dispatched again at once. The abandoned preparation then failed on the
+  closed connection, requeued the chunk its successor now owned and dropped the
+  successor's bookkeeping, so the next tick dispatched it a third time while
+  the successor was still rendering it: the same frames, billed twice. An
+  abandoned run now writes nothing. Cancelling a job during a chunk's final
+  download no longer puts the chunk back in the queue, and the cancel now shows
+  in the Jobs list.
+- **A chunk could complete without all its frames.** The final download pass
+  read the manifest once and took a failed read for an empty one, so frames
+  listed since the last good poll were never fetched, and idle scale-down then
+  destroyed the only copy. The final read is now retried (after 5, 10 and
+  20 s), and a read that never succeeds fails the chunk. A chunk completes only
+  when every frame in its range is downloaded, and a job only when all of its
+  frames are (otherwise it ends `partial`). Missing frames go through requeue,
+  which re-renders just those.
+- **A chunk size of 0 hung the app.** Zero, or a negative chunk size or step,
+  sent frame splitting into an endless loop in the main process. The UI froze,
+  and the scheduler and idle scale-down stopped, while the fleet kept billing.
+  A `VR_JOB_SPEC` campaign took the same path. A fractional step stored frames
+  Blender never renders, and an end before the start made a job that stayed
+  queued forever. `createJob`, which the dialog and `VR_JOB_SPEC` both use, now
+  refuses these with a message, and the dialog lists the problems as you type
+  and disables *Submit*.
+  A job of more than 100,000 frames is refused too.
+- **A second launch on the same profile wrecked the first.** Its boot
+  re-provisioned every live node, killing the first process's renders, reset
+  every in-flight chunk to pending, and then two schedulers rented against two
+  separate spend caps. Now only one app runs per profile: a second launch
+  focuses the running window, and a headless one (`VR_JOB_SPEC`,
+  `VR_E2E_BLEND`) exits with status 1 and submits nothing. `VR_USERDATA`
+  profiles still run alongside the real one.
+- **Stereo, extension-less and stepped renders made broken previews.** The
+  preview encoder read only `0001.ext` names from an unbroken run: a stereo
+  scene's `0001_L.png`, or frames saved without an extension, failed the chunk's
+  encode after a good render, and with a frame step above 1 the clip held one
+  frame while claiming the whole count. It now reads every name Blender saves,
+  makes one clip of one view, keeps each clip frame on its Blender frame across
+  steps and gaps, and discards a clip whose decoded length disagrees.
+- **A full disk or a closed window could break a destroy.** The event system
+  ran inside the destroy and recovery paths, and anything that threw there — a
+  window already gone, or the headless stdout mirror on a full disk (seen: a
+  modal "JavaScript error in the main process" while nodes billed) — unwound
+  into them. A failing subscriber now costs a log line and nothing else.
+- **Provisioning downloads could stall for good.** The static ffmpeg and
+  NVIDIA driver downloads now give up below 100 kB/s for 60 s like the Blender
+  download (whose mirror fallback shipped in 2.2.0), and every download has a
+  30-minute ceiling per attempt.
+
+### Security
+
+- **A rented node could write files anywhere on your computer.** The app saved
+  each downloaded file at the job folder joined with the name in the node's
+  manifest, unchecked, so a name like `../../…` put a file wherever you can
+  write, a login item say. Root on the rented machine was enough, and so was a
+  startup script inside a `.blend`. Manifest entries must now look like what
+  the agent writes (`frames/NNNN.ext`, `thumbs/NNNN.jpg`,
+  `previews/<chunk>_*.mp4`) and carry a SHA-256 and a size under a cap, and
+  every path a node names goes through one `resolveInside()` check. A refused
+  frame counts as lost and re-renders, with one alert per chunk. Job-clip
+  stitching refuses paths that could slip a directive into ffmpeg's concat
+  list.
+  A frame outside the chunk's own range, and a clip named for another chunk,
+  are refused as well.
+- **The window could be steered into running programs.** Opening a file ran
+  whatever path the window asked for, and on Windows that runs an `.exe` or
+  `.bat`; frame names come from rented nodes. Links of any scheme went to the
+  operating system, and nothing stopped the window navigating away from the
+  app with the fleet controls still attached. The renderer is now sandboxed.
+  Only http(s) links leave the app, in your browser, and navigation away from
+  the app's page is blocked. A file opens only if it is a folder, image or clip
+  inside the project or a job's folder; other files there are revealed in
+  Explorer/Finder instead, and anything else is refused. The content security
+  policy also rules out plugins, `<base>` and forms.
+- **The window could reveal any path.** *Show in folder* passed whatever path
+  the window sent to the operating system; on Windows a network path makes
+  Explorer contact that server and hand it your login hash. Only files and
+  folders the app itself shows can be revealed now.
+
 ## [2.2.0] — 2026-09-25
 
 First release as a standalone desktop app: a signed and notarized macOS build
@@ -76,6 +239,11 @@ alongside the Windows installer.
 
 ### Fixed
 
+- **The launch sweep destroyed other installs' fleets.** It destroyed every
+  `vastai-blender` instance this profile did not track, so a second install on
+  the same account (a packaged app and a dev build, or a `VR_USERDATA`
+  profile) killed the first one's live nodes at launch. It now destroys only
+  instances this profile rented, and leaves any other running with a warning.
 - **Healthy nodes were thrown away on boot.** vast.ai reports an instance as
   running before sshd inside it listens, and one refused connection failed and
   destroyed the node. In one 53-node run, 23 nodes were replaced this way. The

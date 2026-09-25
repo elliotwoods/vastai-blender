@@ -1,8 +1,10 @@
 /**
  * The typed IPC contract — the single source of truth for every channel that
  * crosses main ↔ renderer. Both sides import from here; adding a channel means
- * adding it to one of these maps (a missing handler or a type mismatch is then
- * a compile error on whichever side is out of date).
+ * adding it to one of these maps. A type mismatch is then a compile error on
+ * whichever side is out of date, and so is a push channel the renderer does
+ * not handle (useIpcEvents is exhaustive over IpcEventMap). An invoke channel
+ * with no ipcMain handler is not caught: it fails at runtime.
  */
 
 import type {
@@ -94,6 +96,19 @@ export interface IpcInvokeMap {
   // logs
   'logs:getTail': { args: [{ nodeId?: string; chunkId?: string; lines: number }]; result: string[] }
 
+  // alerts
+  /**
+   * Main's buffer of recent alerts, least recently seen first. A window reads
+   * it when it mounts, because an alert emitted before it was listening (the
+   * boot-time orphan sweep, or while a macOS window was closed) reached no one.
+   */
+  'alerts:recent': { args: []; result: AlertRecord[] }
+  /**
+   * The user dismissed these alerts (by alertKey) in a window. Main keeps the
+   * dismissal, so a window reopened or reloaded does not replay them all again.
+   */
+  'alerts:dismiss': { args: [string[]]; result: void }
+
   // shell / dialogs
   'clipboard:write': { args: [string]; result: void }
   'shell:openExternal': { args: [string]; result: void }
@@ -115,6 +130,93 @@ export interface IpcEventMap {
   'asset:added': AssetAddedEvent
   'fleet:cost': FleetCost
   alert: AlertEvent
+}
+
+// -- alerts ------------------------------------------------------------------
+// The rules below are shared because main's replay buffer (events.ts) and the
+// renderer's store (alertStore.ts) must agree on them. If they disagreed, a
+// replayed alert and a pushed one would not merge, and a window opened late
+// would list the same failure twice.
+
+/**
+ * One entry in main's buffer of recent alerts. Identical alerts (alertKey)
+ * collapse into one entry: `ts` is when it first fired, `lastSeen` when it
+ * last did, `count` how many times.
+ */
+export interface AlertRecord extends AlertEvent {
+  id: number
+  key: string
+  ts: number
+  lastSeen: number
+  count: number
+  /** When the user last dismissed it in a window (alerts:dismiss); null if never. */
+  dismissedAt: number | null
+}
+
+/**
+ * A dismissed alert that fires again comes back, but not within this long of
+ * its dismissal. So a failure repeating every 15 s is put in front of the user
+ * once per quiet period, not every 15 s.
+ *
+ * Not for a billing risk (isBillingRisk): any repeat after its dismissal
+ * brings it straight back. None of them repeats on a timer. Each is a new
+ * destroy that failed on an instance still billing, such as Fleet's "clear
+ * failed" retried during a Vast outage right after the user dismissed the
+ * first failure. Kept quiet, that retry's failure would reach no one, and a
+ * Fleet row that did not clear would be the only sign. A billing risk that
+ * did repeat on a timer would need a throttle of its own, not this one.
+ */
+export const RESURFACE_MS = 5 * 60_000
+
+/**
+ * Whether a window should keep this record out of sight: dismissed, and not
+ * fired again since. For anything but a billing risk, a repeat within
+ * RESURFACE_MS of the dismissal does not count either. A window that was open
+ * all along brings an alert back by the same rule when its push arrives
+ * (alertStore's receive), so one replaying the buffer reaches the same answer.
+ */
+export function isStillDismissed(r: AlertRecord): boolean {
+  if (r.dismissedAt === null) return false
+  if (isBillingRisk(r)) return r.lastSeen <= r.dismissedAt
+  return r.lastSeen - r.dismissedAt < RESURFACE_MS
+}
+
+/**
+ * What makes two alerts "the same": level and exact message, nothing looser.
+ * "Destroy failed for instance 123" and "... 456" are two instances billing,
+ * and folding them into one line would hide one of them.
+ */
+export function alertKey(a: AlertEvent): string {
+  return `${a.level}:${a.message}`
+}
+
+/**
+ * Messages saying an instance may be billing with nothing in the app managing
+ * it: a destroy that failed, an orphan, an instance left for the Vast.ai
+ * console. Matched on the text because AlertEvent carries no structured kind
+ * yet; every such message main emits today says one of these things.
+ *
+ * "orphan" matches as a whole word only. The orphan sweep announces
+ * "destroying orphaned instance N" before it tries, and that is not yet a
+ * risk: if the destroy fails it says so in an alert of its own ("orphan
+ * destroy failed ... check the Vast.ai console!"), which matches. Were the
+ * announcement a match too, every sweep would leave a sticky row with a
+ * console link beside it, crying wolf next to the one that is real.
+ */
+const BILLING_RISK = /destroy failed|could not destroy|vast\.ai console|\borphans?\b|unclaimed/i
+
+export function isBillingRisk(a: AlertEvent): boolean {
+  return BILLING_RISK.test(a.message)
+}
+
+/**
+ * Stays on screen until the user dismisses it: every error, and a billing
+ * risk of any level (the "not rented by this profile, left running" warning
+ * among them). The rest are transient toasts. Main's buffer and the store
+ * both evict sticky alerts after the rest, and billing risks last of all.
+ */
+export function isStickyAlert(a: AlertEvent): boolean {
+  return a.level === 'error' || isBillingRisk(a)
 }
 
 export type InvokeChannel = keyof IpcInvokeMap

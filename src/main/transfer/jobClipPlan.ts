@@ -96,7 +96,20 @@ export function nextVersionName(kind: string, prev: string | null): string {
   return `job_${kind}.v${n}.mp4`
 }
 
-/** ffmpeg concat-demuxer list; single quotes escaped the way it expects. */
+/**
+ * ffmpeg concat-demuxer list; single quotes escaped the way it expects.
+ *
+ * A line break cannot be escaped in this format at all: inside a path it ends
+ * the `file` directive and starts a new one, which under `-safe 0` can name
+ * any local file or URL. So a path with any control character is refused, and
+ * the build fails rather than stitching in something else.
+ */
 export function concatList(files: string[]): string {
+  for (const f of files) {
+    // eslint-disable-next-line no-control-regex -- matching control characters is the point
+    if (/[\x00-\x1f\x7f]/.test(f)) {
+      throw new Error(`not stitching ${JSON.stringify(f)}: control character in the path`)
+    }
+  }
   return files.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n') + '\n'
 }

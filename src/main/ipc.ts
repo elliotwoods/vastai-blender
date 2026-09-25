@@ -1,13 +1,15 @@
 /**
- * Registers every ipcMain.handle channel from the shared contract and owns
- * the event-push helper. Real implementations arrive phase by phase; anything
- * not yet built returns an honest empty/stub result (and mock data under
- * VR_MOCK=1 for UI development).
+ * Registers every ipcMain.handle channel from the shared contract, and
+ * forwards the main-process event bus (events.ts) to the renderer windows.
+ * Real implementations arrive phase by phase; anything not yet built returns
+ * an honest empty/stub result (and mock data under VR_MOCK=1 for UI
+ * development).
  */
 
-import { BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
-import type { EventChannel, IpcEventMap, InvokeChannel, IpcInvokeMap } from '../shared/ipc'
+import { BrowserWindow, Notification, clipboard, dialog, ipcMain, shell } from 'electron'
+import { isStickyAlert, type InvokeChannel, type IpcInvokeMap, isBillingRisk } from '../shared/ipc'
 import type {
+  AlertEvent,
   AssetIndex,
   ChunkSnapshot,
   ChunkState,
@@ -24,6 +26,8 @@ import type {
   NodeSnapshot,
   ThumbAsset
 } from '../shared/models'
+import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
+import { dismissAlerts, emit, onAlertSurfaced, onEvent, recentAlerts } from './events'
 import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
 import { currentUser } from './vast/vastClient'
@@ -44,24 +48,6 @@ type Handler<C extends InvokeChannel> = (
 
 function handle<C extends InvokeChannel>(channel: C, handler: Handler<C>): void {
   ipcMain.handle(channel, (_event, ...args) => handler(...(args as IpcInvokeMap[C]['args'])))
-}
-
-/** Push an event to every window. */
-export function emit<C extends EventChannel>(channel: C, payload: IpcEventMap[C]): void {
-  // E2E observability: mirror events to stdout when driving headless tests. Both headless
-  // drivers need this — without it a scripted run has no way to see why a chunk failed,
-  // because the node's render log otherwise only ever reaches the renderer window.
-  const headless = process.env.VR_E2E_BLEND || process.env.VR_JOB_SPEC
-  if (headless && channel !== 'render:logLine') {
-    console.log(`[event] ${channel} ${JSON.stringify(payload).slice(0, 240)}`)
-  }
-  if (headless && channel === 'render:logLine') {
-    const l = payload as IpcEventMap['render:logLine']
-    console.log(`[log:${l.nodeId.slice(0, 8)}] ${l.line}`)
-  }
-  for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send(channel, payload)
-  }
 }
 
 const MOCK = process.env.VR_MOCK === '1'
@@ -166,6 +152,36 @@ function frameThumbs(jobId: string, from: number, to: number): ThumbAsset[] {
     absPath: r.thumb_path,
     mediaUrl: toMediaUrl(r.thumb_path)
   }))
+}
+
+/**
+ * The folders shell:openPath may open things in: the project root, and every
+ * job's output folder, since a job keeps the folder it was created under when
+ * the project root later moves.
+ */
+function openableRoots(): string[] {
+  const jobDirs = getDb().prepare('SELECT DISTINCT output_dir FROM jobs').all() as Array<{
+    output_dir: string
+  }>
+  return [getSettings().projectRoot, ...jobDirs.map((r) => r.output_dir)]
+}
+
+/**
+ * What shell:showItemInFolder may reveal: the folders shell:openPath opens
+ * things in, plus the files the renderer reveals that live outside them — a
+ * job's .blend, an addon's zip, the SSH key. Anything else (a UNC path, which
+ * on Windows would hand an NTLM hash to whoever serves it) is refused.
+ */
+function revealablePlaces(): string[] {
+  const blends = getDb().prepare('SELECT DISTINCT blend_path FROM jobs').all() as Array<{
+    blend_path: string
+  }>
+  return [
+    ...openableRoots(),
+    ...blends.map((r) => r.blend_path),
+    ...listAddons().map((a) => a.zipPath),
+    getSettings().sshKeyPath
+  ]
 }
 
 // Four fixture thumbnails cycled across the range, so a mocked filmstrip has
@@ -548,7 +564,129 @@ const mockHistory = (range: HistoryRange, now = Date.now()): HistorySummary => {
   }
 }
 
-export function registerIpc(): void {
+/**
+ * Bring the app's window to the front, or open one when there is none: on
+ * macOS the app keeps running, and the fleet billing, with its window closed.
+ * As index.ts does for a second launch.
+ */
+function showWindow(createWindow: (() => void) | undefined): void {
+  const win = BrowserWindow.getAllWindows()[0]
+  if (!win) {
+    createWindow?.()
+    return
+  }
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+/**
+ * Notifications not yet clicked or closed. An Electron Notification that
+ * nothing references any more can be garbage-collected, and its click handler
+ * with it, so each is held here until then. Only the newest few: an older one
+ * let go stays on the desktop, and a click on it just does nothing.
+ */
+const heldNotifications = new Set<Notification>()
+const MAX_HELD_NOTIFICATIONS = 20
+
+/**
+ * An OS notification for an error or billing risk that has just surfaced
+ * (events.ts's onAlertSurfaced) while no window of the app is in front: it is
+ * behind another app, minimised, or closed altogether. The banner is where it
+ * is dealt with; clicking this goes there. Raised here in main rather than in
+ * the window, which cannot notify while closed, and whose own window.focus()
+ * may not bring a backgrounded app forward on macOS. A repeat that only
+ * counts up does not surface, so a failure every 15 s notifies once per quiet
+ * period; a billing risk has none (RESURFACE_MS).
+ */
+function notifyUnattended(alert: AlertEvent, createWindow: (() => void) | undefined): void {
+  if (!isStickyAlert(alert) || BrowserWindow.getFocusedWindow()) return
+  if (!Notification.isSupported()) return
+  // Billing risks always notify at once: they are rare, and each one is an
+  // instance that may be costing money. Plain errors come in storms — a dead
+  // node fails dispatch for every pending chunk, each with its own message —
+  // so they are paced, and whatever is held back becomes one summary.
+  if (!isBillingRisk(alert)) {
+    const now = Date.now()
+    const wait = lastErrorNotifyAt + ERROR_NOTIFY_GAP_MS - now
+    if (wait > 0) {
+      heldBackErrors++
+      trailingNotify ??= setTimeout(() => {
+        trailingNotify = null
+        const n = heldBackErrors
+        heldBackErrors = 0
+        if (n === 0 || BrowserWindow.getFocusedWindow() || !Notification.isSupported()) return
+        lastErrorNotifyAt = Date.now()
+        showNotification(
+          `${n} more error${n === 1 ? '' : 's'} — open Vast Render to see them`,
+          createWindow
+        )
+      }, wait)
+      return
+    }
+    lastErrorNotifyAt = now
+  }
+  showNotification(alert.message, createWindow)
+}
+
+/** Errors (not billing risks) notify at most this often; see notifyUnattended. */
+const ERROR_NOTIFY_GAP_MS = 20_000
+let lastErrorNotifyAt = -Infinity
+let heldBackErrors = 0
+let trailingNotify: ReturnType<typeof setTimeout> | null = null
+
+function showNotification(body: string, createWindow: (() => void) | undefined): void {
+  const n = new Notification({ title: 'Vast Render', body })
+  const release = (): void => {
+    heldNotifications.delete(n)
+  }
+  n.on('click', () => {
+    release()
+    showWindow(createWindow)
+  })
+  n.on('close', release)
+  heldNotifications.add(n)
+  if (heldNotifications.size > MAX_HELD_NOTIFICATIONS) {
+    const [oldest] = heldNotifications
+    heldNotifications.delete(oldest)
+  }
+  n.show()
+}
+
+export interface RegisterIpcOptions {
+  /**
+   * index.ts's createWindow, for a notification clicked while no window is
+   * open. Without it such a click does nothing.
+   */
+  createWindow?: () => void
+}
+
+export function registerIpc(opts: RegisterIpcOptions = {}): void {
+  // -- events ---------------------------------------------------------------
+  // Every bus event goes to every window. Subscribed here, once, before
+  // index.ts starts the node manager and scheduler (the first emitters) and
+  // before any window exists, so nothing a window could receive is missed.
+  onEvent(({ channel, payload }) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      win.webContents.send(channel, payload)
+    }
+  })
+  // An error or billing risk nobody is looking at: an OS notification too.
+  // This runs inside emit, before the windows hear the alert, so a failure
+  // here is logged and goes no further. It must never cost the user the
+  // alert itself, or throw into the destroy path that raised it.
+  onAlertSurfaced((alert) => {
+    try {
+      notifyUnattended(alert, opts.createWindow)
+    } catch (e) {
+      console.warn('[alerts] OS notification failed:', e)
+    }
+  })
+  // What a window missed: alerts raised before it existed (or while it was
+  // closed) went to no one above. events.ts keeps the recent ones.
+  handle('alerts:recent', () => recentAlerts())
+  handle('alerts:dismiss', (keys) => dismissAlerts(keys))
+
   // -- settings (real) ------------------------------------------------------
   // VR_MOCK asserts the key too: mock mode exists to drive the UI on a
   // throwaway profile, and without this Fleet renders its "no API key" empty
@@ -563,13 +701,34 @@ export function registerIpc(): void {
   })
   handle('shell:openExternal', async (url) => {
     // http(s) links only (billing page etc.) — never arbitrary protocols.
-    if (/^https?:\/\//.test(url)) await shell.openExternal(url)
+    const safe = externalUrl(url)
+    if (safe) await shell.openExternal(safe)
   })
   handle('shell:openPath', async (p) => {
-    await shell.openPath(p)
+    // openPath is "double-click this": on Windows it runs an .exe or .bat, and
+    // frame paths are named by rented nodes. So only folders and images or
+    // clips inside the project or a job's folder are opened; anything else
+    // there is revealed in Explorer/Finder instead, and anything outside is
+    // refused. See windowPolicy.ts.
+    const verdict = openPathVerdict(p, openableRoots())
+    if (verdict.action === 'open') {
+      const err = await shell.openPath(verdict.path)
+      if (err) console.warn(`[shell] could not open ${verdict.path}: ${err}`)
+    } else if (verdict.action === 'reveal') {
+      shell.showItemInFolder(verdict.path)
+    } else {
+      console.warn(`[shell] refused to open ${JSON.stringify(p)}: ${verdict.reason}`)
+    }
   })
   handle('shell:showItemInFolder', (p) => {
-    shell.showItemInFolder(p)
+    const abs = revealPath(p, revealablePlaces())
+    if (!abs) {
+      console.warn(
+        `[shell] refused to reveal ${JSON.stringify(p)}: not a file or folder the app shows`
+      )
+      return
+    }
+    shell.showItemInFolder(abs)
   })
   handle('dialog:pickBlendFiles', async () => {
     const r = await dialog.showOpenDialog({

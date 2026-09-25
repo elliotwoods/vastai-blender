@@ -1,0 +1,75 @@
+# Every check that runs without Electron, a GPU or a Vast.ai account. Nothing
+# here rents an instance or needs a secret.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run moot. Not on main: two
+# quick pushes there would leave the first commit with no CI result at all.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    # An explicit `bash` adds -o pipefail to the runner's default -e, and the
+    # remote/ steps need bash's globstar.
+    shell: bash
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # selfcheck.py races threads on purpose. If one deadlocks, the run should
+    # fail rather than hold the runner for GitHub's six-hour default.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      # Electron 39 embeds Node 22 and @types/node is pinned to 22, so the main
+      # process is tested on the runtime it ships on. Node 22.13+ also loads
+      # node:sqlite (history.test.ts) without a flag.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      # Nodes run DOCKER_IMAGE (nodeManager.ts), which is Ubuntu 22.04 with
+      # python3 3.10. Checking remote/ on 3.10 catches syntax that the runner's
+      # newer Python accepts but a node would reject.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      # --ignore-scripts skips postinstall's `electron-builder install-app-deps`
+      # (a better-sqlite3 rebuild against Electron's ABI) and Electron's binary
+      # download. Neither is needed: tsc reads electron.d.ts from the package,
+      # and the tests load neither binary (history.test.ts uses node:sqlite
+      # because better-sqlite3 is built for Electron).
+      - run: npm ci --ignore-scripts
+
+      - run: npm run typecheck
+      - run: npx eslint .
+      - run: npx vitest run
+
+      # remote/ is uploaded verbatim to rented nodes. A mistake there shows up
+      # only as a dead agent on a node that is still billing.
+      - name: Agent self-check
+        run: npm run test:remote
+      - name: Compile remote/ Python
+        run: |
+          shopt -s globstar
+          python3 -m py_compile remote/**/*.py
+      # Every script is parsed before the step fails, so one run names every
+      # broken file (under -e, a bare loop would stop at the first).
+      - name: Parse remote/ shell scripts
+        run: |
+          shopt -s globstar
+          rc=0
+          for f in remote/**/*.sh; do bash -n "$f" || rc=1; done
+          exit $rc

@@ -9,7 +9,7 @@ import { app } from 'electron'
 import { existsSync } from 'fs'
 import { join } from 'path'
 import { getDb } from '../db/db'
-import { emit } from '../ipc'
+import { emit } from '../events'
 import { uploadTree } from '../ssh/sftp'
 import type { SshConnection } from '../ssh/sshConnection'
 

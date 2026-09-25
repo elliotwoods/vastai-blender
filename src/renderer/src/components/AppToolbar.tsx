@@ -109,7 +109,7 @@ function FleetReadouts(): React.JSX.Element {
         }
       >
         <button style={linked} onClick={toHistory('spend')}>
-          <span style={{ color: TOKENS.textFaint }}>session</span>
+          <span style={{ color: TOKENS.textFaint }}>total</span>
           <span style={mono}>${(cost?.sessionTotal ?? 0).toFixed(2)}</span>
           <span style={{ color: TOKENS.border }}>|</span>
           <span

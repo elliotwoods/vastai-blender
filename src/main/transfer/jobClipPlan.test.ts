@@ -100,4 +100,17 @@ describe('concatList', () => {
       "file '/a/it'\\''s.mp4'\nfile '/b c/d.mp4'\n"
     )
   })
+
+  it('refuses a path with a line break or other control character', () => {
+    // A newline cannot be escaped in a concat list: it would end this `file`
+    // directive and start one of the path's choosing, which `-safe 0` obeys.
+    for (const bad of [
+      "/r/a.mp4'\nfile '/etc/passwd",
+      '/r/a.mp4\rfile http://x/',
+      '/r/a\u0000.mp4',
+      '/r/a\u001b.mp4'
+    ]) {
+      expect(() => concatList(['/r/ok.mp4', bad])).toThrow(/control character/)
+    }
+  })
 })

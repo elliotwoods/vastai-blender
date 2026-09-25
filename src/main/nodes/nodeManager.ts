@@ -11,7 +11,7 @@
 import { randomUUID } from 'crypto'
 import { co2Grams } from '../carbon/intensity'
 import { getDb } from '../db/db'
-import { emit } from '../ipc'
+import { emit } from '../events'
 import { getSettings } from '../settings'
 import { ensureKeyRegistered, readPrivateKey } from '../ssh/keys'
 import { FIRST_CONNECT_BUDGET_MS, retryWithBackoff } from '../ssh/connectRetry'
@@ -23,7 +23,8 @@ import {
   destroyInstance,
   listInstances,
   sshEndpoints,
-  showInstance
+  showInstance,
+  VastError
 } from '../vast/vastClient'
 import type {
   GpuSample,
@@ -39,6 +40,17 @@ export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22
 
 /** Minimal onstart — real provisioning is pushed over SSH by the app. */
 const ONSTART = 'mkdir -p ~/vastai && touch ~/vastai/.booted'
+
+/**
+ * Whether a createInstance that threw certainly rented nothing: Vast answered
+ * and refused it with a 4xx (the offer was taken, no credit, a bad request).
+ * A network error, a 5xx or a reply that never came can each follow a create
+ * that went through. Plan 1.4 moves this into vastClient and handles that
+ * unknown outcome in full.
+ */
+function createRefused(e: unknown): boolean {
+  return e instanceof VastError && e.status !== undefined && e.status >= 400 && e.status < 500
+}
 
 interface NodeRow {
   id: string
@@ -299,6 +311,31 @@ class ManagedNode {
   }
 
   /**
+   * Destroying or destroyed: the node is on its way out, and no lifecycle
+   * step still running for it may move it back into the fleet.
+   */
+  get gone(): boolean {
+    const s = this.state
+    return s === 'destroying' || s === 'destroyed'
+  }
+
+  /**
+   * For a lifecycle step (driveToReady, resumeNode, recoverUnreachable) back
+   * from an await: whether the node has left `held`, the state the step last
+   * found it in or put it in. While a step holds a node nothing but a destroy
+   * moves it: destroyNode ('destroying', then 'destroyed', or 'failed' when
+   * its DELETE threw and the instance may still be billing). The step must
+   * then stop without writing a state over the destroy's, or a node the user
+   * destroyed comes back into the fleet, and a destroyed one gets a second
+   * DELETE. Not `gone`: a 'failed' destroy is not gone, and a row left
+   * 'destroying' by the last exit is resumed like any other. Plan 2.2 makes
+   * every transition a compare-and-set instead.
+   */
+  movedOn(held: NodeState): boolean {
+    return this.state !== held
+  }
+
+  /**
    * GPU count and latest metrics WITHOUT building a snapshot. The scheduler
    * sizes GPU lanes from these, and the snapshot itself asks the scheduler for
    * slot info — going through `snapshot` here would recurse.
@@ -381,10 +418,11 @@ export class NodeManager {
   }
 
   /**
-   * Billing-leak protection: destroy any instance labelled by this app that
+   * Billing-leak protection: destroy any instance this profile rented that
    * no live node row tracks (e.g. a node marked failed before its destroy
    * completed, or created moments before a crash). Never touches instances
-   * without our label — the account may host unrelated workloads.
+   * without our label — the account may host unrelated workloads — nor
+   * labelled ones another installation or profile rented (below).
    */
   private async reconcileOrphans(): Promise<void> {
     try {
@@ -629,8 +667,23 @@ export class NodeManager {
         label: `vastai-blender ${id.slice(0, 8)}`
       })
       node.update({ instance_id: instanceId })
+      // The row is in the Fleet, destroy button and all, from before the
+      // create; a destroy that landed while it was in flight found no
+      // instance id and so destroyed nothing. The instance is ours to kill.
+      if (node.gone) {
+        await this.destroyAbandoned(node, instanceId)
+        return id
+      }
       void this.driveToReady(node, offer.machineId)
     } catch (e) {
+      // Destroyed while the create was in flight, and the create then
+      // threw. The user cancelled this rental: that is no fault of the
+      // machine's (no blacklist), and it must not be replaced by the next
+      // offer (return, as the success path above does).
+      if (node.gone) {
+        if (!createRefused(e)) this.cancelledCreateUnknown(node, e as Error)
+        return id
+      }
       node.setState('failed', (e as Error).message)
       this.blacklist.add(offer.machineId)
       throw e
@@ -638,15 +691,78 @@ export class NodeManager {
     return id
   }
 
+  /**
+   * A cancelled rental whose create threw without a refusal from Vast: the
+   * instance may exist, billing under this node's label, with its id known
+   * to nobody (a lost reply). destroyNode had no id and ended the node
+   * 'destroyed', so nothing would ever look for it. The node goes back to
+   * 'failed', the state that says "may still be billing", and the user is
+   * told. Its row, which the next start's orphan sweep matches that label
+   * against, is kept whatever its state. Finding the instance now, by the
+   * label, is plan 1.4.
+   */
+  private cancelledCreateUnknown(node: ManagedNode, e: Error): void {
+    const label = `vastai-blender ${node.id.slice(0, 8)}`
+    node.setState(
+      'failed',
+      `cancelled while creating; the create's outcome is unknown: ${e.message}`
+    )
+    emit('alert', {
+      level: 'error',
+      message: `A rental cancelled mid-create may be billing: Vast never said whether the create went through (${e.message}) — check the Vast.ai console for "${label}"!`
+    })
+  }
+
+  /**
+   * Destroy the instance of a node that was destroyed before its instance id
+   * was recorded. destroyNode had no id to destroy, so it marked the node
+   * destroyed and moved on — and after that nothing else would ever touch
+   * the instance: accrueCosts, the Fleet and History all skip 'destroyed'
+   * rows, and the orphan sweep only runs at start-up.
+   */
+  private async destroyAbandoned(node: ManagedNode, instanceId: number): Promise<void> {
+    try {
+      await destroyInstance(instanceId)
+      node.setState('destroyed')
+    } catch (e) {
+      // As destroyNode does when its destroy throws: 'failed', with the
+      // instance id on the row, is the state that says "may still be
+      // billing" — clearFailed retries the destroy, and the orphan sweep
+      // counts a failed row's instance as untracked and destroys it.
+      node.setState('failed', `destroy failed: ${(e as Error).message}`)
+      emit('alert', {
+        level: 'error',
+        message: `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
+      })
+    }
+  }
+
   /** Poll vast until running + SSH reachable, then hand to provisioning. */
   private async driveToReady(node: ManagedNode, machineId: number | null): Promise<void> {
     const instanceId = node.snapshot.instanceId
     if (!instanceId) return
+    // A backstop no caller reaches today. Callers hand over a node they have
+    // just put in 'requested', never one destroyNode is destroying (which
+    // reads the id from the row and destroys the instance itself). So a node
+    // already gone here was destroyed before its instance id was recorded,
+    // the race rentOffer checks for too, and nothing has destroyed the
+    // instance. A caller that broke that rule would send a second DELETE
+    // alongside destroyNode's: a false "Destroy failed" alert and a 'failed'
+    // row until plan 1.2's ensureInstanceGone takes the 404 as done.
+    if (node.gone) {
+      await this.destroyAbandoned(node, instanceId)
+      return
+    }
+    // The state this run holds the node in: 'requested' until SSH answers,
+    // then 'provisioning'. A destroy from here on moves the node off it and
+    // is destroyNode's to finish, so the returns below leave the node and
+    // its instance alone (see movedOn).
+    let held: NodeState = node.state
     const deadline = Date.now() + 8 * 60_000
     try {
       let inst: RawInstance | null = null
       for (;;) {
-        if (node.state === 'destroying' || node.state === 'destroyed') return
+        if (node.movedOn(held)) return
         inst = await showInstance(instanceId)
         if (inst?.actual_status === 'running') {
           const eps = sshEndpoints(inst)
@@ -695,7 +811,7 @@ export class NodeManager {
           budgetMs: FIRST_CONNECT_BUDGET_MS,
           initialDelayMs: 5_000,
           maxDelayMs: 30_000,
-          shouldAbort: () => node.state === 'destroying' || node.state === 'destroyed',
+          shouldAbort: () => node.movedOn(held),
           onRetry: (e, n, delayMs) =>
             emit('render:logLine', {
               nodeId: node.id,
@@ -706,13 +822,34 @@ export class NodeManager {
         }
       )
 
+      // shouldAbort is only asked between attempts. A destroy that lands
+      // during one closes the node's connection, but the attempt then opens a
+      // fresh one on its next endpoint, and that can succeed while the
+      // instance is still being torn down (or is still up: its DELETE
+      // failed). Going on would bring the node back as 'provisioning' over
+      // the destroy's state; drop the connection.
+      if (node.movedOn(held)) {
+        node.closeSsh()
+        return
+      }
       node.setState('provisioning')
+      held = 'provisioning'
       if (this.onReady && node.ssh) {
         await this.onReady({ id: node.id, ssh: node.ssh })
       }
+      // Provisioning takes minutes, plenty of time to be destroyed in; a
+      // node that was must not end 'ready', where the scheduler would use it.
+      if (node.movedOn(held)) return
       node.setState('ready')
       emit('alert', { level: 'info', message: `Node ${node.snapshot.gpuName} ready` })
     } catch (e) {
+      // Destroyed meanwhile: the retry gave up because of it (RetryAbortedError),
+      // or the connection destroyNode closed failed a command. Neither is the
+      // node failing. No 'failed' over the destroy's state, no blacklisted
+      // machine, no error alert, and no second destroy racing destroyNode's.
+      // A destroy whose DELETE threw has left the node 'failed' with its
+      // instance id, which clearFailed and the orphan sweep retry.
+      if (node.movedOn(held)) return
       node.setState('failed', (e as Error).message)
       if (machineId != null) this.blacklist.add(machineId)
       emit('alert', { level: 'error', message: `Node failed: ${(e as Error).message}` })
@@ -736,8 +873,14 @@ export class NodeManager {
       node.setState('failed', 'no instance id at resume')
       return
     }
+    // The Fleet shows the row, destroy button and all, from start-up, and a
+    // resume takes minutes when it re-provisions. So, as in driveToReady,
+    // every await below is followed by a check that the node is still in the
+    // state this step holds it in: first the one the last exit left it in.
+    let held: NodeState = node.state
     try {
       const inst = await showInstance(instanceId)
+      if (node.movedOn(held)) return
       if (!inst) {
         node.setState('destroyed', 'instance missing at resume')
         return
@@ -757,25 +900,59 @@ export class NodeManager {
       // written specs → "No such file" renames or silently stranded chunks)
       // and restarts the agent underneath the dispatch.
       node.setState('provisioning')
-      await node.connectSsh()
-      const r = await node.ssh!.exec('echo ok', { timeoutMs: 30_000 })
+      held = 'provisioning'
+      const ssh = await node.connectSsh()
+      if (node.movedOn(held)) {
+        // destroyNode closed this connection while it was connecting, and a
+        // connect in flight still lands on a closed SshConnection: end the
+        // session it opened to the dying box.
+        ssh.close()
+        return
+      }
+      const r = await ssh.exec('echo ok', { timeoutMs: 30_000 })
+      if (node.movedOn(held)) return
       if (!r.stdout.includes('ok')) throw new Error('echo failed')
       if (this.onReady && node.ssh) {
         await this.onReady({ id: node.id, ssh: node.ssh })
       }
+      // Destroyed while provisioning: not 'ready', where the scheduler would
+      // dispatch to it and scale-down would destroy it a second time.
+      if (node.movedOn(held)) return
       node.setState('ready')
     } catch (e) {
+      // The destroy closed the connection under the connect, the echo or
+      // provisioning. That is not the node becoming unreachable: no
+      // 'unreachable' over the destroy's state, and no recovery that would
+      // end 'failed' and destroy the instance again.
+      if (node.movedOn(held)) return
       node.setState('unreachable', (e as Error).message)
       void this.recoverUnreachable(node)
     }
   }
 
   private async recoverUnreachable(node: ManagedNode): Promise<void> {
+    // 'unreachable', set by resumeNode just now. See movedOn.
+    const held = node.state
     try {
-      if (!node.ssh) await node.connectSsh()
-      await node.ssh!.reconnectWithBackoff()
+      const ssh = node.ssh ?? (await node.connectSsh())
+      // Closed by destroyNode mid-connect, as in resumeNode: end the session
+      // the connect opened anyway.
+      if (node.movedOn(held)) {
+        ssh.close()
+        return
+      }
+      await ssh.reconnectWithBackoff()
+      if (node.movedOn(held)) {
+        ssh.close()
+        return
+      }
       node.setState('ready')
     } catch (e) {
+      // Destroyed meanwhile: destroyNode closed the connection the reconnect
+      // was retrying on, which is what ended it. The destroy is not this
+      // node failing, and destroying the instance again here would be a
+      // second DELETE, a 404 raised as "Could not destroy".
+      if (node.movedOn(held)) return
       node.setState('failed', (e as Error).message)
       // A node that dies mid-render never reaches destroyNode, so the
       // scheduler would otherwise keep polling a dead connection for chunks

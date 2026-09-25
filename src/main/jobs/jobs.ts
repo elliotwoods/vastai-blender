@@ -1,13 +1,14 @@
 /** Job persistence + read models (the scheduler owns state transitions). */
 
 import { randomUUID } from 'crypto'
-import { mkdirSync } from 'fs'
+import { mkdirSync, statSync } from 'fs'
 import { basename, join } from 'path'
 import { resolveJobBlenderVersion } from '../blender/blendInfo'
 import { getDb } from '../db/db'
-import { emit } from '../ipc'
+import { emit } from '../events'
 import { getSettings } from '../settings'
 import { autoChunkSize, framesIn, splitFrames } from '../scheduler/chunker'
+import { validateSubmission } from '../../shared/jobValidation'
 import type {
   ChunkSnapshot,
   ChunkState,
@@ -141,14 +142,37 @@ export function emitChunksChanged(chunkIds: readonly string[]): void {
   for (const id of chunkIds) emitChunkChanged(id)
 }
 
-/** Create job + chunks + frame rows; returns the job id. */
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Create job + chunks + frame rows; returns the job id.
+ *
+ * Refuses an impossible submission before touching the disk or the DB. Both
+ * ways in — job:create from the dialog and the VR_JOB_SPEC campaign driver —
+ * land here, so this is where the rules hold. A chunk size of 0 used to reach
+ * splitFrames and spin the main process until it ran out of memory: no IPC,
+ * no scheduler tick, no idle scale-down, while the fleet kept billing.
+ */
 export async function createJob(sub: JobSubmission): Promise<string> {
+  const problems = validateSubmission(sub)
+  // Only main can see the disk. With a blenderVersionOverride set nothing
+  // below reads the scene, so a missing one would first surface at dispatch,
+  // failing chunk after chunk on a rented node.
+  if (problems.length === 0 && !isFile(sub.blendPath)) {
+    problems.push(`scene file not found: ${sub.blendPath}`)
+  }
+  if (problems.length) throw new Error(problems.join('; '))
+
   const settings = getSettings()
   const id = randomUUID()
   const name = sub.name || basename(sub.blendPath).replace(/\.blend$/i, '')
   const outputDir = join(settings.projectRoot, 'renders', id)
-  mkdirSync(join(outputDir, 'frames'), { recursive: true })
-  mkdirSync(join(outputDir, 'previews'), { recursive: true })
 
   const blenderVersion = await resolveJobBlenderVersion(
     sub.blendPath,
@@ -158,6 +182,11 @@ export async function createJob(sub: JobSubmission): Promise<string> {
   const totalFrames = Math.floor((sub.frameEnd - sub.frameStart) / sub.frameStep) + 1
   const chunkSize = sub.chunkSize ?? autoChunkSize(totalFrames, settings.maxActiveNodes)
   const ranges = splitFrames(sub.frameStart, sub.frameEnd, sub.frameStep, chunkSize)
+
+  // After everything above that can refuse the job, so a refusal leaves no
+  // empty renders/<id> folder behind.
+  mkdirSync(join(outputDir, 'frames'), { recursive: true })
+  mkdirSync(join(outputDir, 'previews'), { recursive: true })
 
   const db = getDb()
   const insertAll = db.transaction(() => {
@@ -214,11 +243,31 @@ export function setJobShareNode(jobId: string, shareNode: boolean): void {
   emitJobChanged(jobId)
 }
 
-/** Recompute a job's state from its chunks; emits on change. */
+/** Frames of a job that have not landed on the local disk. */
+function undownloadedFrameCount(jobId: string): number {
+  return (
+    getDb()
+      .prepare("SELECT COUNT(*) AS n FROM frames WHERE job_id = ? AND state != 'downloaded'")
+      .get(jobId) as { n: number }
+  ).n
+}
+
+/**
+ * Recompute a job's state from its chunks, and announce the job.
+ *
+ * Always announces, a cancelled job included. A cancelled job's state is
+ * final, so there is nothing to recompute, but the call still means something
+ * about it changed. Returning before the emit meant a cancel itself was never
+ * announced: the Jobs list kept showing the job as running.
+ */
 export function refreshJobState(jobId: string): void {
   const db = getDb()
   const row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId) as JobRow | undefined
-  if (!row || row.state === 'cancelled') return
+  if (!row) return
+  if (row.state === 'cancelled') {
+    emitJobChanged(jobId)
+    return
+  }
   const chunks = db
     .prepare('SELECT state, COUNT(*) AS n FROM chunks WHERE job_id = ? GROUP BY state')
     .all(jobId) as Array<{ state: ChunkState; n: number }>
@@ -229,6 +278,12 @@ export function refreshJobState(jobId: string): void {
   else if (count('failed') > 0 && count('complete') + count('failed') === total) state = 'partial'
   else if (count('pending') === total) state = 'queued'
   else state = 'running'
+  // Complete means every frame is on disk, not just that every chunk says so.
+  // The scheduler already holds each chunk to that before completing it; this
+  // is the backstop for any other way a chunk reaches 'complete'. Every chunk
+  // finished with frames still missing is a job with holes: 'partial', not a
+  // 'complete' the user only finds out about when assembling the sequence.
+  if (state === 'complete' && undownloadedFrameCount(jobId) > 0) state = 'partial'
   if (state !== row.state) {
     db.prepare('UPDATE jobs SET state = ? WHERE id = ?').run(state, jobId)
   }

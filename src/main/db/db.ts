@@ -18,6 +18,20 @@ export function getDb(): Db {
   db = new Database(file)
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
+  applySchema(db)
+  return db
+}
+
+/**
+ * Bring an open database up to the current schema: create what is missing,
+ * run the column migrations and the one-shot data backfills. Idempotent.
+ *
+ * Separate from getDb (which owns the file, WAL and foreign keys) so the test
+ * harness builds its in-memory database through this same path, migrations
+ * and backfills included, rather than from schema.sql alone — which a
+ * migration that forgot to update it would silently diverge from.
+ */
+export function applySchema(db: Db): void {
   db.exec(schemaSql)
   const row = db.prepare('SELECT version FROM schema_meta').get() as { version: number } | undefined
   if (!row) {
@@ -25,7 +39,6 @@ export function getDb(): Db {
   }
   migrate(db)
   backfillUsageLog(db)
-  return db
 }
 
 const SCHEMA_VERSION = 5

@@ -27,6 +27,8 @@ import type {
   NodeSnapshot,
   SettingsPublic
 } from '../../../shared/models'
+import type { EventChannel, IpcEventMap } from '../../../shared/ipc'
+import { useAlertStore } from './alertStore'
 import { ipc } from './ipc'
 import { useLogStore } from './logStore'
 import { useProgressStore } from './progressStore'
@@ -216,14 +218,23 @@ export function useSetJobShareNode(): UseMutationResult<
 }
 
 /**
+ * One handler per push channel, or null for a channel deliberately ignored.
+ * A map over every EventChannel, so a channel added to IpcEventMap without a
+ * decision here is a compile error. The `alert` channel went unsubscribed for
+ * the app's whole life that way, and it carries the "Destroy failed ... check
+ * the Vast.ai console!" warnings.
+ */
+type EventHandlers = { [E in EventChannel]: ((payload: IpcEventMap[E]) => void) | null }
+
+/**
  * Subscribe to main-process push events and fold them into the Query cache.
  * Mount exactly once (in App).
  */
 export function useIpcEvents(): void {
   const qc = useQueryClient()
   useEffect(() => {
-    const subs = [
-      ipc.on('node:changed', (node) => {
+    const handlers: EventHandlers = {
+      'node:changed': (node) => {
         qc.setQueryData<NodeSnapshot[]>(qk.nodes, (prev) => {
           if (!prev) return prev
           const i = prev.findIndex((n) => n.id === node.id)
@@ -232,8 +243,8 @@ export function useIpcEvents(): void {
           next[i] = node
           return next
         })
-      }),
-      ipc.on('job:changed', (job) => {
+      },
+      'job:changed': (job) => {
         qc.setQueryData<JobSummary[]>(qk.jobs, (prev) => {
           if (!prev) return prev
           const i = prev.findIndex((j) => j.id === job.id)
@@ -243,27 +254,27 @@ export function useIpcEvents(): void {
           return next
         })
         qc.invalidateQueries({ queryKey: qk.job(job.id) })
-      }),
+      },
       // High-rate (one per in-flight chunk per ~5s agent poll): fold into the
       // local store, never invalidate. This used to trigger a job:get per
       // event, which on a multi-slot fleet is a refetch storm — and the
       // payload's currentFrame was discarded, so the UI could not show the
       // one number that says a render is actually moving.
-      ipc.on('chunk:progress', (p) => {
+      'chunk:progress': (p) => {
         useProgressStore.getState().record(p)
-      }),
+      },
       // Low-rate lifecycle: this is the invalidation signal. It fires for
       // requeue too, which INSERTs new -rN chunk rows, so a node's chunk list
       // has to be re-read rather than patched.
-      ipc.on('chunk:changed', (c) => {
+      'chunk:changed': (c) => {
         qc.invalidateQueries({ queryKey: qk.job(c.jobId) })
         if (c.nodeId) qc.invalidateQueries({ queryKey: qk.nodeChunks(c.nodeId) })
         else qc.invalidateQueries({ queryKey: ['nodeChunks'] })
         if (c.state === 'complete' || c.state === 'failed') {
           useProgressStore.getState().forget(c.chunkId)
         }
-      }),
-      ipc.on('asset:added', (e) => {
+      },
+      'asset:added': (e) => {
         if (e.kind === 'thumb') {
           // Thumbs are per-frame and land constantly, so they stay out of the
           // whole-job asset index. They DO have to refresh the node panel:
@@ -285,14 +296,39 @@ export function useIpcEvents(): void {
         if (e.kind === 'frame') qc.invalidateQueries({ queryKey: qk.job(e.jobId) })
         // A new live clip supersedes the one the node panel is showing.
         if (e.kind === 'live') qc.invalidateQueries({ queryKey: ['nodeChunks'] })
-      }),
-      ipc.on('fleet:cost', (cost) => {
+      },
+      'fleet:cost': (cost) => {
         qc.setQueryData(qk.fleetCost, cost)
-      }),
-      ipc.on('render:logLine', (e) => {
+      },
+      'render:logLine': (e) => {
         useLogStore.getState().append(e)
-      })
-    ]
-    return () => subs.forEach((off) => off())
+      },
+      // An append stream with UI state of its own (dismissed, toast timers),
+      // so a zustand store like the log's rather than the Query cache. No OS
+      // notification from here: main raises it (ipc.ts), even with no window
+      // open, so a second one from the window would tell the user twice.
+      alert: (a) => {
+        useAlertStore.getState().receive(a)
+      }
+    }
+
+    // Generic over the channel, so each handler is checked against its own
+    // payload type rather than the union of all of them.
+    const subscribe = <E extends EventChannel>(channel: E): (() => void) | null => {
+      const handler = handlers[channel]
+      return handler ? ipc.on(channel, handler) : null
+    }
+    const subs = (Object.keys(handlers) as EventChannel[]).map(subscribe)
+
+    // Then replay what main raised before this window was listening: the
+    // boot-time orphan sweep runs before the window exists. Subscribed first,
+    // so nothing falls between the two; an alert that arrives by both routes
+    // is merged by seed().
+    ipc
+      .invoke('alerts:recent')
+      .then((records) => useAlertStore.getState().seed(records))
+      .catch((e: unknown) => console.error('alerts:recent failed', e))
+
+    return () => subs.forEach((off) => off?.())
   }, [qc])
 }

@@ -117,3 +117,45 @@ button:focus-visible {
 .vr-pagebar-tab[aria-selected='true'] .vr-pagebar-icon {
   color: var(--accent);
 }
+
+/* Alert toasts (components/AlertToasts.tsx): a short rise into place. */
+@keyframes vr-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.vr-toast {
+  animation: vr-toast-in 160ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vr-toast {
+    animation: none;
+  }
+}
+
+/* Dismiss button on alert toasts and banner rows. Here rather than inline for
+   the page bar's reason: an inline colour would outrank :hover. It inherits
+   the row's colour, so it reads on the red error rows and the amber ones, and
+   its hover is a tint of that colour (a row's text token) for the same reason. */
+.vr-alert-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  opacity: 0.65;
+  cursor: pointer;
+  transition:
+    opacity 120ms,
+    background 120ms;
+}
+.vr-alert-close:hover {
+  opacity: 1;
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}

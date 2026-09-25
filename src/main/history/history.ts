@@ -120,9 +120,13 @@ export function resolveRange(
  * NULLs, which is exactly what we want: a card that never reported wattage
  * leaves the average to the cards that did rather than pulling it to zero.
  *
- * A bucket with no rows is absent from the result — the caller fills the gap,
- * because "the app wasn't running" and "the fleet was idle" both mean zero
- * spend and neither should be interpolated across.
+ * A bucket with no rows is absent from the result — the caller fills the gap.
+ * No rows means nothing was metered: either no node was rented, which is zero
+ * spend, or the app wasn't running (closed, or the computer asleep) and any
+ * nodes left up billed unseen (#66). A third case hides inside buckets that do
+ * have rows: a 'failed' node whose instance still bills is skipped by
+ * accrueCosts while the app runs (plan 1.2). None of these should be
+ * interpolated across, and only the first is known to be zero.
  */
 function buckets(fromMs: number, bucketMs: number, overhead: number): HistoryBucket[] {
   const db = getDb()

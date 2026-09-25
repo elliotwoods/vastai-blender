@@ -1,9 +1,10 @@
 import { app, shell, BrowserWindow, protocol } from 'electron'
-import { createReadStream, statSync } from 'fs'
-import { extname, join, normalize, sep } from 'path'
+import { createReadStream, statSync, writeSync } from 'fs'
+import { extname, join } from 'path'
 import { Readable } from 'stream'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { externalUrl, isAppPage, type AppPage } from './app/windowPolicy'
 import { resolveBlenderRelease } from './blender/blendInfo'
 import { registerIpc } from './ipc'
 import {
@@ -13,6 +14,7 @@ import {
   setSlotInfoProvider
 } from './nodes/nodeManager'
 import { installBlender, probeEevee, provisionBase } from './nodes/provisioner'
+import { resolveInside } from './paths'
 import { scheduler } from './scheduler/scheduler'
 import { jobClips } from './transfer/jobClip'
 import { getSettings } from './settings'
@@ -23,6 +25,64 @@ import { getSettings } from './settings'
 if (process.env.VR_USERDATA) {
   app.setPath('userData', process.env.VR_USERDATA)
 }
+
+// One main process per profile. A second one on the same userData shares the
+// SQLite state with the first, and its boot is destructive to it: init()
+// re-provisions every live node, killing the first process's paid renders
+// (seen live, 2026-09), start() resets every in-flight chunk to pending, and
+// from then on two schedulers rent against two separate spend caps. So a
+// second launch leaves here, before whenReady and any of that code. The lock
+// is keyed on userData, which is why it is taken after the VR_USERDATA
+// override: throwaway profiles still start beside the real one.
+//
+// A scripted launch (a headless campaign run, or a VR_SHOT capture) that is
+// refused exits 1, so its script can tell "did nothing" from a run that went
+// wrong: a refused capture exited 0 with no PNG, as a broken one can. It also
+// tells the running instance, through additionalData, that it was scripted,
+// and that instance then leaves its window alone.
+const headless = Boolean(process.env.VR_JOB_SPEC || process.env.VR_E2E_BLEND)
+const capture = process.env.VR_SHOT
+const scripted = headless || Boolean(capture)
+if (!app.requestSingleInstanceLock({ scripted })) {
+  const msg =
+    `[vast-render] another instance is already running on ${app.getPath('userData')}; ` +
+    (headless
+      ? 'this headless run submitted nothing.\n'
+      : capture
+        ? `no capture was written to ${capture}.\n`
+        : 'focusing it instead.\n')
+  // writeSync: a piped stderr may be asynchronous, and process.exit would
+  // drop the one line that says why a scripted run did nothing.
+  try {
+    writeSync(2, msg)
+  } catch {
+    // No stderr attached (a Windows GUI launch): nothing to tell.
+  }
+  if (scripted) process.exit(1)
+  app.quit()
+  process.exit(0)
+}
+
+// The primary instance: a second launch (above) by a person is them asking
+// for the app, so show them the one that is running. A scripted one is not:
+// a campaign resubmitted, or a capture, on a box rendering headless must not
+// pop a window up there. A launch that sent no data (an older build) counts
+// as a person's. Emitted only after ready.
+app.on('second-instance', (_event, _argv, _cwd, data) => {
+  if ((data as { scripted?: unknown } | null)?.scripted === true) {
+    console.log('[vast-render] refused a scripted second launch; window left as it is')
+    return
+  }
+  const win = BrowserWindow.getAllWindows()[0]
+  if (!win) {
+    // A headless run may have lost its window; the user asked for one.
+    createWindow()
+    return
+  }
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+})
 
 // media:// serves local media (proxy clips, fixtures) to the renderer with
 // Range-request support for <video> seeking. Registered before app ready.
@@ -83,12 +143,10 @@ function registerMediaProtocol(): void {
     const url = new URL(request.url)
     const root = mediaRoots()[url.host]
     if (!root) return new Response('unknown media root', { status: 404 })
-    const abs = normalize(join(root, decodeURIComponent(url.pathname)))
-    // Trailing separator: without it `C:\renders` also admits `C:\renders-old`.
-    const guard = normalize(root) + sep
-    if (abs !== normalize(root) && !abs.startsWith(guard)) {
-      return new Response('forbidden', { status: 403 })
-    }
+    // The pathname is '/'-rooted at the media root; resolveInside wants it
+    // relative, and refuses anything that would leave the root.
+    const abs = resolveInside(root, decodeURIComponent(url.pathname).replace(/^\/+/, ''))
+    if (!abs) return new Response('forbidden', { status: 403 })
 
     let size: number
     try {
@@ -139,6 +197,12 @@ function registerMediaProtocol(): void {
 }
 
 function createWindow(): void {
+  // The one page this window ever shows: the dev server's, or the build's.
+  const devUrl = is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined
+  const page: AppPage = devUrl
+    ? { url: devUrl }
+    : { file: join(__dirname, '../renderer/index.html') }
+
   const mainWindow = new BrowserWindow({
     width: 1440,
     height: 940,
@@ -150,7 +214,17 @@ function createWindow(): void {
     ...(process.platform !== 'darwin' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      // The renderer decodes HEVC clips and JPEG thumbnails made on rented
+      // machines, so a media-decoder bug is one crafted file away. Sandboxed,
+      // that lands inside Chromium's OS sandbox rather than as the user. The
+      // preload only needs contextBridge and ipcRenderer, which a sandboxed
+      // preload has.
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      // Already Electron's default, pinned here: a file dropped on the window
+      // (a render dragged in by mistake) must not replace the app with it.
+      navigateOnDragDrop: false
     }
   })
 
@@ -190,16 +264,28 @@ function createWindow(): void {
     })
   }
 
+  // No new windows. An http(s) link goes to the user's browser; any other
+  // scheme would launch whichever local program claims it, so it goes nowhere.
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    const url = externalUrl(details.url)
+    if (url) void shell.openExternal(url)
+    else console.warn(`[window] refused to open ${JSON.stringify(details.url)}`)
     return { action: 'deny' }
   })
 
-  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+  // No navigation away from the app's page. Whatever page loaded next would
+  // still get the preload's window.api, and with it the fleet and the shell.
+  mainWindow.webContents.on('will-navigate', (event) => {
+    if (isAppPage(event.url, page)) return
+    event.preventDefault()
+    console.warn(`[window] blocked navigation to ${JSON.stringify(event.url)}`)
+  })
+
+  if ('url' in page) {
     const screen = process.env.VR_SCREEN
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'] + (screen ? `?screen=${screen}` : ''))
+    mainWindow.loadURL(page.url + (screen ? `?screen=${screen}` : ''))
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    mainWindow.loadFile(page.file)
   }
 }
 
@@ -211,7 +297,9 @@ app.whenReady().then(() => {
   })
 
   registerMediaProtocol()
-  registerIpc()
+  // createWindow: an alert's OS notification, clicked with the window closed
+  // (macOS, still billing), opens one.
+  registerIpc({ createWindow })
   // Provisioning pipeline: base setup, default Blender release, EEVEE probe.
   // Job-specific Blender versions are installed on demand at dispatch time.
   // 5.1 (not 4.5): campaign blends are saved by Blender 5.1, so probing EEVEE
@@ -365,16 +453,25 @@ app.whenReady().then(() => {
             )
             continue
           }
-          const jobId = await createJob({
-            blendPath: blend.path,
-            engine: spec.engine ?? 'eevee',
-            frameStart: blend.frameStart ?? spec.frameStart ?? 1,
-            frameEnd: blend.frameEnd ?? spec.frameEnd ?? 200,
-            frameStep: blend.frameStep ?? spec.frameStep ?? 1,
-            addonIds,
-            chunkSize: spec.chunkSize ?? null,
-            shareNode: blend.shareNode ?? spec.shareNode ?? false
-          })
+          // One blend createJob refuses (missing file, impossible range) must
+          // not cost the rest of the campaign its submission — or skip the
+          // kick() below that starts it.
+          let jobId: string
+          try {
+            jobId = await createJob({
+              blendPath: blend.path,
+              engine: spec.engine ?? 'eevee',
+              frameStart: blend.frameStart ?? spec.frameStart ?? 1,
+              frameEnd: blend.frameEnd ?? spec.frameEnd ?? 200,
+              frameStep: blend.frameStep ?? spec.frameStep ?? 1,
+              addonIds,
+              chunkSize: spec.chunkSize ?? null,
+              shareNode: blend.shareNode ?? spec.shareNode ?? false
+            })
+          } catch (e) {
+            console.error(`[spec] skip (${(e as Error).message}): ${blend.path}`)
+            continue
+          }
           created++
           console.log(`[spec] job ${created}/${blends.length} ${jobId} ${blend.path}`)
         }

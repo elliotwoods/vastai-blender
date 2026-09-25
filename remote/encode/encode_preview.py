@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -29,22 +30,96 @@ from preview_common import (  # noqa: E402
 
 )
 
-NUM_RE = re.compile(r"^(\d+)\.(\w+)$")
+# The frame names the agent manifests (the app's manifest.ts FILE_PATTERNS.frame
+# holds the same grammar): the zero-padded frame number, an optional view
+# suffix from a stereo/multiview scene that saves each view to its own file
+# (`_L`, `_R`, or a custom view name), and the format's extension, which a
+# scene with File Extensions off leaves out. 0042.exr, 0042_L.png, 0042.
+FRAME_RE = re.compile(r"^(\d{1,9})([A-Za-z_-][A-Za-z0-9_-]{0,62})?(?:\.([A-Za-z0-9]{1,8}))?$")
+
+# Leading bytes of the formats Blender writes, for frames saved without an
+# extension: ffmpeg's image2 demuxer picks its decoder from the extension.
+MAGIC = [
+    (b"\x89PNG", "png"),
+    (b"\x76\x2f\x31\x01", "exr"),
+    (b"\xff\xd8\xff", "jpg"),
+    (b"II*\x00", "tif"),
+    (b"MM\x00*", "tif"),
+    (b"BM", "bmp"),
+    (b"DDS ", "dds"),
+    (b"\x80\x2a\x5f\xd7", "cin"),
+    (b"SDPX", "dpx"),
+    (b"XPDS", "dpx"),
+]
 
 
-def scan_frames(frames_dir):
-    """Return (pattern, start_number, count, ext)."""
-    frames = []
-    for name in os.listdir(frames_dir):
-        m = NUM_RE.match(name)
+def plan_sequence(names):
+    """Pick the frames one preview clip is made of, from a chunk's frames/ listing.
+
+    Returns (picked, step, view, ext): `picked` is one source name per clip
+    frame, in order. A clip is one view — the plain frames when there are any,
+    else `_L`, else the first view name — because ffmpeg reads a single
+    numbered pattern and a preview needs only one eye.
+
+    Clip index i must stay frame `first + i * step`: the app maps a clip frame
+    back to a Blender frame by that arithmetic (jobClipPlan, frame-domain).
+    ffmpeg's `%04d` + `-start_number` reads until the first missing number, so
+    a frame step above 1 used to give a one-frame clip that still claimed the
+    file count, and a gap cut the clip short with every later frame shifted. So
+    the step is inferred from the numbers, and a missing frame holds the
+    previous one rather than closing the gap.
+    """
+    by_view = {}
+    for name in names:
+        m = FRAME_RE.match(name)
         if m:
-            frames.append((int(m.group(1)), len(m.group(1)), m.group(2).lower()))
-    if not frames:
-        raise SystemExit("no numbered frames found in " + frames_dir)
-    frames.sort()
-    start, width, ext = frames[0]
-    pattern = os.path.join(frames_dir, f"%0{width}d.{ext}")
-    return pattern, start, len(frames), ext
+            by_view.setdefault(m.group(2) or "", []).append((int(m.group(1)), (m.group(3) or "").lower(), name))
+    if not by_view:
+        return [], 1, "", ""
+    view = "" if "" in by_view else ("_L" if "_L" in by_view else sorted(by_view)[0])
+    frames = by_view[view]
+    # One format per clip: the most common extension wins (a stray leftover in
+    # another format must not become the clip's decoder).
+    exts = {}
+    for _, ext, _ in frames:
+        exts[ext] = exts.get(ext, 0) + 1
+    ext = max(sorted(exts), key=lambda e: exts[e])
+    numbered = sorted({n: name for n, e, name in frames if e == ext}.items())
+    nums = [n for n, _ in numbered]
+    diffs = [b - a for a, b in zip(nums, nums[1:])]
+    step = min(diffs) if diffs else 1
+    have = dict(numbered)
+    picked, last = [], None
+    for n in range(nums[0], nums[-1] + 1, step):
+        last = have.get(n, last)
+        picked.append(last)
+    return picked, step, view, ext
+
+
+def sniff_ext(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return ""
+    for magic, ext in MAGIC:
+        if head.startswith(magic):
+            return ext
+    return ""
+
+
+def link_sequence(frames_dir, picked, ext, seq_dir):
+    """Symlink the picked frames as seq_dir/000000.<ext>, 000001.<ext>, …
+
+    A dense, extension-bearing sequence is the one input ffmpeg's image2
+    demuxer reads without surprises, whatever the originals were called.
+    """
+    os.makedirs(seq_dir, exist_ok=True)
+    if not ext:
+        ext = sniff_ext(os.path.join(frames_dir, picked[0])) or "png"
+    for i, name in enumerate(picked):
+        os.symlink(os.path.join(os.path.abspath(frames_dir), name), os.path.join(seq_dir, f"{i:06d}.{ext}"))
+    return os.path.join(seq_dir, f"%06d.{ext}"), ext
 
 
 def probe_size(path):
@@ -147,10 +222,29 @@ def main():
     if not (args.frames_dir and args.out_dir and args.label):
         raise SystemExit("--frames-dir, --out-dir and --label are required")
 
-    pattern, start, count, ext = scan_frames(args.frames_dir)
-    first_frame = pattern % start
-    width, height = probe_size(first_frame)
+    picked, step, view, ext = plan_sequence(os.listdir(args.frames_dir))
+    if not picked:
+        raise SystemExit("no numbered frames found in " + args.frames_dir)
+    count = len(picked)
+    if step != 1 or view or len(set(picked)) != count:
+        print(
+            f"sequence: {count} clip frames, step {step}, view {view or '(single)'}, "
+            f"{count - len(set(picked))} held over a gap",
+            file=sys.stderr,
+        )
     os.makedirs(args.out_dir, exist_ok=True)
+    seq_dir = os.path.join(args.out_dir, f".seq-{args.label}")
+    shutil.rmtree(seq_dir, ignore_errors=True)
+    try:
+        pattern, ext = link_sequence(args.frames_dir, picked, ext, seq_dir)
+        encode_all(args, pattern, ext, count)
+    finally:
+        shutil.rmtree(seq_dir, ignore_errors=True)
+
+
+def encode_all(args, pattern, ext, count):
+    start = 0
+    width, height = probe_size(pattern % start)
     is_exr = ext == "exr"
 
     # Shared with live_preview.py — see preview_common.build_vf for why.
@@ -173,6 +267,12 @@ def main():
         out_path = os.path.join(args.out_dir, name)
         cmd = build_cmd(pattern, start, args.fps, vf, out_path, args.codec, ten_bit, hdr_tags, crf)
         subprocess.run(cmd, check=True)
+        # The app trusts "frames" to map clip index -> Blender frame, so a
+        # clip that came out shorter or longer is not published at all.
+        got = probe_frames(out_path)
+        if got != count:
+            os.remove(out_path)
+            raise SystemExit(f"{name}: encoded {got} frames, expected {count} — clip discarded")
         out_w, out_h = (512, int(height * 512 / width) // 2 * 2) if kind == "proxy" else (width, height)
         print(json.dumps({
             "kindKey": kind,

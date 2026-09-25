@@ -38,21 +38,33 @@ cmd_base() {
   # contract. Fall back to apt ffmpeg only if the download fails.
   if [ ! -x "$VASTAI_HOME/bin/ffmpeg" ]; then
     log "downloading static ffmpeg…"
-    if curl -fsSL --retry 3 -o /tmp/ffmpeg.tar.xz \
-        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"; then
+    # Bounded: this blocks base provisioning (no agent yet, node billing), and
+    # a stalled or trickling server would otherwise hang it forever. Same
+    # guards as the other downloads: 20 s connect, abort below 100 kB/s for
+    # 60 s, retry any error, a 30 min ceiling per attempt and no new attempt
+    # after 30 min. The stall guard catches a dead link; the ceiling is sized
+    # so a slow one that is still moving finishes (~130 MB takes ~22 min at the
+    # 100 kB/s floor), because the apt fallback below cannot decode DWAA EXRs.
+    # Worst case, a failure just short of 30 min and a full retry: ~1 h.
+    if curl -fsSL --connect-timeout 20 --speed-limit 100000 --speed-time 60 \
+         --max-time 1800 --retry 2 --retry-delay 3 --retry-all-errors --retry-max-time 1800 \
+         -o /tmp/ffmpeg.tar.xz \
+         "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"; then
       tar -xJf /tmp/ffmpeg.tar.xz -C /tmp
       cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg "$VASTAI_HOME/bin/"
       cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffprobe "$VASTAI_HOME/bin/"
       rm -rf /tmp/ffmpeg.tar.xz /tmp/ffmpeg-master-latest-linux64-gpl
     else
-      log "static ffmpeg download failed — falling back to apt ffmpeg"
+      # curl's exit code tells a ceiling (28) from a stall or an HTTP error, so
+      # a node left on the degraded apt build can be traced from this line.
+      log "static ffmpeg download failed (curl exit $?) — falling back to apt ffmpeg"
       apt-get install -y -qq ffmpeg > /dev/null
       ln -sf "$(command -v ffmpeg)" "$VASTAI_HOME/bin/ffmpeg"
       ln -sf "$(command -v ffprobe)" "$VASTAI_HOME/bin/ffprobe"
     fi
   fi
   log "ffmpeg: $("$VASTAI_HOME/bin/ffmpeg" -version | head -1)"
-  # Background (fully detached): ~300 MB download that overlaps the Blender
+  # Background (fully detached): ~300-400 MB download that overlaps the Blender
   # install + EEVEE probe. A chunk that starts before it lands renders on CUDA.
   setsid nohup bash "$VASTAI_HOME/provision.sh" ensure-optix \
     > "$VASTAI_HOME/logs/ensure_optix.log" 2>&1 < /dev/null &
@@ -62,8 +74,15 @@ cmd_base() {
   # Kill stray render processes from a previous agent (SIGHUP from the tmux
   # kill does not reliably reach detached blender children) — a zombie
   # blender writing into a chunk dir alongside the fresh agent's own render
-  # corrupts progress accounting. Manifested frames survive; the fresh agent
-  # re-renders only what is missing from the manifest… of unfinished chunks.
+  # corrupts progress accounting. Nothing resumes the renders killed here.
+  # Their frames and manifest stay on disk, but the app re-dispatches each
+  # unfinished chunk with its full frame range (to whichever node it picks),
+  # and the agent renders that whole -s/-e range again. On the same node that
+  # overwrites the frames already there, while their manifest lines keep the
+  # old size and sha256. (A .blend saved with Output > Overwrite off skips
+  # frames already on disk instead; the agent leaves that setting as saved.)
+  # So a re-provision mid-render pays again for the frames its in-flight
+  # chunks had already finished.
   pkill -f "$VASTAI_HOME/blender/" 2>/dev/null || true
   # Clear the job inbox: after an app restart every non-complete chunk is
   # re-dispatched with a fresh spec to whichever node the scheduler picks —
@@ -102,9 +121,15 @@ cmd_install_blender() {
     for url in "${urls[@]}"; do
       log "downloading $url (attempt $attempt)"
       rm -f "$tmp"
-      # stall guard: abort if <100 kB/s for 60 s; retry transient failures on the same URL
+      # stall guard: abort if <100 kB/s for 60 s; retry transient failures on the same URL.
+      # Ceiling: 30 min per attempt and no new attempt after 30 min, as for the
+      # other downloads. This runs at dispatch inside the app's per-node prep
+      # lock, so a mirror trickling just above the stall guard (~67 min for
+      # ~400 MB) would hold up every dispatch to this billing node. A mirror
+      # that cannot deliver in 30 min (~220 kB/s) is dropped for the next one.
       if curl -fsSL --connect-timeout 20 --speed-limit 100000 --speed-time 60 \
-           --retry 2 --retry-delay 3 --retry-all-errors -o "$tmp" "$url" \
+           --max-time 1800 --retry 2 --retry-delay 3 --retry-all-errors --retry-max-time 1800 \
+           -o "$tmp" "$url" \
          && xz -t "$tmp" 2>/dev/null; then
         ok=1; break 2
       fi
@@ -178,8 +203,15 @@ cmd_ensure_optix() {
   local tmp=/tmp/optix-$ver
   rm -rf "$tmp"; mkdir -p "$tmp"
   log "optix: fetching driver $ver libraries"
-  if ! curl -fsSL --retry 3 -o "$tmp/drv.run" \
-      "https://us.download.nvidia.com/XFree86/Linux-x86_64/$ver/NVIDIA-Linux-x86_64-$ver.run"; then
+  # Bounded with the same guards as the other downloads (20 s connect, abort
+  # below 100 kB/s for 60 s, retry any error, 30 min per attempt and no new
+  # attempt after 30 min; 300-400 MB needs only ~220 kB/s to fit). This runs in
+  # the background and blocks nothing; the ceiling exists so a trickling
+  # server can't leave this process hanging for the node's life.
+  if ! curl -fsSL --connect-timeout 20 --speed-limit 100000 --speed-time 60 \
+       --max-time 1800 --retry 2 --retry-delay 3 --retry-all-errors --retry-max-time 1800 \
+       -o "$tmp/drv.run" \
+       "https://us.download.nvidia.com/XFree86/Linux-x86_64/$ver/NVIDIA-Linux-x86_64-$ver.run"; then
     log "optix: driver $ver download failed — staying on CUDA"; rm -rf "$tmp"; return 0
   fi
   if ! sh "$tmp/drv.run" --extract-only --target "$tmp/x" > /dev/null 2>&1; then
