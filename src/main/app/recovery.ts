@@ -39,22 +39,28 @@ import type { NodeState, ReprovisionResult, RetryMissingResult } from '../../sha
  */
 const cancelling = new Map<string, Promise<void>>()
 
+/** For a promise whose outcome is not wanted, only that it is over. */
+function noop(): void {
+  return undefined
+}
+
 /**
  * Cancel `jobId` (scheduler.cancelJob), noting it in `cancelling` until its
  * node cleanup is over. Resolves, or rejects, as the cancel does.
  */
 export async function cancelJob(jobId: string): Promise<void> {
   const done = scheduler.cancelJob(jobId)
-  const over = done.then(
-    () => {},
-    () => {}
-  )
+  // After any cancel of the job still cleaning up, not just this one: a
+  // second cancel finds no runs left and is over at once, and in place of
+  // the first it let a revive go out under the first's pkills (a3 review).
+  const before = cancelling.get(jobId)
+  const over = Promise.all([before, done.then(noop, noop)]).then(noop)
   cancelling.set(jobId, over)
-  try {
-    await done
-  } finally {
+  // Forgotten once the whole chain is over, whichever cancel's that is.
+  void over.then(() => {
     if (cancelling.get(jobId) === over) cancelling.delete(jobId)
-  }
+  })
+  await done
 }
 
 /**

@@ -121,6 +121,9 @@ describe('job:retryMissing', () => {
     })
 
     const cancel = w.invoke('job:cancel', jobId)
+    // A second cancel meanwhile finds no runs left and is over at once; it
+    // must not stand in for the first's clean-up (a3 review).
+    await w.invoke('job:cancel', jobId)
     const retry = w.invoke('job:retryMissing', jobId)
     await w.advance(60_000)
     await cancel
