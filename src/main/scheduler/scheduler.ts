@@ -997,11 +997,17 @@ class ChunkRun {
    * a spec written moments later would survive it, and the agent would render a
    * cancelled chunk. Best-effort: the agent may already have claimed it, in
    * which case the `pkill` is what stops it.
+   *
+   * Timed out: exec has no deadline of its own, and on a wedged connection
+   * the call never returned. The run waiting on it never finished, so its
+   * chunk stayed in flight and its node 'rendering', and scale-down never
+   * let the node go.
    */
   private async retractSpec(): Promise<void> {
     await this.ssh
       .exec(
-        `rm -f ${REMOTE_ROOT}/jobs/inbox/${this.chunkId}.json; pkill -f '${this.chunkId}' || true`
+        `rm -f ${REMOTE_ROOT}/jobs/inbox/${this.chunkId}.json; pkill -f '${this.chunkId}' || true`,
+        { timeoutMs: 30_000, label: 'retract spec' }
       )
       .catch(() => {})
   }

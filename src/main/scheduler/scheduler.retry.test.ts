@@ -2,7 +2,7 @@ import { mkdirSync, promises as fsp, writeFileSync, type StatsFs } from 'fs'
 import { join } from 'path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AddonInfo } from '../../shared/models'
-import { FakeSshConnection } from '../test/fakeSsh'
+import { FakeSshConnection, HANG } from '../test/fakeSsh'
 import {
   setup,
   type AgentSpec,
@@ -417,6 +417,30 @@ describe("1.16: the engine a node reports is the node's word", () => {
     // The render was stopped, and the job's other chunk never sent.
     expect(specs).toHaveLength(1)
     expect(machine.ran(new RegExp(`pkill -f '${specs[0].chunkId}'`))).toHaveLength(1)
+  })
+
+  it('1.16: a render stopped for its engine on a wedged connection still lets its node go', async () => {
+    const { app, ids } = await nodes(1)
+    const machine = w.machineFor(ids[0])
+    machine.onSpec = (spec) => {
+      machine.agent.writeState(spec.chunkId, {
+        status: 'rendering',
+        engine: 'octane'
+      } as Partial<AgentStateFile>)
+    }
+    // The connection wedges as the render is withdrawn: the command is never
+    // answered, as an exec on a dead socket is not.
+    machine.onExec(/jobs\/inbox\/.*pkill -f/, HANG)
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+
+    // Settled within the retract's own deadline, not held in flight for good
+    // with its node 'rendering', which scale-down never lets go.
+    await w.until(() => jobState(jobId) === 'failed', 'job failed', { timeoutMs: 2 * 60_000 })
+    expect(chunkRow(chunk.id).state).toBe('failed')
+    expect(app.scheduler.isLive(chunk.id)).toBe(false)
+    await w.until(() => nodeState(ids[0]) === 'idle', 'node idle', { timeoutMs: 60_000 })
   })
 
   it('1.16: an Octane job whose node says Cycles keeps its engine and fails', async () => {
