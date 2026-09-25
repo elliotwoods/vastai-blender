@@ -879,7 +879,7 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
     if (phase !== 'idle') {
       // A second Cmd+Q while the dialog is up, or while destroying. A
       // headless run has no dialog to bring forward, and on Windows its
-      // window may be hidden on purpose (index.ts).
+      // window may be minimized on purpose (index.ts).
       if (!deps.headless) deps.frontWindow()
       return
     }

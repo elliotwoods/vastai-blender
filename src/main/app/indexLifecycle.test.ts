@@ -15,6 +15,7 @@ class FakeWindow extends EventEmitter {
   static app: Map<string, Array<(...args: unknown[]) => void>> = new Map()
   shown = 0
   hidden = 0
+  minimized = 0
   focused = 0
   restored = 0
 
@@ -46,6 +47,10 @@ class FakeWindow extends EventEmitter {
 
   hide(): void {
     this.hidden++
+  }
+
+  minimize(): void {
+    this.minimized++
   }
 
   focus(): void {
@@ -432,13 +437,16 @@ describe('index.ts, headless (plan 1.1)', () => {
     expect(r.stderr).toContain('SIGTERM: leaving 1 node billing $0.40/hr')
   })
 
-  it('on Windows, closing the window hides it, so a shutdown still asks and is held for the destroy', async () => {
+  it('on Windows, closing the window minimizes it, so a shutdown still asks and is held for the destroy', async () => {
+    // Minimized, not hidden (1.1 review): Windows may end a process with no
+    // visible window at shutdown rather than wait on it.
     await onWindows(async () => {
       const r = await load([node()], { VR_JOB_SPEC: '/campaign/spec.json' })
       const [win] = FakeWindow.all
 
       expect(closeWindow(win)).toBe(false)
-      expect(win.hidden).toBe(1)
+      expect(win.minimized).toBe(1)
+      expect(win.hidden).toBe(0)
       expect(querySessionEnd(win)).toBe(true)
       await vi.advanceTimersByTimeAsync(0)
 

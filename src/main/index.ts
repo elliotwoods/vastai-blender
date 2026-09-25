@@ -252,17 +252,19 @@ function createWindow(): void {
     mainWindow.show()
   })
 
-  // A headless run on Windows keeps its window when it is closed, hidden.
-  // The run carries on without one (window-all-closed), but Windows asks
-  // windows, not processes, whether the session may end: with none, a
-  // shutdown or an overnight update's restart ended the run with its fleet
-  // billing, never asked (app/lifecycle.ts). A person's launch shows it
-  // again (second-instance). app.exit, which is how every quit ends,
-  // destroys windows without a 'close'.
+  // A headless run on Windows keeps its window when it is closed,
+  // minimized. The run carries on without one (window-all-closed), but
+  // Windows asks windows, not processes, whether the session may end: with
+  // none, a shutdown or an overnight update's restart ended the run with
+  // its fleet billing, never asked (app/lifecycle.ts). Minimized, not
+  // hidden: Windows' shutdown screen, and its wait, may pass over a process
+  // with no visible window and end it instead (1.1 review). A person's
+  // launch restores it (second-instance). app.exit, which is how every quit
+  // ends, destroys windows without a 'close'.
   if (headless && process.platform === 'win32') {
     mainWindow.on('close', (event) => {
       event.preventDefault()
-      mainWindow.hide()
+      mainWindow.minimize()
     })
   }
 
