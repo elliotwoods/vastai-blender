@@ -1,11 +1,22 @@
-import { app, shell, BrowserWindow, protocol } from 'electron'
+import {
+  app,
+  shell,
+  BrowserWindow,
+  dialog,
+  Notification,
+  powerMonitor,
+  protocol,
+  type MessageBoxOptions
+} from 'electron'
 import { createReadStream, statSync, writeSync } from 'fs'
 import { extname, join } from 'path'
 import { Readable } from 'stream'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { fleetPort, installLifecycle, parseQuitPolicy, type Prompt } from './app/lifecycle'
 import { externalUrl, isAppPage, type AppPage } from './app/windowPolicy'
 import { resolveBlenderRelease } from './blender/blendInfo'
+import { closeDb, getDb } from './db/db'
 import { registerIpc } from './ipc'
 import {
   nodeManager,
@@ -287,6 +298,53 @@ function createWindow(): void {
   }
 }
 
+/**
+ * The app's window, brought forward for a dialog, or null when none is open.
+ * macOS keeps running with its window closed, and a quit from the Dock must
+ * still put its question in front of the user.
+ */
+function frontWindow(): BrowserWindow | null {
+  const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0] ?? null
+  if (win) {
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
+  } else {
+    app.focus({ steal: true })
+  }
+  return win
+}
+
+/** A lifecycle prompt as a native message box: a sheet on the window, when there is one. */
+async function showMessageBox(
+  parent: BrowserWindow | null,
+  prompt: Prompt<string>
+): Promise<number> {
+  const options: MessageBoxOptions = {
+    type: prompt.type,
+    title: prompt.title,
+    message: prompt.message,
+    detail: prompt.detail,
+    buttons: prompt.buttons,
+    defaultId: prompt.defaultId,
+    cancelId: prompt.cancelId,
+    noLink: prompt.noLink,
+    normalizeAccessKeys: prompt.normalizeAccessKeys
+  }
+  const r = parent
+    ? await dialog.showMessageBox(parent, options)
+    : await dialog.showMessageBox(options)
+  return r.response
+}
+
+/** Jobs a headless campaign still waits on. */
+function openJobs(): number {
+  const row = getDb()
+    .prepare("SELECT COUNT(*) AS n FROM jobs WHERE state IN ('queued', 'running')")
+    .get() as { n: number }
+  return row.n
+}
+
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.kimchiandchips.vastai-blender')
 
@@ -320,6 +378,40 @@ app.whenReady().then(() => {
   // Stitch job clips for any job whose chunk clips outran them — e.g. chunks
   // that finished under a build without job clips, or while ffmpeg failed.
   jobClips.catchUp()
+  // Quit, sleep and Windows session end while nodes bill (app/lifecycle.ts).
+  // Before createWindow, so the first window gets its session-end listener.
+  // A headless run never asks: VR_QUIT_POLICY decides (see the drivers below).
+  const quitPolicy = parseQuitPolicy(process.env.VR_QUIT_POLICY)
+  if (headless && quitPolicy.warning) console.warn(`[vast-render] ${quitPolicy.warning}`)
+  const lifecycle = installLifecycle({
+    app,
+    powerMonitor,
+    showMessageBox,
+    openExternal: (url) => shell.openExternal(url),
+    notify: (body) => {
+      if (Notification.isSupported()) new Notification({ title: 'Vast Render', body }).show()
+    },
+    frontWindow,
+    ensureWindow: () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    },
+    // Nothing for the port's accrueSleep and reconcile yet: nodeManager's
+    // accrual and orphan sweep are private, and the sweep as it stands would
+    // destroy a rental whose create reply is still in flight (plan 1.3).
+    fleet: fleetPort(nodeManager, scheduler),
+    closeDb,
+    headless: headless ? { policy: quitPolicy.policy } : null,
+    signals: process,
+    stderr: (text) => {
+      // writeSync, as for the single-instance refusal: the process exits
+      // right after, and a piped stderr may be asynchronous.
+      try {
+        writeSync(2, text)
+      } catch {
+        // No stderr attached: nowhere to say it.
+      }
+    }
+  })
   createWindow()
 
   // Headless batch driver: VR_JOB_SPEC=<path to .json> submits a whole campaign at boot.
@@ -335,6 +427,13 @@ app.whenReady().then(() => {
   //     "slotsPerGpu": 1,       // renders per GPU on a node (0 = one process, all GPUs)
   //     "offerFilters": { "minNumGpus": 4 }  // partial override of the stored filters
   //   }
+  //
+  // Both drivers stop by the quit policy, VR_QUIT_POLICY (app/lifecycle.ts),
+  // never by a dialog. `destroy`, the default: SIGINT, SIGTERM, SIGHUP or a
+  // quit destroys every node and exits, and so does the campaign being done
+  // (no job queued or running). `leave`: those exit and leave the nodes as
+  // they are, and a finished campaign keeps running for the idle scale-down.
+  // The exit status is 3 when instances may be left billing, else 0.
   const jobSpecPath = process.env.VR_JOB_SPEC
   if (jobSpecPath) {
     setTimeout(() => {
@@ -475,7 +574,9 @@ app.whenReady().then(() => {
         }
         console.log(`[spec] submitted ${created} job(s)`)
         scheduler.kick()
-      })().catch((e) => console.error('[spec] submission failed:', e))
+      })()
+        .catch((e) => console.error('[spec] submission failed:', e))
+        .finally(() => lifecycle.watchCampaign(openJobs))
     }, 3000)
   }
 
@@ -506,7 +607,9 @@ app.whenReady().then(() => {
         })
         console.log(`[e2e] job created: ${jobId}`)
         scheduler.kick()
-      })().catch((e) => console.error('[e2e] job creation failed:', e))
+      })()
+        .catch((e) => console.error('[e2e] job creation failed:', e))
+        .finally(() => lifecycle.watchCampaign(openJobs))
     }, 3000)
   }
 
