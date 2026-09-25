@@ -359,15 +359,26 @@ const HEARTBEAT = `${REMOTE_ROOT}/state/heartbeat`
 /** The agent's heartbeat age by the node's own clock, read the way provision.sh reads it. */
 const HEARTBEAT_AGE = `if [ -f ${HEARTBEAT} ]; then echo "heartbeat $(( $(date +%s) - $(date -r ${HEARTBEAT} +%s) ))"; else echo 'heartbeat none'; fi`
 
-/** The probe: GPU, CPU and RAM usage, then the agent's heartbeat age. */
+/**
+ * Renews this app's lease on the node (plan 1.19): the agent destroys its own
+ * instance once control/app_alive has gone unrenewed for its LEASE_TTL (30
+ * min) with nothing to render. Every probe renews it, so a node the app can
+ * reach never goes by itself; one it has lost (quit with "Leave running", the
+ * lid shut, a crash) does, once idle. Last in each command, and silent, so the
+ * output the probe parses is unchanged.
+ */
+const LEASE_RENEW = `mkdir -p ${REMOTE_ROOT}/control 2>/dev/null; touch ${REMOTE_ROOT}/control/app_alive 2>/dev/null; true`
+
+/** The probe: GPU, CPU and RAM usage, then the agent's heartbeat age, then the lease renewal. */
 const PROBE_COMMAND =
   // `index` goes LAST so the columns everything below reads by position
   // keep their positions.
   `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,index --format=csv,noheader,nounits; echo ----; cat /proc/loadavg; nproc; echo ----; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; head -1 /proc/stat; echo ----; ` +
-  HEARTBEAT_AGE
+  HEARTBEAT_AGE +
+  `; ${LEASE_RENEW}`
 
 /** The probe without its sample: does the node answer, and is its agent's heartbeat fresh (PROBE_SLOW_MS)? */
-const LIVENESS_COMMAND = `echo ok; ${HEARTBEAT_AGE}`
+const LIVENESS_COMMAND = `echo ok; ${HEARTBEAT_AGE}; ${LEASE_RENEW}`
 
 /**
  * How long a withdraw (withdrawGivenBack) goes on stopping the renders of

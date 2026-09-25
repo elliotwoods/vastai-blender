@@ -6,8 +6,15 @@ Contract with the app (all under ~/vastai/):
   jobs/done/  jobs/failed/    specs move here on completion/failure
   logs/<chunkId>.log          full blender stdout/stderr
   state/<chunkId>.json        durable progress; see "Chunk state" below
-  state/heartbeat             touched every 10s. provisioner.ts agentAlive()
-                              reads it, but nothing in the app calls that yet
+  state/heartbeat             touched every 10s. The app's usage probe reads
+                              its age every 15 s (plan 1.7)
+  control/app_alive           the app's lease on this node: its usage probe
+                              touches it every 15 s. With no touch for
+                              LEASE_TTL and nothing to render, the node
+                              destroys its own instance (LeaseWatchdog)
+  state/self_destruct.json    whether it can: {"armed", "verified", "reason",
+                              "instanceId", "leaseTtlS", "updatedAt"}. Never
+                              holds the key
   renders/<chunkId>/frames/   render output
   renders/<chunkId>/manifest.jsonl
                               one JSON line per completed artefact:
@@ -111,6 +118,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 
 HOME = os.path.expanduser("~")
 ROOT = os.environ.get("VASTAI_HOME", os.path.join(HOME, "vastai"))
@@ -270,6 +279,377 @@ def heartbeat_loop():
         except OSError:
             pass
         time.sleep(10)
+
+
+# -- the node lease (plan 1.19, audit A1) --------------------------------------
+#
+# Vast bills an instance until it is destroyed, and only the app destroyed
+# one. Quit with "Leave running", a laptop lid closed, the app crashed or the
+# computer offline: every node billed until the app came back, doing nothing
+# once its inbox was done. So the app renews a lease on each node it reaches
+# (its usage probe touches control/app_alive every 15 s), and a node that has
+# not heard from it for LEASE_TTL and has nothing to render destroys its own
+# instance. Frames it rendered that the app had not downloaded go with it,
+# and are rendered again once the app is back: less than the hours such a
+# node billed idle.
+#
+# With the instance's own key, never the account's: the app sends a node no
+# key at all. Vast sets CONTAINER_API_KEY ("Per-instance API key for CLI
+# commands from inside the container") and CONTAINER_ID in every instance,
+# documents `vastai destroy instance $CONTAINER_ID` from inside one, and its
+# own base image destroys an instance whose provisioning failed that way. The
+# app rents in SSH mode with an onstart of its own, which replaces the
+# image's entrypoint, the thing that copies the container's environment into
+# /etc/environment; so an agent started by tmux over SSH most likely lacks
+# them, and they are read from PID 1's environment instead (/proc/1/environ,
+# root-only, and the agent runs as root).
+#
+# Nothing documents the key's scope beyond "this instance", and Vast's CLI
+# says it can also fetch deployment blobs, so nothing here relies on it being
+# narrow: the agent only ever asks about, and deletes, its own CONTAINER_ID.
+# The key is never logged, nor written anywhere: the app shows logs/agent.log,
+# and users paste it into bug reports. What the app learns is
+# state/self_destruct.json, which its probe reads.
+#
+# Not yet run against a real node (the research could not contact Vast). On
+# the first real one, state/self_destruct.json should read armed and verified:
+# a GET of this instance with its own key succeeded.
+
+# How long a node waits with no word from the app, and nothing to render,
+# before it destroys itself. Long enough for an app restart or update, a
+# short sleep or a network blip; short enough that a node left behind wastes
+# about $4 at an 8×4090's $8/h. nodeManager.ts's NODE_LEASE_TTL_MS mirrors it.
+LEASE_TTL = 30 * 60
+# Seconds between the watchdog's looks at the lease.
+LEASE_CHECK_EVERY = 30.0
+VAST_API = "https://console.vast.ai/api/v0"
+PROC1_ENVIRON = "/proc/1/environ"
+# Vast limits each endpoint to one request per interval, per key and IP
+# ("API requests too frequent endpoint threshold=3.0"), and a 429 says for
+# how long in no header. A refusal waits this long at least.
+RATE_LIMIT_WAIT = 30.0
+# A DELETE that got no answer, or a 5xx, is sent again after 30 s, doubling
+# to this at most.
+DESTROY_BACKOFF_MAX = 300.0
+# Still running this long after Vast took the DELETE: it did not happen, ask
+# again.
+DESTROY_RECHECK = 600.0
+# A check of the key that got no answer is tried again after this.
+VERIFY_RETRY = 600.0
+
+# The chunks being rendered or encoded now, by spec filename: main()'s
+# in_progress, at module level so the watchdog can tell an idle node from a
+# busy one.
+IN_PROGRESS = {}
+
+
+def lease_path():
+    return os.path.join(CONTROL, "app_alive")
+
+
+def self_destruct_path():
+    return os.path.join(STATE, "self_destruct.json")
+
+
+def inbox_work():
+    """Specs in the inbox the main loop would launch: the ones that parse.
+    One that does not is skipped by main() too, so it is not work."""
+    try:
+        names = os.listdir(INBOX)
+    except OSError:
+        return 0
+    n = 0
+    for name in names:
+        if not name.endswith(".json") or name.endswith(".tmp.json"):
+            continue
+        try:
+            with open(os.path.join(INBOX, name)) as f:
+                json.load(f)
+        except (OSError, ValueError):
+            continue
+        n += 1
+    return n
+
+
+def node_busy():
+    """Is there anything to render here: a chunk in progress, or one waiting?"""
+    return bool(IN_PROGRESS) or inbox_work() > 0
+
+
+def instance_credentials(environ=None, proc_environ=PROC1_ENVIRON):
+    """(instance id, key, None), or (None, None, why not): this instance's own
+    Vast id and key, from the agent's environment or else PID 1's (see
+    above). The id is CONTAINER_ID, or VAST_CONTAINERLABEL ("C.<id>")."""
+    sources = [os.environ if environ is None else environ]
+    try:
+        with open(proc_environ, "rb") as f:
+            raw = f.read().decode("utf-8", errors="replace")
+        sources.append(dict(i.split("=", 1) for i in raw.split("\0") if "=" in i))
+    except OSError:
+        pass
+
+    def var(name):
+        for env in sources:
+            v = (env.get(name) or "").strip()
+            if v:
+                return v
+        return ""
+
+    key = var("CONTAINER_API_KEY")
+    cid = var("CONTAINER_ID")
+    if not cid:
+        label = var("VAST_CONTAINERLABEL")
+        cid = label[2:] if label.startswith("C.") else ""
+    if not key:
+        return None, None, "no CONTAINER_API_KEY in the agent's environment or the container's"
+    if not cid.isdigit():
+        return None, None, "no instance id (CONTAINER_ID or VAST_CONTAINERLABEL) in the container"
+    return int(cid), key, None
+
+
+def vast_call(method, instance_id, key, urlopen=None, timeout=30):
+    """One request about this instance, authorised by its own key:
+    (HTTP status, JSON body as a dict), or (None, {"msg": why}) when no answer
+    came. Never raises. Its result never holds the key."""
+    req = urllib.request.Request(
+        f"{VAST_API}/instances/{int(instance_id)}/",
+        data=b"{}" if method == "DELETE" else None,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with (urlopen or urllib.request.urlopen)(req, timeout=timeout) as r:
+            status = getattr(r, "status", None) or r.getcode()
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        status = e.code
+        try:
+            raw = e.read()
+        except Exception:  # noqa: BLE001
+            raw = b""
+    except Exception as e:  # noqa: BLE001 — no answer: offline, DNS, TLS, timeout
+        return None, {"msg": f"{type(e).__name__}: {e}".replace(key, "<key>")}
+    try:
+        body = json.loads(raw or b"{}")
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    return status, body
+
+
+def stop_octane_server():
+    """Give the OTOY license back before the instance goes, as the app's own
+    destroy does (plan 1.18): setup_octane.sh stop-server, when a server was
+    started here (its pidfile). Its last line, or None. Never raises."""
+    script = os.path.join(ROOT, "octane", "setup_octane.sh")
+    if not (os.path.exists(script) and os.path.exists(os.path.join(STATE, "octane-server.pid"))):
+        return None
+    try:
+        r = subprocess.run(
+            ["bash", script, "stop-server"],
+            capture_output=True, text=True, timeout=90,
+            env={**os.environ, "VASTAI_HOME": ROOT},
+        )
+        lines = (r.stdout or "").strip().splitlines()
+        return lines[-1] if lines else f"exit {r.returncode}"
+    except Exception as e:  # noqa: BLE001
+        return f"{type(e).__name__}: {e}"
+
+
+class LeaseWatchdog:
+    """Destroys this node's instance once the app has not renewed its lease
+    for LEASE_TTL and there is nothing to render (see above).
+
+    "Renewed" is control/app_alive's mtime changing, and the time is the
+    agent's monotonic clock: the touch is the node's own, so neither the
+    app's clock nor a step in the node's can make a lease look fresh or
+    stale. The agent's start counts as the app's word, so an app that died
+    before its first touch is covered too.
+
+    Everything outside it is injected, so selfcheck can drive it: the clock,
+    urlopen, the environment, what counts as busy, the Octane stop and the
+    log.
+    """
+
+    def __init__(self, busy=node_busy, clock=time.monotonic, urlopen=None,
+                 environ=None, proc_environ=PROC1_ENVIRON,
+                 stop_octane=stop_octane_server, log=None):
+        self.busy = busy
+        self.clock = clock
+        self.urlopen = urlopen
+        self.stop_octane = stop_octane
+        self._print = log or (lambda text: print(f"[lease] {text}", flush=True))
+        self.instance_id, self._key, self.reason = instance_credentials(environ, proc_environ)
+        self.armed = self._key is not None
+        self.verified = False
+        now = clock()
+        self.last_seen = now
+        self.mtime = self._lease_mtime()
+        self.next_verify = now
+        self.next_try = 0.0
+        self.failures = 0
+        self.stale_noted = False
+        self.octane_stopped = False
+        # Vast took (or had no more of) this instance's destroy.
+        self.taken = False
+        if self.armed:
+            self.log(f"self-destruct armed for instance {self.instance_id}: it destroys "
+                     f"itself after {LEASE_TTL // 60} min with no word from the app and "
+                     "nothing to render")
+        else:
+            self.log(f"self-destruct not armed: {self.reason}")
+        self.publish()
+
+    def log(self, text):
+        """Every line the watchdog writes goes through here, so it is
+        scrubbed of the key whatever it quotes."""
+        self._print(text.replace(self._key, "<key>") if self._key else text)
+
+    def _lease_mtime(self):
+        try:
+            return os.stat(lease_path()).st_mtime_ns
+        except OSError:
+            return None
+
+    def publish(self):
+        """state/self_destruct.json, for the app's probe. Never the key."""
+        path = self_destruct_path()
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        try:
+            with open(tmp, "w") as f:
+                json.dump({
+                    "armed": self.armed,
+                    "verified": self.verified,
+                    "reason": self.reason,
+                    "instanceId": self.instance_id,
+                    "leaseTtlS": LEASE_TTL,
+                    "updatedAt": time.time(),
+                }, f)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def disarm(self, why):
+        self.armed = False
+        self.reason = why
+        self.log(f"self-destruct disarmed: {why}")
+        self.publish()
+
+    def tick(self):
+        """One check that never raises: the backstop must outlive any one."""
+        try:
+            self.step()
+        except Exception as e:  # noqa: BLE001
+            self.log(f"a check failed ({type(e).__name__}: {e}); next in {LEASE_CHECK_EVERY:.0f} s")
+
+    def run(self):
+        while True:
+            self.tick()
+            time.sleep(LEASE_CHECK_EVERY)
+
+    def step(self):
+        now = self.clock()
+        m = self._lease_mtime()
+        if m is not None and m != self.mtime:
+            self.mtime = m
+            self.last_seen = now
+            if self.stale_noted:
+                self.log("the app is back: lease renewed" + (
+                    ", though Vast had already taken this instance's destroy"
+                    if self.taken else ", nothing destroyed"))
+            self.stale_noted = False
+            self.octane_stopped = False
+            self.failures = 0
+            self.next_try = 0.0
+        if not self.armed:
+            return
+        if not self.verified and now >= self.next_verify:
+            self.verify(now)
+            if not self.armed:
+                return
+        age = now - self.last_seen
+        if age <= LEASE_TTL:
+            return
+        if self.busy():
+            if not self.stale_noted:
+                self.stale_noted = True
+                self.log(f"no word from the app for {age / 60:.0f} min: this instance is "
+                         "destroyed once the work it has is done")
+            return
+        if now < self.next_try:
+            return
+        self.destroy(now, age)
+
+    def verify(self, now):
+        """Ask Vast about this instance with its key, once: an answer says
+        the key works (the app then counts the node as able to go by
+        itself); a refusal disarms."""
+        status, body = vast_call("GET", self.instance_id, self._key, self.urlopen)
+        if status == 200:
+            self.verified = True
+            self.log(f"Vast accepts instance {self.instance_id}'s own key")
+            self.publish()
+        elif status in (401, 403):
+            self.disarm(f"Vast refused instance {self.instance_id}'s own key (HTTP {status})")
+        else:
+            self.next_verify = now + VERIFY_RETRY
+            what = f"HTTP {status}" if status is not None else body.get("msg", "no answer")
+            self.log(f"could not check the key with Vast ({what}); again in "
+                     f"{VERIFY_RETRY / 60:.0f} min")
+
+    def destroy(self, now, age):
+        if not self.octane_stopped:
+            self.octane_stopped = True
+            stopped = self.stop_octane()
+            if stopped:
+                self.log(f"OctaneServer stopped first, to give its license back: {stopped}")
+            # The Octane stop takes up to half a minute: look again.
+            if self.busy():
+                return
+        self.stale_noted = True
+        self.log(f"no word from the app for {age / 60:.0f} min and nothing to render: "
+                 f"destroying instance {self.instance_id}")
+        status, body = vast_call("DELETE", self.instance_id, self._key, self.urlopen)
+        msg = str(body.get("msg") or body.get("error") or "")
+        if status is not None and 200 <= status < 300 and body.get("success") is not False:
+            self.taken = True
+            self.failures = 0
+            self.next_try = now + DESTROY_RECHECK
+            self.log(f"Vast took the destroy of instance {self.instance_id} (HTTP {status})")
+        elif status == 404:
+            self.taken = True
+            self.failures = 0
+            self.next_try = now + DESTROY_RECHECK
+            self.log(f"Vast no longer knows instance {self.instance_id}: nothing left to destroy")
+        elif status in (401, 403):
+            self.disarm(f"Vast refused instance {self.instance_id}'s own key (HTTP {status})")
+        else:
+            self.failures += 1
+            wait = min(DESTROY_BACKOFF_MAX, RATE_LIMIT_WAIT * 2 ** min(self.failures - 1, 8))
+            if status == 429:
+                wait = max(wait, RATE_LIMIT_WAIT)
+            self.next_try = now + wait
+            what = f"HTTP {status}" if status is not None else "no answer"
+            self.log(f"the destroy failed ({what}{': ' + msg if msg else ''}); "
+                     f"again in {wait:.0f} s")
+
+
+def lease_watchdog():
+    """The watchdog's thread. Never raises."""
+    try:
+        dog = LeaseWatchdog()
+    except Exception as e:  # noqa: BLE001
+        print(f"[lease] self-destruct not started: {type(e).__name__}: {e}", flush=True)
+        return
+    dog.run()
 
 
 # Serialises write_state. Several threads write the state of ONE chunk — the
@@ -1947,12 +2327,14 @@ def is_exclusive(spec):
 def main():
     ensure_dirs()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    threading.Thread(target=lease_watchdog, daemon=True).start()
     print(f"noderunner up, watching {INBOX}", flush=True)
     # Multi-slot: up to `slots` chunks render concurrently, each in its own
     # blender subprocess + thread. All chunk state is per-chunkId (log, state
     # json, renders/<chunkId>/ dir, manifest) so workers never share files;
-    # the in_progress set stops double-claims within this process.
-    in_progress = {}  # spec filename -> (Thread, exclusive, gpu)
+    # the in_progress set stops double-claims within this process. The lease
+    # watchdog reads it too, as IN_PROGRESS.
+    in_progress = IN_PROGRESS  # spec filename -> (Thread, exclusive, gpu)
     while True:
         for name, (t, _excl, _gpu) in list(in_progress.items()):
             if not t.is_alive():

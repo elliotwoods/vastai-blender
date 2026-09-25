@@ -150,3 +150,20 @@ describe('Feature G: pollMetrics feeds the GPU usage history', () => {
     ])
   })
 })
+
+// Plan 1.19: the agent destroys its own instance once control/app_alive has
+// gone unrenewed for 30 min with nothing to render. Every probe the app makes
+// renews it, so no node the app can still reach ever goes by itself.
+describe('plan 1.19: every usage probe renews the node lease', () => {
+  it('the probe touches control/app_alive, and its output still parses', async () => {
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    const machine = w.machineFor(nodeId)
+    reportUtil(machine, [55])
+    await w.advance(20 * SEC)
+    const probes = machine.execs.filter((c) => /^nvidia-smi --query-gpu/.test(c))
+    expect(probes.length).toBeGreaterThan(0)
+    expect(probes.every((c) => /touch \/root\/vastai\/control\/app_alive/.test(c))).toBe(true)
+    expect(app.nodeManager.get(nodeId)?.snapshot.metrics?.gpuUtil).toBe(55)
+  })
+})

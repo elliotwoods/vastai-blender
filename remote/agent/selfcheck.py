@@ -51,10 +51,16 @@ Covers the failure modes that actually bit:
     These cases drive the real run_render and process() against a scripted
     fake `blender`, and are skipped on Windows, where its `#!/bin/sh` wrapper
     cannot run.
+  * nothing but the app destroyed a node: quit with "Leave running", a laptop
+    lid closed or a crash, and every node billed until the app came back,
+    idle once its inbox was done. The lease watchdog is driven on a fake
+    clock against a fake Vast, and must never let the instance's key into a
+    log or a file.
 """
 
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -66,6 +72,7 @@ import tempfile
 import threading
 import time
 import types
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import noderunner as nr  # noqa: E402
@@ -1894,6 +1901,359 @@ def test_preview_sequence():
               ext == "png" and linked == ["000000.png", "000001.png"] and pattern.endswith("%06d.png"))
 
 
+# -- the node lease (plan 1.19) -------------------------------------------------
+#
+# A node the app has not reached for LEASE_TTL, with nothing to render,
+# destroys its own instance with the instance's own key (noderunner.py's
+# LeaseWatchdog). Driven here on a fake clock against a fake Vast, so nothing
+# leaves this machine.
+
+LEASE_KEY = "inst-key-4242-never-in-a-log"
+LEASE_URL = "https://console.vast.ai/api/v0/instances/4242/"
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class FakeResponse:
+    def __init__(self, status, raw):
+        self.status = status
+        self._raw = raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._raw
+
+    def getcode(self):
+        return self.status
+
+
+class FakeVastApi:
+    """urlopen for vast_call: records every request and answers from a
+    script of (status, body) or exceptions, 200 {"success": true} once it is
+    spent. A 4xx or 5xx is raised as HTTPError, as urllib does."""
+
+    def __init__(self, clock, *answers):
+        self.clock = clock
+        self.answers = list(answers)
+        self.calls = []
+
+    def script(self, *answers):
+        self.answers.extend(answers)
+
+    def __call__(self, req, timeout=None):
+        self.calls.append({
+            "method": req.get_method(),
+            "url": req.full_url,
+            "auth": req.get_header("Authorization"),
+            "data": req.data,
+            "timeout": timeout,
+            "at": self.clock(),
+        })
+        answer = self.answers.pop(0) if self.answers else (200, {"success": True})
+        if isinstance(answer, BaseException):
+            raise answer
+        status, body = answer
+        raw = json.dumps(body).encode()
+        if status >= 400:
+            raise urllib.error.HTTPError(req.full_url, status, "refused", {}, io.BytesIO(raw))
+        return FakeResponse(status, raw)
+
+    def of(self, method):
+        return [c for c in self.calls if c["method"] == method]
+
+
+@contextlib.contextmanager
+def lease_node(env=None, answers=((200, {"instances": {}}),), proc_environ=None):
+    """A LeaseWatchdog in a temp ~/vastai, on a fake clock and a fake Vast
+    that first answers the key check with `answers`. The node is idle until
+    `n.busy[0]` says otherwise."""
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = (nr.CONTROL, nr.STATE, nr.INBOX)
+        nr.CONTROL, nr.STATE, nr.INBOX = (os.path.join(tmp, d) for d in ("control", "state", "inbox"))
+        for d in (nr.CONTROL, nr.STATE, nr.INBOX):
+            os.makedirs(d)
+        n = types.SimpleNamespace(tmp=tmp, clock=FakeClock(), busy=[False], octane=[], logs=[], touches=0)
+        n.vast = FakeVastApi(n.clock, *answers)
+
+        def stop_octane():
+            n.octane.append(n.clock())
+            return "OCTANE_STOPPED clean"
+
+        n.dog = nr.LeaseWatchdog(
+            busy=lambda: n.busy[0],
+            clock=n.clock,
+            urlopen=n.vast,
+            environ={"CONTAINER_API_KEY": LEASE_KEY, "CONTAINER_ID": "4242"} if env is None else env,
+            proc_environ=proc_environ or os.path.join(tmp, "no-such-proc-environ"),
+            stop_octane=stop_octane,
+            log=n.logs.append,
+        )
+        try:
+            yield n
+        finally:
+            nr.CONTROL, nr.STATE, nr.INBOX = saved
+
+
+def touch_lease(n):
+    """The app's probe: `touch control/app_alive`, a new mtime each time."""
+    path = nr.lease_path()
+    with open(path, "a"):
+        pass
+    n.touches += 1
+    stamp = 1_700_000_000_000_000_000 + n.touches * 15_000_000_000
+    os.utime(path, ns=(stamp, stamp))
+
+
+def lease_run(n, seconds, touch_every=None):
+    """Move the clock `seconds` on, one watchdog check at a time, the app
+    touching the lease every `touch_every` seconds (never, by default)."""
+    end = n.clock.t + seconds
+    next_touch = n.clock.t if touch_every else None
+    while n.clock.t < end:
+        if next_touch is not None and n.clock.t >= next_touch:
+            touch_lease(n)
+            next_touch += touch_every
+        n.dog.tick()
+        n.clock.t += nr.LEASE_CHECK_EVERY
+
+
+def first_stale():
+    """Seconds from the agent's start to the first check at which the lease
+    is stale (strictly past LEASE_TTL): an idle node's first DELETE."""
+    return nr.LEASE_TTL + 2 * nr.LEASE_CHECK_EVERY
+
+
+def published(n):
+    with open(nr.self_destruct_path()) as f:
+        return json.load(f)
+
+
+def test_lease_credentials():
+    key, cid = "K", "77"
+    got = nr.instance_credentials({"CONTAINER_API_KEY": key, "CONTAINER_ID": cid}, "/no/such/file")
+    check("lease: the key and id from the agent's environment", got == (77, "K", None))
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = os.path.join(tmp, "environ")
+        with open(proc, "wb") as f:
+            f.write(b"PATH=/usr/bin\0CONTAINER_API_KEY=K1\0CONTAINER_ID=88\0HOME=/root\0")
+        check("lease: from PID 1's environment when the agent's lacks them (SSH-mode tmux)",
+              nr.instance_credentials({}, proc) == (88, "K1", None))
+        check("lease: the agent's own environment first",
+              nr.instance_credentials({"CONTAINER_API_KEY": "K0"}, proc) == (88, "K0", None))
+        with open(proc, "wb") as f:
+            f.write(b"CONTAINER_API_KEY=K2\0VAST_CONTAINERLABEL=C.99\0")
+        check("lease: the id from VAST_CONTAINERLABEL (C.<id>) without CONTAINER_ID",
+              nr.instance_credentials({}, proc) == (99, "K2", None))
+    none = nr.instance_credentials({}, "/no/such/file")
+    check("lease: no key anywhere is no self-destruct, and says why",
+          none[:2] == (None, None) and "CONTAINER_API_KEY" in none[2])
+    no_id = nr.instance_credentials({"CONTAINER_API_KEY": "K"}, "/no/such/file")
+    check("lease: a key with no instance id is none either", no_id[:2] == (None, None) and "instance id" in no_id[2])
+
+
+def test_lease_node_busy():
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = (nr.INBOX, dict(nr.IN_PROGRESS))
+        nr.INBOX = tmp
+        nr.IN_PROGRESS.clear()
+        try:
+            check("lease: an empty inbox with nothing in progress is idle", not nr.node_busy())
+            for name, text in (("a.tmp.json", "{}"), ("b.json", "{not json"), ("notes.txt", "x")):
+                with open(os.path.join(tmp, name), "w") as f:
+                    f.write(text)
+            check("lease: a spec mid-write, one that does not parse or a stray file is no work",
+                  not nr.node_busy())
+            with open(os.path.join(tmp, "c1.json"), "w") as f:
+                json.dump({"chunkId": "c1"}, f)
+            check("lease: a spec waiting in the inbox is work", nr.node_busy())
+            os.remove(os.path.join(tmp, "c1.json"))
+            nr.IN_PROGRESS["c2.json"] = (None, False, None)
+            check("lease: a chunk in progress is work", nr.node_busy())
+        finally:
+            nr.INBOX = saved[0]
+            nr.IN_PROGRESS.clear()
+            nr.IN_PROGRESS.update(saved[1])
+    source = inspect.getsource(nr.main)
+    check("lease: main() runs the watchdog, and its in_progress is the one the watchdog reads",
+          "target=lease_watchdog" in source and "in_progress = IN_PROGRESS" in source)
+
+
+def test_lease_fresh_never_destroys():
+    with lease_node() as n:
+        lease_run(n, 3 * 3600, touch_every=15)
+        check("lease: renewed every 15 s, an idle node is never destroyed", n.vast.of("DELETE") == [])
+        check("lease: its key is checked once, with a GET of its own instance",
+              [(c["url"], c["auth"]) for c in n.vast.of("GET")] == [(LEASE_URL, f"Bearer {LEASE_KEY}")])
+        state = published(n)
+        check("lease: the app reads it as armed and verified",
+              state["armed"] is True and state["verified"] is True and state["instanceId"] == 4242
+              and state["leaseTtlS"] == nr.LEASE_TTL)
+
+
+def test_lease_counts_from_agent_start():
+    with lease_node() as n:
+        # The app never touches: it died before its first probe.
+        lease_run(n, nr.LEASE_TTL + nr.LEASE_CHECK_EVERY)
+        check("lease: nothing destroyed until LEASE_TTL has passed", n.vast.of("DELETE") == [])
+        lease_run(n, nr.LEASE_CHECK_EVERY)
+        deletes = n.vast.of("DELETE")
+        check("lease: past LEASE_TTL with nothing to render, exactly one DELETE",
+              len(deletes) == 1)
+        check("lease: of its own instance, with its own key as a Bearer token",
+              deletes and deletes[0]["url"] == LEASE_URL
+              and deletes[0]["auth"] == f"Bearer {LEASE_KEY}" and deletes[0]["data"] == b"{}")
+        lease_run(n, nr.DESTROY_RECHECK - nr.LEASE_CHECK_EVERY)
+        check("lease: once Vast took it, not asked again for ten minutes", len(n.vast.of("DELETE")) == 1)
+        lease_run(n, nr.LEASE_CHECK_EVERY)
+        check("lease: still running ten minutes on, asked again", len(n.vast.of("DELETE")) == 2)
+
+
+def test_lease_waits_for_work():
+    with lease_node() as n:
+        touch_lease(n)
+        n.busy[0] = True
+        lease_run(n, 3 * 3600)
+        check("lease: stale for hours while rendering, nothing destroyed", n.vast.of("DELETE") == [])
+        noted = [line for line in n.logs if "once the work it has is done" in line]
+        check("lease: says once that it waits for the work", len(noted) == 1)
+        n.busy[0] = False
+        lease_run(n, nr.LEASE_CHECK_EVERY)
+        check("lease: the work done, destroyed at the next check", len(n.vast.of("DELETE")) == 1)
+
+
+def test_lease_renewed_in_time():
+    with lease_node() as n:
+        n.vast.script((502, {"msg": "bad gateway"}))
+        lease_run(n, first_stale())
+        check("lease: stale and idle, a DELETE is tried", len(n.vast.of("DELETE")) == 1)
+        # The app comes back before the retry.
+        lease_run(n, 3600, touch_every=15)
+        check("lease: the app back, nothing more is sent", len(n.vast.of("DELETE")) == 1)
+        check("lease: and it says so", any("the app is back" in line for line in n.logs))
+        check("lease: the Octane server was stopped once, before the DELETE",
+              len(n.octane) == 1 and n.octane[0] <= n.vast.of("DELETE")[0]["at"])
+        lease_run(n, first_stale())
+        check("lease: gone again, stale again: Octane stopped again, then the DELETE",
+              len(n.octane) == 2 and len(n.vast.of("DELETE")) == 2)
+
+
+def test_lease_answers():
+    def first_delete_then(answer, seconds):
+        """The first DELETE answered `answer`, then `seconds` more of checks.
+        The node, and what it last published, read before its dir goes."""
+        with lease_node() as n:
+            n.vast.script(answer)
+            lease_run(n, first_stale() + seconds)
+            n.state = published(n)
+            return n
+
+    n = first_delete_then((404, {"success": False, "error": "not_found", "msg": "Instance not found"}),
+                          nr.DESTROY_RECHECK - nr.LEASE_CHECK_EVERY)
+    check("lease: 404 is done: not sent again for ten minutes", len(n.vast.of("DELETE")) == 1)
+    check("lease: 404 says there is nothing left to destroy",
+          any("nothing left to destroy" in line for line in n.logs))
+    n = first_delete_then((429, {"error": "rate_limit_exceeded",
+                                 "msg": "API requests too frequent endpoint threshold=3.0"}), 60)
+    d = n.vast.of("DELETE")
+    check("lease: 429 waits at least 30 s before the next DELETE",
+          len(d) >= 2 and d[1]["at"] - d[0]["at"] >= nr.RATE_LIMIT_WAIT)
+    with lease_node() as n:
+        n.vast.script(*[(503, {})] * 6, urllib.error.URLError("no route to host"))
+        lease_run(n, first_stale() + 40 * 60)
+        gaps = [b["at"] - a["at"] for a, b in zip(n.vast.of("DELETE"), n.vast.of("DELETE")[1:])]
+        check("lease: 5xx and no answer back off, doubling to five minutes",
+              gaps[:6] == [30.0, 60.0, 120.0, 240.0, 300.0, 300.0])
+        check("lease: and try until Vast takes it", n.vast.of("DELETE") and len(gaps) >= 7)
+    n = first_delete_then((200, {"success": False, "msg": "instance busy"}), nr.RATE_LIMIT_WAIT)
+    check("lease: 200 with success false is a failure, retried",
+          len(n.vast.of("DELETE")) >= 2 and any("instance busy" in line for line in n.logs))
+    n = first_delete_then((401, {"msg": "unauthorized"}), 3600)
+    check("lease: 401 disarms: one DELETE and no more", len(n.vast.of("DELETE")) == 1)
+    check("lease: and the app is told why",
+          n.state["armed"] is False and "HTTP 401" in (n.state["reason"] or ""))
+
+
+def test_lease_verify():
+    with lease_node(answers=((403, {"msg": "forbidden"}),)) as n:
+        lease_run(n, 3 * 3600)
+        state = published(n)
+        check("lease: a key Vast refuses on the check disarms before any DELETE",
+              n.vast.of("DELETE") == [] and state["armed"] is False and "HTTP 403" in state["reason"])
+    with lease_node(answers=(urllib.error.URLError("timed out"), (200, {}))) as n:
+        check("lease: a check with no answer leaves it armed, unverified",
+              published(n)["armed"] and not published(n)["verified"])
+        lease_run(n, nr.VERIFY_RETRY + nr.LEASE_CHECK_EVERY, touch_every=15)
+        check("lease: the check is asked again after VERIFY_RETRY, and then verified",
+              len(n.vast.of("GET")) == 2 and published(n)["verified"])
+    with lease_node(answers=tuple([(500, {})] * 20)) as n:
+        lease_run(n, first_stale())
+        check("lease: never verified, it still destroys once stale", len(n.vast.of("DELETE")) == 1)
+    with lease_node(env={}) as n:
+        lease_run(n, 3 * 3600)
+        state = published(n)
+        check("lease: with no key, nothing is ever sent", n.vast.calls == [])
+        check("lease: and the app is told it is not armed, and why",
+              state["armed"] is False and "CONTAINER_API_KEY" in state["reason"])
+
+
+def test_lease_never_leaks_key():
+    with lease_node(answers=(urllib.error.URLError(f"refused, key {LEASE_KEY}"),)) as n:
+        n.vast.script((500, {"msg": f"echoed {LEASE_KEY}"}), (401, {"msg": LEASE_KEY}))
+        lease_run(n, first_stale() + 5 * 60)
+        n.dog.busy = lambda: (_ for _ in ()).throw(RuntimeError(f"boom {LEASE_KEY}"))
+        n.dog.armed = True
+        n.dog.verified = True
+        n.dog.tick()
+        with open(nr.self_destruct_path()) as f:
+            state_text = f.read()
+        text = "\n".join(n.logs)
+        check("lease: the key is in no log line, whatever quoted it", LEASE_KEY not in text)
+        check("lease: it is scrubbed where it was quoted", "<key>" in text)
+        check("lease: nor in the state file the app reads", LEASE_KEY not in state_text)
+        check("lease: a check that raises is logged, and the watchdog goes on",
+              any("a check failed" in line for line in n.logs))
+        files = []
+        for root, _dirs, names in os.walk(n.tmp):
+            for name in names:
+                with open(os.path.join(root, name), "rb") as f:
+                    files.append(f.read())
+        check("lease: nor in any file it wrote", all(LEASE_KEY.encode() not in b for b in files))
+
+
+def test_lease_stops_octane():
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = (nr.ROOT, nr.STATE)
+        nr.ROOT, nr.STATE = tmp, os.path.join(tmp, "state")
+        os.makedirs(os.path.join(tmp, "octane"))
+        os.makedirs(nr.STATE)
+        script = os.path.join(tmp, "octane", "setup_octane.sh")
+        with open(script, "w") as f:
+            f.write('echo "$1 $VASTAI_HOME" > "$VASTAI_HOME/called"\necho OCTANE_STOPPED clean\n')
+        try:
+            check("lease: no Octane server started here, no stop run",
+                  nr.stop_octane_server() is None and not os.path.exists(os.path.join(tmp, "called")))
+            with open(os.path.join(nr.STATE, "octane-server.pid"), "w") as f:
+                f.write("123\n")
+            said = nr.stop_octane_server()
+            with open(os.path.join(tmp, "called")) as f:
+                called = f.read().strip()
+            check("lease: a server started here is stopped with setup_octane.sh stop-server",
+                  said == "OCTANE_STOPPED clean" and called == f"stop-server {tmp}")
+        finally:
+            nr.ROOT, nr.STATE = saved
+
+
 def run(fn):
     """Run one case. A case that raises is a failure, not the end of the suite."""
     try:
@@ -1921,6 +2281,15 @@ def main():
         test_preflight_reads_only_what_renders,
         test_startup_script_marker,
         test_enable_gpu,
+        test_lease_credentials,
+        test_lease_node_busy,
+        test_lease_fresh_never_destroys,
+        test_lease_counts_from_agent_start,
+        test_lease_waits_for_work,
+        test_lease_renewed_in_time,
+        test_lease_answers,
+        test_lease_verify,
+        test_lease_never_leaks_key,
     ):
         run(fn)
     # Through fake_node, whose `blender` is a `#!/bin/sh` wrapper that Windows
@@ -1947,6 +2316,7 @@ def main():
         test_agent_gpu_and_engine,
         test_out_of_memory,
         test_pin_failure_is_reported,
+        test_lease_stops_octane,
     ):
         if os.name == "nt":
             print(f"SKIP  {fn.__name__}: the fake blender needs a POSIX shell")
