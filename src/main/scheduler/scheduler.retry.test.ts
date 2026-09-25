@@ -414,9 +414,12 @@ describe("1.16: the engine a node reports is the node's word", () => {
     })
     // Nothing Octane ran anywhere, and no credential left this computer.
     expect(ranAnywhere(ids, /setup_octane|OCTANE_USER|OCTANE_PASS|hunter2/)).toEqual([])
-    // The render was stopped, and the job's other chunk never sent.
+    // The render was stopped (withdrawn once, and killed again once the
+    // agent could have relaunched it), and the job's other chunk never sent.
     expect(specs).toHaveLength(1)
-    expect(machine.ran(new RegExp(`pkill -f '${specs[0].chunkId}'`))).toHaveLength(1)
+    expect(
+      machine.ran(new RegExp(`inbox/${specs[0].chunkId}\\.json; pkill -f '${specs[0].chunkId}'`))
+    ).toHaveLength(1)
   })
 
   it("1.16: the node's engine is quoted to the user only when it is an engine's name", async () => {

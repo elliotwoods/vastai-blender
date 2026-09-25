@@ -594,6 +594,50 @@ describe('1.7: a hung Blender', () => {
       /no progress \(no frame started or saved\) for 4\d min while it kept running, where this job's frames have taken up to 10 min on this hardware/
     )
   }, 30_000)
+
+  it('a render the app stopped is stopped again once the agent could have relaunched it, but not once it is sent there again', async () => {
+    // Review round 2: noderunner takes the kill of an EEVEE render that saved
+    // no frame for a Vulkan failure and relaunches it on OpenGL, for a chunk
+    // the app has already given back, on a lane it counts as free.
+    const { app, ids } = await fleet(1)
+    const machine = w.machineFor(ids[0])
+    const kills: Array<{ command: string; at: number }> = []
+    machine.onExec(/pkill -f/, (command) => {
+      kills.push({ command, at: Date.now() })
+      return ''
+    })
+    // The first spec write's rename lands with its answer lost (#245): the
+    // spec is withdrawn and its render, if the agent had started one, killed.
+    machine.onSftp(
+      'rename',
+      (from, m) => {
+        if (!from.endsWith('.tmp.json')) return undefined
+        m.files.set(from.replace(/\.tmp\.json$/, '.json'), m.files.get(from)!)
+        m.files.delete(from)
+        return HANG
+      },
+      1
+    )
+    const jobId = await w.submitJob(app, { engine: 'eevee' })
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => kills.length === 1, 'the spec withdrawn')
+    await w.advance(40_000, 1_000)
+    expect(kills.map((k) => k.command)).toEqual([
+      `rm -f ${REMOTE_ROOT}/jobs/inbox/${chunk.id}.json; pkill -f '${chunk.id}' || true`,
+      `pkill -f '${chunk.id}' || true`
+    ])
+    expect(kills[1].at - kills[0].at).toBeGreaterThanOrEqual(30_000)
+
+    // Sent to the node again: its own render is left alone.
+    machine.onSpec = (spec) => machine.agent.progress(spec.chunkId, 0)
+    await w.until(() => chunksOf(jobId)[0].state === 'rendering', 'sent again')
+    app.scheduler.stopRelaunch(ids[0], chunk.id)
+    await w.advance(60_000, 1_000)
+    expect(kills).toHaveLength(2)
+    machine.agent.finish(chunk.id)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+  })
 })
 
 describe('1.8: a spec write with no answer', () => {

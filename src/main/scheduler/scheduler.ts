@@ -560,6 +560,14 @@ const STATE_MISSING_MS = 3 * 60_000
 const SPEC_UNCLAIMED_MS = 15 * 60_000
 
 /**
+ * How long after the app stops a render it kills it again
+ * (Scheduler.stopRelaunch): past the agent's pause between a render's exit
+ * and its EEVEE retry on OpenGL, which it runs when the render it lost had
+ * saved no frame, whoever killed it.
+ */
+const AGENT_RELAUNCH_MS = 30_000
+
+/**
  * Every read of the state failing (exec throws, times out or loses its
  * channel) for this long, and the run gives its chunk back. A node that
  * stops answering was otherwise polled every 5 s for good, its chunk
@@ -632,6 +640,12 @@ class ChunkRun {
   private agentStatus: AgentState['status'] | null = null
   /** Since when the spec has waited in the inbox with no render of ours on the node (epoch ms). */
   private unclaimedSince: number | null = null
+  /**
+   * The spec is being queued on the node, or is: from the clearing of the
+   * last attempt's state on. From then on a render of this chunk there is
+   * this run's (Scheduler.stopRelaunch).
+   */
+  private queueing = false
 
   /** EWMA of frames/sec while rendering; null until two progress samples land. */
   private framesPerSec: number | null = null
@@ -963,6 +977,7 @@ class ChunkRun {
     // state written by the attempt it is polling. (Observed failure: chunks
     // re-dispatched after a crash sat queued behind busy slots while the
     // watchdog read the dead attempt's frozen state and burned every retry.)
+    this.queueing = true
     await this.ssh
       .exec(`rm -f ${REMOTE_ROOT}/state/${this.chunkId}.json`, {
         timeoutMs: 30_000,
@@ -1203,6 +1218,11 @@ class ChunkRun {
    */
   holdsLane(): boolean {
     return !this.stopped && (this.agentStatus === 'rendering' || this.agentStatus === 'encoding')
+  }
+
+  /** Is this run's spec on the node, or on its way there (Scheduler.stopRelaunch)? */
+  isQueueing(): boolean {
+    return !this.stopped && this.queueing
   }
 
   /** Is this chunk's spec still in the agent's inbox? null when that could not be read. */
@@ -1610,6 +1630,9 @@ class ChunkRun {
    * the call never returned. The run waiting on it never finished, so its
    * chunk stayed in flight and its node 'rendering', and scale-down never
    * let the node go.
+   *
+   * Killed again once the agent could have relaunched it
+   * (Scheduler.stopRelaunch).
    */
   private async retractSpec(): Promise<void> {
     await this.ssh
@@ -1618,6 +1641,7 @@ class ChunkRun {
         { timeoutMs: 30_000, label: 'retract spec' }
       )
       .catch(() => {})
+    scheduler.stopRelaunch(this.nodeId, this.chunkId)
   }
 
   /** True once this run has finished or been aborted: it owns nothing any more. */
@@ -2206,6 +2230,29 @@ class Scheduler {
         else this.agentDownOn(nodeId, reason)
       })
     }, AGENT_RECHECK_MS)
+  }
+
+  /**
+   * Kill a render the app has stopped again, AGENT_RELAUNCH_MS on: the agent
+   * takes the kill of an EEVEE render that saved no frame for a Vulkan
+   * failure and relaunches it on OpenGL, for a chunk already given back, on
+   * a lane the app counts as free, where it holds the node's only EEVEE lane
+   * with nobody watching it. Not once the chunk is being sent to the node
+   * again: a render of it there is then that run's.
+   */
+  stopRelaunch(nodeId: string, chunkId: string): void {
+    setTimeout(() => {
+      const run = this.runs.get(chunkId)
+      if (run && run.nodeId === nodeId && run.isQueueing()) return
+      const ssh = nodeManager.get(nodeId)?.ssh
+      if (!ssh) return
+      void ssh
+        .exec(`pkill -f '${chunkId}' || true`, {
+          timeoutMs: 30_000,
+          label: 'stop a relaunched render'
+        })
+        .catch(() => {})
+    }, AGENT_RELAUNCH_MS)
   }
 
   /**
@@ -3557,6 +3604,9 @@ class Scheduler {
             { timeoutMs: 30_000, label: 'cancel chunk' }
           )
           .catch(() => {})
+        // An EEVEE render cancelled before its first frame is relaunched by
+        // the agent, and renders a cancelled chunk.
+        this.stopRelaunch(run.nodeId, run.chunkId)
       }
       if (node && node.state === 'rendering' && !this.hasRuns(run.nodeId)) {
         node.update({ state: 'idle' })
