@@ -61,6 +61,11 @@ function settingsPath(): string {
 
 function load(): SettingsFile {
   if (cache) return cache
+  // Whether what is on disk was read: the file, or its absence (ENOENT, a
+  // first launch). Anything else (a file that does not parse, EACCES, EBUSY
+  // or EPERM from an antivirus lock, EIO) leaves defaults in memory for the
+  // session, and load() must not write them over the file.
+  let readOk = true
   try {
     const raw = JSON.parse(readFileSync(settingsPath(), 'utf-8')) as Partial<SettingsFile>
     const d = defaults()
@@ -72,14 +77,15 @@ function load(): SettingsFile {
       },
       secrets: raw.secrets ?? {}
     }
-  } catch {
+  } catch (e) {
+    readOk = (e as NodeJS.ErrnoException | null)?.code === 'ENOENT'
     cache = defaults()
   }
   migrateNodeSlots(cache.public)
   // The has* flags are derived, never trusted from disk.
   cache.public.hasVastApiKey = !!cache.secrets.vastApiKey
   cache.public.hasOtoyCredentials = !!cache.secrets.otoyUsername && !!cache.secrets.otoyPassword
-  ensureInstallId(cache)
+  ensureInstallId(cache, readOk)
   return cache
 }
 
@@ -90,15 +96,19 @@ function load(): SettingsFile {
  * tell this profile's instances from those of another install or profile on
  * the same Vast account, whose destroy would kill that app's live render.
  *
- * Saved at once, so the next launch labels its rentals with the same id. A
- * disk that will not take the file still gets an id for the session, and
- * its rentals are still recognised later: the reconcile matches an instance
- * to its node row by the label the row itself stores.
+ * Saved at once, so the next launch labels its rentals with the same id, but
+ * only when the file was read, or there was none (`readOk`). After a read
+ * that failed, the file on disk is still the user's settings, API key and
+ * all, and saving would write this session's defaults over it (#13): the id
+ * is kept in memory for the session instead, as it is on a disk that will
+ * not take the file. Its rentals are still recognised later: the reconcile
+ * matches an instance to its node row by the label the row itself stores.
  */
-function ensureInstallId(file: SettingsFile): void {
+function ensureInstallId(file: SettingsFile, readOk: boolean): void {
   const id = file.public.installId
   if (typeof id === 'string' && /^[0-9a-f-]{8,}$/.test(id)) return
   file.public.installId = randomUUID()
+  if (!readOk) return
   try {
     persist()
   } catch {

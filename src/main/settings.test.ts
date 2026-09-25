@@ -74,6 +74,66 @@ describe('1.3 install id', () => {
     expect(onDisk().public.installId).toBe(id)
   })
 
+  it('a file that was read keeps its secrets and the rest when the id is added', async () => {
+    const secrets = { vastApiKey: 'ZW5jcnlwdGVkLWtleQ==', otoyUsername: 'dXNlcg==' }
+    writeFileSync(
+      join(paths.userData, 'settings.json'),
+      JSON.stringify({ public: { spendCapPerHour: 6, projectRoot: '/Volumes/r' }, secrets })
+    )
+    const id = (await launch()).getSettings().installId
+    const saved = JSON.parse(readFileSync(join(paths.userData, 'settings.json'), 'utf-8')) as {
+      public: Record<string, unknown>
+      secrets: unknown
+    }
+    expect(saved.secrets).toEqual(secrets)
+    expect(saved.public).toMatchObject({
+      installId: id,
+      spendCapPerHour: 6,
+      projectRoot: '/Volumes/r'
+    })
+  })
+
+  // Review of 21be3e7 (major): the id was saved after ANY failed read, so the
+  // first read of a launch that met a hand-edited file or a Windows antivirus
+  // lock wrote the defaults, secrets {}, over settings.json: the Vast key,
+  // the spend cap and the project root gone for good, and a relaunch mid-
+  // render left with no key to reach the instances still billing (#13).
+  it('a settings.json that does not parse is left exactly as it was; the session still has an id', async () => {
+    const file = join(paths.userData, 'settings.json')
+    const text = '{ "public": { "maxActiveNodes": 7, }, "secrets": { "vastApiKey": "ZW5j" } '
+    writeFileSync(file, text)
+    const settings = await launch()
+    const id = settings.getSettings().installId
+    expect(id).toMatch(UUID)
+    expect(settings.getSettings().installId).toBe(id)
+    expect(readFileSync(file, 'utf-8')).toBe(text)
+  })
+
+  it.skipIf(process.getuid?.() === 0)(
+    'a settings.json that cannot be read (a lock, EACCES) is left exactly as it was',
+    async () => {
+      const file = join(paths.userData, 'settings.json')
+      const text = JSON.stringify({
+        public: { maxActiveNodes: 7, spendCapPerHour: 6 },
+        secrets: { vastApiKey: 'ZW5jcnlwdGVkLWtleQ==' }
+      })
+      writeFileSync(file, text)
+      chmodSync(file, 0o000)
+      try {
+        const settings = await launch()
+        expect(settings.getSettings().installId).toMatch(UUID)
+      } finally {
+        chmodSync(file, 0o600)
+      }
+      expect(readFileSync(file, 'utf-8')).toBe(text)
+      // The lock gone, the next launch reads it, secrets and all, and saves
+      // an id of its own.
+      const next = (await launch()).getSettings()
+      expect(next).toMatchObject({ maxActiveNodes: 7, spendCapPerHour: 6, hasVastApiKey: true })
+      expect(onDisk().public.installId).toBe(next.installId)
+    }
+  )
+
   it('a disk that will not take the file still gives the session one id', async () => {
     chmodSync(paths.userData, 0o500)
     const settings = await launch()
