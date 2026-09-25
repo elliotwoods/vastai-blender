@@ -37,12 +37,15 @@ import {
   admits,
   breakerKey,
   budgetFor,
+  chargeFor,
   chunkBackoffMs,
   freeExclusiveLanes,
   hasRoom,
   JobBreaker,
   NODE_REST_BASE_MS,
   nodeRestMs,
+  renderOnMachine,
+  type AttemptStage,
   type NodeOccupancy,
   type RetryBudget
 } from './admission'
@@ -231,8 +234,8 @@ interface AgentState {
   } | null
 }
 
-/** Where in an attempt a chunk failed. */
-type FailureStage = 'dispatch' | 'render' | 'download' | 'node'
+/** Where in an attempt a chunk failed (admission.ts AttemptStage). */
+type FailureStage = AttemptStage
 
 /** A failed attempt, as the retry policy (plan 1.17) weighs it. */
 interface ChunkFailure {
@@ -306,11 +309,20 @@ function agentFailure(state: AgentState, nodeId: string): ChunkFailure {
       fatal: attentionKind(kind, message)
     }
   }
+  // Out of memory is agent-oom whatever else the error says: its text quotes
+  // Blender's "CUDA error: Out of memory", which classify reads as the GPU
+  // failing, and a node is rested for that but not for this (rest()).
+  if (state.oom === true) {
+    return {
+      c: own('machine', 'agent-oom', `out of GPU memory on this node: ${describeError(f)}`),
+      stage: 'render',
+      nodeId
+    }
+  }
   const c = classify(f)
   if (kind === 'machine' && c.kind !== 'machine') {
-    const label = state.oom ? 'out of GPU memory on this node' : 'this node cannot render it'
     return {
-      c: own('machine', state.oom ? 'agent-oom' : 'agent-machine', `${label}: ${describeError(f)}`),
+      c: own('machine', 'agent-machine', `this node cannot render it: ${describeError(f)}`),
       stage: 'render',
       nodeId
     }
@@ -1028,10 +1040,14 @@ class Scheduler {
     { until: number; failures: number; lastError: string; stage: FailureStage }
   >()
   /**
-   * Nodes each chunk failed on for a machine's or the network's reason. It
-   * is sent to one of them again only when no other node could take it.
+   * What each chunk has failed for a machine's reason, until it completes or
+   * fails for good: the nodes (it goes back to one of them only when no other
+   * node can take it: pickChunk), and the rules of the renders that failed
+   * (the same one again is charged to the render: admission.ts chargeFor).
+   * The chunks a requeue splits it into share its entry. In memory only: a
+   * restart forgets it, and the budgets still bound every chunk.
    */
-  private failedOn = new Map<string, Set<string>>()
+  private failedOn = new Map<string, { nodes: Set<string>; renderRules: Set<string> }>()
   /** The same failure on two nodes holds its job for the user (plan 1.17). */
   private breaker = new JobBreaker()
 
@@ -1760,7 +1776,7 @@ class Scheduler {
     for (let i = 0; i < pending.length; i++) {
       const c = pending[i]
       if (!admits(occ, { id: c.id, sharesNode: c.share_node === 1 })) continue
-      const avoid = this.failedOn.get(c.id)
+      const avoid = this.failedOn.get(c.id)?.nodes
       if (avoid?.has(node.id) && eligible.some((n) => !avoid.has(n.id))) continue
       if (!c.blender_version || node.blenderVersions.includes(c.blender_version)) return i
       if (fallback < 0) fallback = i
@@ -2020,8 +2036,10 @@ class Scheduler {
     if (f.fatal) return this.failJob(chunk, job.name, f)
 
     const alerts: AlertEvent[] = []
-    const budget = budgetFor(f.c)
-    const key = breakerKey(f.c)
+    const history = this.failedOn.get(chunkId)
+    const repeat = renderOnMachine(f.c, f.stage) && history?.renderRules.has(f.c.rule) === true
+    const budget = chargeFor(f.c, f.stage, repeat)
+    const key = breakerKey(f.c, f.stage)
     if (key && job.attention == null && this.breaker.record(chunk.job_id, key, f.nodeId)) {
       const hold = this.holdJob(chunk.job_id, job.name, key, f)
       if (hold) alerts.push(hold)
@@ -2033,15 +2051,18 @@ class Scheduler {
       notBefore: waitMs > 0 ? Date.now() + waitMs : null
     })
     // A node that failed it for its own reasons is the last it goes back to;
-    // the chunks it was split into inherit that.
+    // the chunks it was split into inherit that. Only the machine's reasons:
+    // a transient failure says nothing about the node, and waits out its
+    // backoff instead.
     if (r.outcome !== 'pending') {
       this.failedOn.delete(chunkId)
-    } else if (budget === 'infra' && f.stage !== 'download') {
-      const avoid = this.failedOn.get(chunkId) ?? new Set<string>()
-      avoid.add(f.nodeId)
-      for (const id of r.touched) this.failedOn.set(id, avoid)
+    } else if (f.c.kind === 'machine' && f.stage !== 'download') {
+      const h = history ?? { nodes: new Set<string>(), renderRules: new Set<string>() }
+      h.nodes.add(f.nodeId)
+      if (f.stage === 'render') h.renderRules.add(f.c.rule)
+      for (const id of r.touched) this.failedOn.set(id, h)
     }
-    const alert = this.failureAlert(chunk, f, budget, r, waitMs)
+    const alert = this.failureAlert(chunk, f, budget, r, waitMs, repeat)
     if (alert) alerts.unshift(alert)
     return { r, alerts }
   }
@@ -2057,7 +2078,8 @@ class Scheduler {
     f: ChunkFailure,
     budget: RetryBudget,
     r: Resplit,
-    waitMs: number
+    waitMs: number,
+    repeat: boolean
   ): AlertEvent | null {
     if (f.stage === 'node') return null
     const what = `${f.stage === 'dispatch' ? 'dispatch' : 'chunk'} ${before.id} failed`
@@ -2076,7 +2098,9 @@ class Scheduler {
     }
     let next: string
     if (budget === 'render') {
-      next = `requeued, render retry ${before.retries + 1}/${MAX_RETRIES}`
+      next =
+        `requeued, render retry ${before.retries + 1}/${MAX_RETRIES}` +
+        (repeat ? ' (it failed this way before, so it is taken as the render)' : '')
     } else if (budget === 'infra') {
       next =
         `requeued without charging the render (attempt ${before.infra_retries + 1}/` +

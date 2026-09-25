@@ -86,9 +86,23 @@ function nodeState(nodeId: string): string {
   return w.get<{ state: string }>('SELECT state FROM nodes WHERE id = ?', nodeId)!.state
 }
 
+function attentionOf(jobId: string): string | null {
+  return w.get<{ attention: string | null }>('SELECT attention FROM jobs WHERE id = ?', jobId)!
+    .attention
+}
+
 /** Every command any machine of the world was sent that matches. */
 function ranAnywhere(ids: string[], pattern: RegExp): string[] {
   return ids.flatMap((id) => w.machineFor(id).ran(pattern))
+}
+
+/** What the agent reports for a render stopped out of GPU memory. */
+const outOfMemory = {
+  error: 'out of GPU memory on GPU 0 (exit -15): CUDA error: Out of memory in cuMemAlloc',
+  exitCode: -15,
+  errorKind: 'machine',
+  oom: true,
+  gpu: 0
 }
 
 /** The agent reports a failed chunk, with what the real one adds to a failure. */
@@ -550,6 +564,61 @@ describe('1.17: the job breaker, the same failure on two nodes', () => {
       message: expect.stringContaining('install blender 4.2.3 failed (exit 1)')
     })
     expect(chunksOf(jobId).map((c) => c.retries)).toEqual([0, 0, 0, 0])
+  })
+
+  it('1.17: a scene that runs out of GPU memory on every node holds the job after 2 nodes', async () => {
+    const { app, ids } = await nodes(2)
+    const specs: AgentSpec[] = []
+    for (const id of ids) {
+      const machine = w.machineFor(id)
+      machine.onSpec = (spec) => {
+        specs.push(spec)
+        failWith(machine, spec.chunkId, outOfMemory)
+      }
+    }
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 2 })
+    app.scheduler.kick()
+    const dispatched = (): number =>
+      w.eventsOf('chunk:changed').filter((c) => c.jobId === jobId && c.state === 'assigned').length
+    await w.until(() => attentionOf(jobId) !== null, 'job held')
+    const sent = dispatched()
+    await w.advance(10 * 60_000)
+
+    // Each attempt is a paid render. The same failure on the second node is
+    // taken as the scene's, not 2 chunks x 9 attempts on the machines' budget
+    // (a dispatch already under way when it tripped runs its course).
+    expect(dispatched()).toBe(sent)
+    expect(specs.length).toBeLessThanOrEqual(sent)
+    expect(sent).toBeLessThanOrEqual(3)
+    const job = await w.invoke('job:get', jobId)
+    expect(job?.attention).toMatchObject({
+      kind: 'repeatedFailure',
+      errorClass: 'machine',
+      message: expect.stringMatching(/on 2 nodes .*out of GPU memory/)
+    })
+    expect(w.alerts('error').filter((a) => a.includes('is held'))).toHaveLength(1)
+    expect(w.vast.count('createInstance')).toBe(2)
+  })
+
+  it('1.17: on a one-node fleet, a render out of GPU memory every time stops at its render retries', async () => {
+    const { app, ids } = await nodes(1)
+    const machine = w.machineFor(ids[0])
+    const specs: AgentSpec[] = []
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      failWith(machine, spec.chunkId, outOfMemory)
+    }
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => settled(jobId), 'job settled', { timeoutMs: 60 * 60_000 })
+
+    // The first failure is the machine's; the same one again, with no other
+    // node to try, is the render's: 1 + 4 retries + the last, not 1 + 8.
+    expect(jobState(jobId)).toBe('partial')
+    expect(chunkRow(chunk.id)).toMatchObject({ state: 'failed', retries: 4, infra_retries: 1 })
+    expect(specs).toHaveLength(6)
+    expect(w.alerts('warn').join('\n')).toContain('it failed this way before')
   })
 
   it('1.17: a crash now and then, between chunks that render, never holds the job', async () => {

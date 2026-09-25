@@ -4,6 +4,7 @@ import {
   BREAKER_NODES,
   breakerKey,
   budgetFor,
+  chargeFor,
   chunkBackoffMs,
   freeExclusiveLanes,
   hasRoom,
@@ -168,6 +169,26 @@ describe('retry policy (plan 1.17)', () => {
     })
   })
 
+  describe('chargeFor: the same render failing on the machine again is the render', () => {
+    it('charges a first render that failed on the machine to the machines', () => {
+      expect(chargeFor(f('machine', 'agent-oom'), 'render', false)).toBe('infra')
+      expect(chargeFor(f('machine', 'agent-stalled'), 'render', false)).toBe('infra')
+    })
+
+    it('charges the same failure again to the render, so it is bounded by the render retries', () => {
+      expect(chargeFor(f('machine', 'agent-oom'), 'render', true)).toBe('render')
+      expect(chargeFor(f('machine', 'agent-killed'), 'render', true)).toBe('render')
+    })
+
+    it('1d59516c: a node that cannot be reached, or goes away, never is', () => {
+      expect(chargeFor(f('machine', 'ssh-unreachable'), 'dispatch', true)).toBe('infra')
+      expect(chargeFor(f('machine', 'node-setup'), 'dispatch', true)).toBe('infra')
+      expect(chargeFor(f('machine', 'node-gone'), 'node', true)).toBe('infra')
+      expect(chargeFor(f('transient', 'frames-lost'), 'download', true)).toBe('infra')
+      expect(chargeFor(f('localFs', 'local-sink'), 'download', true)).toBe('none')
+    })
+  })
+
   describe('chunkBackoffMs: only a transient failure waits', () => {
     it('doubles from the base with each infrastructure retry, up to the cap', () => {
       const t = f('transient', 'ssh-channels')
@@ -204,6 +225,18 @@ describe('retry policy (plan 1.17)', () => {
       expect(breakerKey(f('machine', 'agent-gpu'))).toBeNull()
       expect(breakerKey(f('transient', 'ssh-channels'))).toBeNull()
       expect(breakerKey(f('localFs', 'local-sink'))).toBeNull()
+    })
+
+    it('a render that failed on the machine, by rule, once the stage says it rendered', () => {
+      expect(breakerKey(f('machine', 'agent-oom'), 'render')).toBe('render:agent-oom')
+      expect(breakerKey(f('machine', 'agent-stalled'), 'render')).toBe('render:agent-stalled')
+      expect(breakerKey(f('machine', 'agent-gpu'), 'render')).toBe('render:agent-gpu')
+      // 1d59516c: the machines failing before anything rendered never are.
+      expect(breakerKey(f('machine', 'ssh-unreachable'), 'dispatch')).toBeNull()
+      expect(breakerKey(f('machine', 'node-gone'), 'node')).toBeNull()
+      expect(breakerKey(f('transient', 'frames-lost'), 'download')).toBeNull()
+      // The job's own failures keep their key whatever the stage.
+      expect(breakerKey(f('job', 'agent-exit'), 'render')).toBe('job')
     })
 
     it('not a setup step whose connection went before it exited', () => {

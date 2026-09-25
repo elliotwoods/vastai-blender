@@ -96,8 +96,9 @@ export function freeExclusiveLanes(occ: NodeOccupancy): number {
 // stopped two of its three nodes, and 16 chunks burned all their retries on
 // them in minutes, each with an empty reason, instead of moving to the node
 // that still worked. What a failure costs now depends on whose fault it is
-// (errors.ts classify), and a node that fails a dispatch is rested before it
-// is sent more.
+// (errors.ts classify) and, for a render that failed on the machine, on
+// whether it failed that way before (chargeFor), and a node that fails a
+// dispatch is rested before it is sent more.
 
 /**
  * Which budget a failed attempt is charged to.
@@ -123,6 +124,39 @@ export function budgetFor(c: FailureClass): RetryBudget {
   if (c.kind === 'job') return 'render'
   if (c.rule === 'local-sink') return 'none'
   return 'infra'
+}
+
+/**
+ * Where in an attempt a chunk failed: sending it (node prep and the spec),
+ * the render on the node, the final download, or the node going away under
+ * it (forgetNode).
+ */
+export type AttemptStage = 'dispatch' | 'render' | 'download' | 'node'
+
+/**
+ * A render that ran on a node and failed for the machine's reason: out of
+ * GPU memory, killed, stalled, its GPU erroring, the agent saying the node
+ * cannot run it. Unlike a node that could not be reached, each of these paid
+ * for a render, and each can be the scene's doing (too big for the card, a
+ * shader that hangs Blender) as easily as the node's.
+ */
+export function renderOnMachine(c: FailureClass, stage: AttemptStage): boolean {
+  return stage === 'render' && c.kind === 'machine'
+}
+
+/**
+ * What this attempt costs, given whether the chunk has already failed a
+ * render for the same machine rule (`repeat`). The first time is the
+ * machine's (budgetFor). The same failure again is charged to the render:
+ * the chunk goes back to a node it failed on only when no other can take it,
+ * so a repeat is either a second node failing it the same way or the only
+ * node there is, and neither is fixed by trying more. Left on the larger
+ * infrastructure budget, a scene too big for a one-node fleet's GPU paid for
+ * nine renders a chunk, where it used to pay for five.
+ */
+export function chargeFor(c: FailureClass, stage: AttemptStage, repeat: boolean): RetryBudget {
+  const budget = budgetFor(c)
+  return budget === 'infra' && repeat && renderOnMachine(c, stage) ? 'render' : budget
 }
 
 /** First wait after a transient failure; each further one doubles it. */
@@ -161,8 +195,9 @@ export function nodeRestMs(failures: number): number {
 
 /**
  * The job breaker's name for a failure that may be the job's own rather than
- * a machine's, or null for one that cannot be: a node gone, the network, a
- * GPU that fell off. The same name on BREAKER_NODES nodes holds the job.
+ * a machine's, or null for one that cannot be: a node gone or refusing
+ * connections, the network, this computer's disk holding frames back. The
+ * same name on BREAKER_NODES nodes holds the job.
  * - job: the render failed (a crash, a guard, an error nothing recognises).
  * - node-setup: installing the job's Blender, add-ons or Octane failed. One
  *   node failing it is a flaky mirror or disk; two is a version no mirror
@@ -173,11 +208,18 @@ export function nodeRestMs(failures: number): number {
  * - localFs: this computer could not read what the job sends (its scene
  *   gone or unreadable). Its disk is the same whichever node is asking, so
  *   two failures hold the job, on one node or several.
+ * - render:<rule>: a render that ran and failed for the machine's reason
+ *   (renderOnMachine), by rule. One node running out of GPU memory, or
+ *   stalling, is that node; two is a scene too big or too heavy for the
+ *   fleet's GPUs, and every further attempt pays for another render. Only
+ *   with the `stage` given: without it, every machine rule but node-setup
+ *   reads as the node's, as a dispatch's does.
  */
-export function breakerKey(c: FailureClass): string | null {
+export function breakerKey(c: FailureClass, stage?: AttemptStage): string | null {
   if (c.kind === 'job') return 'job'
   if (c.rule === 'node-setup') return /\(exit null\)/.test(c.reason ?? '') ? null : 'node-setup'
   if (c.kind === 'localFs' && c.rule !== 'local-sink') return 'localFs'
+  if (stage && renderOnMachine(c, stage)) return `render:${c.rule}`
   return null
 }
 
