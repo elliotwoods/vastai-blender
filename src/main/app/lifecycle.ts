@@ -39,8 +39,19 @@
  *   may be left billing: a destroy that could not be confirmed (listed on
  *   stderr), or nodes left by `leave`. Otherwise it is EXIT_NOT_SUBMITTED (1)
  *   for a campaign that ended with part of it never submitted (a spec that
- *   did not parse, a blend createJob refused), and 0 when all is well. A
- *   second signal during the destroy exits at once, with 3.
+ *   did not parse, a blend createJob refused), and 0 when all is well.
+ *   A signal during the destroy does not cut it short by itself. SIGHUP
+ *   never does: it says the terminal went away, so nobody is there to want
+ *   out, and closing a terminal delivers it twice, 0.4 ms apart (the shell
+ *   resends it to its jobs, then the kernel sends it to the foreground
+ *   group; seen on macOS, 1.1 review). Taking the second for "exit now"
+ *   abandoned the destroy it had just started, with nobody left to read that
+ *   the fleet was billing. One Ctrl+C can arrive twice too (the `electron`
+ *   CLI forwards the SIGINT its child already had). So only a SIGINT or
+ *   SIGTERM that comes SECOND_SIGNAL_MS or more after an earlier one the run
+ *   acted on exits at once, with 3. A first one during a destroy the run
+ *   started for another reason (the campaign done, a quit, a session end)
+ *   only says how to exit now.
  *
  * Destroy all must rent nothing while it destroys. scheduler.stop() only
  * clears the tick timer, and a kick still ticks. Every destroy kicks
@@ -107,6 +118,13 @@ export const EXIT_BILLING_LEFT = 3
  * another instance on the profile: the run did not do what it was asked.
  */
 export const EXIT_NOT_SUBMITTED = 1
+
+/**
+ * How long after the SIGINT or SIGTERM that armed it another one may end a
+ * headless destroy early. One sooner is taken for the same signal delivered
+ * twice (see the header).
+ */
+export const SECOND_SIGNAL_MS = 2_000
 
 /** Headless destroy attempts before giving up. Nobody is there to press "Try again". */
 const HEADLESS_ATTEMPTS = 3
@@ -567,6 +585,10 @@ export interface LifecycleApp {
   exit(exitCode?: number): void
 }
 
+/** The signals that stop the app: Ctrl+C, a kill, and a terminal (or console) gone away. */
+export type Signal = 'SIGINT' | 'SIGTERM' | 'SIGHUP'
+const SIGNALS: readonly Signal[] = ['SIGINT', 'SIGTERM', 'SIGHUP']
+
 /** `W` is the window a message box is shown against: a BrowserWindow in the app. */
 export interface LifecycleDeps<W = unknown> {
   app: LifecycleApp
@@ -589,7 +611,7 @@ export interface LifecycleDeps<W = unknown> {
   /** null for the app a person runs; the quit policy for a headless run. */
   headless: { policy: QuitPolicy } | null
   /** Where SIGINT, SIGTERM and SIGHUP arrive: `process`. Only a headless run listens. */
-  signals: { on(signal: 'SIGINT' | 'SIGTERM' | 'SIGHUP', listener: () => void): unknown }
+  signals: { on(signal: Signal, listener: () => void): unknown }
   /** A line for a script's stderr, written before the process exits. */
   stderr(text: string): void
   /** Test knobs for destroyFleet. */
@@ -624,6 +646,9 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
   // Destroy all (or an unattended stop) is under way, its failure dialog
   // included. exiting: app.exit is being called.
   let phase: 'idle' | 'asking' | 'destroying' | 'exiting' = 'idle'
+  // Read through a call, where a narrowed `phase` would not see what a call
+  // just before it changed.
+  const destroying = (): boolean => phase === 'destroying'
   let asleep: Asleep | null = null
 
   const contained = (what: string, fn: () => void): void => {
@@ -843,26 +868,48 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
 
   if (deps.headless) {
     const { policy } = deps.headless
-    const onSignal = (signal: string) => (): void => {
+    // When a SIGINT or SIGTERM the run acted on arrived: the one that started
+    // the destroy, or the first during one started otherwise. Only another
+    // SECOND_SIGNAL_MS or more after it ends the destroy early (header).
+    let armedAt: number | null = null
+    const arm = (signal: Signal): void => {
+      armedAt = Date.now()
+      deps.stderr(
+        `[vast-render] ${signal === 'SIGINT' ? 'Ctrl+C' : signal} again, ` +
+          `${SECOND_SIGNAL_MS / 1000} s or more from now, exits without waiting for the ` +
+          'destroy, and lists what may still be billing\n'
+      )
+    }
+    const onSignal = (signal: Signal) => (): void => {
       if (phase === 'exiting') return
-      if (phase === 'destroying') {
-        // A second signal: the user wants out now, destroy or not.
-        const still = billingFleet(fleet.list()).nodes.map((node) => ({
-          node,
-          reason: 'its destroy was still under way'
-        }))
-        deps.stderr(
-          `[vast-render] ${signal} again: exiting without waiting; ` +
-            `${plural(still.length, 'instance')} may still be billing ` +
-            `(${VAST_CONSOLE}):\n${listing(still)}`
-        )
-        return finish(still.length > 0 ? EXIT_BILLING_LEFT : 0)
+      if (phase === 'idle') {
+        // Synchronous up to its first await: 'destroying' once it returns
+        // unless there was nothing to wait for and it has exited.
+        void stopUnattended(signal, policy, HEADLESS_ATTEMPTS).catch(fail(signal))
+        // A hangup is not armed: nobody is at a terminal that hung up.
+        if (destroying() && signal !== 'SIGHUP') arm(signal)
+        return
       }
-      void stopUnattended(signal, policy, HEADLESS_ATTEMPTS).catch(fail(signal))
+      if (signal === 'SIGHUP') {
+        say('[vast-render] SIGHUP: the terminal went away; the destroy carries on')
+        return
+      }
+      if (armedAt === null) return arm(signal)
+      // The same signal, delivered twice.
+      if (Date.now() - armedAt < SECOND_SIGNAL_MS) return
+      // Asked twice, by someone at the terminal: out now, destroy or not.
+      const still = billingFleet(fleet.list()).nodes.map((node) => ({
+        node,
+        reason: 'its destroy was still under way'
+      }))
+      deps.stderr(
+        `[vast-render] ${signal} again: exiting without waiting; ` +
+          `${plural(still.length, 'instance')} may still be billing ` +
+          `(${VAST_CONSOLE}):\n${listing(still)}`
+      )
+      return finish(still.length > 0 ? EXIT_BILLING_LEFT : 0)
     }
-    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-      deps.signals.on(signal, onSignal(signal))
-    }
+    for (const signal of SIGNALS) deps.signals.on(signal, onSignal(signal))
   }
 
   return {

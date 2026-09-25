@@ -576,19 +576,87 @@ describe('headless runs follow VR_QUIT_POLICY, never a dialog (plan 1.1)', () =>
     expect(err).toContain(`instance ${stuck} (RTX 4090, $0.40/hr): destroy failed`)
   })
 
-  it('a second SIGINT during the destroy exits at once, with 3', async () => {
+  it('a second SIGINT, 2 s or more after the first, exits at once, with 3', async () => {
     const { engine } = await twoNodes()
     const r = await rig(engine, { headless: 'destroy' })
     w.vast.hold('destroyInstance')
 
     r.signals.emit('SIGINT')
-    await w.advance(1_000)
+    expect(r.stderr.join('')).toContain('Ctrl+C again, 2 s or more from now, exits without waiting')
+    await w.advance(2_000)
     expect(r.app.exits).toEqual([])
     r.signals.emit('SIGINT')
 
     expect(r.app.exits).toHaveLength(1)
     expect(r.app.exits[0].code).toBe(3)
     expect(r.stderr.join('')).toContain('SIGINT again: exiting without waiting')
+  })
+
+  it('1.1: terminal closed: SIGHUP twice, 1 ms apart, still destroys every node, exit 0', async () => {
+    // 1.1 review, field incident A1 again: a closed terminal sends SIGHUP
+    // twice, 0.4 ms apart (the shell resends it to its jobs, then the kernel
+    // to the foreground group). The second was taken for "exit now": the
+    // destroy the first had started was abandoned 0.4 ms in, exit 3, to a
+    // terminal no longer there, and both nodes billed on.
+    const { engine, instances } = await twoNodes()
+    const r = await rig(engine, { headless: 'destroy' })
+
+    r.signals.emit('SIGHUP')
+    await w.advance(1, 1)
+    r.signals.emit('SIGHUP')
+    await w.until(() => r.app.exits.length > 0, 'the run to exit')
+
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+  })
+
+  it('1.1: one Ctrl+C delivered twice (the electron CLI forwards it): the destroy carries on, exit 0', async () => {
+    const { engine, instances } = await twoNodes()
+    const r = await rig(engine, { headless: 'destroy' })
+
+    r.signals.emit('SIGINT')
+    await w.advance(1, 1)
+    r.signals.emit('SIGINT')
+    await w.until(() => r.app.exits.length > 0, 'the run to exit')
+
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+  })
+
+  it('1.1: the campaign done, then one Ctrl+C during its destroy: the destroy carries on, exit 0', async () => {
+    // 1.1 review: the first Ctrl+C a user sent, while the destroy the
+    // campaign's end had started was under way, was taken for their second.
+    w = await setup()
+    const engine = await w.boot()
+    const instance = instanceOf(await w.readyNode(engine))
+    const r = await rig(engine, { headless: 'destroy' })
+    const gate = w.vast.hold('destroyInstance')
+    r.lifecycle.watchCampaign(openJobs)
+    await w.until(() => gate.reached, "the campaign end's DELETE in flight")
+
+    r.signals.emit('SIGINT')
+    await w.advance(5_000)
+    expect(r.app.exits).toEqual([])
+    expect(r.stderr.join('')).toContain('Ctrl+C again, 2 s or more from now, exits without waiting')
+
+    gate.release()
+    await w.until(() => r.app.exits.length > 0, 'the run to exit')
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: [instance] }])
+  })
+
+  it('the campaign done, its destroy under way: Ctrl+C, and again 2 s later, exits 3', async () => {
+    w = await setup()
+    const engine = await w.boot()
+    const instance = instanceOf(await w.readyNode(engine))
+    const r = await rig(engine, { headless: 'destroy' })
+    const gate = w.vast.hold('destroyInstance')
+    r.lifecycle.watchCampaign(openJobs)
+    await w.until(() => gate.reached, "the campaign end's DELETE in flight")
+
+    r.signals.emit('SIGINT')
+    await w.advance(2_000)
+    r.signals.emit('SIGINT')
+
+    expect(r.app.exits).toEqual([{ code: 3, live: [instance], created: [instance] }])
+    expect(r.stderr.join('')).toContain(`SIGINT again: exiting without waiting; 1 instance may`)
   })
 
   it('the campaign done: policy destroy destroys the fleet and exits 0', async () => {
