@@ -208,6 +208,39 @@ describe('quitting with nodes billing (plan 1.1, field incident A1)', () => {
     expect(r.app.exits).toHaveLength(1)
   })
 
+  it("1.1: a person's app, its terminal closed (npm run dev): SIGHUP twice asks once, and the answer decides", async () => {
+    // 1.1 review: Electron's own handler has one shot and then puts the
+    // signal back to its default, so the second SIGHUP of a closed terminal
+    // killed the app with the dialog up and the fleet billing.
+    const { engine, instances } = await twoNodes()
+    const r = await rig(engine)
+    const answer = deferred<number>()
+    r.answers.push(answer.promise)
+
+    r.signals.emit('SIGHUP')
+    await w.advance(1, 1)
+    r.signals.emit('SIGHUP')
+    r.signals.emit('SIGINT')
+    await w.advance(5_000)
+    expect(r.dialogs.map((d) => d.message)).toEqual(['2 nodes are billing $0.80/hr'])
+    expect(r.app.exits).toEqual([])
+
+    answer.resolve(DESTROY)
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+  })
+
+  it("a person's app, Ctrl+C with nothing billing: quits at once", async () => {
+    w = await setup()
+    const engine = await w.boot()
+    const r = await rig(engine)
+
+    r.signals.emit('SIGINT')
+
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: [] }])
+    expect(r.dialogs).toEqual([])
+  })
+
   it('nothing billing: the quit goes ahead at once, with no dialog', async () => {
     w = await setup()
     const engine = await w.boot()

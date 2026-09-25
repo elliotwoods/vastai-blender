@@ -8,7 +8,8 @@
  * billing until the next launch, with nothing rendering or downloading in
  * the meantime. Now:
  *
- * - Quit (Cmd+Q, the menu, the last window closing on Windows). If any node
+ * - Quit (Cmd+Q, the menu, the last window closing on Windows, or Ctrl+C,
+ *   SIGTERM or a hangup from the terminal the app was started in). If any node
  *   may be billing, the quit waits on a dialog, "N nodes are billing $X/hr",
  *   with Destroy all & quit, Leave running and Cancel. It asks every time
  *   (Elliot, 2026-09-25). Destroy all stops the scheduler, destroys every
@@ -610,7 +611,10 @@ export interface LifecycleDeps<W = unknown> {
   closeDb(): void
   /** null for the app a person runs; the quit policy for a headless run. */
   headless: { policy: QuitPolicy } | null
-  /** Where SIGINT, SIGTERM and SIGHUP arrive: `process`. Only a headless run listens. */
+  /**
+   * Where SIGINT, SIGTERM and SIGHUP arrive: `process`. A headless run
+   * follows its policy; a person's app asks, as for Cmd+Q.
+   */
   signals: { on(signal: Signal, listener: () => void): unknown }
   /** A line for a script's stderr, written before the process exits. */
   stderr(text: string): void
@@ -910,6 +914,23 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
       return finish(still.length > 0 ? EXIT_BILLING_LEFT : 0)
     }
     for (const signal of SIGNALS) deps.signals.on(signal, onSignal(signal))
+  } else {
+    // A person's app started from a terminal (`npm run dev`, the working
+    // arrangement for renders). Electron's own handler for these signals
+    // has one shot: it puts the signal back to its default before it quits,
+    // so a closed terminal's second SIGHUP, or a second Ctrl+C, killed the
+    // process while the dialog was up, the fleet billing and nothing asked
+    // (1.1 review). A listener here takes over from it. A signal quits as
+    // Cmd+Q does, through the dialog, which can still be answered in the
+    // window once the terminal is gone. More of them while it is up, or
+    // while Destroy all runs, change nothing.
+    for (const signal of SIGNALS) {
+      deps.signals.on(signal, () => {
+        if (phase !== 'idle') return
+        say(`[lifecycle] ${signal}: quitting`)
+        void askAndQuit().catch(fail(signal))
+      })
+    }
   }
 
   return {

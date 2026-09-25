@@ -373,9 +373,22 @@ describe('index.ts installs the quit lifecycle (plan 1.1, field incident A1)', (
     ])
   })
 
-  it("a person's app leaves SIGINT, SIGTERM and SIGHUP to Electron's quit", async () => {
+  it("a person's app: Ctrl+C or a closed terminal asks, as Cmd+Q does, once however many arrive", async () => {
+    // Not left to Electron's handler, which has one shot: the second SIGHUP
+    // of a closed terminal killed the app with the dialog up (1.1 review).
     const r = await load([node()])
-    expect([...r.signals.keys()].filter((s) => s.startsWith('SIG'))).toEqual([])
+    expect([...r.signals.keys()]).toEqual(expect.arrayContaining(['SIGINT', 'SIGTERM', 'SIGHUP']))
+
+    r.signals.get('SIGHUP')!()
+    r.signals.get('SIGHUP')!()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(r.boxes).toHaveLength(1)
+    expect(r.exits).toEqual([])
+
+    r.answer(0)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(r.destroyed).toEqual(['node-1-abcdef'])
+    expect(r.exits).toEqual([0])
   })
 
   it('Windows asks whether it may shut down: held while the fleet is destroyed, then the app exits', async () => {
