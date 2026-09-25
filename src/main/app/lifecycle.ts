@@ -599,7 +599,7 @@ async function settleNode(
  * Once `hurry` is aborted, the next destroy starts as soon as the last one
  * has settled, or its 3 s are up, whichever is first. Not all at once:
  * under the per-endpoint limit Vast documents, DELETEs sent together are
- * refused but one, and vastClient retries the rest 2, 6 and 14 s later, so
+ * refused but one, and vastClient retries the rest 3, 7 and 15 s later, so
  * all-at-once got 2 of 6 through in 10 s where one every 3 s gets 4
  * (lifecycle.quit.test.ts, against vastRateLimit). Should the limit turn
  * out to be per instance, each goes the moment the one before it is done.
