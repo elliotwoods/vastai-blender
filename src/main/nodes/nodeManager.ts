@@ -1294,6 +1294,7 @@ export class NodeManager {
   /** The low-runway warning has been given, and not re-armed since. */
   private runwayWarned = false
   private holdListeners = new Set<(holds: FleetHolds) => void>()
+  private bootListeners = new Set<(nodeId: string, failure: string | null) => void>()
   /** The last search the spend cap left empty, for CAP_EMPTY_BACKOFF_MS. */
   private capEmpty: { headroom: number; filters: string; at: number } | null = null
   /** Each supervised node's run of failed probes, while it lasts (plan 1.7). */
@@ -2624,6 +2625,32 @@ export class NodeManager {
   }
 
   /**
+   * Called when a rental's boot ends (driveToReady): `failure` is null once
+   * the node is ready, else why it never became usable (a machine that
+   * would not boot, provisioning that failed or ran past its deadline). Not
+   * for an account refusal (the account hold) or Vast being silent the
+   * whole boot: neither says anything about renting again. The scheduler
+   * counts failures toward its scale backoff (plan 1.17). Returns the
+   * unsubscribe function.
+   */
+  onBootEnded(listener: (nodeId: string, failure: string | null) => void): () => void {
+    this.bootListeners.add(listener)
+    return () => {
+      this.bootListeners.delete(listener)
+    }
+  }
+
+  private bootEnded(nodeId: string, failure: string | null): void {
+    for (const l of [...this.bootListeners]) {
+      try {
+        l(nodeId, failure)
+      } catch {
+        // A listener's failure is its own.
+      }
+    }
+  }
+
+  /**
    * Called with this module's holds whenever one is set or released (for
    * fleet:holds). Returns the unsubscribe function.
    */
@@ -3444,6 +3471,7 @@ export class NodeManager {
       this.provisioned.add(node.id)
       node.setState('ready')
       emit('alert', { level: 'info', message: `Node ${node.snapshot.gpuName} ready` })
+      this.bootEnded(node.id, null)
     } catch (e) {
       // Destroyed meanwhile: the retry gave up because of it (RetryAbortedError),
       // or the connection destroyNode closed failed a command. Neither is the
@@ -3460,6 +3488,7 @@ export class NodeManager {
       // Nor does Vast being silent for the whole boot.
       else if (machineId != null && e !== vastSilent) this.blacklist.add(machineId)
       emit('alert', { level: 'error', message: `Node failed: ${(e as Error).message}` })
+      if (c.kind !== 'account' && e !== vastSilent) this.bootEnded(node.id, c.reason)
       // Clean up the rented instance — never leave a failed node billing.
       await this.ensureInstanceGone(instanceId, { node })
     }

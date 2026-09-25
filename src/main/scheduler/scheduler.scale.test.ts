@@ -50,7 +50,39 @@ describe('scale-up against the plan', () => {
       stepMs: 5_000
     })
     await w.until(() => app.scheduler.fleetHolds().scale == null, 'the backoff cleared')
-    expect(w.alerts('info')).toContain('Scale-up rents again: a rental went through')
+    expect(w.alerts('info')).toContain('Scale-up rents again: a rented node is ready')
+  })
+
+  it('1.17: rentals that never become ready back off scale-up too, not rent and destroy on every tick', async () => {
+    // A docker image without what provision.sh needs, or a Blender mirror
+    // too slow for the 25-minute deadline, fails every node at its
+    // provisioning. Each batch "succeeded" (it rented), so nothing counted,
+    // and the fleet rented, billed through a boot, and destroyed a node on
+    // every tick, blacklisting one good machine after another (n4, n5).
+    w = await setup({ settings: { maxActiveNodes: 1, spendCapPerHour: 10 } })
+    for (let i = 0; i < 60; i++) w.vast.addOffer()
+    const app = await w.boot()
+    app.nodeManager.onReady = async () => {
+      throw new Error('install blender 5.1.0 failed (exit 1)')
+    }
+    await w.submitJob(app)
+    app.scheduler.kick()
+    await w.advance(10 * 60_000, 1_000)
+    // Two in a row, then waits of 1, 2 and 4 minutes: five or so, where
+    // every tick rented one (40 in ten minutes).
+    expect(w.vast.count('createInstance')).toBeGreaterThanOrEqual(3)
+    expect(w.vast.count('createInstance')).toBeLessThanOrEqual(6)
+    expect(app.scheduler.fleetHolds().scale?.reason).toMatch(
+      /a rented node never became ready: .*install blender 5\.1\.0 failed/
+    )
+
+    // Provisioning works again: the next rental's node is ready, and ends it.
+    app.nodeManager.onReady = null
+    await w.until(() => app.scheduler.fleetHolds().scale == null, 'the backoff over', {
+      timeoutMs: 30 * 60_000,
+      stepMs: 5_000
+    })
+    expect(app.nodeManager.list().filter((n) => n.state === 'ready')).toHaveLength(1)
   })
 
   it('1.17: the user releasing the backoff lets the next tick rent at once', async () => {

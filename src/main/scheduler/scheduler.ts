@@ -1932,6 +1932,7 @@ class Scheduler {
   private lastHolds = '{}'
   private unsubscribeHolds: (() => void) | null = null
   private unsubscribeOctane: (() => void) | null = null
+  private unsubscribeBoots: (() => void) | null = null
   /**
    * Nodes resting after an attempt failed for their own or their network's
    * reason (plan 1.17; see rest()): tick() sends them nothing new until
@@ -2087,6 +2088,13 @@ class Scheduler {
     // idle node was ever let go while the fleet billed.
     this.timer ??= setInterval(() => void this.tick(), TICK_MS)
     this.unsubscribeHolds ??= nodeManager.onHoldsChanged(() => this.noteHolds())
+    // Rentals that never became ready count toward the scale backoff, and
+    // one that did ends it.
+    this.unsubscribeBoots ??= nodeManager.onBootEnded((_id, failure) =>
+      failure == null
+        ? this.scaleSucceeded()
+        : this.countScaleFailure(`a rented node never became ready: ${failure}`)
+    )
     // A node signed in to Octane: jobs held for a sign-in go out again.
     this.unsubscribeOctane ??= onOctaneState((_id, state) => {
       if (state === 'licensed') this.releaseSignInHolds()
@@ -2378,12 +2386,19 @@ class Scheduler {
     this.noteHolds()
   }
 
-  /** A scale-up batch rented something: whatever was failing no longer is. */
+  /**
+   * A rented node reached ready: whatever was failing no longer is. Not a
+   * batch that rented: a rental that then failed to provision (a docker
+   * image without what provision.sh needs, a Blender mirror too slow for
+   * the deadline) would reset the count each time, and the fleet rent and
+   * destroy a node every few minutes, each billed through its boot, with no
+   * backoff (n4 and n5 reviews).
+   */
   private scaleSucceeded(): void {
     this.scaleFailures = 0
     if (this.scaleHold) {
       this.scaleHold = null
-      emit('alert', { level: 'info', message: 'Scale-up rents again: a rental went through' })
+      emit('alert', { level: 'info', message: 'Scale-up rents again: a rented node is ready' })
       this.noteHolds()
     }
   }
@@ -2406,6 +2421,15 @@ class Scheduler {
     }
     const reason = describeError(e)
     emit('alert', { level: 'warn', message: `scale-up failed: ${reason}` })
+    this.countScaleFailure(reason)
+  }
+
+  /**
+   * One more scale-up that came to nothing: a batch that failed, or a node
+   * it rented that never became ready (nodeManager.onBootEnded, whose own
+   * alert has said why). Past SCALE_BACKOFF_AFTER in a row, scale-up waits.
+   */
+  private countScaleFailure(reason: string): void {
     this.scaleFailures++
     if (this.scaleFailures < SCALE_BACKOFF_AFTER) return
     const waitMs = Math.min(
@@ -2478,6 +2502,8 @@ class Scheduler {
     this.unsubscribeHolds = null
     this.unsubscribeOctane?.()
     this.unsubscribeOctane = null
+    this.unsubscribeBoots?.()
+    this.unsubscribeBoots = null
   }
 
   kick(): void {
@@ -4089,7 +4115,6 @@ class Scheduler {
       void nodeManager
         .requestNodes(plan.maxRentals, { budget: plan.budget, engine: rentEngine })
         .then((ids) => {
-          if (ids.length > 0) this.scaleSucceeded()
           if (ids.length > 1) {
             emit('alert', { level: 'info', message: `scale-up: rented ${ids.length} nodes` })
           }
