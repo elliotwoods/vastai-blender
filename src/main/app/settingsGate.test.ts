@@ -119,6 +119,58 @@ describe('applySettingsPatch (plan 1.14)', () => {
     expect(s.getSettings().maxActiveNodes).toBe(30)
   })
 
+  it("1.14 review: settings sent back as handed out during a headless run write none of the run's values", () => {
+    // settings:set still takes a Partial<SettingsPublic>, and the renderer
+    // before 1.14 sent the whole offerFilters object. What getSettings()
+    // hands out carries the overlay, so sending it back named every field.
+    const overlay = new SettingsOverlay()
+    const run = {
+      maxActiveNodes: 30,
+      spendCapPerHour: 12,
+      noSpendCap: false,
+      eagerFleet: true,
+      offerFilters: { minNumGpus: 4 }
+    }
+    overlay.set(run)
+    const s = store(overlay)
+    const handedOut = s.getSettings()
+
+    const r = applySettingsPatch({ ...handedOut, idleTimeoutMinutes: 9 }, s, {
+      ...posix,
+      overlay
+    })
+
+    expect(r.errors).toEqual([])
+    expect(s.saved).toMatchObject({
+      maxActiveNodes: 2,
+      spendCapPerHour: 2,
+      noSpendCap: false,
+      eagerFleet: false,
+      idleTimeoutMinutes: 9
+    })
+    expect(s.saved.offerFilters).not.toHaveProperty('minNumGpus')
+    for (const write of s.writes) {
+      for (const key of ['maxActiveNodes', 'spendCapPerHour', 'noSpendCap', 'eagerFleet']) {
+        expect(write).not.toHaveProperty(key)
+      }
+      expect(write.offerFilters ?? {}).not.toHaveProperty('minNumGpus')
+    }
+    // Still the run's, in force, until the run ends or a person changes one.
+    expect(overlay.fields()).toEqual(run)
+    expect(r.settings).toMatchObject({ maxActiveNodes: 30, spendCapPerHour: 12, eagerFleet: true })
+  })
+
+  it("a value the overlay does not hold is the person's, the saved one included", () => {
+    const overlay = new SettingsOverlay()
+    overlay.set({ maxActiveNodes: 30, spendCapPerHour: 12, noSpendCap: false })
+    const s = store(overlay)
+    // The saved figures, typed back in: a choice to go back to them now.
+    applySettingsPatch({ maxActiveNodes: 2, spendCapPerHour: 2 }, s, { ...posix, overlay })
+    expect(s.writes).toEqual([{ maxActiveNodes: 2, spendCapPerHour: 2, noSpendCap: false }])
+    expect(overlay.isEmpty()).toBe(true)
+    expect(s.getSettings()).toMatchObject({ maxActiveNodes: 2, spendCapPerHour: 2 })
+  })
+
   it('max nodes set to 0 during a headless run is in force at once, not hidden behind the spec', () => {
     const overlay = new SettingsOverlay()
     overlay.set({ maxActiveNodes: 30 })

@@ -14,7 +14,9 @@
  * Only the fields the patch named are saved, never the whole sanitized
  * settings. What getSettings() returns can carry a headless run's overlay
  * (settingsOverlay.ts), and saving it back whole would write the run's
- * settings to disk: the bug the overlay exists to fix.
+ * settings to disk: the bug the overlay exists to fix. For the same reason
+ * a field the patch sends at the value the overlay holds is not saved
+ * either (withoutOverlayEchoes).
  */
 
 import type {
@@ -89,11 +91,52 @@ export function acceptedFields(patch: unknown, result: SettingsPatchResult): Ove
   return out as OverlayFields
 }
 
+function sameValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/**
+ * `accepted` without the fields it sends at the value `overlay` holds for
+ * them. A caller that sends back the settings it was handed (settings:set
+ * still takes a Partial<SettingsPublic>, and the renderer before plan 1.14
+ * sent the whole offerFilters object) would otherwise save a headless
+ * run's session-only values to settings.json, and release them: the field
+ * bug again, by another way in. Such a field changes nothing in force, so
+ * it is neither saved nor released. A value that differs from the
+ * overlay's, the saved one included, is the person's choice and is saved.
+ * The spend cap and its flag are judged as the pair they are.
+ */
+function withoutOverlayEchoes(accepted: OverlayFields, overlay: SettingsOverlay): OverlayFields {
+  if (overlay.isEmpty()) return accepted
+  const held = overlay.fields() as Record<string, unknown>
+  const heldFilters = (held.offerFilters ?? {}) as Record<string, unknown>
+  const holds = (key: string, value: unknown): boolean => key in held && sameValue(held[key], value)
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(accepted)) {
+    if (key === 'offerFilters') {
+      const filters: Record<string, unknown> = {}
+      for (const [f, v] of Object.entries(value as Record<string, unknown>)) {
+        if (!(f in heldFilters && sameValue(heldFilters[f], v))) filters[f] = v
+      }
+      if (Object.keys(filters).length > 0) out.offerFilters = filters
+    } else if (key === 'spendCapPerHour' || key === 'noSpendCap') {
+      const pairHeld =
+        holds('spendCapPerHour', accepted.spendCapPerHour) &&
+        holds('noSpendCap', accepted.noSpendCap)
+      if (!pairHeld) out[key] = value
+    } else if (!holds(key, value)) {
+      out[key] = value
+    }
+  }
+  return out as OverlayFields
+}
+
 /**
  * Check `patch`, save what passed, and say what did not. The result's
  * settings are what is in force afterwards; its errors name each field not
  * saved as sent. A field the user saved leaves the session overlay, so a
- * person's change during a headless run takes effect at once.
+ * person's change during a headless run takes effect at once. One sent at
+ * the overlay's own value is left as it is (withoutOverlayEchoes).
  */
 export function applySettingsPatch(
   patch: unknown,
@@ -104,7 +147,7 @@ export function applySettingsPatch(
   const result = sanitizeSettingsPatch(patch, store.getSettings(), {
     pathFlavour: opts.pathFlavour
   })
-  const accepted = acceptedFields(patch, result)
+  const accepted = withoutOverlayEchoes(acceptedFields(patch, result), overlay)
   if (Object.keys(accepted).length > 0) {
     try {
       store.updateSettings(accepted as Partial<SettingsPublic>)
