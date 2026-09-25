@@ -8,6 +8,7 @@
  */
 
 import type { FleetHoldKind, FleetHolds } from '../../../shared/models'
+import { RUNWAY_RELEASE_MIN } from '../lib/runway'
 
 /** What a row's release button does, when it has one. */
 export interface HoldRelease {
@@ -45,6 +46,25 @@ const KNOWN: ReadonlySet<string> = new Set<FleetHoldKind>([
  * on this; the reason is shown as main wrote it either way.
  */
 const AUTH_REASON = /\b40[13]\b|api key|unauthori[sz]ed|forbidden|permission|refused the account/i
+/**
+ * An account hold for money: a runway hold's reason starts "Vast balance
+ * $X", a credit refusal's says balance, credit or payment. Checked first,
+ * so a balance or rate whose digits read as 401 is still money.
+ */
+const MONEY_REASON = /balance|credit|payment/i
+
+/**
+ * Whether an account hold waits for a key ('auth') or for money. Main's
+ * hold knows its cause; FleetHolds does not carry it yet, so it is read
+ * from the reason when absent. Anything unclear is money, the side with no
+ * one-click release.
+ */
+function accountCause(a: NonNullable<FleetHolds['account']>): 'auth' | 'money' {
+  const cause = (a as { cause?: unknown }).cause
+  if (cause === 'auth') return 'auth'
+  if (cause === 'credit' || cause === 'runway') return 'money'
+  return !MONEY_REASON.test(a.reason) && AUTH_REASON.test(a.reason) ? 'auth' : 'money'
+}
 
 function clock(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -69,7 +89,7 @@ export function holdRows(holds: FleetHolds | null | undefined): HoldRow[] {
   const rows: HoldRow[] = []
   const a = holds.account
   if (a) {
-    const auth = AUTH_REASON.test(a.reason)
+    const auth = accountCause(a) === 'auth'
     // Main's runway reason already names the balance ("Vast balance $0.42,
     // lasts ..."); said twice it reads as two different figures.
     const balance =
@@ -79,14 +99,22 @@ export function holdRows(holds: FleetHolds | null | undefined): HoldRow[] {
     rows.push({
       kind: 'account',
       tone: 'danger',
-      text: `Renting is paused: ${sentence(a.reason)}${balance} Nodes already rented keep rendering and billing.`,
+      text:
+        `Renting is paused: ${sentence(a.reason)}${balance} Nodes already rented keep rendering and billing.` +
+        (auth
+          ? ''
+          : ` Renting resumes by itself within a minute of a top-up that covers ${RUNWAY_RELEASE_MIN} minutes of what the account bills.`),
       since: a.since,
-      release: {
-        label: 'Try now',
-        title: auth
-          ? 'Ask Vast.ai again now, for a key fixed in Settings'
-          : 'Ask Vast.ai again now, after a top-up. It comes back if the balance is still short.'
-      },
+      // A money hold has no release here (1d59516c). Main lifts it at the
+      // first balance read after a top-up, so a button adds nothing for a
+      // real top-up, and released by hand while the money is still short a
+      // runway hold is not set again until the runway has recovered: one
+      // click before the payment lands would rent into an account Vast is
+      // about to stop. A key hold comes straight back on the next refusal,
+      // so asking again is only ever a wasted request.
+      release: auth
+        ? { label: 'Try now', title: 'Ask Vast.ai again now, for a key fixed in Settings' }
+        : null,
       topUp: !auth,
       apiKey: auth
     })

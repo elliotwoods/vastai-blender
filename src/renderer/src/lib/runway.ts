@@ -14,6 +14,12 @@ import type { UnclaimedInstance } from '../../../shared/models'
 export const RUNWAY_WARN_MIN = 30
 /** Main holds renting under this many (nodeManager RUNWAY_HOLD_MIN). */
 export const RUNWAY_HOLD_MIN = 10
+/**
+ * Main lifts that hold by itself once a top-up leaves this many, at the
+ * higher of what the account bills now and when it held (nodeManager
+ * RUNWAY_RELEASE_MIN).
+ */
+export const RUNWAY_RELEASE_MIN = 20
 
 /**
  * An unclaimed instance bills its rate unless Vast has stopped it: an

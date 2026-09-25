@@ -34,7 +34,24 @@ describe('the holds: why the fleet is not renting', () => {
     expect(html).toContain('Renting is paused: insufficient_credit.')
     expect(html).toContain('Vast balance $0.00.')
     expect(html).toContain('Top up')
+    expect(html).toContain('Renting resumes by itself')
+    // No one-click release: main's release is an override that silences
+    // the runway guard, and a top-up lifts the hold by itself.
+    expect(html).not.toContain('Try now')
+    expect(html).not.toContain('Release')
+  })
+
+  it('1.20: a refused key sends the user to Settings, and may be asked again', () => {
+    const html = render({
+      account: {
+        reason: 'Vast rejected the API key (invalid or revoked)',
+        balance: 12,
+        since: Date.UTC(2026, 8, 25, 12)
+      }
+    })
+    expect(html).toContain('API key')
     expect(html).toContain('Try now')
+    expect(html).not.toContain('Top up')
   })
 
   it('1.9: recovered work asks before renting, and a finished hold goes away', () => {

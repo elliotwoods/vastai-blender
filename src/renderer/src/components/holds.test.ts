@@ -23,7 +23,44 @@ describe('holdRows', () => {
     expect(row.text).toContain('Vast balance $0.00.')
     expect(row.topUp).toBe(true)
     expect(row.apiKey).toBe(false)
-    expect(row.release?.label).toBe('Try now')
+    expect(row.text).toContain('Renting resumes by itself within a minute of a top-up')
+  })
+
+  // Review of 1.20: a one-click "Try now" on a money hold was main's
+  // override, not a retry. Released by hand, a runway hold is not set again
+  // until the runway has recovered, so one click before a payment landed
+  // rented into an account about to hit $0, the credit guard silenced. Main
+  // lifts a money hold by itself at the first balance read after a top-up.
+  it('offers no release for a spent balance or a short runway: only Top up (1d59516c)', () => {
+    for (const reason of [
+      'insufficient_credit (400)',
+      'Vast balance too low',
+      'Vast wants payment',
+      "Vast balance $2.40, about 9 min at the fleet's $16.00/hr"
+    ]) {
+      const [row] = holdRows({ account: { reason, balance: 2.4, since: 1 } })
+      expect(row.release, reason).toBeNull()
+      expect(row.topUp, reason).toBe(true)
+    }
+  })
+
+  it('reads a balance whose digits look like a 401 as money, not a key', () => {
+    const [row] = holdRows({
+      account: {
+        reason: "Vast balance $401.00, about 9 min at the account's $2,700.00/hr",
+        balance: 401,
+        since: 1
+      }
+    })
+    expect(row.release).toBeNull()
+    expect(row.apiKey).toBe(false)
+  })
+
+  it('goes by the hold’s own cause when main sends one', () => {
+    const withCause = (reason: string, cause: string): FleetHolds =>
+      ({ account: { reason, balance: 5, since: 1, cause } }) as unknown as FleetHolds
+    expect(holdRows(withCause('no Vast.ai API key', 'runway'))[0].release).toBeNull()
+    expect(holdRows(withCause('something new', 'auth'))[0].release?.label).toBe('Try now')
   })
 
   it('does not name the balance twice when the reason already does', () => {
@@ -39,6 +76,9 @@ describe('holdRows', () => {
     })
     expect(row.apiKey).toBe(true)
     expect(row.topUp).toBe(false)
+    // Main holds again at the next refusal, so asking again costs nothing.
+    expect(row.release?.label).toBe('Try now')
+    expect(row.text).not.toContain('top-up')
   })
 
   it('names a disk that will not take frames, and when scale-up tries again', () => {
