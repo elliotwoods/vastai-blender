@@ -15,6 +15,7 @@ import type {
   ReprovisionResult,
   RetryMissingResult
 } from '../../../shared/models'
+import { holdsInstance } from '../../../shared/nodeState'
 
 /** A chunk with a run to come or under way: its frames are already queued. */
 const LIVE: ReadonlySet<ChunkState> = new Set<ChunkState>([
@@ -103,10 +104,20 @@ export function describeReprovision(r: ReprovisionResult | void): string {
 /**
  * Whether a node's destroy button is live. Not while a destroy is under
  * way: a second DELETE on a node that is 'destroying' fails, and raised a
- * false "check the Vast.ai console" alarm (#113).
+ * false "check the Vast.ai console" alarm (#113). Not for a node whose
+ * instance Vast has confirmed gone. But a 'destroyed' row whose destroy was
+ * never confirmed still holds an instance that may be billing
+ * (nodeState.holdsInstance: a DELETE can answer 200 and leave it running,
+ * #140), and the Fleet lists it for that reason: its button stays live, and
+ * main's destroyNode goes ahead for it.
  */
-export function canDestroy(node: Pick<NodeSnapshot, 'state'>): boolean {
-  return node.state !== 'destroying' && node.state !== 'destroyed'
+export function canDestroy(
+  node: Pick<NodeSnapshot, 'state'> &
+    Partial<Pick<NodeSnapshot, 'instanceId' | 'destroyedAt' | 'createUnknownSince'>>
+): boolean {
+  if (node.state === 'destroying') return false
+  if (node.state !== 'destroyed') return true
+  return holdsInstance({ ...node, instanceId: node.instanceId ?? null })
 }
 
 /**

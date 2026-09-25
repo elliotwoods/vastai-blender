@@ -130,6 +130,17 @@ describe('node actions', () => {
     expect(canDestroy({ state: 'destroying' })).toBe(false)
   })
 
+  it('offers destroy for a destroyed row Vast has not confirmed gone, which the Fleet lists as billing', () => {
+    // A DELETE can answer 200 and leave the instance running (#140): until
+    // destroyedAt is stamped the row may be billing, and main destroys it
+    // again on request.
+    expect(canDestroy({ state: 'destroyed', instanceId: 42, destroyedAt: null })).toBe(true)
+    expect(canDestroy({ state: 'destroyed', instanceId: 42, destroyedAt: 1_000 })).toBe(false)
+    // Destroyed while its create was out with no answer: whatever it made may bill.
+    expect(canDestroy({ state: 'destroyed', instanceId: null, createUnknownSince: 5 })).toBe(true)
+    expect(canDestroy({ state: 'destroyed', instanceId: null })).toBe(false)
+  })
+
   it('describes a reprovision', () => {
     expect(describeReprovision({ requeued: 2 })).toBe('agent restarted; 2 chunks back in the queue')
     expect(describeReprovision({ requeued: 0 })).toBe('agent restarted')

@@ -16,7 +16,7 @@ export function DestroyNodeButton({
   node,
   onDestroy
 }: {
-  node: Pick<NodeSnapshot, 'state'>
+  node: Parameters<typeof canDestroy>[0]
   onDestroy: () => Promise<unknown>
 }): React.JSX.Element {
   return (
@@ -26,7 +26,11 @@ export function DestroyNodeButton({
       title={
         node.state === 'destroying'
           ? 'Being destroyed'
-          : "Destroy this node's instance on Vast.ai. What it is rendering goes back to the queue."
+          : node.state === 'destroyed'
+            ? canDestroy(node)
+              ? 'Vast has not confirmed this instance gone, so it may still be billing: destroy it again'
+              : 'Destroyed'
+            : "Destroy this node's instance on Vast.ai. What it is rendering goes back to the queue."
       }
       onConfirm={onDestroy}
     />

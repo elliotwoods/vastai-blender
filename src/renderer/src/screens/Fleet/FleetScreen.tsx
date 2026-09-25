@@ -14,6 +14,7 @@ import { pctOf, usageTone } from '../../lib/usage'
 import { useNodes, useSettings, useUpdateSettings } from '../../lib/queries'
 import { useNow } from '../../lib/useNow'
 import { SCALE, TOKENS, type StatusTone } from '../../lib/theme'
+import { holdsInstance } from '../../../../shared/nodeState'
 import type { NodeSnapshot, NodeState } from '../../../../shared/models'
 
 const STATE_TONE: Record<NodeState, StatusTone> = {
@@ -321,9 +322,15 @@ export function FleetScreen(): React.JSX.Element {
     }
   }
 
-  const live = (nodes ?? []).filter((n) => n.state !== 'destroyed')
-  const failedCount = live.filter((n) => n.state === 'failed').length
-  const visible = showFailed ? live : live.filter((n) => n.state !== 'failed')
+  // A 'destroyed' row whose destroy Vast has not confirmed may still be
+  // billing (nodeState.holdsInstance), so it stays listed; and a failed row
+  // that may be billing is never one "show failed" can hide (#64, #194).
+  const listed = (nodes ?? []).filter((n) => n.state !== 'destroyed' || holdsInstance(n))
+  const hideable = (n: NodeSnapshot): boolean => n.state === 'failed' && !holdsInstance(n)
+  const failedCount = listed.filter((n) => n.state === 'failed').length
+  const hideableCount = listed.filter(hideable).length
+  const hiddenCount = showFailed ? 0 : hideableCount
+  const visible = showFailed ? listed : listed.filter((n) => !hideable(n))
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -346,7 +353,7 @@ export function FleetScreen(): React.JSX.Element {
                 checked={showFailed}
                 onChange={(e) => setShowFailed(e.target.checked)}
               />
-              show failed ({failedCount})
+              show failed ({hideableCount})
             </label>
             <button
               style={btn({ size: 'sm', disabled: failedCount === 0 || clearing })}
@@ -392,8 +399,8 @@ export function FleetScreen(): React.JSX.Element {
             <span style={{ color: TOKENS.textFaint }}>
               {isLoading
                 ? 'Loading…'
-                : failedCount > 0
-                  ? `${failedCount} failed node${failedCount === 1 ? '' : 's'} hidden.`
+                : hiddenCount > 0
+                  ? `${hiddenCount} failed node${hiddenCount === 1 ? '' : 's'} hidden.`
                   : 'No active nodes. Nodes start automatically when jobs are queued.'}
             </span>
           </div>

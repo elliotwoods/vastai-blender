@@ -9,6 +9,7 @@ import { InfoDot, Tooltip } from './Tooltip'
 import { ipc } from '../lib/ipc'
 import { useNav } from '../lib/nav'
 import { useFleetCost, useNodes, useSettings } from '../lib/queries'
+import { capUsage } from '../../../shared/nodeState'
 import type { HistoryMetric } from '../../../shared/models'
 
 const bar: CSSProperties = {
@@ -63,9 +64,13 @@ function FleetReadouts(): React.JSX.Element {
   const { data: nodes } = useNodes()
   const { data: settings } = useSettings()
   const navigate = useNav((s) => s.navigate)
-  const active = (nodes ?? []).filter(
-    (n) => !['destroyed', 'failed', 'destroying'].includes(n.state)
-  ).length
+  // The caps' own count and rate (nodeState.capUsage), the ones main's
+  // maxActiveNodes and spend cap use: a failed node whose destroy Vast has
+  // not confirmed counts, since it may still be billing (#64, #120). Read
+  // from the nodes, which node:changed keeps live, so the rate is right at
+  // launch rather than $0.000/hr until the first fleet:cost a minute in (#96).
+  const usage = nodes ? capUsage(nodes) : null
+  const perHour = usage?.perHour ?? cost?.perHour ?? null
   // Every readout is a live number with a past — clicking one opens its series.
   const toHistory = (metric: HistoryMetric) => () => navigate({ screen: 'history', metric })
   const linked: CSSProperties = { ...readout(), cursor: 'pointer' }
@@ -74,7 +79,7 @@ function FleetReadouts(): React.JSX.Element {
       <span style={readout()}>
         <span style={{ color: TOKENS.textFaint }}>nodes</span>
         <span style={mono}>
-          {active} / {settings?.maxActiveNodes ?? '—'}
+          {usage?.nodes ?? '—'} / {settings?.maxActiveNodes ?? '—'}
         </span>
       </span>
       {/* Tooltip wraps the pill rather than nesting an InfoHint inside it:
@@ -83,7 +88,7 @@ function FleetReadouts(): React.JSX.Element {
       <Tooltip text={HINTS.fleetRate}>
         <button style={linked} onClick={toHistory('spend')}>
           <span style={{ color: TOKENS.textFaint }}>rate</span>
-          <span style={mono}>{cost ? fmtRate(cost.perHour) : '$0.000/hr'}</span>
+          <span style={mono}>{perHour != null ? fmtRate(perHour) : '—'}</span>
           <InfoDot size={10} />
         </button>
       </Tooltip>
@@ -96,7 +101,8 @@ function FleetReadouts(): React.JSX.Element {
       >
         <button style={linked} onClick={toHistory('spend')}>
           <span style={{ color: TOKENS.textFaint }}>total</span>
-          <span style={mono}>${(cost?.sessionTotal ?? 0).toFixed(2)}</span>
+          {/* Unknown until main's first fleet:cost, not $0.00. */}
+          <span style={mono}>{cost ? `$${cost.sessionTotal.toFixed(2)}` : '—'}</span>
           <span style={{ color: TOKENS.border }}>|</span>
           <span
             style={{
@@ -108,7 +114,7 @@ function FleetReadouts(): React.JSX.Element {
             }}
           >
             <Icon name="power" size={11} />
-            {fmtEnergy(cost?.sessionWh ?? 0)}
+            {cost ? fmtEnergy(cost.sessionWh) : '—'}
           </span>
           <InfoDot size={10} />
         </button>
