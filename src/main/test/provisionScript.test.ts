@@ -26,7 +26,9 @@ interface AgentStatus {
   restartReason: string
 }
 
-describe.skipIf(process.platform === 'win32')('provision.sh', () => {
+// Each test runs the script under bash, several times: seconds of real time,
+// more when the whole suite runs in parallel (as provisioner.test.ts).
+describe.skipIf(process.platform === 'win32')('provision.sh', { timeout: 60_000 }, () => {
   let n: RemoteNode
   beforeEach(() => {
     n = remoteNode()
