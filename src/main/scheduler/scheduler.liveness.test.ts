@@ -440,7 +440,9 @@ describe('1.8: a node prep that hangs', () => {
     const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 1 })
     app.scheduler.kick()
     await w.until(() => assignedTo(stuckId) === 4, 'four lanes in node prep')
-    await w.advance(55 * 60_000, 5_000)
+    // install-blender's own ceiling is 130 min: on healthy mirrors it may
+    // take that long, so nothing is given up before.
+    await w.advance(125 * 60_000, 5_000)
     expect(chunksOf(jobId).map((c) => c.state)).toEqual([
       'assigned',
       'assigned',
@@ -467,7 +469,7 @@ describe('1.8: a node prep that hangs', () => {
       [0, 1]
     ])
     expect(w.alerts('warn').join('\n')).toMatch(
-      /setting up the node did not finish in 60 min: installing Blender 4\.2\.3 is still running/
+      /setting up the node did not finish: installing Blender 4\.2\.3 ran past its own 130 min limit/
     )
 
     // Sent nothing more, it is let go of while work is still queued.
@@ -477,9 +479,76 @@ describe('1.8: a node prep that hangs', () => {
     })
     expect(chunksOf(jobId).some((c) => c.state === 'pending')).toBe(true)
     expect(assignedTo(stuckId)).toBe(4)
+    // Forgotten with the node, not kept for good.
+    expect(app.scheduler.nodeUnfit(stuckId)).toBeNull()
     await w.until(() => jobState(jobId) === 'complete', 'job complete', {
       timeoutMs: 60 * 60_000,
       stepMs: 5_000
     })
   }, 20_000)
+
+  it('a 70-minute Blender install and a scene upload moving for 70 minutes both finish, and the chunk renders on that node', async () => {
+    // The review's case: one deadline over the whole prep, 60 min, took a
+    // node still installing within install-blender's own ceiling for stuck,
+    // and destroyed it five minutes before the install would have finished.
+    w = await setup({ settings: { maxActiveNodes: 1, idleTimeoutMinutes: 5 } })
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    const machine = w.machineFor(nodeId)
+    machine.onExec(
+      /provision\.sh install-blender/,
+      () => new Promise((resolve) => setTimeout(() => resolve(''), 70 * 60_000))
+    )
+    slowUploads(app.nodeManager.get(nodeId)!.ssh, 70 * 60_000)
+    machine.agent.autoFinish()
+    const jobId = await w.submitJob(app)
+    const startedAt = Date.now()
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 180 * 60_000,
+      stepMs: 5_000
+    })
+    // Both ran their whole length, one after the other.
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(140 * 60_000)
+    expect(chunksOf(jobId)[0]).toMatchObject({ node_id: nodeId, retries: 0, infra_retries: 0 })
+    expect(assignedTo(nodeId)).toBe(1)
+    expect(nodeState(nodeId)).not.toBe('destroyed')
+    expect(app.scheduler.nodeUnfit(nodeId)).toBeNull()
+    expect(w.alerts().join('\n')).not.toMatch(/did not finish|is stuck/)
+  }, 20_000)
 })
+
+/** The SFTP channel as slowUploads handles it. */
+interface UploadChannel {
+  slowed?: boolean
+  fastPut: (
+    local: string,
+    remote: string,
+    opts: { step?: () => void },
+    cb: (err?: Error | null) => void
+  ) => void
+}
+
+/**
+ * Every upload on this connection takes `ms`, reporting progress every 20 s
+ * as a transfer that keeps moving does: its stall guard never fires.
+ */
+function slowUploads(ssh: unknown, ms: number): void {
+  const conn = ssh as { sftp: (...args: unknown[]) => Promise<UploadChannel> }
+  const open = conn.sftp.bind(conn)
+  conn.sftp = async (...args) => {
+    const sftp = await open(...args)
+    if (!sftp.slowed) {
+      sftp.slowed = true
+      const put = sftp.fastPut.bind(sftp)
+      sftp.fastPut = (local, remote, opts, cb) => {
+        const moving = setInterval(() => opts.step?.(), 20_000)
+        setTimeout(() => {
+          clearInterval(moving)
+          put(local, remote, opts, cb)
+        }, ms)
+      }
+    }
+    return sftp
+  }
+}

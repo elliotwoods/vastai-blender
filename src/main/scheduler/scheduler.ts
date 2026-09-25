@@ -23,7 +23,13 @@ import {
   noteChunkError,
   refreshJobState
 } from '../jobs/jobs'
-import { agentAlive, installBlender, installExtension, REMOTE_ROOT } from '../nodes/provisioner'
+import {
+  agentAlive,
+  installBlender,
+  installExtension,
+  INSTALL_BLENDER_TIMEOUT_MS,
+  REMOTE_ROOT
+} from '../nodes/provisioner'
 import { listAddons } from '../addons/addons'
 import { nodeManager } from '../nodes/nodeManager'
 import { getSettings } from '../settings'
@@ -113,43 +119,63 @@ const nodePrepLocks = new Map<string, Promise<void>>()
 const installedExtensions = new Map<string, string | null>()
 
 /**
- * How long one dispatch's node prep may hold the node's prep lock. Longer
- * than any healthy step (a Blender download that needs a second mirror, a
- * large scene upload); shorter than install-blender's own ceiling of two
- * rounds of four mirrors at 30 min each, which is no healthy node's.
+ * How long the steps of one dispatch's node prep that have no deadline of
+ * their own may hold the node's prep lock, between them (see StepBound).
  */
 const PREP_DEADLINE_MS = 60 * 60_000
 
 /**
- * Node preps still running past their deadline, by node: the step, and since
- * when. Until it ends, however it ends, the node is sent nothing (see
- * Scheduler.nodeUnfit): its lock is free, and a second prep would run beside
- * the stuck one, two installs writing one download, which is what the lock
- * is for.
+ * What bounds a step of a node's prep (withNodePrep):
+ * - 'prep', the default: PREP_DEADLINE_MS, shared by every such step of the
+ *   prep. For steps with no deadline of their own.
+ * - a number: the step's own ceiling in ms, the deadline its own commands
+ *   run under. The shared budget does not run meanwhile, and the prep
+ *   times out when the step does.
+ * - 'progress': a transfer that its own stall guard ends once it stops
+ *   moving. No wall clock: a large scene over a home uplink shared by
+ *   several nodes can take hours, moving all the while.
+ *
+ * One 60-minute deadline over the whole prep was shorter than what it
+ * covered: install-blender may take 130 minutes on healthy mirrors, and an
+ * upload has no ceiling at all. A node still installing, or still
+ * receiving the scene, was taken as stuck, sent nothing more and destroyed,
+ * and its replacement ran the same step into the same deadline.
  */
-const stuckPreps = new Map<string, { since: number; step: string }>()
+type StepBound = 'prep' | number | 'progress'
 
-/** A node's prep ran past PREP_DEADLINE_MS, or an earlier one on the node still is. */
+/** Names the prep step now running, and what bounds it (StepBound). */
+type PrepStep = (what: string, bound?: StepBound) => void
+
+/**
+ * Node preps that ran out of time, by node: the step, since when the prep
+ * began, and whether the step is still running. While it runs its lock is
+ * free, and a second prep would run beside it, two installs writing one
+ * download, which is what the lock is for. After it ends the node is still
+ * sent nothing: a step that ran out its time there runs it out again. Kept
+ * until the node is forgotten (Scheduler.forgetNode, nodeUnfit).
+ */
+const prepTimeouts = new Map<string, { since: number; step: string; running: boolean }>()
+
+/** A node's prep ran out of time, or an earlier one on the node did. */
 class NodePrepTimeout extends Error {
   override readonly name = 'NodePrepTimeout'
 }
 
 /**
- * Run `fn` holding the node's prep lock, under PREP_DEADLINE_MS. `fn` names
- * the step it is on with `step`, for the error.
+ * Run `fn` holding the node's prep lock, each step under its deadline
+ * (StepBound). `fn` names each step with `step` as it begins, for the error
+ * and for what bounds it.
  *
  * The lock was released only when `fn` settled, and nothing in it had a
  * deadline of its own (a Blender download that trickles, a command on a
  * wedged connection), so one hung step held the lock for good: every later
  * dispatch to the node queued behind it, its chunk 'assigned' and its node
- * billing (#82, #139). At the deadline the lock is released and the dispatch
- * fails; the step itself cannot be cancelled from here, so it is marked
- * stuck (stuckPreps) until it ends, and a prep that finds it so fails at once.
+ * billing (#82, #139). At a step's deadline the lock is released and the
+ * dispatch fails; the step itself cannot be cancelled from here, so the
+ * node is marked (prepTimeouts), and every prep on it from then on,
+ * including those already queued behind this one, fails at once.
  */
-async function withNodePrep<T>(
-  nodeId: string,
-  fn: (step: (what: string) => void) => Promise<T>
-): Promise<T> {
+async function withNodePrep<T>(nodeId: string, fn: (step: PrepStep) => Promise<T>): Promise<T> {
   const prev = nodePrepLocks.get(nodeId) ?? Promise.resolve()
   let release!: () => void
   const gate = new Promise<void>((r) => (release = r))
@@ -159,37 +185,66 @@ async function withNodePrep<T>(
   )
   await prev
   let timer: NodeJS.Timeout | undefined
+  let settled = false
   try {
-    const stuck = stuckPreps.get(nodeId)
-    if (stuck) {
+    const before = prepTimeouts.get(nodeId)
+    if (before) {
       throw new NodePrepTimeout(
-        `setting up the node is stuck: ${stuck.step} has been running for ` +
-          `${Math.round((Date.now() - stuck.since) / 60_000)} min`
+        before.running
+          ? `setting up the node is stuck: ${before.step} has been running for ` +
+              `${Math.round((Date.now() - before.since) / 60_000)} min`
+          : `setting up the node ran out of time earlier: ${before.step} did not finish, ` +
+              'so nothing more is set up on it'
       )
     }
     const startedAt = Date.now()
     let step = 'setting up the node'
-    const work = fn((what) => {
-      step = what
-    })
+    let bound: StepBound = 'prep'
+    let stepAt = startedAt
+    /** ms the 'prep'-bounded steps have used so far */
+    let shared = 0
+    let work: Promise<T> | null = null
+    let expire!: () => void
     const deadline = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        const entry = { since: startedAt, step }
-        stuckPreps.set(nodeId, entry)
+      expire = () => {
+        const entry = { since: startedAt, step, running: true }
+        prepTimeouts.set(nodeId, entry)
         const ended = (): void => {
-          if (stuckPreps.get(nodeId) === entry) stuckPreps.delete(nodeId)
+          entry.running = false
         }
-        work.then(ended, ended)
+        work?.then(ended, ended)
         reject(
           new NodePrepTimeout(
-            `setting up the node did not finish in ${PREP_DEADLINE_MS / 60_000} min: ${step} ` +
-              'is still running, and nothing more is sent to the node until it ends'
+            typeof bound === 'number'
+              ? `setting up the node did not finish: ${step} ran past its own ` +
+                  `${Math.round(bound / 60_000)} min limit, and nothing more is sent to the node`
+              : `setting up the node did not finish in ${PREP_DEADLINE_MS / 60_000} min: ${step} ` +
+                  'is still running, and nothing more is sent to the node'
           )
         )
-      }, PREP_DEADLINE_MS)
+      }
     })
+    // Armed as each step begins, before the step's own commands start: a
+    // step with its own ceiling times out here first, at the same moment.
+    const arm = (): void => {
+      clearTimeout(timer)
+      if (settled || bound === 'progress') return
+      const ms = bound === 'prep' ? PREP_DEADLINE_MS - shared : bound
+      timer = setTimeout(expire, Math.max(0, ms))
+    }
+    const next: PrepStep = (what, b = 'prep') => {
+      const now = Date.now()
+      if (bound === 'prep') shared += now - stepAt
+      step = what
+      bound = b
+      stepAt = now
+      arm()
+    }
+    arm()
+    work = fn(next)
     return await Promise.race([work, deadline])
   } finally {
+    settled = true
     clearTimeout(timer)
     release()
   }
@@ -732,18 +787,21 @@ class ChunkRun {
     // Steps 1-3 are serialized per node (see withNodePrep) — with multiple
     // slots two dispatches would otherwise race on userpref/extension state.
     const remoteBlend = `${this.jobId}.blend`
+    // Each step is named with what bounds it (StepBound): its own ceiling,
+    // its own stall guard, or the prep's shared budget.
     const bootstrapExprs: string[] = await withNodePrep(this.nodeId, async (step) => {
-      // 1. Blender version (idempotent, cheap when already installed).
+      // 1. Blender version (idempotent, cheap when already installed). Its
+      // ceiling is install-blender's own: every mirror at its 30-min limit.
       if (job.blender_version && !node.snapshot.blenderVersions.includes(job.blender_version)) {
-        step(`installing Blender ${job.blender_version}`)
+        step(`installing Blender ${job.blender_version}`, INSTALL_BLENDER_TIMEOUT_MS)
         await installBlender(this.ssh, this.nodeId, job.blender_version)
       }
 
       // 1b. Octane jobs need the X11/VNC + OctaneServer environment (and an
       // OctaneBlender build on the node — see docs/OCTANE.md).
       if (job.engine === 'octane' && !node.snapshot.octaneReady) {
-        const { setupOctane } = await import('../octane/octaneLicense')
         step('setting up Octane')
+        const { setupOctane } = await import('../octane/octaneLicense')
         await setupOctane(this.ssh, this.nodeId)
       }
 
@@ -776,7 +834,9 @@ class ChunkRun {
           if (installedExtensions.has(key)) {
             expr = installedExtensions.get(key) ?? null
           } else {
-            step(`installing the add-on ${addon.id}`)
+            // Its commands have deadlines of their own, and its upload a
+            // stall guard.
+            step(`installing the add-on ${addon.id}`, 'progress')
             expr = await installExtension(this.ssh, this.nodeId, job.blender_version, addon)
             installedExtensions.set(key, expr)
           }
@@ -784,8 +844,9 @@ class ChunkRun {
         }
       }
 
-      // 3. Scene upload (hash-skipped when the node already has this version).
-      step('uploading the scene')
+      // 3. Scene upload (hash-skipped when the node already has this version),
+      // bounded by its stall guard: a large scene can take hours, moving.
+      step('uploading the scene', 'progress')
       const result = await uploadFileVerified(
         this.ssh,
         job.blend_path,
@@ -1595,6 +1656,9 @@ class Scheduler {
     this.laneGuards.delete(nodeId)
     this.laneCeilings.delete(nodeId)
     this.agentDown.delete(nodeId)
+    // A node that comes back (recoverUnreachable) is judged afresh. A step
+    // still running from before only sets its own entry's `running`.
+    prepTimeouts.delete(nodeId)
     this.idleSince.delete(nodeId)
     if (this.reservation?.nodeId === nodeId) this.reservation = null
     // Sent nothing for a while. destroyNode forgets a node before it marks it
@@ -1986,14 +2050,16 @@ class Scheduler {
 
   /**
    * Why the scheduler sends this node nothing whatever is queued, or null:
-   * its agent is down, or a setup step on it is stuck past its deadline
-   * (withNodePrep). For the fleet view and the node supervisor (plan 1.7).
+   * its agent is down, or a setup step on it ran out of time, still running
+   * or not (withNodePrep). For the fleet view and the node supervisor (plan
+   * 1.7).
    */
   nodeUnfit(nodeId: string): string | null {
     const down = this.agentDown.get(nodeId)
     if (down) return down.reason
-    const stuck = stuckPreps.get(nodeId)
-    if (stuck) return `setting up the node is stuck: ${stuck.step}`
+    const prep = prepTimeouts.get(nodeId)
+    if (prep?.running) return `setting up the node is stuck: ${prep.step}`
+    if (prep) return `setting up the node ran out of time: ${prep.step}`
     return null
   }
 
