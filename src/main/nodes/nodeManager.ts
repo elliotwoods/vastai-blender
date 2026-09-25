@@ -3100,7 +3100,14 @@ export class NodeManager {
    */
   ensureInstanceGone(
     instanceId: number,
-    opts: { node?: ManagedNode; budgetMs?: number; quiet?: boolean; reason?: string } = {}
+    opts: {
+      node?: ManagedNode
+      budgetMs?: number
+      quiet?: boolean
+      reason?: string
+      /** The most the Octane stop may take: see destroyUntilGone. 0 skips it. */
+      octaneStopMs?: number
+    } = {}
   ): Promise<boolean> {
     const running = this.goneChecks.get(instanceId)
     if (running) return running
@@ -3113,15 +3120,29 @@ export class NodeManager {
 
   private async destroyUntilGone(
     instanceId: number,
-    opts: { node?: ManagedNode; budgetMs?: number; quiet?: boolean; reason?: string }
+    opts: {
+      node?: ManagedNode
+      budgetMs?: number
+      quiet?: boolean
+      reason?: string
+      octaneStopMs?: number
+    }
   ): Promise<boolean> {
     const { node } = opts
     if (node) {
       // Its VNC login first, connection or none (plan 1.18 review).
       forgetOctaneNode(node.id)
       // Best effort: nothing about the license may stand between the
-      // instance and its DELETE.
-      await this.stopOctane(node).catch(() => {})
+      // instance and its DELETE. A caller with a budget of its own (a quit's
+      // destroy) gets the stop within OCTANE_STOP_BUDGET_MS, which is what it
+      // allows for: the 35 s a server known to have run gets otherwise came
+      // out of the DELETE's window, so a licensed node gone quiet, and two
+      // 502s, left the quit reporting it billing, and 'Quit anyway' left it
+      // live (n5 review). 0 skips the stop: the process may be ended any
+      // moment, and the instance matters more than the seat.
+      const stopMs =
+        opts.octaneStopMs ?? (opts.budgetMs != null ? OCTANE_STOP_BUDGET_MS : undefined)
+      if (stopMs !== 0) await this.stopOctane(node, stopMs).catch(() => {})
       node.closeSsh()
     }
     let last: unknown = null
@@ -3173,11 +3194,13 @@ export class NodeManager {
    * OCTANE_STOP_RUNNING_BUDGET_MS where the server is known to have run.
    * Neither is billing's concern: the instance bills the same either way.
    */
-  private async stopOctane(node: ManagedNode): Promise<void> {
+  private async stopOctane(node: ManagedNode, capMs?: number): Promise<void> {
     const ssh = node.ssh
     if (!ssh || !node.sshEverAnswered) return
-    const timeoutMs =
-      node.octaneState === 'none' ? OCTANE_STOP_BUDGET_MS : OCTANE_STOP_RUNNING_BUDGET_MS
+    const timeoutMs = Math.min(
+      node.octaneState === 'none' ? OCTANE_STOP_BUDGET_MS : OCTANE_STOP_RUNNING_BUDGET_MS,
+      capMs ?? Number.POSITIVE_INFINITY
+    )
     await stopOctaneServer(ssh, { timeoutMs, onlyIfStarted: true })
   }
 
@@ -3741,7 +3764,16 @@ export class NodeManager {
    * caller with a deadline of its own (quit's destroy-all) passes it; 0 is
    * one attempt. A refused DELETE (a 4xx) is never retried within the call.
    */
-  async destroyNode(id: string, opts: { budgetMs?: number } = {}): Promise<void> {
+  /**
+   * Destroy a node's instance (ensureInstanceGone). `budgetMs` bounds the
+   * retries of its DELETE, and with it the Octane stop to
+   * OCTANE_STOP_BUDGET_MS; `octaneStopMs` sets that bound itself, 0 to skip
+   * the stop (a quit the OS may end at any moment).
+   */
+  async destroyNode(
+    id: string,
+    opts: { budgetMs?: number; octaneStopMs?: number } = {}
+  ): Promise<void> {
     const node = this.nodes.get(id)
     if (!node) return
     const facts = node.facts
@@ -3781,7 +3813,11 @@ export class NodeManager {
     }
     // Octane drain ordering (a clean OctaneServer exit releases the floating
     // license before the instance goes) is ensureInstanceGone's.
-    await this.ensureInstanceGone(instanceId, { node, budgetMs: opts.budgetMs })
+    await this.ensureInstanceGone(instanceId, {
+      node,
+      budgetMs: opts.budgetMs,
+      octaneStopMs: opts.octaneStopMs
+    })
   }
 
   /**

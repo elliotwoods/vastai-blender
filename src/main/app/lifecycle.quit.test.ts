@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { setup, type App, type World } from '../test/harness'
+import { HANG, setup, type App, type World } from '../test/harness'
 import { rateLimitDestroys } from '../test/vastRateLimit'
 import type { FleetPort, Lifecycle, Prompt, QuitPolicy } from './lifecycle'
 
@@ -361,6 +361,47 @@ describe('Destroy all that cannot confirm a destroy (plan 1.1)', () => {
     await w.until(() => r.app.exits.length > 0, 'the app to exit')
     expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
     expect(w.vast.count('destroyInstance')).toBe(2)
+  })
+})
+
+describe('Destroy all with an Octane node gone quiet (plans 1.1, 1.18)', () => {
+  /** One node, licensed for Octane, whose OctaneServer stop never answers. */
+  async function quietOctaneNode(): Promise<{ engine: App; instances: number[] }> {
+    const { engine, ids, instances } = await fleetOf(1)
+    w.db.prepare("UPDATE nodes SET octane_state = 'licensed' WHERE id = ?").run(ids[0])
+    w.machineFor(ids[0]).onExec(/stop-server/, HANG)
+    return { engine, instances }
+  }
+
+  it("n5 review: a licensed node's stop does not eat the DELETE's window: two 502s, and it is still destroyed", async () => {
+    // A server known to have run gets 35 s to stop, and the stop came out
+    // of the quit's 40 s for the node: 5 s were left for the DELETE and its
+    // retries, the quit listed the node as billing, and 'Quit anyway' left
+    // it live. Under a quit's budget the stop gets the 20 s it allows for.
+    const { engine, instances } = await quietOctaneNode()
+    const r = await rig(engine)
+    r.answers.push(DESTROY, QUIT_ANYWAY)
+    w.vast.fail('destroyInstance', { status: 502, message: 'bad gateway' }, 2)
+
+    r.app.quit()
+    await w.until(() => r.app.exits.length > 0, 'the app to exit', { timeoutMs: 120_000 })
+
+    expect(r.dialogs).toHaveLength(1)
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+  })
+
+  it('1.1 / 1.18: a session end nobody asked about sends the DELETE without waiting on the Octane stop', async () => {
+    const { engine, instances } = await quietOctaneNode()
+    const r = await rig(engine)
+    const win = new EventEmitter()
+    r.app.emit('browser-window-created', {}, win)
+
+    win.emit('session-end')
+    await w.advance(3_000, 100)
+
+    expect(w.vast.count('destroyInstance')).toBe(1)
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
   })
 })
 

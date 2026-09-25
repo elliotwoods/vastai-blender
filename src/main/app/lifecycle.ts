@@ -109,9 +109,11 @@ export const DESTROY_BUDGET_MS = 20_000
 /**
  * More time for a node SSH may have answered. ensureInstanceGone first stops
  * OctaneServer over SSH wherever its pidfile exists, so the OTOY licence is
- * released, and gives that up to 20 s (nodeManager's OCTANE_STOP_BUDGET_MS)
- * before the DELETE even starts. A node gone quiet (after a sleep, say) can
- * spend all of it.
+ * released, before the DELETE even starts, and fleetPort holds that stop to
+ * this, whatever the node's Octane state: a server known to have run gets
+ * 35 s otherwise, which came out of the DELETE's 20 s. A node gone quiet
+ * (after a sleep, say) can spend all of it. Once the process may be ended
+ * at any moment (`hurry`) there is no stop at all.
  */
 export const OCTANE_STOP_MS = 20_000
 
@@ -377,8 +379,12 @@ export interface FleetPort {
   list(): NodeSnapshot[]
   /** One node, fresh from the database. */
   snapshot(id: string): NodeSnapshot | undefined
-  /** nodeManager.destroyNode, retrying transient failures for at most `budgetMs`. */
-  destroyNode(id: string, budgetMs: number): Promise<void>
+  /**
+   * nodeManager.destroyNode, retrying transient failures for at most
+   * `budgetMs`, after an Octane stop of at most OCTANE_STOP_MS, or none with
+   * `skipOctaneStop` (the process may be ended at any moment: `hurry`).
+   */
+  destroyNode(id: string, budgetMs: number, opts?: { skipOctaneStop?: boolean }): Promise<void>
   /**
    * Stop dispatching and renting, for good: only ever on the way out. After
    * this nothing is sent to a node and no create goes out, whatever kicks
@@ -400,7 +406,7 @@ export interface FleetPort {
 interface NodeManagerLike {
   list(): NodeSnapshot[]
   get(id: string): { snapshot: NodeSnapshot } | undefined
-  destroyNode(id: string, opts: { budgetMs?: number }): Promise<void>
+  destroyNode(id: string, opts: { budgetMs?: number; octaneStopMs?: number }): Promise<void>
   shutdown(): void
   activeCount(): number
 }
@@ -414,7 +420,11 @@ export function fleetPort(nodes: NodeManagerLike, scheduler: SchedulerLike): Fle
   return {
     list: () => nodes.list(),
     snapshot: (id) => nodes.get(id)?.snapshot,
-    destroyNode: (id, budgetMs) => nodes.destroyNode(id, { budgetMs }),
+    destroyNode: (id, budgetMs, opts) =>
+      nodes.destroyNode(id, {
+        budgetMs,
+        octaneStopMs: opts?.skipOctaneStop ? 0 : OCTANE_STOP_MS
+      }),
     stopScheduling: () => {
       scheduler.stop()
       // A stopgap, on these two instances, until the scheduler has a stop
@@ -531,7 +541,8 @@ async function settleNode(
   fleet: FleetPort,
   id: string,
   budgetMs: number,
-  pollMs: number
+  pollMs: number,
+  hurry?: AbortSignal
 ): Promise<string | null> {
   const deadline = Date.now() + budgetMs
   const secs = `${Math.round(budgetMs / 1000)} s`
@@ -563,8 +574,12 @@ async function settleNode(
   // A destroy already under way (the idle scale-down, the Fleet's button) is
   // joined, not repeated: ensureInstanceGone runs one check per instance.
   const left = deadline - Date.now()
+  // Hurried, the OctaneServer stop goes: on a node gone quiet it could
+  // take all the seconds the OS leaves before this node's DELETE (a1 review).
   const settled = await settlesWithin(
-    fleet.destroyNode(id, Math.min(DESTROY_BUDGET_MS, left)).catch(() => {}),
+    fleet
+      .destroyNode(id, Math.min(DESTROY_BUDGET_MS, left), { skipOctaneStop: hurry?.aborted })
+      .catch(() => {}),
     left
   )
   n = fleet.snapshot(id)
@@ -613,7 +628,9 @@ export async function destroyFleet(
     for (const n of fresh) {
       const previous = settling.at(-1)
       if (previous) await pause(staggerMs, opts.hurry, previous)
-      settling.push(settleNode(fleet, n.id, budget(n), pollMs).catch((e: unknown) => String(e)))
+      settling.push(
+        settleNode(fleet, n.id, budget(n), pollMs, opts.hurry).catch((e: unknown) => String(e))
+      )
     }
     const results = await Promise.all(settling)
     results.forEach((reason, i) => reasons.set(fresh[i].id, reason))
