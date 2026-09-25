@@ -285,8 +285,36 @@ export function describeError(e: unknown): string {
   return clip(describe(e, 0))
 }
 
+/**
+ * Secrets an error's text can carry. vastClient puts the API key in every
+ * URL (api_key=) and in a Bearer header, and a fetch failure such as
+ * undici's "Failed to parse URL from …?api_key=…" quotes the URL back.
+ * Credentials passed as an environment assignment at the front of a command
+ * (Octane's sign-in once was) can be quoted by an error that names it.
+ * Reasons go into alerts, chunks.lastError and scale status, which are
+ * stored and shown, so every one is scrubbed, before it is cut to length so
+ * no cut leaves part of a key behind.
+ */
+const SECRETS: ReadonlyArray<[RegExp, string]> = [
+  [/\b(api[_-]?key=)[^&\s"'<>]+/gi, '$1[redacted]'],
+  [/\b(Bearer\s+)[^\s"',;)]+/gi, '$1[redacted]'],
+  [
+    // NAME='…' as shq quotes it ('\'' inside), "…", or a bare word; a quote
+    // an error cut short runs to the end.
+    /\b([A-Z][A-Z0-9_]*(?:PASS|PASSWORD|PASSWD|SECRET|TOKEN|API_KEY))=('(?:[^']|'\\'')*(?:'|$)|"[^"]*(?:"|$)|[^\s;&|]+)/g,
+    '$1=[redacted]'
+  ]
+]
+
+function redact(s: string): string {
+  let out = s
+  for (const [pattern, replacement] of SECRETS) out = out.replace(pattern, replacement)
+  return out
+}
+
 function clip(s: string): string {
-  return s.length > 600 ? `${s.slice(0, 597)}...` : s
+  const r = redact(s)
+  return r.length > 600 ? `${r.slice(0, 597)}...` : r
 }
 
 function describe(e: unknown, depth: number): string {

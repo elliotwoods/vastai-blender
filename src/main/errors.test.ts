@@ -678,3 +678,62 @@ describe('describeError: never empty, always names the code', () => {
     expect(describeError(new Error('x'.repeat(5000))).length).toBeLessThanOrEqual(600)
   })
 })
+
+describe('reasons never carry a secret', () => {
+  // Reasons are stored (chunks.lastError, alerts) and shown (scale status).
+  const key = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'
+
+  it("drops the Vast API key from a URL vastClient's fetch quoted back", () => {
+    // vastClient adds api_key= to every URL; undici quotes a URL it cannot parse.
+    const e = new VastError(
+      `network error: Failed to parse URL from https://console.vast.ai/api/v0/instances/?owner=me&api_key=${key}&x=1`
+    )
+    for (const s of [describeError(e), classify(e).reason, classify(e, { via: 'vast' }).reason]) {
+      expect(s).not.toContain(key.slice(0, 12))
+      expect(s).toMatch(/api_key=\[redacted\]&x=1/)
+    }
+    // Also in a cause, or an AggregateError's parts, that supply the message.
+    const inCause = Object.assign(new Error(''), {
+      cause: new Error(`GET https://console.vast.ai/api/v0/bundles/?api_key=${key}`)
+    })
+    expect(classify(inCause).reason).not.toContain(key.slice(0, 12))
+    const inParts = new AggregateError([new Error(`?api_key=${key}`)], '')
+    expect(describeError(inParts)).not.toContain(key.slice(0, 12))
+  })
+
+  it('drops a Bearer token', () => {
+    const e = new Error(`request refused: {"Authorization": "Bearer ${key}"}`)
+    const { reason } = classify(e)
+    expect(reason).not.toContain(key.slice(0, 12))
+    expect(reason).toMatch(/Bearer \[redacted\]/)
+  })
+
+  it('drops a credential passed as an environment assignment, quoted or cut short', () => {
+    const quoted = new ExecTimeoutError(
+      'exec',
+      "OCTANE_USER='me@example.com' OCTANE_PASS='hunter'\\''2' bash setup_octane.sh start-server",
+      60_000
+    )
+    const cut = new ExecTimeoutError(
+      'exec',
+      "OCTANE_USER='me@example.com' OCTANE_PASS='hunt",
+      60_000
+    )
+    const bare = new Error('agent env: RENDER_TOKEN=abc123def VASTAI_HOME=/root/vastai')
+    for (const e of [quoted, cut, bare]) {
+      const { reason } = classify(e, { via: 'ssh' })
+      expect(reason).not.toMatch(/hunt|abc123def/)
+      expect(reason).toMatch(/(OCTANE_PASS|RENDER_TOKEN)=\[redacted\]/)
+    }
+    // What is not secret stays readable.
+    expect(classify(quoted).reason).toMatch(/bash setup_octane\.sh start-server/)
+    expect(classify(bare).reason).toMatch(/VASTAI_HOME=\/root\/vastai/)
+  })
+
+  it('scrubs before it cuts, so no cut leaves the start of a key', () => {
+    const e = new Error(`${'x'.repeat(580)}?api_key=${key}`)
+    const s = describeError(e)
+    expect(s.length).toBeLessThanOrEqual(600)
+    expect(s).not.toContain(key.slice(0, 4))
+  })
+})
