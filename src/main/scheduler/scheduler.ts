@@ -506,18 +506,20 @@ const STATE_STALL_MS = 15 * 60_000
  */
 const HUNG_MIN_MS = 45 * 60_000
 /**
- * ...and for at least this many times the longest a frame of its job has
- * been seen to take on the same hardware (Scheduler.frameTimeFor), since a
- * heavy scene legitimately spends a long while on each frame.
+ * ...and for at least this many times the longest a frame has been seen to
+ * take, by the run itself or by its job on the same hardware
+ * (Scheduler.frameTimeFor), since a heavy scene legitimately spends a long
+ * while on each frame.
  */
 const HUNG_SLOWEST_FACTOR = 3
 /**
- * The limit while nothing is known of the job's frames on that hardware: no
- * run of it there has yet seen a frame saved. Judged against HUNG_MIN_MS
- * alone, every chunk's first frame was killed once it passed 45 minutes, and
- * again on each retry: noderunner's heartbeat was added for this user's SDF
- * scenes, silent for 15+ minutes a frame on a whole node, and pinned to one
- * card of an eight-GPU node the same frame takes two hours.
+ * The floor while the run itself has not yet seen a frame of its own saved.
+ * Judged against HUNG_MIN_MS alone, every chunk's first frame was killed
+ * once it passed 45 minutes, and again on each retry: noderunner's heartbeat
+ * was added for this user's SDF scenes, silent for 15+ minutes a frame on a
+ * whole node, and pinned to one card of an eight-GPU node the same frame
+ * takes two hours. Other runs' frames never bring a run under it (see
+ * ChunkRun.hungFor).
  */
 const HUNG_UNKNOWN_MS = 3 * 60 * 60_000
 
@@ -1313,11 +1315,16 @@ class ChunkRun {
           if (this.stopped) return
           await this.downloader?.drain()
           if (this.stopped) return
-          const known =
+          const upTo =
             hung.frameS == null
-              ? 'no frame of this job had finished on this hardware yet'
+              ? ''
               : `this job's frames have taken up to ${Math.max(1, Math.round(hung.frameS / 60))} ` +
                 'min on this hardware'
+          const known = hung.ownFrame
+            ? upTo
+            : upTo === ''
+              ? 'no frame of this job had finished on this hardware yet'
+              : `it had not yet finished a frame of its own, and ${upTo}`
           this.fail(
             'render',
             own(
@@ -1363,8 +1370,9 @@ class ChunkRun {
 
   /**
    * How long a render still running has gone without progress, when that
-   * is long enough to take it as hung, and what its job's frames are known
-   * to take there (seconds; null = nothing known yet); null otherwise.
+   * is long enough to take it as hung, the longest a frame was known to
+   * take (seconds; null = nothing known), and whether this run saw one of
+   * its own saved; null otherwise.
    *
    * The agent refreshes updatedAt every 60 s while Blender lives, so a state
    * kept fresh says the process is alive, not that it is working, and a
@@ -1374,23 +1382,31 @@ class ChunkRun {
    * lastProgressAt moves only when Blender starts, and on each frame it
    * starts or saves. Measured against updatedAt, both on the node's clock.
    *
-   * A heavy scene's frames can take a long while, so the limit is the longer
-   * of HUNG_MIN_MS and HUNG_SLOWEST_FACTOR times the longest the job's frames
-   * have taken on this hardware, whichever run of it saw that, and
-   * HUNG_UNKNOWN_MS while nothing is known. It was this run's own slowest
-   * gap, which on a chunk's first frame is only Blender starting: every
-   * frame longer than 45 minutes was killed, on every attempt. An agent that
-   * does not report lastProgressAt is never judged.
+   * A heavy scene's frames can take a long while. Once the run has seen a
+   * frame of its own saved, the limit is the longer of HUNG_MIN_MS and
+   * HUNG_SLOWEST_FACTOR times the longest frame it, or any run of its job on
+   * this hardware, has seen. Until then it is at least HUNG_UNKNOWN_MS: what
+   * other runs saw may only lengthen a limit. Ranges of one job differ in
+   * weight, and the light ones save first, so a heavy range's first frame
+   * was held to three times a light frame and stopped at 46 min on every
+   * attempt; a frame longer than the limit is never saved, so it never
+   * raised it. An agent that does not report lastProgressAt is never judged.
    */
-  private hungFor(state: AgentState): { idleMs: number; frameS: number | null } | null {
+  private hungFor(
+    state: AgentState
+  ): { idleMs: number; frameS: number | null; ownFrame: boolean } | null {
     const at = state.lastProgressAt
     if (typeof at !== 'number' || !Number.isFinite(at)) return null
     if (state.status !== 'rendering' || typeof state.updatedAt !== 'number') return null
     const idleMs = (state.updatedAt - at) * 1000
-    const frameS = scheduler.frameTimeFor(this)
-    const limitMs =
-      frameS == null ? HUNG_UNKNOWN_MS : Math.max(HUNG_MIN_MS, HUNG_SLOWEST_FACTOR * frameS * 1000)
-    return idleMs > limitMs ? { idleMs, frameS } : null
+    const jobS = scheduler.frameTimeFor(this)
+    const ownFrame = this.timedFrame
+    const frameS = ownFrame ? Math.max(jobS ?? 0, this.slowestProgressS) : jobS
+    const limitMs = Math.max(
+      ownFrame ? HUNG_MIN_MS : HUNG_UNKNOWN_MS,
+      HUNG_SLOWEST_FACTOR * (frameS ?? 0) * 1000
+    )
+    return idleMs > limitMs ? { idleMs, frameS, ownFrame } : null
   }
 
   /** finish('failed') for a failure this run found itself. */

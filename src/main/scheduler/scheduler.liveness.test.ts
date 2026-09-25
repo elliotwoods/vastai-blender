@@ -64,6 +64,41 @@ function emptyInbox(machine: FakeMachine): string[] {
   return gone
 }
 
+/** lastProgressAt (epoch s) and framesDone as an agent's render reports them at a moment. */
+type Progress = () => { at: number; frames: number }
+
+/** Write the state an agent's heartbeat writes while Blender lives, as `progressAt()` says now. */
+function beat(machine: FakeMachine, chunkId: string, progressAt: Progress): void {
+  const p = progressAt()
+  machine.agent.writeState(chunkId, {
+    status: 'rendering',
+    framesDone: p.frames,
+    currentFrame: p.frames + 1,
+    lastProgressAt: p.at
+  } as Partial<AgentStateFile>)
+}
+
+/**
+ * An agent whose render runs as scripted: the state rewritten every 60 s,
+ * as the agent's heartbeat does while Blender lives, with lastProgressAt
+ * wherever the last frame left it, as `progressAt()` says at each beat.
+ */
+function heartbeat(machine: FakeMachine, chunkId: string, progressAt: Progress): () => void {
+  beat(machine, chunkId, progressAt)
+  const timer = setInterval(() => beat(machine, chunkId, progressAt), 60_000)
+  return () => clearInterval(timer)
+}
+
+/** lastProgressAt and framesDone for frames saved at `savedMin` minutes after `start` (epoch s). */
+function savedAt(start: number, savedMin: number[]): Progress {
+  const saved = savedMin.map((m) => start + m * 60)
+  return () => {
+    const now = Date.now() / 1000
+    const done = saved.filter((t) => t <= now)
+    return { at: done.length ? done[done.length - 1] : start, frames: done.length }
+  }
+}
+
 describe('1.7 field incident 81fe2875: phantom runs', () => {
   it('specs a second launch deleted from the inbox are requeued, and the lanes they held are used again', async () => {
     // One 4-GPU node, four lanes, four specs waiting in its inbox when a
@@ -236,40 +271,6 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
 })
 
 describe('1.7: a hung Blender', () => {
-  /**
-   * An agent whose render runs as scripted: the state rewritten every 60 s,
-   * as the agent's heartbeat does while Blender lives, with lastProgressAt
-   * wherever the last frame left it, as `progressAt()` says at each beat.
-   */
-  function heartbeat(
-    machine: FakeMachine,
-    chunkId: string,
-    progressAt: () => { at: number; frames: number }
-  ): () => void {
-    const beat = (): void => {
-      const p = progressAt()
-      machine.agent.writeState(chunkId, {
-        status: 'rendering',
-        framesDone: p.frames,
-        currentFrame: p.frames + 1,
-        lastProgressAt: p.at
-      } as Partial<AgentStateFile>)
-    }
-    beat()
-    const timer = setInterval(beat, 60_000)
-    return () => clearInterval(timer)
-  }
-
-  /** lastProgressAt and framesDone for frames saved at `savedMin` minutes after `start` (epoch s). */
-  function savedAt(start: number, savedMin: number[]): () => { at: number; frames: number } {
-    const saved = savedMin.map((m) => start + m * 60)
-    return () => {
-      const now = Date.now() / 1000
-      const done = saved.filter((t) => t <= now)
-      return { at: done.length ? done[done.length - 1] : start, frames: done.length }
-    }
-  }
-
   it('frames saved at ten and twenty minutes, then none for 45: stopped, and only its missing frames render again', async () => {
     const { app, ids } = await fleet(1)
     const machine = w.machineFor(ids[0])
@@ -446,6 +447,48 @@ describe('1.7: a hung Blender', () => {
     expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 0 })
     expect(w.alerts().join('\n')).not.toMatch(/no progress/)
   }, 20_000)
+
+  it('a light range does not judge a heavy one on the same cards: frames of ten minutes, then of an hour', async () => {
+    // Review round 2: a run that had timed no frame of its own was held to
+    // three times the longest frame any run of its job had shown on its
+    // hardware. The light ranges save first, so a heavy range's first frame
+    // was stopped at 46 min, on every attempt, and never finished: nothing
+    // longer than the limit is ever saved to raise it.
+    const { app, ids } = await fleet(1, { num_gpus: 2 })
+    const machine = w.machineFor(ids[0])
+    const specs: AgentSpec[] = []
+    const stops = new Map<string, () => void>()
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      // Frame 1 takes ten minutes, frames 2 to 5 an hour each.
+      const minutes = spec.frameStart === 1 ? 10 : 60
+      const stop = heartbeat(machine, spec.chunkId, savedAt(Date.now() / 1000, [minutes]))
+      stops.set(spec.chunkId, stop)
+      setTimeout(
+        () => {
+          stop()
+          if (machine.agent.spec(spec.chunkId)) machine.agent.finish(spec.chunkId)
+        },
+        minutes * 60_000 + 30_000
+      )
+    }
+    machine.onExec(/pkill -f '(\S+)'/, (_command, match) => {
+      stops.get(match[1])?.()
+      return ''
+    })
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 5, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 4 * 60 * 60_000,
+      stepMs: 5_000
+    })
+    for (const stop of stops.values()) stop()
+    expect(specs).toHaveLength(5)
+    expect(chunksOf(jobId).map((c) => [c.retries, c.infra_retries])).toEqual(
+      Array.from({ length: 5 }, () => [0, 0])
+    )
+    expect(w.alerts().join('\n')).not.toMatch(/no progress/)
+  }, 60_000)
 })
 
 describe('1.8: a spec write with no answer', () => {
