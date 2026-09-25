@@ -140,6 +140,23 @@ describe('scale-up against the plan', () => {
     expect(w.alerts('warn').filter((m) => m.startsWith('scale-up failed'))).toEqual([])
   })
 
+  it('1.20 n3 review: a key Vast refuses on the offer search holds renting for the account, with one alert', async () => {
+    // Only a create refused for the account set the hold. A key refused on
+    // the search failed every scale-up batch instead, a warning each time.
+    w = await setup({ settings: { maxActiveNodes: 2, spendCapPerHour: 10 } })
+    w.vast.addOffer()
+    w.vast.fail('searchOffers', { status: 401, message: 'invalid api key' }, 100)
+    const app = await w.boot()
+    await w.submitJob(app)
+    app.scheduler.kick()
+    await w.advance(5 * 60_000, 1_000)
+    expect(w.vast.count('searchOffers')).toBe(1)
+    expect(app.scheduler.fleetHolds().account?.reason).toMatch(/401|key/i)
+    expect(app.scheduler.fleetHolds().scale).toBeUndefined()
+    expect(w.alerts('warn').filter((m) => m.startsWith('scale-up failed'))).toEqual([])
+    expect(w.alerts('error').filter((m) => /renting is paused/.test(m))).toHaveLength(1)
+  })
+
   it('1.14: a blank spend cap with "no cap" off rents nothing, and says so once', async () => {
     w = await setup({ settings: { maxActiveNodes: 2, spendCapPerHour: null, noSpendCap: false } })
     w.vast.addOffer()

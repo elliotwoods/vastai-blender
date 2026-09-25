@@ -2525,11 +2525,22 @@ export class NodeManager {
     ) {
       return []
     }
-    await ensureKeyRegistered()
-
-    const offers = await findOffers({ ...settings.offerFilters, maxDphTotal }, this.blacklist, {
-      secureCloudOnly
-    })
+    let offers: Offer[]
+    try {
+      await ensureKeyRegistered()
+      offers = await findOffers({ ...settings.offerFilters, maxDphTotal }, this.blacklist, {
+        secureCloudOnly
+      })
+    } catch (e) {
+      // Vast refusing the account before any create (a key it rejects, or
+      // one without the permission to register an SSH key or search): the
+      // account hold and its one alert, as a create refused for it gets,
+      // not a scale-up failure on every tick (n3 review).
+      const c = classify(e, { via: 'vast' })
+      if (c.kind !== 'account') throw e
+      this.accountRefused(c)
+      return []
+    }
     if (offers.length === 0) {
       // The cap may be what left nothing: say so, and do not cry "no offers"
       // on every tick while the fleet sits just under its cap.
