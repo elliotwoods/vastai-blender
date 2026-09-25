@@ -3105,23 +3105,36 @@ class Scheduler {
    *
    * One node at a time: reserving more would idle the fleet to satisfy a
    * single chunk.
+   *
+   * Only a node that may be sent the chunk (takesEngine), and only for a
+   * chunk some node may be sent. An Octane chunk at the head with no Octane
+   * image set reserved a node scale-up had rented for Cycles, which
+   * pickChunk never gives it: the node drained, then sat empty and billing
+   * for good, refusing the Cycles work behind it, and scale-down spared it
+   * as reserved.
    */
   private reserveForExclusive(pending: PendingChunk[], eligible: NodeSnapshot[]): void {
     if (this.reservation) {
-      const stillWaiting = pending.some((c) => c.id === this.reservation!.chunkId)
-      const nodeUsable = eligible.some((n) => n.id === this.reservation!.nodeId)
-      if (stillWaiting && nodeUsable) return
+      const { nodeId, chunkId } = this.reservation
+      const waiting = pending.find((c) => c.id === chunkId)
+      const nodeUsable = eligible.some((n) => n.id === nodeId)
+      // Also let go of a node that stopped being one the chunk may go to
+      // since (Octane's setup found it unfit, say).
+      if (waiting && nodeUsable && this.takesEngine(nodeId, waiting.engine)) return
       this.reservation = null
     }
-    const head = pending[0]
+    // The head of the queue as far as these nodes go: a chunk none of them
+    // may be sent waits for another node, and holds none of these back.
+    const head = pending.find((c) => eligible.some((n) => this.takesEngine(n.id, c.engine)))
     if (!head || head.share_node === 1) return
+    const takers = eligible.filter((n) => this.takesEngine(n.id, head.engine))
     // Something is already free (an empty node, or a free GPU lane on a node
     // running exclusive work) — no need to hold a node back.
     const candidate = { id: head.id, sharesNode: false }
-    if (eligible.some((n) => admits(this.occupancy(n.id, head.engine), candidate))) return
+    if (takers.some((n) => admits(this.occupancy(n.id, head.engine), candidate))) return
     // Drain whichever node is closest to empty.
     let best: { id: string; size: number } | null = null
-    for (const n of eligible) {
+    for (const n of takers) {
       const size = this.runsOn(n.id).size
       if (!best || size < best.size) best = { id: n.id, size }
     }
@@ -3289,9 +3302,12 @@ class Scheduler {
 
   /**
    * Could a node the chunk has not failed on take it now: one with room that
-   * admits it? Any other node at all was the old test, so at the tail a node
-   * the chunk failed on sat idle and billing while the chunk waited for a
-   * busy one, and one reserved for it stayed reserved and empty.
+   * admits it, and that may be sent its engine (takesEngine)? Any other node
+   * at all was the old test, so at the tail a node the chunk failed on sat
+   * idle and billing while the chunk waited for a busy one, and one reserved
+   * for it stayed reserved and empty. And an idle node rented for Cycles
+   * "took" an Octane chunk it is never sent, so the Octane node it failed on
+   * passed it over too, both billing, until the idle one timed out.
    */
   private anotherTakes(
     c: PendingChunk,
@@ -3299,7 +3315,12 @@ class Scheduler {
     eligible: NodeSnapshot[]
   ): boolean {
     const cand = { id: c.id, sharesNode: c.share_node === 1 }
-    return eligible.some((n) => !avoid.has(n.id) && admits(this.occupancy(n.id, c.engine), cand))
+    return eligible.some(
+      (n) =>
+        !avoid.has(n.id) &&
+        this.takesEngine(n.id, c.engine) &&
+        admits(this.occupancy(n.id, c.engine), cand)
+    )
   }
 
   /** Is this node resting after a failed dispatch? */

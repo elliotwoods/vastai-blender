@@ -82,6 +82,116 @@ describe('Octane in the scheduler (plan 1.18)', () => {
     expect(w.machineFor(nodeId).ran(/setup_octane\.sh (install|start)/)).toEqual([])
   })
 
+  it('1.18: Octane work queued with no Octane image holds back no node from the Cycles job behind it', async () => {
+    // The Octane chunk at the head of the queue reserved the only node, one
+    // scale-up rented for Cycles, which it is never sent (takesEngine). The
+    // node drained, then sat empty for good: the Cycles job behind it was
+    // refused as not the chunk it was held for, and scale-down spared it as
+    // reserved. Six hours of fake time billed with nothing rendered.
+    w = await setup({ settings: { maxActiveNodes: 1, spendCapPerHour: 10, idleTimeoutMinutes: 5 } })
+    const app = await w.boot()
+    w.vast.addOffer()
+    const [nodeId] = await app.nodeManager.requestNodes(1, { engine: 'cycles' })
+    await w.until(() => app.nodeManager.get(nodeId)?.state === 'ready', 'ready')
+    const machine = w.machineFor(nodeId)
+    const specs: AgentSpec[] = []
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      // The first holds the node busy while the Octane chunk is at the head.
+      if (specs.length > 1) machine.agent.finish(spec.chunkId)
+    }
+    const octaneJob = await w.submitJob(app, {
+      engine: 'octane',
+      frameStart: 1,
+      frameEnd: 1,
+      chunkSize: 1
+    })
+    await w.advance(1_000)
+    const cyclesJob = await w.submitJob(app, {
+      engine: 'cycles',
+      frameStart: 1,
+      frameEnd: 4,
+      chunkSize: 1
+    })
+    app.scheduler.kick()
+    await w.advance(90_000, 1_000)
+    expect(specs).toHaveLength(1)
+    machine.agent.finish(specs[0].chunkId)
+
+    await w.until(
+      () =>
+        w.get<{ state: string }>('SELECT state FROM jobs WHERE id = ?', cyclesJob)?.state ===
+        'complete',
+      'the Cycles job complete',
+      { timeoutMs: 10 * MIN, stepMs: 1_000 }
+    )
+    expect(specs.map((s) => s.engine)).toEqual(['cycles', 'cycles', 'cycles', 'cycles'])
+    // Nothing here may take the Octane chunk, so the idle node is let go.
+    await w.until(() => app.nodeManager.get(nodeId)?.state === 'destroyed', 'the node let go', {
+      timeoutMs: 15 * MIN,
+      stepMs: 5_000
+    })
+    expect(w.all('SELECT state FROM chunks WHERE job_id = ?', octaneJob)).toEqual([
+      { state: 'pending' }
+    ])
+    expect(w.vast.count('createInstance')).toBe(1)
+  })
+
+  it('1.18: an Octane chunk goes back to the Octane node it failed on, not to wait on an idle Cycles node', async () => {
+    // anotherTakes counted the idle Cycles node as one that could take the
+    // chunk, so the node it failed on passed it over; the Cycles node never
+    // may. Both billed, nothing rendered, until the idle one timed out.
+    w = await setup({
+      settings: { maxActiveNodes: 2, spendCapPerHour: 10, idleTimeoutMinutes: 60 }
+    })
+    const app = await w.boot()
+    // Rented by hand, for no engine in particular: it may try Octane.
+    const octaneNode = await w.readyNode(app)
+    w.vast.addOffer()
+    const [cyclesNode] = await app.nodeManager.requestNodes(1, { engine: 'cycles' })
+    await w.until(() => app.nodeManager.get(cyclesNode)?.state === 'ready', 'ready')
+    const machine = w.machineFor(octaneNode)
+    fakeOctane(machine)
+    const specs: AgentSpec[] = []
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      if (specs.length > 1) return machine.agent.finish(spec.chunkId)
+      // The machine's failure, not the scene's: the chunk goes back to this
+      // node only when no other node may be sent it (pickChunk).
+      machine.agent.fail(spec.chunkId, 'out of GPU memory on GPU 0 (exit -15)', -15)
+      machine.agent.writeState(spec.chunkId, {
+        status: 'failed',
+        framesDone: 0,
+        error: 'out of GPU memory on GPU 0 (exit -15)',
+        exitCode: -15,
+        errorKind: 'machine',
+        oom: true
+      })
+    }
+    const cyclesSpecs: AgentSpec[] = []
+    w.machineFor(cyclesNode).onSpec = (spec) => cyclesSpecs.push(spec)
+    const jobId = await w.submitJob(app, {
+      engine: 'octane',
+      frameStart: 1,
+      frameEnd: 1,
+      chunkSize: 1
+    })
+    app.scheduler.kick()
+
+    await w.until(
+      () =>
+        w.get<{ state: string }>('SELECT state FROM jobs WHERE id = ?', jobId)?.state ===
+        'complete',
+      'the Octane job complete',
+      { timeoutMs: 10 * MIN, stepMs: 1_000 }
+    )
+    expect(specs).toHaveLength(2)
+    expect(cyclesSpecs).toEqual([])
+    expect(w.all('SELECT infra_retries FROM chunks WHERE job_id = ?', jobId)).toEqual([
+      { infra_retries: 1 }
+    ])
+  })
+
   it('1.18: Octane work with no Octane image set rents nothing, and says why once', async () => {
     w = await setup({ settings: { maxActiveNodes: 2, spendCapPerHour: 10 } })
     w.vast.addOffer()
