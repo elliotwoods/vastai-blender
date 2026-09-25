@@ -72,8 +72,12 @@ function toOffer(r: RawOffer): Offer {
   }
 }
 
-/** Measured frames/hour for ONE GPU of this model (see recordThroughput). */
-function measuredFramesPerHour(gpuName: string): number | null {
+/**
+ * Measured frames/hour for ONE GPU of this model (see recordThroughput), or
+ * null while nothing is learned. Exported for scale-up (plans 1.5, 1.21):
+ * the tail rule's provisional fleet rate is this × each usable node's GPUs.
+ */
+export function measuredFramesPerHour(gpuName: string): number | null {
   try {
     const row = getDb()
       .prepare('SELECT frames_per_hour FROM gpu_perf WHERE gpu_name = ?')

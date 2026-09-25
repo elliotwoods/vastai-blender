@@ -13,6 +13,15 @@ import { co2Grams } from '../carbon/intensity'
 import { getDb, readAppState, writeAppState } from '../db/db'
 import { classify, type Classification } from '../errors'
 import { emit } from '../events'
+import { normaliseSlotsPerGpu } from '../scheduler/gpuLanes'
+import {
+  budgetOpen,
+  offerContribution,
+  subtractRental,
+  withDemand,
+  type RentalContribution
+} from '../scheduler/scaling'
+import { learnedSlots } from '../scheduler/slotController'
 import { getSettings } from '../settings'
 import { ensureKeyRegistered, readPrivateKey } from '../ssh/keys'
 import { FIRST_CONNECT_BUDGET_MS, retryWithBackoff } from '../ssh/connectRetry'
@@ -29,6 +38,8 @@ import {
   vastErrorKind
 } from '../vast/vastClient'
 import type {
+  CapacityBudget,
+  EngineId,
   FleetCost,
   FleetHolds,
   GpuSample,
@@ -37,12 +48,16 @@ import type {
   NodeState,
   NodeWorkRef,
   Offer,
+  RequestNodeOptions,
+  SettingsPublic,
   UnclaimedInstance,
   UnclaimedOwner
 } from '../../shared/models'
 import {
+  capacityBudget,
   capUsage,
   createOutcomeUnknown,
+  fitsBudget,
   holdsInstance,
   type NodeCostFacts
 } from '../../shared/nodeState'
@@ -166,6 +181,14 @@ export function parseRentalLabel(
   const colon = rest.indexOf(':')
   if (colon < 0) return rest ? { install: null, node: rest } : null
   return { install: rest.slice(0, colon), node: rest.slice(colon + 1) }
+}
+
+/** Why a manual request stops at the spend cap, in words the user can act on. */
+function spendCapReached(caps: CapacityBudget, settings: SettingsPublic): string {
+  if (settings.spendCapPerHour == null) {
+    return 'No spend cap is set: set one in Settings, or switch the cap off there on purpose'
+  }
+  return `Spend cap reached: the fleet bills ${money(caps.perHour)}/hr of ${money(caps.spendCap ?? 0)}/hr. Confirm renting past the cap to go on.`
 }
 
 /** Minutes the balance lasts at `perHour`: 0 once it is spent, unbounded for a fleet billing nothing. */
@@ -306,6 +329,26 @@ interface ReconcileRow {
   instance_id: number | null
   state: NodeState
   label: string | null
+}
+
+/** How far one requestNodes batch may go (plan 1.5). */
+export interface RequestNodesOptions {
+  /**
+   * The scheduler's plan (planScaling's budget). Its demand, the exclusive
+   * lanes and shared slots still wanted, is carried across the batch and
+   * spent down by what each rental brings (subtractRental); the batch stops
+   * once it is covered. Its caps are not used: before each rental they are
+   * taken afresh from the live fleet and settings (withDemand). Without it
+   * the batch is bounded by `count` and the caps alone.
+   */
+  budget?: CapacityBudget
+  /**
+   * The user confirmed renting past the spend cap: RequestNodeOptions'
+   * overSpendCap, for a manual request only. maxActiveNodes still holds.
+   */
+  overSpendCap?: boolean
+  /** The engine the rentals are for, which decides the lanes an offer brings. */
+  engine?: EngineId | null
 }
 
 /** What the billing predicates (shared/nodeState.ts) read, from a row. */
@@ -1226,20 +1269,71 @@ export class NodeManager {
     return this.capUsage().perHour
   }
 
-  /** Rent the best matching offer and drive it to ready. */
-  async requestNode(): Promise<string> {
+  /**
+   * Rent the best matching offer and drive it to ready: the Fleet's button
+   * (fleet:requestNode). It stops at the spend cap, as scale-up does, unless
+   * the user confirmed going past it (`overSpendCap`, plan 1.5). It used to
+   * ignore the cap altogether. It never goes past maxActiveNodes, nor rents
+   * while the account is on hold.
+   */
+  async requestNode(opts: RequestNodeOptions = {}): Promise<string> {
     const held = this.accountHold()
     if (held) throw new Error(`Renting is paused: ${held.reason}`)
     const settings = getSettings()
     if (this.activeCount() >= settings.maxActiveNodes) {
       throw new Error(`max active nodes (${settings.maxActiveNodes}) reached`)
     }
-    const ids = await this.requestNodes(1, { respectSpendCap: false })
+    const overSpendCap = opts.overSpendCap === true
+    if (!overSpendCap) {
+      const caps = this.liveCaps(settings)
+      if (caps.headroomPerHour != null && !(caps.headroomPerHour > 0)) {
+        throw new Error(spendCapReached(caps, settings))
+      }
+    }
+    const ids = await this.requestNodes(1, { overSpendCap })
     if (ids.length > 0) return ids[0]
     // Vast refused for the account in this very request: its hold says why.
     const refused = this.accountHold()
     if (refused) throw new Error(`Renting is paused: ${refused.reason}`)
     throw new Error('no node could be rented')
+  }
+
+  /**
+   * The caps as they stand now: maxActiveNodes and the spend cap, over every
+   * node that may be billing (nodeState.capacityBudget). A null cap without
+   * noSpendCap is $0/hr, as capacityBudget reads it. `overSpendCap` lifts
+   * the money part only.
+   */
+  private liveCaps(settings: SettingsPublic, overSpendCap = false): CapacityBudget {
+    const caps = capacityBudget(
+      [...this.nodes.values()].map((n) => n.facts),
+      settings
+    )
+    return overSpendCap ? { ...caps, spendCap: null, headroomPerHour: null } : caps
+  }
+
+  /**
+   * What renting `offer` brings to the fleet, for spending a scheduler
+   * budget's demand down (plan 1.5, #227 #237): its GPU lanes for `engine`
+   * and the shared slots it will start at.
+   */
+  private contribution(
+    offer: Offer,
+    settings: SettingsPublic,
+    engine: EngineId | null | undefined
+  ): RentalContribution {
+    let learned: number | null = null
+    try {
+      learned = learnedSlots(offer.gpuName)?.bestSlots ?? null
+    } catch {
+      // Nothing learned readable: the default seed.
+    }
+    return offerContribution(offer, {
+      slotsPerGpu: normaliseSlotsPerGpu(settings.slotsPerGpu),
+      maxNodeSlots: settings.maxNodeSlots ?? 0,
+      learnedSlotsPerGpu: learned,
+      engine: engine ?? null
+    })
   }
 
   /**
@@ -1249,10 +1343,19 @@ export class NodeManager {
    * renting down the ranked list is exactly what repeated searches would do
    * anyway. Machines are never rented twice in a batch, and an offer that
    * fails to rent (taken by someone else meanwhile) blacklists its machine and
-   * moves on to the next. The caps are re-checked before every rental —
-   * maxActiveNodes against the live count, and (unless told otherwise, for
-   * the manual button) the spend cap against the running $/hr, allowing a
-   * rental while the fleet is still under the cap, as scale-up always has.
+   * moves on to the next.
+   *
+   * The spend cap is a budget, not a yes/no (plan 1.5, audit A7). The search
+   * asks only for offers priced within what the cap has left
+   * (maxDphTotal = min(filter, headroom)), and before each rental the caps
+   * are taken afresh from the live fleet and settings, and the offer must fit
+   * them after its own price: under a $2/h cap with $1.95/h running, only an
+   * offer at $0.05/h or less. "Still under the cap" used to be enough, and
+   * rented an $8/h box on top of it. maxActiveNodes is re-read before every
+   * rental too: each create awaits Vast, and meanwhile the user can lower it,
+   * or a quit's destroy-all start. `budget` (the scheduler's plan) adds the
+   * demand still to cover; `overSpendCap` (a confirmed manual request) lifts
+   * the money part.
    *
    * A create that gets no answer ends the batch (plan 1.4): the instance may
    * exist, billing, under the row's label, and renting the next offer at once
@@ -1262,16 +1365,34 @@ export class NodeManager {
    * offer would meet it too. And so does an account refusal (plan 1.20): it
    * sets the account hold, and nothing is rented until that is released.
    */
-  async requestNodes(count: number, opts: { respectSpendCap?: boolean } = {}): Promise<string[]> {
+  async requestNodes(count: number, opts: RequestNodesOptions = {}): Promise<string[]> {
     if (count <= 0) return []
     // Held for the account (plan 1.20): the hold's one alert has said why.
     // Scale-up asks every tick, and each ask used to add a failed row.
     if (this.hold) return []
-    const settings = getSettings()
+    let settings = getSettings()
+    // activeCount rather than the budget's own count: quit's destroy-all
+    // stops renting by making it read as full (lifecycle.ts fleetPort).
+    if (this.activeCount() >= settings.maxActiveNodes) return []
+    const overSpendCap = opts.overSpendCap === true
+    const first = this.liveCaps(settings, overSpendCap)
+    const firstBudget = opts.budget ? withDemand(first, opts.budget) : first
+    if (!budgetOpen(firstBudget)) return []
     await ensureKeyRegistered()
 
-    const offers = await findOffers(settings.offerFilters, this.blacklist)
+    const filterMax = settings.offerFilters.maxDphTotal
+    const headroom = first.headroomPerHour
+    const maxDphTotal =
+      headroom != null && (filterMax == null || headroom < filterMax) ? headroom : filterMax
+    const offers = await findOffers({ ...settings.offerFilters, maxDphTotal }, this.blacklist)
     if (offers.length === 0) {
+      // The cap may be what left nothing: say so, and do not cry "no offers"
+      // on every tick while the fleet sits just under its cap.
+      if (headroom != null && maxDphTotal === headroom) {
+        throw new Error(
+          `no matching offers at or under ${money(headroom)}/hr, what the spend cap of ${money(first.spendCap ?? 0)}/hr leaves`
+        )
+      }
       emit('alert', { level: 'warn', message: 'No matching Vast.ai offers found' })
       throw new Error('no matching offers')
     }
@@ -1279,17 +1400,21 @@ export class NodeManager {
     const usedMachines = new Set<number>()
     let lastErr: Error | null = null
     let failures = 0
+    let carried: CapacityBudget | null = opts.budget ?? null
     for (const offer of offers) {
       if (ids.length >= count) break
       // A systemic refusal (no credit, a bad key) fails every offer the same
       // way; stop before it turns into a failed node row per offer.
       if (failures >= 3) break
       if (this.hold) break
+      settings = getSettings()
       if (this.activeCount() >= settings.maxActiveNodes) break
-      if (opts.respectSpendCap !== false && settings.spendCapPerHour != null) {
-        if (this.billingPerHour() >= settings.spendCapPerHour) break
-      }
+      const live = this.liveCaps(settings, overSpendCap)
+      const budget = carried ? withDemand(live, carried) : live
+      if (!budgetOpen(budget)) break
       if (usedMachines.has(offer.machineId) || this.blacklist.has(offer.machineId)) continue
+      // Too dear for what is left now; one further down the ranking may fit.
+      if (!fitsBudget(budget, offer.dphTotal)) continue
       usedMachines.add(offer.machineId)
       let r: Rental
       try {
@@ -1304,6 +1429,9 @@ export class NodeManager {
         failures++
       } else {
         ids.push(r.id)
+        if (carried) {
+          carried = subtractRental(budget, offer, this.contribution(offer, settings, opts.engine))
+        }
       }
       if (r.stop) break
     }
