@@ -50,7 +50,8 @@ import { getSettings } from './settings'
 // closed terminal (a headless run's SIGHUP; a person's app started from a
 // terminal that went away) or to a full disk can fail after the call has
 // returned, as an 'error' event on the stream, and one with no listener is
-// an uncaught exception, in the middle of a destroy as often as not.
+// an uncaught exception. A closed terminal is also what starts a headless
+// run's destroy, which goes on writing to it.
 guardStdio([process.stdout, process.stderr])
 installCrashGuard({
   proc: process,
