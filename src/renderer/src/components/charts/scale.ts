@@ -298,3 +298,15 @@ export function hoverNotes(
     ...capped('marker', markerLabels)
   ]
 }
+
+/**
+ * Which series the hover readout lists, as indices: all of them in order, or
+ * past `max` the `max` highest values at the crosshair (no reading last).
+ */
+export function tooltipRows(values: ReadonlyArray<number | null>, max?: number): number[] {
+  const all = values.map((_, i) => i)
+  if (max == null || values.length <= max) return all
+  return all
+    .sort((a, b) => (values[b] ?? -Infinity) - (values[a] ?? -Infinity) || a - b)
+    .slice(0, max)
+}

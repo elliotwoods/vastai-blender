@@ -61,6 +61,7 @@ type MetricsReading = import('../../lib/metricsStore').MetricsReading
 const { FleetScreen } = await import('./FleetScreen')
 const { NodeDetail } = await import('./NodeDetail')
 const { AppToolbar } = await import('../../components/AppToolbar')
+const { activityLead } = await import('./activity')
 
 const settings = {
   hasVastApiKey: true,
@@ -396,10 +397,70 @@ describe('Feature G: GPU use over time', () => {
     )
     expect(html).toContain('gpu use')
     expect(html).toContain('17 / 24')
-    expect(html).toContain('61%')
+    expect(html).toContain('latest reading')
     expect(html).toContain('$2.400/hr')
     expect(html).toContain('rented')
     expect(html).toContain('busy')
+  })
+
+  it('mean util is over the whole window (main’s summary), not the newest bucket', () => {
+    // An hour mostly idle that ends busy averaged low; the last bucket's 97%
+    // would say the hour was well spent.
+    const history: FleetGpuHistory = {
+      fromMs: now - 3_600_000,
+      toMs: now,
+      bucketMs: 30_000,
+      points: [
+        { ts: now - 90_000, gpusRented: 4, gpusBusy: 0, meanUtil: 3, idlePerHour: 1 },
+        { ts: now - 60_000, gpusRented: 4, gpusBusy: 4, meanUtil: 97, idlePerHour: 0 }
+      ],
+      summary: { meanUtil: 23.4, gpuHours: 4, busyGpuHours: 1, idleCost: 0.75 }
+    }
+    const html = withCache(
+      (qc) => {
+        qc.setQueryData(qk.nodes, [node({})])
+        qc.setQueryData(qk.fleetGpuHistory('1h'), history)
+      },
+      <FleetScreen />
+    )
+    expect(html).toContain('>23%<')
+    expect(html).not.toContain('>97%<')
+    expect(html).toContain('all GPUs, over the last 1h')
+    expect(html).toContain('$0.75 over the last 1h')
+  })
+
+  it('per GPU: one utilisation line per GPU, named by node and index', () => {
+    stored['vr:fleet:gpuView'] = 'perGpu'
+    const util = (mean: number): { ts: number; mean: number; min: null; max: null }[] => [
+      { ts: now - 90_000, mean, min: null, max: null },
+      { ts: now - 60_000, mean, min: null, max: null }
+    ]
+    const history: FleetGpuHistory = {
+      fromMs: now - 3_600_000,
+      toMs: now,
+      bucketMs: 30_000,
+      points: [{ ts: now - 60_000, gpusRented: 2, gpusBusy: 1, meanUtil: 50, idlePerHour: 0.4 }],
+      summary: { meanUtil: 50, gpuHours: 2, busyGpuHours: 1, idleCost: 0.1 },
+      gpus: [
+        { nodeId: 'node-a', gpuIndex: 0, label: 'RTX 4090 · node-a #0', util: util(95) },
+        { nodeId: 'node-b', gpuIndex: 0, label: 'RTX 3090 · node-b #0', util: util(5) }
+      ],
+      gpusOmitted: 3
+    }
+    const html = withCache(
+      (qc) => {
+        qc.setQueryData(qk.nodes, [node({})])
+        qc.setQueryData(qk.fleetGpuHistory('1h', true), history)
+      },
+      <FleetScreen />
+    )
+    expect(html).toMatch(/aria-pressed="true"[^>]*>per GPU</)
+    expect(html).toContain('RTX 4090 · node-a #0')
+    expect(html).toContain('RTX 3090 · node-b #0')
+    expect(html).toContain('3 more GPUs not drawn')
+    // The y axis is utilisation, 0–100%, not GPU counts.
+    expect(html).toContain('>100%<')
+    expect(html.match(/<polyline/g)?.length).toBe(2)
   })
 
   it("NodeDetail draws each GPU's line and shades one idle with work assigned (81fe2875)", () => {
@@ -420,5 +481,63 @@ describe('Feature G: GPU use over time', () => {
     expect(html).toContain('idle with work assigned')
     expect(html).toContain('vram used %')
     expect(html).toContain('gpu power, all cards')
+  })
+})
+
+describe("a row shows the job it's working on", () => {
+  const work = [
+    {
+      chunkId: 'c1',
+      jobId: 'job-1',
+      gpu: 0,
+      jobName: 'hero_shot_v12',
+      thumbUrl: 'media://thumbs/hero.jpg'
+    },
+    { chunkId: 'c2', jobId: 'job-1', gpu: 1, jobName: 'hero_shot_v12', thumbUrl: null },
+    { chunkId: 'c3', jobId: 'job-2', gpu: null, jobName: 'lookdev', thumbUrl: null }
+  ]
+
+  it("as the job's latest frame and its name, a button to the job, with the others counted", () => {
+    const html = withCache(
+      (qc) => qc.setQueryData(qk.nodes, [node({ currentWork: work, slotTarget: 4 })]),
+      <FleetScreen />
+    )
+    expect(html).toContain('src="media://thumbs/hero.jpg"')
+    expect(html).toMatch(/<button[^>]*title="Open hero_shot_v12"[^>]*>hero_shot_v12<\/button>/)
+    expect(html).toContain('+1 job<')
+    expect(html).toContain('>3/4<')
+    // The old summary named a chunk, not the job.
+    expect(html).not.toContain('>3/4 · ')
+  })
+
+  it("a node's last error still takes the cell", () => {
+    const html = withCache(
+      (qc) =>
+        qc.setQueryData(qk.nodes, [
+          node({ currentWork: work, lastError: 'ssh: connection reset' })
+        ]),
+      <FleetScreen />
+    )
+    expect(html).toContain('ssh: connection reset')
+    expect(html).not.toContain('title="Open hero_shot_v12"')
+  })
+})
+
+describe('activityLead', () => {
+  it('names the job with most of the slots, the first on a tie, falling back to its id', () => {
+    expect(
+      activityLead([
+        { chunkId: 'a', jobId: 'j1' },
+        { chunkId: 'b', jobId: 'j2', jobName: 'two', thumbUrl: 'media://x' },
+        { chunkId: 'c', jobId: 'j2' }
+      ])
+    ).toEqual({ jobId: 'j2', jobName: 'two', thumbUrl: 'media://x', otherJobs: 1 })
+    expect(
+      activityLead([
+        { chunkId: 'a', jobId: 'j1' },
+        { chunkId: 'b', jobId: 'j2' }
+      ])
+    ).toEqual({ jobId: 'j1', jobName: 'j1', thumbUrl: null, otherJobs: 1 })
+    expect(activityLead([])).toBeNull()
   })
 })

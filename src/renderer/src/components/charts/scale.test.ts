@@ -12,6 +12,7 @@ import {
   summarize,
   ticks,
   tooltipLeft,
+  tooltipRows,
   unionXs,
   valueAt,
   yDomain
@@ -377,5 +378,18 @@ describe('hoverNotes', () => {
     ]
     expect(hoverNotes(300, 10, bands, markers)).toEqual([{ kind: 'marker', label: 'near' }])
     expect(hoverNotes(105, 10, bands, [])).toEqual([{ kind: 'band', label: 'early' }])
+  })
+})
+
+describe('tooltipRows', () => {
+  it('lists every series in order when there are few enough', () => {
+    expect(tooltipRows([5, null, 9])).toEqual([0, 1, 2])
+    expect(tooltipRows([5, null, 9], 3)).toEqual([0, 1, 2])
+  })
+
+  it('past the limit, lists the highest values first, and no reading last', () => {
+    // A fleet of two dozen GPU lines would stack a readout taller than the chart.
+    expect(tooltipRows([5, null, 9, 9, 1], 3)).toEqual([2, 3, 0])
+    expect(tooltipRows([null, null, 4], 2)).toEqual([2, 0])
   })
 })

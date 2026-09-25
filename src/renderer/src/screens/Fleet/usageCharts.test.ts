@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import type { FleetGpuHistory } from '../../../../shared/models'
+import type { FleetGpuHistory, MetricsPoint } from '../../../../shared/models'
 import type { GpuReading, MetricsReading } from '../../lib/metricsStore'
 import { gpuColor } from '../../components/charts/palette'
 import {
   GAP_MIN_MS,
+  fleetGpuLines,
   fleetStripSeries,
   gpuAxisMax,
   latestFleetPoint,
@@ -177,5 +178,51 @@ describe('the fleet strip', () => {
     expect(gpuAxisMax(24)).toBe(24)
     expect(gpuAxisMax(9)).toBe(12)
     expect(gpuAxisMax(0)).toBe(4)
+  })
+})
+
+describe('the fleet strip, per GPU', () => {
+  const pt = (ts: number, mean: number | null): MetricsPoint => ({
+    ts,
+    mean,
+    min: null,
+    max: null
+  })
+  const history = (n: number): FleetGpuHistory => ({
+    fromMs: 0,
+    toMs: 120_000,
+    bucketMs: 60_000,
+    points: [],
+    summary: { meanUtil: 50, gpuHours: 1, busyGpuHours: 0.5, idleCost: 0 },
+    gpus: Array.from({ length: n }, (_, i) => ({
+      nodeId: `node-${i >> 1}`,
+      gpuIndex: i % 2,
+      label: `RTX 4090 · node-${i >> 1} #${i % 2}`,
+      util: [pt(0, 90), pt(60_000, null)]
+    })),
+    gpusOmitted: 0
+  })
+
+  it("draws one 0–100% line per GPU at each bucket's middle, a bucket with no reading as a break", () => {
+    const [first] = fleetGpuLines(history(1))
+    expect(first.label).toBe('RTX 4090 · node-0 #0')
+    expect(first.points).toEqual([
+      { x: 30_000, y: 90 },
+      { x: 90_000, y: null }
+    ])
+  })
+
+  it("colours by place in the fleet, so two nodes' GPU 0 differ, and greys past the palette", () => {
+    const lines = fleetGpuLines(history(10))
+    expect(new Set(lines.map((l) => l.id)).size).toBe(10)
+    expect(lines[0].color).toBe(gpuColor(0))
+    expect(lines[2].color).toBe(gpuColor(2))
+    expect(lines[2].color).not.toBe(lines[0].color)
+    expect(lines[8].color).toBe(gpuColor(8))
+    expect(lines[9].color).toBe(lines[8].color)
+  })
+
+  it('draws nothing from a read made without perGpu', () => {
+    expect(fleetGpuLines({ ...history(0), gpus: undefined })).toEqual([])
   })
 })

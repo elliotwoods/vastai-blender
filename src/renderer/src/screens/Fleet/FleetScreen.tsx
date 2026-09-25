@@ -11,6 +11,8 @@ import { ipc } from '../../lib/ipc'
 import { useNav } from '../../lib/nav'
 import { ipcErrorText } from '../../lib/recovery'
 import { DestroyNodeButton } from './NodeActions'
+import { ACTIVITY_MIN_W } from './activity'
+import { NodeActivity } from './NodeActivity'
 import { NodeDetail } from './NodeDetail'
 import { FleetGpuStrip } from './FleetGpuStrip'
 import { overCapBound, overCapRequest } from './requestNode'
@@ -158,23 +160,10 @@ function HeaderRow(): React.JSX.Element {
       <HeaderCell h={h} width={COLS.cost} label="cost" hint={HINTS.spent} />
       <HeaderCell h={h} width={COLS.power} label="power" hint={HINTS.power} />
       <span style={{ ...h, width: COLS.uptime }}>uptime</span>
-      <span style={{ ...h, flex: 1 }}>activity</span>
+      <span style={{ ...h, flex: 1, minWidth: ACTIVITY_MIN_W }}>activity</span>
       <span style={{ width: COLS.actions }} />
     </div>
   )
-}
-
-/**
- * Collapsed-row activity text. Built from `currentWork` rather than a
- * pre-joined string so a multi-slot node reads as a count plus one job name
- * instead of a wall of chunk ids; expand the row for the per-slot detail.
- */
-function activitySummary(node: NodeSnapshot): string {
-  const work = node.currentWork
-  if (work.length === 0) return ''
-  const jobs = new Set(work.map((w) => w.jobId))
-  const slots = `${work.length}/${node.slotTarget}`
-  return jobs.size === 1 ? `${slots} · ${work[0].chunkId}` : `${slots} · ${jobs.size} jobs`
 }
 
 const pct = (v: number): string => `${v.toFixed(0)}%`
@@ -320,18 +309,7 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
           </span>
         </span>
         <span style={{ ...mono, ...cellSm, width: COLS.uptime }}>{uptime}</span>
-        <span
-          style={{
-            flex: 1,
-            fontSize: SCALE.textXs,
-            color: TOKENS.textFaint,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap'
-          }}
-        >
-          {node.lastError ?? activitySummary(node)}
-        </span>
+        <NodeActivity node={node} />
         <span style={{ width: COLS.actions, display: 'inline-flex', justifyContent: 'flex-end' }}>
           <DestroyNodeButton node={node} onDestroy={() => ipc.invoke('node:destroy', node.id)} />
         </span>

@@ -29,6 +29,17 @@ stalled the app).
   paid for idle GPUs. With `perGpu: true` it adds each GPU's own utilisation
   line (at most 64).
 
+- **The Fleet screen shows each node's job, and GPU use per GPU.** A
+  collapsed row's activity is now its slots in use, the job's latest frame
+  and the job's name, which opens the job (the row doesn't expand), with
+  "+N jobs" when the node is on several; a node's last error still takes the
+  cell. The GPU strip leads with *mean util* over the whole window chosen,
+  every GPU of the fleet weighted by the time it was rented, and says so
+  ("all GPUs, over the last 1h"); the other figures are marked as the
+  latest reading. A "combined | per GPU" switch (remembered) draws each
+  GPU's utilisation 0–100%, coloured by its place in the fleet, grey past
+  eight, with the readout listing the busiest eight at the crosshair.
+
 - **Blender's live status, and whose work a node is doing.** `chunk:progress`
   now carries Blender's latest status line (never the agent's `VR_*` markers),
   read into frame, sample x/y, time and time left, memory and phase

@@ -32,6 +32,7 @@ import {
   stepHover,
   ticks,
   tooltipLeft,
+  tooltipRows,
   unionXs,
   valueAt,
   yDomain,
@@ -96,6 +97,13 @@ export interface TimeChartProps {
    * order, null where a series has no reading at `x`.
    */
   tooltipExtra?: (x: number, values: ReadonlyArray<number | null>) => string[] | null
+  /**
+   * With more series than this, the readout lists only the highest this many
+   * values at the crosshair (then "+N more"), so a fleet's two dozen GPU
+   * lines don't stack a panel taller than the chart. Unset = list every one,
+   * in series order.
+   */
+  tooltipMax?: number
   /** Shaded spans, drawn behind the marks. Overlaps merge into one wash. */
   bands?: TimeBand[]
   /** The legend's name for the shading ("paid, idle"); no entry without it. */
@@ -126,6 +134,7 @@ export function TimeChart({
   baseline = 'zero',
   yMax,
   tooltipExtra,
+  tooltipMax,
   bands,
   bandLabel,
   markers,
@@ -405,7 +414,8 @@ export function TimeChart({
           {multi ? (
             // Value first, name second: the reader has the series and wants
             // the number. Keyed by a short stroke, like the line it names.
-            series.map((s, si) => {
+            tooltipRows(hoverValues, tooltipMax).map((si) => {
+              const s = series[si]
               const v = hoverValues[si]
               return (
                 <div key={s.id} style={tooltipRow}>
@@ -431,6 +441,11 @@ export function TimeChart({
               {hoverValues[0] != null ? format(hoverValues[0]) : null}
             </div>
           )}
+          {multi && tooltipMax != null && series.length > tooltipMax ? (
+            <div style={{ ...tooltipRow, color: TOKENS.textMuted }}>
+              +{series.length - tooltipMax} more
+            </div>
+          ) : null}
           {notes.map((n, i) => (
             <div key={i} style={tooltipRow}>
               {n.kind === 'more' ? null : <span style={n.kind === 'band' ? bandKey : markerKey} />}

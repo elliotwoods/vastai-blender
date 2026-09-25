@@ -246,6 +246,27 @@ export function fleetStripSeries(h: FleetGpuHistory): FleetStripSeries {
   return { rented, busy, byX, peakRented }
 }
 
+/**
+ * The strip's "per GPU" view: one 0–100% utilisation line per GPU across the
+ * fleet, from a fleet:gpuHistory read made with perGpu. Buckets are stamped
+ * at their middle, as in fleetStripSeries, and a bucket with no reading is a
+ * break in that GPU's line.
+ *
+ * Colour follows the GPU's place in main's list (by node, then index), not
+ * its nvidia-smi index: every node has a GPU 0, and on one chart they must
+ * not share a hue. Past the palette's eight, gpuColor gives the rest its
+ * grey; the legend and readout name each one.
+ */
+export function fleetGpuLines(h: FleetGpuHistory): TimeSeries[] {
+  const half = h.bucketMs / 2
+  return (h.gpus ?? []).map((g, i): TimeSeries => ({
+    id: `${g.nodeId}#${g.gpuIndex}`,
+    label: g.label,
+    color: gpuColor(i),
+    points: g.util.map((p) => ({ x: Math.min(p.ts + half, h.toMs), y: p.mean }))
+  }))
+}
+
 /** The newest bucket that saw the fleet, for the strip's figures; null when none did. */
 export function latestFleetPoint(h: FleetGpuHistory | undefined): FleetGpuPoint | null {
   if (!h) return null
