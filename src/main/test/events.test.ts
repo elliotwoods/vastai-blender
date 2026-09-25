@@ -377,6 +377,17 @@ describe('OS notification (ipc.ts)', () => {
   }
   const bodies = (): unknown[] => w.notifications.map((n) => n.options.body)
 
+  /**
+   * `p`'s outcome once fake time has run it out: a destroy retries Vast on
+   * timers (plan 1.2), so awaiting one without moving the clock never ends.
+   */
+  async function settled<T>(p: Promise<T>, what: string): Promise<T> {
+    let done = false
+    const tracked = p.finally(() => (done = true))
+    await w.until(() => done, what, { stepMs: 1_000 })
+    return tracked
+  }
+
   it('for an error or billing risk while no window is in front; never for a toast', async () => {
     const bus = await boot()
     const win = w.openWindow() // open, behind another app
@@ -437,18 +448,23 @@ describe('OS notification (ipc.ts)', () => {
     const app = await w.boot()
     const id = await w.readyNode(app)
     const [instanceId] = w.vast.created
-    const message = `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
 
-    // A Vast outage: the destroy fails, and so does the retry.
-    w.vast.fail('destroyInstance', { status: 503, message: 'service unavailable' }, 2)
-    await app.nodeManager.destroyNode(id)
-    expect(bodies()).toEqual([message])
+    // A Vast outage longer than a destroy rides out its blips for (plan
+    // 1.2): the destroy gives up for now, and so does the retry.
+    w.vast.fail('destroyInstance', { status: 503, message: 'service unavailable' }, 100)
+    await settled(app.nodeManager.destroyNode(id), 'destroy given up for now')
+    const [message] = bodies() as string[]
+    expect(bodies()).toHaveLength(1)
+    expect(message).toContain(`Destroy failed for instance ${instanceId}`)
+    expect(message).toContain('Vast.ai console')
 
     // The user dismisses it in the window, and a minute later presses Fleet's
-    // "clear failed", which retries the destroy.
+    // "clear failed", which retries the destroy. The retry timer's own tries
+    // meanwhile tell nobody: the user has heard.
     await w.invoke('alerts:dismiss', [`error:${message}`])
     await w.advance(60_000)
-    await expect(w.invoke('fleet:clearFailed')).resolves.toBe(0)
+    expect(bodies()).toEqual([message])
+    await expect(settled(w.invoke('fleet:clearFailed'), 'clear failed')).resolves.toBe(0)
     expect(w.vast.live()).toEqual([instanceId])
 
     // Still billing, so the user is told again...
