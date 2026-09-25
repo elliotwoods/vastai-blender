@@ -321,3 +321,48 @@ describe('1.11 #224: a chunk with cards to spare goes out across every card', ()
     await w.until(() => jobState(jobId) === 'complete', 'job complete')
   })
 })
+
+describe('1.11 #225: what a pinned run teaches gpu_perf', () => {
+  it('three pinned lanes on a 4-GPU node teach their own rate, not three quarters of it', async () => {
+    const { app, nodeId, machine } = await gpuNode(4)
+    const specs = recordSpecs(machine)
+    await submit(app, 'cycles', 4)
+    app.scheduler.kick()
+    await w.until(() => specs.length === 4, 'four pinned lanes')
+    // Each on its own card, as the agent reports.
+    specs.forEach((s, gpu) => machine.agent.writeState(s.chunkId, { status: 'rendering', gpu }))
+    // One finishes at once (too soon to teach anything). The other three
+    // then render with a card each and nothing waiting for the fourth.
+    machine.agent.finish(specs[0].chunkId)
+    await w.until(() => app.scheduler.activeWorkForNode(nodeId).length === 3, 'three left')
+    await w.advance(10 * 60_000)
+    const doneAt = Date.now()
+    specs.slice(1).forEach((s, i) => {
+      machine.agent.finish(s.chunkId)
+      // The real agent's done state keeps every field it had, its GPU included.
+      machine.agent.writeState(s.chunkId, {
+        status: 'done',
+        framesDone: 1,
+        framesTotal: 1,
+        exitCode: 0,
+        gpu: i + 1
+      })
+    })
+    await w.until(() => app.scheduler.activeWorkForNode(nodeId).length === 0, 'all done')
+
+    // One frame in about ten minutes on one card: ~6 frames/h per GPU. Scaled
+    // by the node's runs over its GPUs it was 3/4 of that.
+    const gpuName = w.get<{ gpu_name: string }>(
+      'SELECT gpu_name FROM nodes WHERE id = ?',
+      nodeId
+    )!.gpu_name
+    const perf = w.get<{ frames_per_hour: number; samples: number }>(
+      'SELECT frames_per_hour, samples FROM gpu_perf WHERE gpu_name = ?',
+      gpuName
+    )!
+    const dispatchedAt = doneAt - 10 * 60_000 - 60_000
+    expect(perf.samples).toBe(3)
+    expect(perf.frames_per_hour).toBeGreaterThan(3_600_000 / (Date.now() - dispatchedAt) - 0.01)
+    expect(perf.frames_per_hour).toBeLessThanOrEqual(6)
+  })
+})

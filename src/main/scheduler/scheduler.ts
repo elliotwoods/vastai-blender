@@ -56,7 +56,9 @@ import {
   guardLanes,
   initialGuard,
   normaliseSlotsPerGpu,
+  perGpuFramesPerHour,
   planLanes,
+  runsOnGpu,
   type LaneGuard,
   type LaneGuardContext,
   type LanePlan
@@ -391,6 +393,9 @@ class ChunkRun {
   /** Running mean of how many chunks shared this node during the render. */
   private concurrencySum = 0
   private concurrencySamples = 0
+  /** Running mean of how many runs shared this run's GPU, while it was pinned to one. */
+  private gpuRunsSum = 0
+  private gpuRunsSamples = 0
   /** GPU the agent pinned this run to (from its state file); null = unpinned/unknown */
   gpu: number | null = null
 
@@ -425,10 +430,14 @@ class ChunkRun {
    * agent reports 'rendering' — encoding and downloading produce no frames,
    * and counting them would read as a throughput collapse.
    */
-  private sampleRate(framesDone: number, concurrency: number): void {
+  private sampleRate(framesDone: number, work: ReadonlyArray<{ gpu?: number | null }>): void {
     const now = Date.now()
-    this.concurrencySum += concurrency
+    this.concurrencySum += Math.max(1, work.length)
     this.concurrencySamples += 1
+    if (this.gpu != null) {
+      this.gpuRunsSum += runsOnGpu(work, this.gpu)
+      this.gpuRunsSamples += 1
+    }
     if (this.lastSampleAt > 0 && framesDone > this.lastFramesDone) {
       const rate = (framesDone - this.lastFramesDone) / ((now - this.lastSampleAt) / 1000)
       if (Number.isFinite(rate) && rate > 0) {
@@ -804,7 +813,7 @@ class ChunkRun {
           framesTotal
         })
         if (state.status === 'rendering') {
-          this.sampleRate(state.framesDone, scheduler.slotsInUse(this.nodeId))
+          this.sampleRate(state.framesDone, scheduler.activeWorkForNode(this.nodeId))
         }
         const mismatch = this.noteEngine(state.engine)
         if (mismatch) {
@@ -957,15 +966,28 @@ class ChunkRun {
       const gpuName = snap?.gpuName
       if (gpuName && elapsedH > 0.005) {
         // Scale by the concurrency this chunk actually ran under. gpu_perf
-        // ranks OFFERS, so it must mean "frames/hour the whole node delivers".
+        // ranks OFFERS, so it must mean "frames/hour the hardware delivers".
         // A chunk sharing a node with five others takes ~6x as long in
         // wall-clock; recording that unscaled would teach the offer scorer
         // that packing makes a GPU slow, and it would stop buying the models
         // that pack best.
         //
-        // Stored per GPU (recordThroughput divides by the GPU count), so a
-        // 4-GPU node and a 1-GPU node of one model teach the same figure.
-        recordThroughput(gpuName, (frames / elapsedH) * this.meanConcurrency(), snap?.numGpus ?? 1)
+        // Stored per GPU, so a 4-GPU node and a 1-GPU node of one model
+        // teach the same figure. A pinned run is scaled by the runs that
+        // shared ITS card, not by the runs on the node over every GPU: with
+        // fewer runs than cards each had a card to itself, and the node
+        // figure taught runs/GPUs of the truth (a job's last chunk alone on a
+        // 4-GPU node, 25%), which pulled every offer of the model down the
+        // ranking, 1-GPU offers included (#225).
+        const perGpu = perGpuFramesPerHour({
+          runFramesPerHour: frames / elapsedH,
+          gpu: this.gpu,
+          meanRunsOnGpu: this.gpuRunsSamples > 0 ? this.gpuRunsSum / this.gpuRunsSamples : 1,
+          meanRunsOnNode: this.meanConcurrency(),
+          numGpus: snap?.numGpus ?? 1,
+          engine: this.engine
+        })
+        if (perGpu != null) recordThroughput(gpuName, perGpu, 1)
       }
       scheduler.onChunkFinished(this, { rendered: true })
       return
