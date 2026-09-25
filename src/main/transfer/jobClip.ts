@@ -19,6 +19,7 @@ import { mkdir, rename, rm, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { basename, join } from 'path'
 import { getDb } from '../db/db'
+import { describeError } from '../errors'
 import { emit } from '../events'
 import { ffmpegPath, runFfmpeg } from '../media/ffmpeg'
 import { toMediaUrl } from '../mediaUrl'
@@ -66,7 +67,7 @@ class JobClipBuilder {
         this.timers.delete(jobId)
         this.chain = this.chain.then(() =>
           this.build(jobId).catch((e) =>
-            console.warn(`[jobClip] ${jobId.slice(0, 8)}: ${(e as Error).message}`)
+            console.warn(`[jobClip] ${jobId.slice(0, 8)}: ${describeError(e)}`)
           )
         )
       },

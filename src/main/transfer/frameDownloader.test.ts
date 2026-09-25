@@ -187,6 +187,23 @@ describe('ChunkDownloader.drain', () => {
   })
 })
 
+describe('what a failed download says (1.20)', () => {
+  it('1.20 1d59516c: a transfer that fails with no message still names its code', async () => {
+    const r = await rig()
+    saved(r, 'frames/0001.png')
+    // A socket reset under the channel: ssh2 passes the system error on, and
+    // it may have no message at all.
+    r.machine.onSftp('open', Object.assign(new Error(''), { code: 'ECONNRESET' }), 1)
+    const out = await drain(r)
+
+    expect(out).toEqual({ manifestRead: true, lost: [], localSinkBlocked: [] })
+    const failed = w.alerts('warn').filter((a) => a.startsWith('download failed'))
+    expect(failed).toHaveLength(1)
+    expect(failed[0]).toMatch(/attempt 1\/\d+\): .*ECONNRESET/)
+    expect(w.alerts().filter((a) => /:\s*$/.test(a))).toEqual([])
+  })
+})
+
 describe('a line the parser should have refused', () => {
   afterEach(() => {
     vi.doUnmock('./manifest')

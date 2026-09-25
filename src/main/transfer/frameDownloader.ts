@@ -10,6 +10,7 @@ import { promises as fsp } from 'fs'
 import { rm } from 'fs/promises'
 import { dirname, join } from 'path'
 import { getDb } from '../db/db'
+import { describeError } from '../errors'
 import { emit } from '../events'
 import { toMediaUrl } from '../mediaUrl'
 import { isInside, resolveInside } from '../paths'
@@ -181,7 +182,7 @@ export async function recheckLocalSink(): Promise<boolean> {
 
 /** A download could not be written locally: pause them all, tell the user once. */
 function sinkFailed(e: LocalSinkError, dir: string): void {
-  const reason = e.message
+  const reason = describeError(e)
   const needBytes = e.needBytes ?? 0
   if (sinkTrouble) {
     sinkTrouble.reason = reason
@@ -685,7 +686,9 @@ export class ChunkDownloader {
       })
       return
     }
-    this.retryOrGiveUp(entry, (e as Error).message)
+    // With its code: a dropped connection can fail a transfer with an empty
+    // message, and the alert then said nothing after the colon (1.20).
+    this.retryOrGiveUp(entry, describeError(e))
   }
 
   /**
@@ -718,7 +721,7 @@ export class ChunkDownloader {
       this.retrying.delete(entry)
       if (this.stopped) return
       if (takes) {
-        this.retryOrGiveUp(entry, `the project folder would not take it: ${e.message}`)
+        this.retryOrGiveUp(entry, `the project folder would not take it: ${describeError(e)}`)
         return
       }
       this.queue.unshift(entry)
