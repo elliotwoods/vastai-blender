@@ -3,6 +3,8 @@ import { SETTINGS_LIMITS } from '../../../../shared/settingsSanitize'
 import {
   blenderVersionPatch,
   blenderVersionProblem,
+  dockerImagePatch,
+  dockerImageProblem,
   fieldsOf,
   limitsOf,
   mergeFieldErrors,
@@ -90,5 +92,20 @@ describe('limitsOf', () => {
       max: SETTINGS_LIMITS.spendCapPerHour.max,
       integer: false
     })
+  })
+})
+
+describe('docker images per engine (plan 1.18)', () => {
+  it('takes an image name, and blank for the built-in one', () => {
+    expect(dockerImageProblem('vastai/base-image:cuda-12.1.1')).toBeNull()
+    expect(dockerImageProblem('  ')).toBeNull()
+    expect(dockerImageProblem('not an image; rm -rf /')).toMatch(/not an image name/)
+  })
+
+  it('saves the trimmed name, and blank as back to the built-in image', () => {
+    expect(dockerImagePatch('octane', ' otoy/octane:1 ')).toEqual({
+      dockerImageByEngine: { octane: 'otoy/octane:1' }
+    })
+    expect(dockerImagePatch('cycles', '')).toEqual({ dockerImageByEngine: { cycles: null } })
   })
 })

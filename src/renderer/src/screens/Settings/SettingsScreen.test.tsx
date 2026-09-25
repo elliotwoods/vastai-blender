@@ -5,7 +5,7 @@ import type { SettingsPublic } from '../../../../shared/models'
 // The preload bridge does not exist outside Electron.
 vi.mock('../../lib/ipc', () => ({ ipc: { invoke: vi.fn(), on: vi.fn(() => () => {}) } }))
 
-const { SpendCapRow } = await import('./SettingsScreen')
+const { OctaneOptions, SpendCapRow } = await import('./SettingsScreen')
 
 // Plan 1.14 (#99 #112): the spend cap was a `type="number"` field whose
 // blank meant "no cap", saved on every keystroke. Backspacing it to retype
@@ -48,5 +48,35 @@ describe('the spend cap row', () => {
     const html = row({ spendCapPerHour: null })
     expect(html).toContain('No spend cap is set, so scale-up rents nothing')
     expect(noCapBox(html)).not.toContain('checked')
+  })
+})
+
+// Plan 1.18: Octane is signed in to by hand over VNC unless the user opts
+// in to the script, Octane nodes need an image with OctaneBlender, and the
+// credentials text says where they go now (stdin, only when opted in).
+describe('the Octane settings', () => {
+  const octane = (s: Partial<SettingsPublic>): string =>
+    renderToStaticMarkup(
+      <OctaneOptions settings={s as SettingsPublic} save={() => {}} errorFor={() => undefined} />
+    )
+  const box = (html: string, text: string): string =>
+    new RegExp(`<input type="checkbox"[^>]*>${text}`).exec(html)?.[0] ?? ''
+
+  it('signs in by hand unless the script is opted into, and says what the script discloses', () => {
+    const off = octane({})
+    expect(box(off, 'sign in by script')).not.toContain('checked')
+    expect(off).toContain('Open VNC login')
+    expect(off).toContain('its owner has it')
+    const on = octane({ octane: { scriptedSignIn: true, secureCloudOnly: true } })
+    expect(box(on, 'sign in by script')).toContain('checked')
+    expect(box(on, 'Octane on datacenter')).toContain('checked')
+  })
+
+  it('says Octane rents nothing without its image, and shows each engine’s', () => {
+    expect(octane({})).toContain('No Octane image is set, so Octane jobs rent nothing')
+    const set = octane({ dockerImageByEngine: { octane: 'otoy/octane:2024' } })
+    expect(set).not.toContain('No Octane image is set')
+    expect(set).toContain('value="otoy/octane:2024"')
+    expect(set).toContain('aria-label="Docker image for cycles nodes"')
   })
 })

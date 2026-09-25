@@ -11,6 +11,7 @@ import { qk, useAddons, useSettings, useUpdateSettings } from '../../lib/queries
 import { SCALE, TOKENS } from '../../lib/theme'
 import { useQueryClient } from '@tanstack/react-query'
 import type {
+  EngineId,
   OfferFilters,
   SettingsFieldError,
   SettingsPatch,
@@ -21,6 +22,8 @@ import type {
 import {
   blenderVersionPatch,
   blenderVersionProblem,
+  dockerImagePatch,
+  dockerImageProblem,
   limitsOf,
   mergeFieldErrors,
   noSpendCapPatch,
@@ -620,23 +623,181 @@ function AddonsSection(): React.JSX.Element {
   )
 }
 
+/** One engine's docker image: saved when the field is left or Enter pressed, blank = built-in. */
+function DockerImageField({
+  engine,
+  value,
+  save,
+  required
+}: {
+  engine: EngineId
+  value: string | undefined
+  save: (patch: SettingsPatch) => void
+  /** Octane's: the built-in image has no OctaneBlender */
+  required?: boolean
+}): React.JSX.Element {
+  const [draft, setDraft] = useState<string | null>(null)
+  const text = draft ?? value ?? ''
+  const problem = draft == null ? null : dockerImageProblem(draft)
+  const commit = (): void => {
+    if (draft == null) return
+    if (!problem && (draft.trim() || undefined) !== value) save(dockerImagePatch(engine, draft))
+    if (!problem) setDraft(null)
+  }
+  return (
+    <>
+      <input
+        type="text"
+        aria-label={`Docker image for ${engine} nodes`}
+        aria-invalid={problem != null || undefined}
+        title={problem ?? undefined}
+        placeholder={required ? 'required: an image with OctaneBlender' : 'built-in'}
+        value={text}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commit()
+          if (e.key === 'Escape' && draft != null) {
+            e.stopPropagation()
+            setDraft(null)
+          }
+        }}
+        style={{ ...input({ size: 'sm', invalid: problem != null }), ...mono, width: 320 }}
+      />
+      {problem ? (
+        <span style={{ fontSize: SCALE.textXs, color: TOKENS.danger }}>{problem}</span>
+      ) : null}
+    </>
+  )
+}
+
+const ENGINE_LABEL: Record<EngineId, string> = {
+  octane: 'Octane',
+  cycles: 'Cycles',
+  eevee: 'EEVEE'
+}
+
+/**
+ * How Octane nodes are rented and signed in (plan 1.18). Exported for its
+ * test. By hand over VNC is the default: a credential used on a rented
+ * machine is disclosed to its owner whatever route it takes, so scripting
+ * the sign-in is an opt-in that says so.
+ */
+export function OctaneOptions({
+  settings,
+  save,
+  errorFor
+}: {
+  settings: SettingsPublic
+  save: (patch: SettingsPatch) => void
+  errorFor: (field: string) => SettingsFieldError | undefined
+}): React.JSX.Element {
+  const o = settings.octane
+  const images = settings.dockerImageByEngine ?? {}
+  const box: CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    fontSize: SCALE.textSm,
+    color: TOKENS.text,
+    cursor: 'pointer'
+  }
+  return (
+    <div>
+      <div style={{ ...sectionLabel(), marginBottom: SCALE.space3 }}>Octane sign-in</div>
+      <div style={formRow}>
+        <label style={box}>
+          <input
+            type="checkbox"
+            checked={o?.scriptedSignIn === true}
+            onChange={(e) => save({ octane: { scriptedSignIn: e.target.checked } })}
+          />
+          sign in by script, with the saved OTOY account
+        </label>
+      </div>
+      <div style={{ ...hintText, margin: `-${SCALE.space2} 0 ${SCALE.space3} 22px` }}>
+        Off: each Octane node waits for you to sign in on its desktop (Fleet › the node › Open VNC
+        login), and your OTOY password never leaves this computer. On: the saved account is sent to
+        each Octane node&apos;s OctaneServer on its standard input. Root on that machine can still
+        read it, so its owner has it: use this only with hosts you trust
+        {o?.secureCloudOnly === true
+          ? '. With datacenter hosts only on, it goes to no other host.'
+          : ', or with datacenter hosts only below.'}
+      </div>
+      <FieldNote error={errorFor('octane.scriptedSignIn')} />
+      <div style={formRow}>
+        <label style={box}>
+          <input
+            type="checkbox"
+            checked={o?.secureCloudOnly === true}
+            onChange={(e) => save({ octane: { secureCloudOnly: e.target.checked } })}
+          />
+          Octane on datacenter (secure cloud) hosts only
+        </label>
+      </div>
+      <div style={{ ...hintText, margin: `-${SCALE.space2} 0 ${SCALE.space3} 22px` }}>
+        Rent Octane nodes only from Vast.ai&apos;s datacenter hosts, and ask for no sign-in, by hand
+        or by script, on a node rented any other way. Fewer, dearer offers.
+      </div>
+      <FieldNote error={errorFor('octane.secureCloudOnly')} />
+
+      <div style={{ ...sectionLabel(), margin: `${SCALE.space4} 0 ${SCALE.space3}` }}>
+        Docker images
+      </div>
+      {(['octane', 'cycles', 'eevee'] as const).map((engine) => (
+        <div key={engine}>
+          <div style={formRow}>
+            <span style={label}>{ENGINE_LABEL[engine]} nodes</span>
+            <DockerImageField
+              engine={engine}
+              value={images[engine]}
+              save={save}
+              required={engine === 'octane'}
+            />
+          </div>
+          {engine === 'octane' && !images.octane ? (
+            <div
+              style={{
+                ...hintText,
+                color: TOKENS.warn,
+                margin: `-${SCALE.space2} 0 ${SCALE.space3} 182px`
+              }}
+            >
+              No Octane image is set, so Octane jobs rent nothing: the built-in image has no
+              OctaneBlender.
+            </div>
+          ) : null}
+          <FieldNote error={errorFor(`dockerImageByEngine.${engine}`)} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function OctaneSection(): React.JSX.Element {
   const { data: settings } = useSettings()
+  const { save, errorFor, failure } = useSettingsSave()
   const qc = useQueryClient()
   const [user, setUser] = useState('')
   const [pass, setPass] = useState('')
+  if (!settings) return <div />
   return (
     <div>
-      <div style={{ ...sectionLabel(), marginBottom: SCALE.space3 }}>Octane license</div>
+      <SaveFailure failure={failure} />
+      <OctaneOptions settings={settings} save={save} errorFor={errorFor} />
+      <div style={{ ...sectionLabel(), margin: `${SCALE.space4} 0 ${SCALE.space3}` }}>
+        OTOY account
+      </div>
       <div style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint, marginBottom: SCALE.space3 }}>
-        Stored encrypted on this computer. To license a node they are sent to it — in the setup
-        command and OctaneServer&apos;s environment — so treat them as disclosed to the owner of
-        every machine an Octane node is rented from.
+        Used only when &quot;sign in by script&quot; is on. Stored encrypted on this computer, and
+        sent to a node on OctaneServer&apos;s standard input, never in a command line, the
+        environment or a file there: treat it as disclosed to the owner of every machine it is sent
+        to.
       </div>
       <div style={formRow}>
         <span style={label}>OTOY account</span>
         <input
-          placeholder={settings?.hasOtoyCredentials ? '(saved)' : 'email'}
+          placeholder={settings.hasOtoyCredentials ? '(saved)' : 'email'}
           value={user}
           onChange={(e) => setUser(e.target.value)}
           style={{ ...input({ size: 'sm' }), width: 240 }}

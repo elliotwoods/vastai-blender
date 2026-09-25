@@ -12,12 +12,17 @@
  */
 
 import type {
+  EngineId,
   OfferFilters,
   SettingsFieldError,
   SettingsPatch,
   SettingsPublic
 } from '../../../../shared/models'
-import { BLENDER_VERSION_RE, SETTINGS_LIMITS } from '../../../../shared/settingsSanitize'
+import {
+  BLENDER_VERSION_RE,
+  SETTINGS_LIMITS,
+  isDockerImage
+} from '../../../../shared/settingsSanitize'
 
 type Limited = keyof typeof SETTINGS_LIMITS
 
@@ -102,4 +107,20 @@ export function blenderVersionProblem(text: string): string | null {
 export function blenderVersionPatch(text: string): SettingsPatch {
   const t = text.trim()
   return { blenderVersionOverride: t === '' ? null : t }
+}
+
+/**
+ * Why a docker image typed for an engine's nodes would be refused, or null
+ * when main will take it (plan 1.18; the sanitizer's own check). Blank is
+ * fine: it means the built-in image.
+ */
+export function dockerImageProblem(draft: string): string | null {
+  const t = draft.trim()
+  if (!t || isDockerImage(t)) return null
+  return 'not an image name, such as vastai/base-image:tag'
+}
+
+/** The patch that sets one engine's image; blank goes back to the built-in one. */
+export function dockerImagePatch(engine: EngineId, draft: string): SettingsPatch {
+  return { dockerImageByEngine: { [engine]: draft.trim() || null } }
 }
