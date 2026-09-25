@@ -22,9 +22,10 @@ import {
   type Prompt
 } from './app/lifecycle'
 import { startHeadlessDrivers } from './app/headless/drivers'
+import { resolveMediaUrl, type MediaPlaces, type MediaTarget } from './app/mediaProtocol'
 import { externalUrl, isAppPage, type AppPage } from './app/windowPolicy'
 import { resolveBlenderRelease } from './blender/blendInfo'
-import { closeDb } from './db/db'
+import { closeDb, getDb } from './db/db'
 import { emit } from './events'
 import { registerIpc } from './ipc'
 import {
@@ -34,7 +35,6 @@ import {
   setSlotInfoProvider
 } from './nodes/nodeManager'
 import { installBlender, probeEevee, provisionBase } from './nodes/provisioner'
-import { resolveInside } from './paths'
 import { scheduler } from './scheduler/scheduler'
 import { jobClips } from './transfer/jobClip'
 import { getSettings } from './settings'
@@ -148,13 +148,27 @@ protocol.registerSchemesAsPrivileged([
   }
 ])
 
-/** Roots addressable as media://<host>/<relative-path>. */
-function mediaRoots(): Record<string, string> {
+/**
+ * What media:// URLs address (app/mediaProtocol.ts): media://job/<jobId>/…
+ * inside that job's jobs.output_dir, and media://<host>/… under these fixed
+ * roots.
+ */
+function mediaPlaces(): MediaPlaces {
   return {
-    // Dev fixtures (scripts/make-fixtures.ps1).
-    fixtures: join(app.getAppPath(), 'fixtures'),
-    // Downloaded renders (proxy clips) under the configured project root.
-    project: getSettings().projectRoot
+    roots: {
+      // Dev fixtures (scripts/make-fixtures.ps1).
+      fixtures: join(app.getAppPath(), 'fixtures'),
+      // The current project root, for URLs handed out before plan 1.13. One
+      // made relative to a root since changed names nothing.
+      project: getSettings().projectRoot
+    },
+    // The folder the job was given when it was submitted, whatever the
+    // project root is now.
+    jobDir: (jobId) =>
+      (
+        getDb().prepare('SELECT output_dir FROM jobs WHERE id = ?').get(jobId) as
+          { output_dir: string } | undefined
+      )?.output_dir ?? null
   }
 }
 
@@ -182,13 +196,18 @@ const MEDIA_TYPES: Record<string, string> = {
  */
 function registerMediaProtocol(): void {
   protocol.handle('media', async (request) => {
-    const url = new URL(request.url)
-    const root = mediaRoots()[url.host]
-    if (!root) return new Response('unknown media root', { status: 404 })
-    // The pathname is '/'-rooted at the media root; resolveInside wants it
-    // relative, and refuses anything that would leave the root.
-    const abs = resolveInside(root, decodeURIComponent(url.pathname).replace(/^\/+/, ''))
-    if (!abs) return new Response('forbidden', { status: 403 })
+    // Nothing outside its root (resolveInside); a malformed escape is a 400,
+    // where decodeURIComponent used to throw out of the handler.
+    let target: MediaTarget
+    try {
+      target = resolveMediaUrl(request.url, mediaPlaces())
+    } catch (e) {
+      // The job lookup's database, most likely.
+      console.warn(`[media] could not resolve ${JSON.stringify(request.url)}:`, e)
+      return new Response('media lookup failed', { status: 500 })
+    }
+    if ('status' in target) return new Response(target.reason, { status: target.status })
+    const abs = target.abs
 
     let size: number
     try {

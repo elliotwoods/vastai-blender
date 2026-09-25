@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -91,6 +91,8 @@ interface Loaded {
   schedulerStopped: number
   shutdowns: number
   nodes: NodeSnapshot[]
+  /** protocol.handle registrations, by scheme. */
+  protocols: Map<string, (request: Request) => Promise<Response>>
 }
 
 function node(patch: Partial<NodeSnapshot> = {}): NodeSnapshot {
@@ -138,6 +140,8 @@ async function load(
     userData?: string
     layOverlay?: boolean
     settings?: SettingsPublic
+    /** jobs.output_dir by job id, for the media:// handler's lookup. */
+    jobDirs?: Record<string, string>
   } = {}
 ): Promise<Loaded> {
   for (const k of ['VR_JOB_SPEC', 'VR_E2E_BLEND', 'VR_SHOT', 'VR_USERDATA', 'VR_QUIT_POLICY']) {
@@ -163,7 +167,8 @@ async function load(
     closedDb: 0,
     schedulerStopped: 0,
     shutdowns: 0,
-    nodes
+    nodes,
+    protocols: new Map()
   }
   FakeWindow.app = out.listeners
   let ready!: () => void
@@ -191,7 +196,12 @@ async function load(
       whenReady: () => whenReady
     },
     BrowserWindow: FakeWindow,
-    protocol: { registerSchemesAsPrivileged: () => {}, handle: () => {} },
+    protocol: {
+      registerSchemesAsPrivileged: () => {},
+      handle: (scheme: string, fn: (request: Request) => Promise<Response>) => {
+        out.protocols.set(scheme, fn)
+      }
+    },
     shell: { openExternal: async () => {} },
     dialog: {
       showMessageBox: (...args: unknown[]) => {
@@ -289,8 +299,18 @@ async function load(
     closeDb: () => {
       out.closedDb++
     },
-    // openJobs' count: no job queued or running.
-    getDb: () => ({ prepare: () => ({ get: () => ({ n: 0 }) }) })
+    getDb: () => ({
+      prepare: (sql: string) => ({
+        get: (id?: string) =>
+          // The media:// handler's job lookup.
+          sql.includes('output_dir')
+            ? opts.jobDirs?.[id ?? ''] != null
+              ? { output_dir: opts.jobDirs[id ?? ''] }
+              : undefined
+            : // openJobs' count: no job queued or running.
+              { n: 0 }
+      })
+    })
   }))
   vi.doMock('../jobs/jobs', () => ({
     listJobs: () => [],
@@ -806,5 +826,59 @@ describe('index.ts, an error nothing caught (plan 1.21)', () => {
     // to a terminal that went away fails later, as an 'error' event.
     const r = await load([])
     expect(r.stdio).toEqual(expect.arrayContaining(['stdout error', 'stderr error']))
+  })
+})
+
+describe('index.ts serves media:// (plan 1.13)', () => {
+  const JOB = '4f1c2a9e-0000-4000-8000-000000000001'
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'vr-media-'))
+  })
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  /** index.ts's media:// handler, with JOB's output folder under `dir/old-root`. */
+  async function media(): Promise<(url: string, headers?: HeadersInit) => Promise<Response>> {
+    const jobDir = join(dir, 'old-root', 'renders', JOB)
+    mkdirSync(join(jobDir, 'frames'), { recursive: true })
+    writeFileSync(join(jobDir, 'frames', '0001.png'), 'png bytes')
+    writeFileSync(join(dir, 'secret.txt'), 'not for the renderer')
+    // The project root has since moved (B7): the job's folder is not under it.
+    const settings = { projectRoot: join(dir, 'new-root') } as SettingsPublic
+    const r = await load([], {}, { settings, jobDirs: { [JOB]: jobDir } })
+    const handler = r.protocols.get('media')
+    expect(handler).toBeTypeOf('function')
+    return (url, headers) => handler!(new Request(url, { headers }))
+  }
+
+  it("1.13: a job's file comes from its own output folder, after the project root moved", async () => {
+    // Field: changing the root in Settings blanked every earlier job's
+    // previews (#9 #61 #175 #202 #214). media://job names the job, not a
+    // path under the current root.
+    const get = await media()
+    const res = await get(`media://job/${JOB}/frames/0001.png`)
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toBe('image/png')
+    expect(await res.text()).toBe('png bytes')
+  })
+
+  it('with byte ranges, for <video> seeking', async () => {
+    const get = await media()
+    const res = await get(`media://job/${JOB}/frames/0001.png`, { range: 'bytes=4-' })
+    expect(res.status).toBe(206)
+    expect(res.headers.get('content-range')).toBe('bytes 4-8/9')
+    expect(await res.text()).toBe('bytes')
+  })
+
+  it('nothing outside the job folder; an unknown job or a bad escape is refused, not thrown', async () => {
+    const get = await media()
+    expect((await get(`media://job/${JOB}/..%2F..%2F..%2Fsecret.txt`)).status).toBe(403)
+    expect((await get(`media://job/${JOB}/%2e%2e/%2e%2e/secret.txt`)).status).toBe(404)
+    expect((await get('media://job/no-such-job/frames/0001.png')).status).toBe(404)
+    expect((await get(`media://job/${JOB}/frames/%E0%A4%A`)).status).toBe(400)
+    expect((await get(`media://job/${JOB}/frames/0002.png`)).status).toBe(404)
   })
 })

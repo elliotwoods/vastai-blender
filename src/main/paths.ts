@@ -7,7 +7,8 @@
  *    (root on the box) and any .blend startup script, so a bare
  *    `join(jobDir, entry.file)` turns `../../Library/LaunchAgents/x.plist`
  *    into a file written anywhere the user can write;
- *  - the renderer's media:// URLs, relative to the project root.
+ *  - the renderer's media:// URLs, relative to a job's output folder or to
+ *    a fixed root such as the project's (app/mediaProtocol.ts).
  *
  * Both go through resolveInside, which hands back an absolute path only when
  * it is strictly inside the root, and null for anything else. It works on the
