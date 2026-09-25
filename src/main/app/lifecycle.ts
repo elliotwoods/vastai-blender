@@ -439,13 +439,14 @@ async function settlesWithin(p: Promise<unknown>, ms: number): Promise<boolean> 
 
 /**
  * A create that may still answer: no instance id, no known outcome, and not
- * ended 'failed'. A create in flight is 'requested', or 'destroying' or
- * 'destroyed' if a destroy landed on it meanwhile (destroyNode then leaves
- * the instance to rentOffer). One that answered with no outcome (a 5xx, a
- * lost reply, a cancel mid-create) ends 'failed' still counted, and nothing
- * more will come for it until plan 1.4's label lookup. A row an earlier run
- * left 'requested' and the boot's sweep could not settle (offline) reads as
- * in flight too, and costs its budget in waiting.
+ * ended 'failed'. A create in flight, or one whose reply was lost and whose
+ * instance plan 1.4's lookup is looking for by its label, is 'requested', or
+ * 'destroying' or 'destroyed' if a destroy landed on it meanwhile (rentOffer
+ * then destroys whatever turns up). Either may settle within the quit. A
+ * 'failed' row with no known outcome will not: an older build's lost create,
+ * left so, that the boot's sweep could not look up (Vast not answering). A
+ * row an earlier run left 'requested' that the sweep could not settle reads
+ * as in flight too, and costs its budget in waiting.
  */
 function createMayStillAnswer(n: NodeSnapshot): boolean {
   return createOutcomeUnknown(n) && n.state !== 'failed'
