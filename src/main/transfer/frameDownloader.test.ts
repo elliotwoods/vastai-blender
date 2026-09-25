@@ -243,6 +243,21 @@ describe("frames that are not the chunk's", () => {
     expect(downloaded(r.jobId)).toEqual([1, 4])
     expect(local(r, 'frames/0002.png') || local(r, 'frames/0003.png')).toBe(false)
   })
+
+  it('of a legacy job with a fractional step, are judged on the grid the node renders (1.9 review)', async () => {
+    // A job from before submissions were validated: frame_step 2.5. The
+    // agent renders int() of the spec's numbers, so Blender saved 1, 3 and 5,
+    // each paid for. Judged on 2.5, 3 and 5 were refused and never fetched.
+    const r = await rig({ start: 1, end: 5.5, step: 2.5 })
+    for (const f of ['0001', '0002', '0003', '0005', '0007']) saved(r, `frames/${f}.png`)
+
+    const result = await drain(r)
+
+    expect(result.lost).toEqual([])
+    for (const f of ['0001', '0003', '0005']) expect(local(r, `frames/${f}.png`)).toBe(true)
+    // Off the node's own grid, or past its end: still not this chunk's.
+    expect(local(r, 'frames/0002.png') || local(r, 'frames/0007.png')).toBe(false)
+  })
 })
 
 // A stereo or multiview scene with Views Format 'Individual' saves each view

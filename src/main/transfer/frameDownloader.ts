@@ -556,7 +556,16 @@ export class ChunkDownloader {
     // ever get through, it is not this check's to judge: download() still
     // holds it to the job folder.
     if (frame == null) return true
-    const { start, end, step } = this.target.frames
+    // Judged on the grid Blender renders, which is the agent's: noderunner
+    // takes int() of the spec's frameStart, frameEnd and frameStep, and
+    // Math.trunc is Python's int(). Every job since submissions were
+    // validated has whole numbers there already. A job from before can carry
+    // a fractional frame_step (the dialog accepted 2.5): its nodes render 1,
+    // 3, 5…, and judged on 2.5 those frames were refused, never fetched,
+    // though every one was paid for.
+    const start = Math.trunc(this.target.frames.start)
+    const end = Math.trunc(this.target.frames.end)
+    const step = Math.trunc(this.target.frames.step || 1)
     return frame >= start && frame <= end && (frame - start) % step === 0
   }
 
