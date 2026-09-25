@@ -30,11 +30,13 @@
  * sign-in by hand moves a node from needsLogin to licensed.
  *
  * Every destroy (nodeManager's ensureInstanceGone) SIGTERMs the server and
- * waits, up to 20 s, for a clean exit (which releases the floating license)
- * BEFORE destroying the instance, on any node with an OctaneServer pidfile
- * that it still has a connection to. A node already unreachable, or one
- * destroyed at start-up before it was reconnected, is not stopped — see
- * docs/OCTANE.md for the manual recovery path.
+ * waits for a clean exit (which releases the floating license) BEFORE
+ * destroying the instance, on any node with an OctaneServer pidfile that it
+ * still has a connection to: up to 35 s where octane_state says the server
+ * ran, which covers the script's own 30 s wait, and 20 s otherwise. A node
+ * already unreachable, or one destroyed at start-up before it was
+ * reconnected, is not stopped — see docs/OCTANE.md for the manual recovery
+ * path.
  */
 
 import { randomBytes } from 'crypto'

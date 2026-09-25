@@ -160,10 +160,22 @@ const DESTROY_RETRY_MS = 60_000
 
 /**
  * The longest a destroy waits for OctaneServer to stop and release its
- * floating license. A clean exit takes seconds; the script's own wait is 30 s,
- * and past this the instance going away ends the server anyway.
+ * floating license, on a node with a pidfile that the app does not know to
+ * have run Octane (octane_state 'none': a server from before this build, or
+ * whose state was never read). A clean exit takes seconds; past this the
+ * instance going away ends the server anyway.
  */
 const OCTANE_STOP_BUDGET_MS = 20_000
+
+/**
+ * The same, on a node whose server the app knows ran (octane_state not
+ * 'none'): setup_octane.sh's own wait for a clean exit, which is what
+ * releases the OTOY seat, is 30 s, and a server cut off mid-shutdown may
+ * hold its seat until OTOY times it out. Plus the connect and exec. Only a
+ * stop that overlaps another stop already running (the script's lock) can
+ * take longer.
+ */
+const OCTANE_STOP_RUNNING_BUDGET_MS = 35_000
 
 /**
  * Plan 1.4: how long the instance of a create that got no answer is looked
@@ -3132,12 +3144,16 @@ export class NodeManager {
    * answered (nothing can run on a node where it never has) and over the
    * node's own connection, which exec reconnects if it dropped. The script
    * runs only when the node has an OctaneServer pidfile, and a wedged or dead
-   * node holds the destroy up for OCTANE_STOP_BUDGET_MS at most.
+   * node holds the destroy up for OCTANE_STOP_BUDGET_MS at most, or
+   * OCTANE_STOP_RUNNING_BUDGET_MS where the server is known to have run.
+   * Neither is billing's concern: the instance bills the same either way.
    */
   private async stopOctane(node: ManagedNode): Promise<void> {
     const ssh = node.ssh
     if (!ssh || !node.sshEverAnswered) return
-    await stopOctaneServer(ssh, { timeoutMs: OCTANE_STOP_BUDGET_MS, onlyIfStarted: true })
+    const timeoutMs =
+      node.octaneState === 'none' ? OCTANE_STOP_BUDGET_MS : OCTANE_STOP_RUNNING_BUDGET_MS
+    await stopOctaneServer(ssh, { timeoutMs, onlyIfStarted: true })
   }
 
   /** The managed nodes whose row holds `instanceId` unconfirmed. */

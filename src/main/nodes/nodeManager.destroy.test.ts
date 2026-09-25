@@ -292,6 +292,42 @@ describe('1.2 ensureInstanceGone: a destroy is done when Vast confirms it', () =
     expect(del.at - start).toBeLessThanOrEqual(21_000)
     expect(row(id).state).toBe('destroyed')
   })
+
+  it("a server the app knows ran gets the script's 30 s to exit cleanly, 35 s at most (1.18 review 2)", async () => {
+    // Its clean exit is what gives the OTOY seat back; one cut off at 20 s
+    // mid-shutdown could hold the seat until OTOY timed it out.
+    const app = await bootNodes()
+    app.nodeManager.init()
+    const id = await w.readyNode(app)
+    w.db.prepare(`UPDATE nodes SET octane_state = 'licensed' WHERE id = ?`).run(id)
+    let stopAnswered = false
+    w.machineFor(id).onExec(/octane-server\.pid/, async () => {
+      // The server takes 28 s to exit, inside the script's own wait.
+      await new Promise((resolve) => setTimeout(resolve, 28_000))
+      stopAnswered = true
+      return 'OCTANE_STOPPED clean\n'
+    })
+
+    const start = Date.now()
+    const destroying = watch(app.nodeManager.destroyNode(id))
+    await w.until(() => destroying.done, 'destroy finished', { stepMs: 1_000 })
+    const del = w.vast.calls.find((c) => c.method === 'destroyInstance')!
+    expect(stopAnswered).toBe(true)
+    expect(del.at - start).toBeGreaterThanOrEqual(28_000)
+    expect(del.at - start).toBeLessThanOrEqual(29_000)
+
+    // A stop that hangs is still bounded.
+    const other = await w.readyNode(app)
+    w.db.prepare(`UPDATE nodes SET octane_state = 'needsLogin' WHERE id = ?`).run(other)
+    w.machineFor(other).onExec(/octane-server\.pid/, () => HANG)
+    const t = Date.now()
+    const second = watch(app.nodeManager.destroyNode(other))
+    await w.until(() => second.done, 'second destroy finished', { stepMs: 1_000 })
+    const del2 = w.vast.calls.filter((c) => c.method === 'destroyInstance')[1]
+    expect(del2.at - t).toBeGreaterThanOrEqual(35_000)
+    expect(del2.at - t).toBeLessThanOrEqual(36_000)
+    expect(row(other).state).toBe('destroyed')
+  })
 })
 
 describe('1.2 at start-up: what the last run left', () => {
