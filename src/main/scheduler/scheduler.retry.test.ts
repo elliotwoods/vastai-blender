@@ -380,8 +380,10 @@ describe('1.17: the machines and the network are not the render', () => {
 
     // destroyNode lets the scheduler forget the node before it marks it
     // destroying: the requeue must not hand the chunk straight back to it.
-    void app.nodeManager.destroyNode(first)
-    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    let destroyed = false
+    void app.nodeManager.destroyNode(first).finally(() => (destroyed = true))
+    // The destroy runs its course inside the test, not into the next one.
+    await w.until(() => destroyed && jobState(jobId) === 'complete', 'destroyed, job complete')
     expect(assignedTo(first)).toBe(1)
     expect(assignedTo(second)).toBe(1)
     expect(chunkRow(chunk.id)).toMatchObject({
