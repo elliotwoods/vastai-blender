@@ -2136,7 +2136,9 @@ class Scheduler {
    * (describeError; job 1d59516c's alerts ended at "failed: "), and what
    * happens next. A chunk requeued after its node went away says nothing of
    * its own: forgetNode's alert covers them all. One that failed for good
-   * does, since that alert counts only the chunks it requeued.
+   * does, since that alert counts only the chunks it requeued. One whose
+   * every frame had already arrived is complete: nothing failed, and a
+   * node destroyed at the end of its render warned that it had.
    */
   private failureAlert(
     before: ChunkRow,
@@ -2146,7 +2148,7 @@ class Scheduler {
     waitMs: number,
     repeat: boolean
   ): AlertEvent | null {
-    if (f.stage === 'node' && r.outcome === 'pending') return null
+    if (f.stage === 'node' && r.outcome !== 'failed') return null
     const what = `${f.stage === 'dispatch' ? 'dispatch' : 'chunk'} ${before.id} failed`
     if (r.outcome === 'complete') {
       return {

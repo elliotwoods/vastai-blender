@@ -583,6 +583,29 @@ describe('1.17: where a chunk the machines failed goes, and what it is told', ()
     expect(w.alerts().filter((a) => /requeued — node went away/.test(a))).toEqual([])
   })
 
+  it('1.17: a node that goes away after every frame of its chunk arrived says nothing failed', async () => {
+    const { app, ids } = await nodes(1)
+    const machine = w.machineFor(ids[0])
+    machine.onSpec = (spec) => {
+      // Every frame rendered and listed; the agent is still encoding.
+      machine.agent.render(spec.chunkId)
+      machine.agent.writeState(spec.chunkId, { status: 'encoding', framesDone: 4 })
+    }
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => downloaded(jobId).length === 4, 'every frame downloaded')
+
+    let destroyed = false
+    void app.nodeManager.destroyNode(ids[0]).finally(() => (destroyed = true))
+    await w.until(() => destroyed && settled(jobId), 'destroyed, job settled')
+    expect(jobState(jobId)).toBe('complete')
+    expect(chunkRow(chunk.id)).toMatchObject({ state: 'complete', retries: 0 })
+    // Nothing failed: no warning reads as though something had.
+    expect(w.alerts().filter((a) => a.includes(chunk.id))).toEqual([])
+    expect(w.alerts().filter((a) => /requeued — node went away/.test(a))).toEqual([])
+  })
+
   it('1.17: a chunk goes back to the node it failed on when the only other node is busy', async () => {
     const { app, ids } = await nodes(2)
     const attempts = new Map<string, number>()
