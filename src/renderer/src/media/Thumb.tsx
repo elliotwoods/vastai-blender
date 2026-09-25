@@ -12,8 +12,14 @@
  * is the difference between "not yet" and "went wrong".
  */
 
-import { CHUNK_TONE, SCALE, STATUS_VARS, TOKENS } from '../lib/theme'
+import { CHUNK_TONE, SCALE, STATUS_VARS, TOKENS, type StatusTone } from '../lib/theme'
 import type { ChunkState } from '../../../shared/models'
+
+/**
+ * A chunk state as a thumbnail sees it. `'cancelled'` is named here ahead of
+ * (and harmlessly alongside) the backend adding it to ChunkState.
+ */
+export type ThumbState = ChunkState | 'cancelled'
 
 /** States where a missing thumbnail means "in progress", not "never coming". */
 const WORKING: ChunkState[] = ['rendering', 'encoding', 'downloading']
@@ -33,7 +39,7 @@ export function Thumb({
   width: number
   height: number
   /** Owning chunk's state — drives the placeholder's vocabulary. */
-  state?: ChunkState
+  state?: ThumbState
   /** Small caption drawn over the bottom edge (frame number, usually). */
   label?: string
   title?: string
@@ -41,8 +47,14 @@ export function Thumb({
   onDoubleClick?: () => void
   selected?: boolean
 }): React.JSX.Element {
-  const tone = state ? STATUS_VARS[CHUNK_TONE[state]] : null
-  const working = !!state && WORKING.includes(state)
+  const cancelled = state === 'cancelled'
+  const toneName: StatusTone | undefined = cancelled
+    ? 'dead'
+    : state
+      ? (CHUNK_TONE as Partial<Record<string, StatusTone>>)[state]
+      : undefined
+  const tone = toneName ? STATUS_VARS[toneName] : null
+  const working = !!state && (WORKING as string[]).includes(state)
   const failed = state === 'failed'
 
   return (
@@ -78,16 +90,20 @@ export function Thumb({
           style={{
             width: '100%',
             height: '100%',
+            // Cancelled hatches in the dead tone's BORDER colour: its fill is
+            // almost the surface colour and would read as "queued".
             background: failed
               ? STATUS_VARS.error.fill
-              : `repeating-linear-gradient(45deg, ${TOKENS.surface} 0 4px, ${TOKENS.surfaceRaised} 4px 8px)`,
+              : cancelled
+                ? `repeating-linear-gradient(-45deg, ${TOKENS.surface} 0 3px, ${STATUS_VARS.dead.border} 3px 5px)`
+                : `repeating-linear-gradient(45deg, ${TOKENS.surface} 0 4px, ${TOKENS.surfaceRaised} 4px 8px)`,
             display: 'grid',
             placeItems: 'center',
             color: tone?.text ?? TOKENS.textFaint,
             fontSize: SCALE.text2xs
           }}
         >
-          {failed ? '!' : null}
+          {failed ? '!' : cancelled ? '×' : null}
         </div>
       )}
       {label ? (

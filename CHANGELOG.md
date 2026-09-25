@@ -131,6 +131,12 @@ stalled the app).
 - **Preview playback speed.** The preview's transport bar has 0.25×, 0.5×,
   1×, 2× and 4× buttons, and `<` / `>` step between them. The choice is
   remembered. Compared clips stay in sync at any speed.
+- **A zoomable film strip** (built, not yet on the job page): a minimap of the
+  whole job, coloured by chunk state, with a window you drag, resize and
+  Ctrl/⌘-scroll to zoom, over a row of thumbnails that never scrolls. When the
+  window holds more frames than fit, the row shows every Nth frame and a chip
+  says so ("every 12th frame · 1–5000") with a *zoom to all frames* button.
+  Thumbnails of cancelled chunks are hatched grey.
 
 ### Changed
 
