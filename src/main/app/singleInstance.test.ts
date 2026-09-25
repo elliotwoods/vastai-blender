@@ -142,6 +142,14 @@ async function load(lockHeld: boolean, env: Record<string, string> = {}): Promis
   vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
     throw new Exit(code ?? 0)
   }) as typeof process.exit)
+  // index.ts installs its crash guard and stdio guard as it loads (plan
+  // 1.21). Recorded here rather than added to the test runner's own process
+  // and streams: every load would leave one of each behind for the rest of
+  // the worker, writing crash lines and raising alerts for its errors.
+  vi.spyOn(process, 'on').mockImplementation((() => process) as typeof process.on)
+  for (const stream of [process.stdout, process.stderr]) {
+    vi.spyOn(stream, 'on').mockImplementation((() => stream) as typeof stream.on)
+  }
 
   try {
     await import('../index')
@@ -235,5 +243,21 @@ describe('the running instance, on a second launch', () => {
     r.secondInstance!({}, [], '/', { scripted: true })
     expect(win).toMatchObject({ restored: 0, shown: 0, focused: 0 })
     expect(FakeWindow.created).toBe(1)
+  })
+})
+
+describe('loading index.ts here', () => {
+  it("leaves no listener on the test runner's process or streams", async () => {
+    const count = (): number[] => [
+      process.listenerCount('uncaughtException'),
+      process.listenerCount('unhandledRejection'),
+      process.stdout.listenerCount('error'),
+      process.stderr.listenerCount('error')
+    ]
+    const before = count()
+    await load(false)
+    vi.resetModules()
+    await load(true, { VR_JOB_SPEC: '/campaign/spec.json' })
+    expect(count()).toEqual(before)
   })
 })
