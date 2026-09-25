@@ -3,6 +3,8 @@ import type { ChunkSnapshot, ChunkState, JobDetail } from '../../../shared/model
 import {
   canDestroy,
   canReprovision,
+  canResume,
+  describeResume,
   describeReprovision,
   describeRetry,
   ipcErrorText,
@@ -139,6 +141,17 @@ describe('node actions', () => {
     // Destroyed while its create was out with no answer: whatever it made may bill.
     expect(canDestroy({ state: 'destroyed', instanceId: null, createUnknownSince: 5 })).toBe(true)
     expect(canDestroy({ state: 'destroyed', instanceId: null })).toBe(false)
+  })
+
+  it('1.17: offers resume only for a job the breaker held and that is still live', () => {
+    const held = { kind: 'repeatedFailure' as const, message: 'm', since: 1 }
+    expect(canResume({ state: 'running', attention: held })).toBe(true)
+    expect(canResume({ state: 'queued', attention: held })).toBe(true)
+    expect(canResume({ state: 'failed', attention: { ...held, kind: 'engine' } })).toBe(false)
+    expect(canResume({ state: 'cancelled', attention: held })).toBe(false)
+    expect(canResume({ state: 'running', attention: null })).toBe(false)
+    expect(describeResume(true)).toBe('resumed: its chunks go out again')
+    expect(describeResume(false)).toBe('the job was not held')
   })
 
   it('describes a reprovision', () => {

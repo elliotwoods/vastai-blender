@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import type { ChunkSnapshot, ChunkState, JobDetail } from '../../../../shared/models'
-import { JobActions, JobAttentionNote } from './JobActions'
+import { JobActions, JobAttentionNote, SceneChangedNote } from './JobActions'
 
 // JobDetail's cancel and "Re-render missing" ask before they act (audit D4,
 // plan 1.15): each is a ConfirmButton, whose resting label sits in an
@@ -49,6 +49,7 @@ const render = (j: JobDetail, note: string | null = null): string =>
   renderToStaticMarkup(
     <JobActions
       job={j}
+      onResume={() => Promise.resolve()}
       onRetryMissing={() => Promise.resolve()}
       onCancel={() => Promise.resolve()}
       note={note}
@@ -79,6 +80,35 @@ describe('JobActions', () => {
   it('shows what the last re-render did', () => {
     const html = render(job({ state: 'partial', chunks: [chunk('failed')] }), '3 frames queued')
     expect(html).toContain('3 frames queued')
+  })
+})
+
+describe('1.17: a job the retry breaker held', () => {
+  const held = {
+    kind: 'repeatedFailure' as const,
+    message: 'the same failure on 2 nodes',
+    since: 1
+  }
+
+  it('offers resume, asking first: cancel and resubmit would bill every finished frame again', () => {
+    const html = render(job({ state: 'running', attention: held }))
+    expect(html).toContain('<span aria-live="polite">resume</span>')
+  })
+
+  it('offers no resume for a job failed outright, or one nothing holds', () => {
+    expect(
+      render(job({ state: 'failed', attention: { ...held, kind: 'scene' }, chunks: [] }))
+    ).not.toContain('>resume<')
+    expect(render(job({}))).not.toContain('>resume<')
+  })
+})
+
+describe('SceneChangedNote (1.12)', () => {
+  it('says the scene changed after submit, and nothing otherwise', () => {
+    expect(renderToStaticMarkup(<SceneChangedNote job={job({ sceneChanged: true })} />)).toContain(
+      'scene changed since submit'
+    )
+    expect(renderToStaticMarkup(<SceneChangedNote job={job({ sceneChanged: null })} />)).toBe('')
   })
 })
 

@@ -17,12 +17,12 @@ import { useLogStore } from '../../lib/logStore'
 import { useNav } from '../../lib/nav'
 import { usePreview } from '../../lib/preview'
 import { useChunkProgress } from '../../lib/progressStore'
-import { useJob, useRetryMissing, useSetJobShareNode } from '../../lib/queries'
-import { describeRetry, ipcErrorText } from '../../lib/recovery'
+import { useJob, useResumeJob, useRetryMissing, useSetJobShareNode } from '../../lib/queries'
+import { describeResume, describeRetry, ipcErrorText } from '../../lib/recovery'
 import { CHUNK_TONE, SCALE, STATUS_VARS, TOKENS } from '../../lib/theme'
 import { Filmstrip } from '../../media/Filmstrip'
 import type { ChunkSnapshot } from '../../../../shared/models'
-import { JobActions, JobAttentionNote } from './JobActions'
+import { JobActions, JobAttentionNote, SceneChangedNote } from './JobActions'
 
 function ChunkCell({ chunk }: { chunk: ChunkSnapshot }): React.JSX.Element {
   const openPreview = usePreview((s) => s.open)
@@ -198,6 +198,13 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
       (r) => setNote({ jobId, text: describeRetry(r) }),
       (e: unknown) => setNote({ jobId, text: ipcErrorText(e) })
     )
+  // "resume" for a job the retry breaker held (plan 1.17), the same way.
+  const resume = useResumeJob()
+  const onResume = (): Promise<void> =>
+    resume.mutateAsync(jobId).then(
+      (r) => setNote({ jobId, text: describeResume(r) }),
+      (e: unknown) => setNote({ jobId, text: ipcErrorText(e) })
+    )
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -219,6 +226,7 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
               </button>
               <JobActions
                 job={job}
+                onResume={onResume}
                 onRetryMissing={onRetryMissing}
                 onCancel={() => ipc.invoke('job:cancel', jobId)}
                 note={note?.jobId === jobId ? note.text : null}
@@ -269,6 +277,7 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
               </label>
             ) : null}
             {job ? <JobAttentionNote job={job} /> : null}
+            {job ? <SceneChangedNote job={job} /> : null}
           </>
         }
       />

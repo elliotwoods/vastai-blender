@@ -72,6 +72,25 @@ export function retryMissingOffer(job: JobDetail): RetryOffer | null {
   }
 }
 
+/**
+ * Whether JobDetail offers "resume" (job:resume, plan 1.17): the retry
+ * breaker held the job after the same failure on several nodes. Before the
+ * channel existed a held job's only way on was cancel and resubmit, which
+ * renders and bills every finished frame again. A job the scheduler failed
+ * outright (its scene, engine or an extension) stays failed: main refuses
+ * to resume it, since it would fail the same way on a paid node.
+ */
+export function canResume(job: Pick<JobDetail, 'state' | 'attention'>): boolean {
+  return (
+    job.attention?.kind === 'repeatedFailure' && (job.state === 'queued' || job.state === 'running')
+  )
+}
+
+/** What a finished "resume" did. */
+export function describeResume(resumed: boolean): string {
+  return resumed ? 'resumed: its chunks go out again' : 'the job was not held'
+}
+
 /** What a finished "Re-render missing" did, for the line beside the button. */
 export function describeRetry(r: RetryMissingResult | void): string {
   if (!r || r.frames === 0) return 'nothing was missing'
