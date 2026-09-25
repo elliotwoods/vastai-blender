@@ -11,7 +11,9 @@
  *   tmux        one session, `vr-agent`, kept as a marker file. new-session
  *               starts a fake agent as FAKE_AGENT says: `beat` (default) writes
  *               state/heartbeat as noderunner.py's heartbeat_loop does at once
- *               (the time, str(time.time()), no newline), `crash` dies at
+ *               (the time, str(time.time()), no newline) and leaves a real
+ *               long-lived "tmux-server" that, like tmux's, inherits every fd
+ *               the client had but stdio, `crash` dies at
  *               startup (no session, a traceback in agent.log), `silent` keeps
  *               the session but never beats, and `stale-beat` is silent while
  *               a beat stamped 30 s before the launch lands, as the old
@@ -54,7 +56,7 @@ import {
   writeFileSync
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const REMOTE_SRC = fileURLToPath(new URL('../../../remote', import.meta.url))
@@ -122,7 +124,10 @@ case "$1" in
   kill-session) rm -f "$STUB_REC/tmux-session" ;;
   new-session)
     case "\${FAKE_AGENT:-beat}" in
-      beat) touch "$STUB_REC/tmux-session"; mkdir -p "$VASTAI_HOME/state"; printf '%s.25' "$(date +%s)" > "$VASTAI_HOME/state/heartbeat" ;;
+      beat)
+        touch "$STUB_REC/tmux-session"; mkdir -p "$VASTAI_HOME/state"; printf '%s.25' "$(date +%s)" > "$VASTAI_HOME/state/heartbeat"
+        (exec -a tmux-server sleep 300) < /dev/null > /dev/null 2>&1 &
+        echo $! >> "$STUB_REC/spawned" ;;
       crash) echo "Traceback (most recent call last): fake crash" >> "$VASTAI_HOME/logs/agent.log" ;;
       silent) touch "$STUB_REC/tmux-session" ;;
       stale-beat) touch "$STUB_REC/tmux-session"; printf '%s.9' "$(( $(date +%s) - 30 ))" > "$VASTAI_HOME/state/heartbeat" ;;
@@ -359,6 +364,7 @@ export function remoteNode(opts: { provisioned?: boolean } = {}): RemoteNode {
       return r
     },
     holdLock: (path) => {
+      mkdirSync(dirname(path), { recursive: true })
       const ready = `${path}.held`
       const child = spawn(
         '/usr/bin/perl',

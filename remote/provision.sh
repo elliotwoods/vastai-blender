@@ -35,6 +35,10 @@ AGENT_STALE_S=60
 AGENT_START_WAIT_S="${AGENT_START_WAIT_S:-30}"
 # How long a stopped agent has to exit before it is killed. (Tests shorten it.)
 AGENT_STOP_WAIT_S="${AGENT_STOP_WAIT_S:-10}"
+# How long restart-agent waits for one already running on the node, which
+# takes at most AGENT_STOP_WAIT_S + AGENT_START_WAIT_S and a little more.
+# (Tests shorten it.)
+AGENT_LOCK_WAIT_S="${AGENT_LOCK_WAIT_S:-90}"
 # The agent process as ps shows it. tmux runs the command below through sh,
 # which starts python3 with this path unquoted; neither the tmux server nor
 # that sh match, since their command lines quote it.
@@ -58,7 +62,10 @@ take_lock() {
   fi
   mkdir -p "$STATE_DIR"
   exec 9> "$STATE_DIR/$1.lock"
-  if [ "$2" = 0 ]; then flock -n 9; else flock -w "$2" 9; fi
+  flock -n 9 && return 0
+  [ "$2" != 0 ] || return 1
+  log "waiting up to ${2}s for another $1 on this node…"
+  flock -w "$2" 9
 }
 
 make_dirs() {
@@ -269,6 +276,14 @@ start_ensure_optix() {
 cmd_restart_agent() {
   local reason started waited=0
   make_dirs
+  # One at a time, deciding on what the one before left. Two that overlap (the
+  # app's prep deadline can give up on an exec that still runs here) would
+  # both find the agent dead and both restart it, and one would fail on a good
+  # node: its agent killed by the other's stop, or its new-session a duplicate.
+  if ! take_lock restart-agent "$AGENT_LOCK_WAIT_S"; then
+    log "another restart-agent still running after ${AGENT_LOCK_WAIT_S}s — nothing done"
+    exit 1
+  fi
   if [ "${1:-}" = "--force" ]; then
     reason="forced"
   else
@@ -305,7 +320,9 @@ cmd_restart_agent() {
   rm -f "$HEARTBEAT"
   content_hash list_agent > "$AGENT_HASH_FILE.tmp" && mv -f "$AGENT_HASH_FILE.tmp" "$AGENT_HASH_FILE"
   started="$(date +%s)"
-  tmux new-session -d -s vr-agent "python3 '$VASTAI_HOME/agent/noderunner.py' >> '$VASTAI_HOME/logs/agent.log' 2>&1"
+  # 9>&-: the tmux server this may start, and the agent in it, must not
+  # inherit the lock.
+  tmux new-session -d -s vr-agent "python3 '$VASTAI_HOME/agent/noderunner.py' >> '$VASTAI_HOME/logs/agent.log' 2>&1" 9>&-
   # An agent that cannot start must fail provisioning here. Otherwise the node
   # goes 'ready', bills, and every chunk sent to it waits on a state file
   # nothing will ever write.

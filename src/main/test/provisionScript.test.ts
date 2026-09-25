@@ -233,6 +233,42 @@ describe.skipIf(process.platform === 'win32')('provision.sh', () => {
     expect(r.stdout).not.toMatch(/AGENT_RESTARTED/)
   })
 
+  it('1.9: two restart-agents that overlap start one agent; the second keeps it', async () => {
+    // Both are under way before either looks at the agent: the app's prep
+    // deadline gave up on the first exec while it still ran here.
+    const release = n.holdLock(join(n.vastai, 'state', 'restart-agent.lock'))
+    const first = n.provisionAsync(['restart-agent'])
+    const second = n.provisionAsync(['restart-agent'])
+    await new Promise((r) => setTimeout(r, 300))
+    release()
+    const results = await Promise.all([first, second])
+
+    for (const r of results) expect(r.code, r.stdout + r.stderr).toBe(0)
+    expect(n.calls().filter((c) => c.startsWith('tmux new-session'))).toHaveLength(1)
+    expect(results.map((r) => r.stdout.trim().split('\n').pop()).sort()).toEqual([
+      'AGENT_KEPT',
+      'AGENT_RESTARTED no agent session'
+    ])
+  })
+
+  it('1.9: restart-agent waits for one already running; the agent it starts holds no lock', () => {
+    const quick = { env: { AGENT_LOCK_WAIT_S: '1' } }
+    const release = n.holdLock(join(n.vastai, 'state', 'restart-agent.lock'))
+    const r = n.provision(['restart-agent'], quick)
+    expect(r.code).toBe(1)
+    expect(r.stdout).toMatch(/waiting up to 1s for another restart-agent/)
+    expect(r.stdout).toMatch(/another restart-agent still running after 1s/)
+    expect(n.calls().filter((c) => c.startsWith('tmux'))).toEqual([])
+    release()
+
+    expect(n.provision(['restart-agent'], quick).stdout).toMatch(/^AGENT_RESTARTED/m)
+    // The tmux server outlives the script. Had it inherited the lock, no
+    // restart-agent (nor base) could run on this node again.
+    const again = n.provision(['restart-agent'], quick)
+    expect(again.code, again.stdout).toBe(0)
+    expect(again.stdout).toMatch(/^AGENT_KEPT$/m)
+  })
+
   it('1.9: restart-agent stops an agent running outside its tmux session', () => {
     busyNode()
     // The tmux socket was lost: no session, but noderunner still runs and
