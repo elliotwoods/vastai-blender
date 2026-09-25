@@ -26,7 +26,21 @@ import type { Offer, OfferFilters } from '../../shared/models'
 import { searchOffers } from './vastClient'
 import type { RawOffer } from './types'
 
-export function buildQuery(f: OfferFilters): Record<string, unknown> {
+/** How a search is narrowed beyond the user's OfferFilters. */
+export interface OfferSearchOptions {
+  /**
+   * Plan 1.18: datacenter hosts only, which Vast calls its secure cloud:
+   * vetted businesses rather than individuals. Octane rentals ask for it
+   * when settings.octane.secureCloudOnly is on, since any OTOY sign-in on a
+   * node, by hand or scripted, is disclosed to whoever has root there.
+   */
+  secureCloudOnly?: boolean
+}
+
+export function buildQuery(
+  f: OfferFilters,
+  opts: OfferSearchOptions = {}
+): Record<string, unknown> {
   const q: Record<string, unknown> = {
     rentable: { eq: true },
     verified: { eq: true },
@@ -48,7 +62,21 @@ export function buildQuery(f: OfferFilters): Record<string, unknown> {
   // leftovers delivered ~4 frames/min across 80 slots).
   if (f.minCpuCores != null) q.cpu_cores_effective = { gte: f.minCpuCores }
   if (f.minNumGpus != null) q.num_gpus = { gte: f.minNumGpus }
+  if (opts.secureCloudOnly) q.datacenter = { eq: true }
   return q
+}
+
+/**
+ * Whether Vast's reply says the offer is on a datacenter (secure cloud)
+ * host. The query asks Vast for those only; this holds each offer to it as
+ * well, and an offer whose reply does not say so is not taken for one: a
+ * query key Vast ignored, or a field it renamed, must leave the search
+ * empty, never rent a host nobody vetted for a sign-in the user asked to
+ * keep off them.
+ */
+function onDatacenter(r: RawOffer): boolean {
+  const o = r as RawOffer & { datacenter?: unknown; hosting_type?: unknown }
+  return o.datacenter === true || o.hosting_type === 1
 }
 
 function toOffer(r: RawOffer): Offer {
@@ -169,14 +197,19 @@ export function scoreOffer(o: Offer, cpuBound = false): number {
 
 /**
  * Rank by the documented score (descending). `exclude` filters machines that
- * already failed this session.
+ * already failed this session; `opts.secureCloudOnly` keeps datacenter hosts
+ * only (onDatacenter).
  */
 export async function findOffers(
   filters: OfferFilters,
-  exclude: Set<number> = new Set()
+  exclude: Set<number> = new Set(),
+  opts: OfferSearchOptions = {}
 ): Promise<Offer[]> {
-  const raw = await searchOffers(buildQuery(filters))
-  const offers = raw.map(toOffer).filter((o) => !exclude.has(o.machineId))
+  const raw = await searchOffers(buildQuery(filters, opts))
+  const offers = raw
+    .filter((r) => !opts.secureCloudOnly || onDatacenter(r))
+    .map(toOffer)
+    .filter((o) => !exclude.has(o.machineId))
   const cpuBound = filters.cpuBound === true
   return offers.sort((a, b) => scoreOffer(b, cpuBound) - scoreOffer(a, cpuBound))
 }

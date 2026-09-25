@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { OctaneState } from '../../shared/models'
+import type { OctaneState, SettingsPublic } from '../../shared/models'
+import type { CreateInstanceOptions } from '../vast/vastClient'
 import { fakeOctane } from '../test/fakeOctane'
 import { setup, type AgentSpec, type World } from '../test/harness'
 
@@ -130,5 +131,85 @@ describe('1.18: Octane on a node, as the fleet sees it', () => {
       octaneState: 'none',
       octaneReady: false
     })
+  })
+})
+
+describe('1.18: renting for Octane', () => {
+  const OCTANE_IMAGE = 'otoy/octane-blender:2025.2'
+
+  function images(): string[] {
+    return w.vast.argsOf('createInstance').map((a) => (a[0] as CreateInstanceOptions).image)
+  }
+
+  function octaneSettings(o: Partial<SettingsPublic>): void {
+    Object.assign(w.settings, { maxActiveNodes: 4, ...o })
+  }
+
+  it('1.18: each engine rents with its own docker image; one with none set, the built-in', async () => {
+    const app = await w.boot()
+    const nm = await import('./nodeManager')
+    octaneSettings({ dockerImageByEngine: { octane: OCTANE_IMAGE } })
+    w.vast.addOffer()
+    w.vast.addOffer()
+    w.vast.addOffer()
+    await app.nodeManager.requestNodes(1, { engine: 'octane' })
+    await app.nodeManager.requestNodes(1, { engine: 'cycles' })
+    await app.nodeManager.requestNode({ engine: 'octane' })
+    expect(images()).toEqual([OCTANE_IMAGE, nm.DOCKER_IMAGE, OCTANE_IMAGE])
+  })
+
+  it('1.18: an image that is not an image name rents nothing, rather than a refusal per machine', async () => {
+    const app = await w.boot()
+    octaneSettings({ dockerImageByEngine: { octane: 'otoy/octane; rm -rf /' } })
+    w.vast.addOffer()
+    await expect(app.nodeManager.requestNodes(1, { engine: 'octane' })).rejects.toThrow(
+      /docker image set for octane nodes is not an image name/
+    )
+    expect(w.vast.count('searchOffers')).toBe(0)
+    expect(w.vast.count('createInstance')).toBe(0)
+    expect(w.all('SELECT id FROM nodes')).toEqual([])
+  })
+
+  it('1.18: with secure cloud only, an Octane rental takes a datacenter host and passes over the rest', async () => {
+    const app = await w.boot()
+    octaneSettings({ octane: { scriptedSignIn: false, secureCloudOnly: true } })
+    // The cheapest and best-ranked is someone's own machine.
+    const home = w.vast.addOffer({ dph_total: 0.2, datacenter: false } as never)
+    const dc = w.vast.addOffer({ dph_total: 0.5, datacenter: true } as never)
+    const [id] = await app.nodeManager.requestNodes(1, { engine: 'octane' })
+    expect(
+      w.vast.argsOf('createInstance').map((a) => (a[0] as CreateInstanceOptions).offerId)
+    ).toEqual([dc.id])
+    expect(w.get('SELECT dph_total FROM nodes WHERE id = ?', id)).toEqual({ dph_total: 0.5 })
+    // Not for Cycles: the home machine is fine there.
+    await app.nodeManager.requestNodes(1, { engine: 'cycles' })
+    expect(
+      w.vast.argsOf('createInstance').map((a) => (a[0] as CreateInstanceOptions).offerId)
+    ).toEqual([dc.id, home.id])
+  })
+
+  it('1.18: with secure cloud only and no datacenter host on offer, nothing is rented, and the alert says why', async () => {
+    const app = await w.boot()
+    octaneSettings({
+      octane: { scriptedSignIn: false, secureCloudOnly: true },
+      spendCapPerHour: null,
+      noSpendCap: true
+    })
+    w.vast.addOffer({ datacenter: false } as never)
+    // A reply that does not say is not taken for a datacenter.
+    w.vast.addOffer()
+    await expect(app.nodeManager.requestNodes(1, { engine: 'octane' })).rejects.toThrow(
+      'no matching offers on datacenter (secure cloud) hosts'
+    )
+    expect(w.vast.count('createInstance')).toBe(0)
+    expect(w.alerts('warn')).toEqual([
+      'No matching Vast.ai offers on datacenter (secure cloud) hosts, which the Octane settings rent from only'
+    ])
+    // Under a cap, the reason names both.
+    Object.assign(w.settings, { spendCapPerHour: 2, noSpendCap: false })
+    await expect(app.nodeManager.requestNodes(1, { engine: 'octane' })).rejects.toThrow(
+      /^no matching offers on datacenter \(secure cloud\) hosts at or under \$2\.00\/hr, what the spend cap/
+    )
+    expect(w.vast.count('createInstance')).toBe(0)
   })
 })

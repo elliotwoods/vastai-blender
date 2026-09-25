@@ -28,6 +28,7 @@ import { FIRST_CONNECT_BUDGET_MS, retryWithBackoff } from '../ssh/connectRetry'
 import { shq } from '../ssh/shq'
 import { HostKeyMismatchError, SshConnection, type ExecResult } from '../ssh/sshConnection'
 import { findOffers } from '../vast/offers'
+import { isDockerImage } from '../../shared/settingsSanitize'
 import {
   createInstance,
   currentUser,
@@ -85,6 +86,27 @@ import {
 } from '../octane/octaneLicense'
 
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
+
+/**
+ * The docker image to rent `engine`'s nodes with (plan 1.18): Settings'
+ * image for the engine, or DOCKER_IMAGE. Octane needs one with OctaneBlender
+ * in it, which DOCKER_IMAGE is not. The name goes to Vast's create call as
+ * data, never to a shell. One that is not a well-formed image reference (a
+ * settings.json edited by hand: sanitizeSettingsPatch refuses one) throws,
+ * and nothing is rented: Vast would refuse every create with it, and each
+ * refusal blacklists the machine it was for.
+ */
+export function rentalImage(settings: SettingsPublic, engine?: EngineId | null): string {
+  const image = engine ? settings.dockerImageByEngine?.[engine]?.trim() : undefined
+  if (!image) return DOCKER_IMAGE
+  if (!isDockerImage(image)) {
+    throw new Error(
+      `the docker image set for ${engine} nodes is not an image name ` +
+        `(${JSON.stringify(image.slice(0, 80))}): nothing was rented`
+    )
+  }
+  return image
+}
 
 /** Minimal onstart — real provisioning is pushed over SSH by the app. */
 const ONSTART = 'mkdir -p ~/vastai && touch ~/vastai/.booted'
@@ -2201,10 +2223,11 @@ export class NodeManager {
    * the user confirmed going past it (`overSpendCap`, plan 1.5), and then
    * rents nothing dearer than `maxPerHour` when the confirmation named one.
    * It used to ignore the cap altogether. It never goes past maxActiveNodes,
-   * nor rents while the account is on hold.
+   * nor rents while the account is on hold. `engine` rents for that engine
+   * (its docker image, and for Octane its secure-cloud setting).
    */
   async requestNode(
-    opts: RequestNodeOptions & { maxPerHour?: number | null } = {}
+    opts: RequestNodeOptions & { maxPerHour?: number | null; engine?: EngineId | null } = {}
   ): Promise<string> {
     const held = this.accountHold()
     if (held) throw new Error(`Renting is paused: ${held.reason}`)
@@ -2219,7 +2242,11 @@ export class NodeManager {
         throw new Error(spendCapReached(caps, settings))
       }
     }
-    const ids = await this.rentBatch(1, { overSpendCap, maxPerHour: opts.maxPerHour }, true)
+    const ids = await this.rentBatch(
+      1,
+      { overSpendCap, maxPerHour: opts.maxPerHour, engine: opts.engine },
+      true
+    )
     if (ids.length > 0) return ids[0]
     // Vast refused for the account in this very request: its hold says why.
     const refused = this.accountHold()
@@ -2328,7 +2355,12 @@ export class NodeManager {
       if (c != null && (maxDphTotal == null || c < maxDphTotal)) maxDphTotal = c
     }
     const capBound = headroom != null && maxDphTotal === headroom
-    const filters = JSON.stringify(settings.offerFilters)
+    // Plan 1.18: what the rentals are for decides their image, and whether
+    // only datacenter hosts may take them (an Octane sign-in, by hand or
+    // scripted, is disclosed to whoever has root on the node).
+    const image = rentalImage(settings, opts.engine)
+    const secureCloudOnly = opts.engine === 'octane' && settings.octane?.secureCloudOnly === true
+    const filters = JSON.stringify({ ...settings.offerFilters, secureCloudOnly })
     const lastEmpty = this.capEmpty
     if (
       !manual &&
@@ -2342,18 +2374,30 @@ export class NodeManager {
     }
     await ensureKeyRegistered()
 
-    const offers = await findOffers({ ...settings.offerFilters, maxDphTotal }, this.blacklist)
+    const offers = await findOffers({ ...settings.offerFilters, maxDphTotal }, this.blacklist, {
+      secureCloudOnly
+    })
     if (offers.length === 0) {
       // The cap may be what left nothing: say so, and do not cry "no offers"
       // on every tick while the fleet sits just under its cap.
+      const where = secureCloudOnly ? ' on datacenter (secure cloud) hosts' : ''
       if (capBound) {
         this.capEmpty = { headroom, filters, at: Date.now() }
         throw new Error(
-          `no matching offers at or under ${money(headroom)}/hr, what the spend cap of ${money(first.spendCap ?? 0)}/hr leaves`
+          `no matching offers${where} at or under ${money(headroom)}/hr, what the spend cap of ${money(first.spendCap ?? 0)}/hr leaves`
         )
       }
       if (bound != null && maxDphTotal === bound) {
-        throw new Error(`no matching offers at or under ${money(bound)}/hr`)
+        throw new Error(`no matching offers${where} at or under ${money(bound)}/hr`)
+      }
+      if (secureCloudOnly) {
+        emit('alert', {
+          level: 'warn',
+          message:
+            'No matching Vast.ai offers on datacenter (secure cloud) hosts, which the Octane ' +
+            'settings rent from only'
+        })
+        throw new Error('no matching offers on datacenter (secure cloud) hosts')
       }
       emit('alert', { level: 'warn', message: 'No matching Vast.ai offers found' })
       throw new Error('no matching offers')
@@ -2382,7 +2426,7 @@ export class NodeManager {
       usedMachines.add(offer.machineId)
       let r: Rental
       try {
-        r = await this.rentOffer(offer, settings.offerFilters.minDiskGb)
+        r = await this.rentOffer(offer, settings.offerFilters.minDiskGb, image)
       } catch (e) {
         // Not a failure rentOffer knows (those it returns): whatever it left
         // behind, rent nothing more on top of it.
@@ -2615,8 +2659,8 @@ export class NodeManager {
     }
   }
 
-  /** Create an instance from one offer and start driving it to ready. */
-  private async rentOffer(offer: Offer, diskGb: number): Promise<Rental> {
+  /** Create an instance from one offer, with `image`, and start driving it to ready. */
+  private async rentOffer(offer: Offer, diskGb: number, image: string): Promise<Rental> {
     const id = randomUUID()
     // This profile's install id and the node's (plan 1.3): the reconcile
     // matches the instance back to this row by it.
@@ -2640,7 +2684,7 @@ export class NodeManager {
     try {
       instanceId = await createInstance({
         offerId: offer.id,
-        image: DOCKER_IMAGE,
+        image,
         diskGb,
         onstart: ONSTART,
         env: { NVIDIA_DRIVER_CAPABILITIES: 'all' },
