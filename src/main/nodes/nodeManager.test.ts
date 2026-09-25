@@ -68,7 +68,15 @@ describe('nodeManager lifecycle', () => {
     expect(w.vast.live()).toEqual([])
     expect(machine.alive).toBe(false)
     expect(app.nodeManager.get(id)?.state).toBe('destroyed')
-    expect(w.get('SELECT state FROM nodes WHERE id = ?', id)).toEqual({ state: 'destroyed' })
+    // Stamped only once Vast confirmed it (plan 1.2): the stamp is what stops
+    // the node counting as billing.
+    const row = w.get<{ state: string; destroyed_at: number | null }>(
+      'SELECT state, destroyed_at FROM nodes WHERE id = ?',
+      id
+    )
+    expect(row?.state).toBe('destroyed')
+    expect(row?.destroyed_at).not.toBeNull()
+    expect(app.nodeManager.activeCount()).toBe(0)
   })
 
   it('a node whose provisioning fails is destroyed, not left billing', async () => {
@@ -115,14 +123,16 @@ describe('nodeManager lifecycle', () => {
     await expect(app.nodeManager.requestNodes(1)).rejects.toThrow('ECONNRESET')
 
     // The instance is billing under this node's label, which is all the app
-    // has to find it by: it never learned the instance id. This pins today's
-    // behaviour — the node is written off and the instance left running until
-    // the next start's orphan sweep — so plan 1.4 flips these expectations;
-    // the scenario is the part to keep.
+    // has to find it by: it never learned the instance id. The node is not
+    // written off: with the create's outcome unknown it counts as billing
+    // (plan 1.2). This pins that the instance is left running until the next
+    // start's orphan sweep, so plan 1.4, which looks it up by label at once,
+    // flips that part; the scenario is the part to keep.
     const [row] = w.all<{ id: string; state: string; instance_id: number | null }>(
       'SELECT id, state, instance_id FROM nodes'
     )
     expect(row).toMatchObject({ state: 'failed', instance_id: null })
+    expect(app.nodeManager.activeCount()).toBe(1)
     const live = w.vast.live()
     expect(live).toHaveLength(1)
     expect(w.vast.instance(live[0])?.label).toBe(`vastai-blender ${row.id.slice(0, 8)}`)

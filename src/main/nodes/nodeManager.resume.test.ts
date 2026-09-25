@@ -16,7 +16,11 @@ beforeEach(async () => {
 })
 afterEach(() => w.dispose())
 
-/** Every state a node was shown in from event index `from` on. */
+/**
+ * Every state a node was shown in from event index `from` on. A snapshot
+ * pushed for another field (the destroy's stamp) that repeats the state
+ * before it is left out.
+ */
 function statesSince(nodeId: string, from: number): NodeState[] {
   return w.events
     .slice(from)
@@ -24,6 +28,7 @@ function statesSince(nodeId: string, from: number): NodeState[] {
     .map((e) => e.payload as { id: string; state: NodeState })
     .filter((s) => s.id === nodeId)
     .map((s) => s.state)
+    .filter((s, i, all) => i === 0 || s !== all[i - 1])
 }
 
 /**
@@ -129,19 +134,21 @@ describe('destroy while a restart re-provisions the node (resumeNode)', () => {
     await w.until(() => prov.entered, 'resume provisioning')
 
     const from = w.events.length
-    w.vast.fail('destroyInstance', { status: 500, message: 'internal error' })
+    // Refused outright, so ensureInstanceGone gives up at once (a 5xx it
+    // would retry within the call).
+    w.vast.fail('destroyInstance', { status: 403, message: 'access denied' })
     await app.nodeManager.destroyNode(id)
     prov.finish()
-    await w.advance(60_000)
+    await w.advance(1_000)
 
     expect(statesSince(id, from)).toEqual(['destroying', 'failed'])
     expect(w.get('SELECT state, instance_id FROM nodes WHERE id = ?', id)).toEqual({
       state: 'failed',
       instance_id: instanceId
     })
-    expect(w.alerts('error')).toEqual([
-      `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
-    ])
+    const errors = w.alerts('error')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain(`Destroy failed for instance ${instanceId}`)
     await expect(app.nodeManager.clearFailed()).resolves.toBe(1)
     expect(w.vast.live()).toEqual([])
   })

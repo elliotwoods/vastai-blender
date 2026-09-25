@@ -6,9 +6,11 @@
  * to the host (plan 1.18 moves them to stdin and makes manual sign-in the
  * default). The manual path is meant to be openVncTunnel below, but nothing
  * in the renderer calls node:openVncTunnel yet (plan 1.18 adds the button).
- * destroyNode SIGTERMs the server and waits for a clean exit (which releases
- * the floating license) BEFORE destroying the instance, but only for a node
- * whose license was confirmed; no other destroy path does — see
+ * Every destroy (nodeManager's ensureInstanceGone) SIGTERMs the server and
+ * waits, up to 20 s, for a clean exit (which releases the floating license)
+ * BEFORE destroying the instance, on any node with an OctaneServer pidfile
+ * that it still has a connection to. A node already unreachable, or one
+ * destroyed at start-up before it was reconnected, is not stopped — see
  * docs/OCTANE.md for the manual recovery path.
  */
 
@@ -128,10 +130,26 @@ export function closeVncTunnel(nodeId: string): void {
   }
 }
 
-/** Drain hook: release the license before the instance is destroyed. */
-export async function stopOctaneServer(ssh: SshConnection): Promise<void> {
+/** Where setup_octane.sh records the OctaneServer it launched ($VASTAI_HOME/state). */
+export const OCTANE_PIDFILE = `${REMOTE_ROOT}/state/octane-server.pid`
+
+/**
+ * Drain hook: release the license before the instance is destroyed.
+ *
+ * `onlyIfStarted` runs the stop only on a node with an OctaneServer pidfile,
+ * which setup_octane.sh writes at every launch: every destroy path asks
+ * (nodeManager's ensureInstanceGone), and most nodes never ran Octane.
+ * `timeoutMs` bounds the whole call, connecting included; the default covers
+ * the script's own 30 s wait for a clean exit.
+ */
+export async function stopOctaneServer(
+  ssh: SshConnection,
+  opts: { timeoutMs?: number; onlyIfStarted?: boolean } = {}
+): Promise<void> {
+  const stop = `bash ${REMOTE_ROOT}/octane/setup_octane.sh stop-server`
+  const command = opts.onlyIfStarted ? `if [ -f ${OCTANE_PIDFILE} ]; then ${stop}; fi` : stop
   await ssh
-    .exec(`bash ${REMOTE_ROOT}/octane/setup_octane.sh stop-server`, { timeoutMs: 45_000 })
+    .exec(command, { timeoutMs: opts.timeoutMs ?? 45_000, label: 'stop OctaneServer' })
     .catch(() => {
       // best effort — docs/OCTANE.md covers manual license release
     })

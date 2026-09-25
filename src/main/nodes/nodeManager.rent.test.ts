@@ -36,7 +36,11 @@ function sshRetries(nodeId: string): number {
     .filter((l) => l.nodeId === nodeId && l.line.startsWith('ssh attempt')).length
 }
 
-/** Every state a node was shown in from event index `from` on. */
+/**
+ * Every state a node was shown in from event index `from` on. A snapshot
+ * pushed for another field (the create's outcome, the destroy's stamp) that
+ * repeats the state before it is left out.
+ */
 function statesSince(nodeId: string, from: number): NodeState[] {
   return w.events
     .slice(from)
@@ -44,6 +48,23 @@ function statesSince(nodeId: string, from: number): NodeState[] {
     .map((e) => e.payload as { id: string; state: NodeState })
     .filter((s) => s.id === nodeId)
     .map((s) => s.state)
+    .filter((s, i, all) => i === 0 || s !== all[i - 1])
+}
+
+/**
+ * A DELETE Vast refuses outright. ensureInstanceGone does not retry it
+ * within the call (plan 1.2), so the destroy is unconfirmed at once; the
+ * retry timer tries again a minute later. A 5xx would be retried with
+ * backoff inside the call instead.
+ */
+const REFUSED = { status: 403, message: 'access denied' }
+
+/** Asserts the one alert a destroy Vast has not confirmed raises. */
+function expectDestroyFailedAlert(instanceId: number): void {
+  const errors = w.alerts('error')
+  expect(errors).toHaveLength(1)
+  expect(errors[0]).toContain(`Destroy failed for instance ${instanceId}`)
+  expect(errors[0]).toContain('Vast.ai console')
 }
 
 /**
@@ -90,10 +111,14 @@ describe('destroy while createInstance is in flight (finding #110)', () => {
     expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
     expect(w.vast.live()).toEqual([])
 
-    // And it is never driven towards ready, then or later.
+    // And it is never driven towards ready, then or later: the one question
+    // to Vast about it is the destroy's confirmation, after the DELETE.
     await w.advance(5 * 60_000)
-    expect(w.vast.count('showInstance')).toBe(0)
-    expect(w.vast.count('destroyInstance')).toBe(1)
+    expect(w.vast.calls.map((c) => c.method).filter((m) => /Instance$/.test(m))).toEqual([
+      'createInstance',
+      'destroyInstance',
+      'showInstance'
+    ])
     expect(w.get('SELECT state, instance_id FROM nodes WHERE id = ?', id)).toEqual({
       state: 'destroyed',
       instance_id: instanceId
@@ -110,27 +135,27 @@ describe('destroy while createInstance is in flight (finding #110)', () => {
     const [{ id }] = w.all<{ id: string }>('SELECT id FROM nodes')
     await app.nodeManager.destroyNode(id)
 
-    w.vast.fail('destroyInstance', { status: 500, message: 'internal error' })
+    w.vast.fail('destroyInstance', REFUSED)
     gate.release()
     await renting
     const [instanceId] = w.vast.created
 
     // Still billing, and the row says so: 'failed' with the instance id is
-    // what clearFailed and the orphan sweep act on.
+    // what the retry timer and clearFailed act on, and it counts.
     expect(w.vast.live()).toEqual([instanceId])
     const row = w.get<{ state: string; instance_id: number; last_error: string }>(
       'SELECT state, instance_id, last_error FROM nodes WHERE id = ?',
       id
     )
     expect(row).toMatchObject({ state: 'failed', instance_id: instanceId })
-    expect(row?.last_error).toContain('internal error')
-    expect(w.alerts('error')).toEqual([
-      `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
-    ])
+    expect(row?.last_error).toContain('access denied')
+    expectDestroyFailedAlert(instanceId)
+    expect(app.nodeManager.activeCount()).toBe(1)
 
     await expect(app.nodeManager.clearFailed()).resolves.toBe(1)
     expect(w.vast.live()).toEqual([])
     expect(app.nodeManager.get(id)?.state).toBe('destroyed')
+    expect(app.nodeManager.activeCount()).toBe(0)
   })
 
   it('a create Vast refuses is the end of it: no failure, no blacklist, no replacement', async () => {
@@ -270,19 +295,18 @@ describe('destroy during the first-connect SSH retry (findings #239, #221)', () 
     const [instanceId] = w.vast.created
 
     const from = w.events.length
-    w.vast.fail('destroyInstance', { status: 500, message: 'internal error' })
+    w.vast.fail('destroyInstance', REFUSED)
     await app.nodeManager.destroyNode(id)
+    expect(app.nodeManager.get(id)?.state).toBe('failed')
     // sshd answers from the next attempt on, had there been one.
     await w.advance(2 * 60_000)
 
     expect(provisioned).toEqual([])
-    expect(statesSince(id, from)).toEqual(['destroying', 'failed'])
+    // Unconfirmed, then destroyed by the retry timer: never back in the fleet.
+    expect(statesSince(id, from)).toEqual(['destroying', 'failed', 'destroyed'])
     expect(app.nodeManager.get(id)?.ssh).toBeNull()
-    expect(w.vast.count('destroyInstance')).toBe(1)
-    expect(w.alerts('error')).toEqual([
-      `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
-    ])
-    await expect(app.nodeManager.clearFailed()).resolves.toBe(1)
+    expect(w.vast.count('destroyInstance')).toBe(2)
+    expectDestroyFailedAlert(instanceId)
     expect(w.vast.live()).toEqual([])
   })
 })
@@ -320,10 +344,10 @@ describe('destroy during provisioning', () => {
     const [instanceId] = w.vast.created
 
     const from = w.events.length
-    w.vast.fail('destroyInstance', { status: 500, message: 'internal error' })
+    w.vast.fail('destroyInstance', REFUSED)
     await app.nodeManager.destroyNode(id)
     finish()
-    await w.advance(60_000)
+    await w.advance(1_000)
 
     // 'failed' with the instance id: still billing, and the row says so. Not
     // 'ready', where the scheduler would take it back into the fleet.
@@ -333,13 +357,13 @@ describe('destroy during provisioning', () => {
       instance_id: instanceId
     })
     expect(w.alerts().filter((m) => m.endsWith(' ready'))).toEqual([])
-    expect(w.alerts('error')).toEqual([
-      `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
-    ])
+    expectDestroyFailedAlert(instanceId)
     expect(w.vast.count('destroyInstance')).toBe(1)
     expect(w.vast.live()).toEqual([instanceId])
 
-    await expect(app.nodeManager.clearFailed()).resolves.toBe(1)
+    // The retry timer finishes the destroy, and nothing brought it back meanwhile.
+    await w.until(() => app.nodeManager.get(id)?.state === 'destroyed', 'destroy retried')
+    expect(statesSince(id, from)).toEqual(['destroying', 'failed', 'destroyed'])
     expect(w.vast.live()).toEqual([])
     expect(await rentsAgain(app, offer.machine_id)).toBe(true)
   })

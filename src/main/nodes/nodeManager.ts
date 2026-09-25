@@ -11,6 +11,7 @@
 import { randomUUID } from 'crypto'
 import { co2Grams } from '../carbon/intensity'
 import { getDb } from '../db/db'
+import { classify } from '../errors'
 import { emit } from '../events'
 import { getSettings } from '../settings'
 import { ensureKeyRegistered, readPrivateKey } from '../ssh/keys'
@@ -34,6 +35,12 @@ import type {
   NodeWorkRef,
   Offer
 } from '../../shared/models'
+import {
+  capUsage,
+  createOutcomeUnknown,
+  holdsInstance,
+  type NodeCostFacts
+} from '../../shared/nodeState'
 import type { RawInstance } from '../vast/types'
 
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
@@ -42,14 +49,52 @@ export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22
 const ONSTART = 'mkdir -p ~/vastai && touch ~/vastai/.booted'
 
 /**
- * Whether a createInstance that threw certainly rented nothing: Vast answered
- * and refused it with a 4xx (the offer was taken, no credit, a bad request).
- * A network error, a 5xx or a reply that never came can each follow a create
- * that went through. Plan 1.4 moves this into vastClient and handles that
- * unknown outcome in full.
+ * How long one ensureInstanceGone keeps at a destroy before it calls it
+ * unconfirmed. Long enough to ride out a Vast blip or a burst of 429s without
+ * an alarm; short enough that the destroy button, which waits for it, and a
+ * quit's destroy-all are not held for minutes. The retry timer carries on
+ * after it (DESTROY_RETRY_MS).
  */
-function createRefused(e: unknown): boolean {
-  return e instanceof VastError && e.status !== undefined && e.status >= 400 && e.status < 500
+const DESTROY_BUDGET_MS = 60_000
+const DESTROY_FIRST_DELAY_MS = 2_000
+const DESTROY_MAX_DELAY_MS = 15_000
+
+/**
+ * How often a destroy Vast has not confirmed is tried again, one attempt per
+ * node per round. One Vast blip during an unattended idle scale-down used to
+ * leave the instance billing until the user came back and pressed "clear
+ * failed" or restarted the app (#194).
+ */
+const DESTROY_RETRY_MS = 60_000
+
+/**
+ * The longest a destroy waits for OctaneServer to stop and release its
+ * floating license. A clean exit takes seconds; the script's own wait is 30 s,
+ * and past this the instance going away ends the server anyway.
+ */
+const OCTANE_STOP_BUDGET_MS = 20_000
+
+/**
+ * The states in which the app wants a node's instance gone: it is being
+ * destroyed, it failed, or it was destroyed and Vast has not confirmed that.
+ */
+const DESTROY_STATES: ReadonlySet<NodeState> = new Set<NodeState>([
+  'failed',
+  'destroying',
+  'destroyed'
+])
+
+/**
+ * Vast answered a destroy, and showInstance still finds the instance. A
+ * DELETE can answer 200 and leave the instance running (#140), so this is
+ * not a destroy until Vast stops knowing the instance.
+ */
+class InstanceStillListed extends Error {
+  override readonly name = 'InstanceStillListed'
+
+  constructor(instanceId: number, status: string | undefined) {
+    super(`Vast still lists instance ${instanceId} after its destroy (${status ?? 'no status'})`)
+  }
 }
 
 interface NodeRow {
@@ -69,6 +114,21 @@ interface NodeRow {
   blender_versions: string
   last_error: string | null
   geolocation: string | null
+  destroyed_at: number | null
+  label: string | null
+  octane_state: string
+  create_unknown_since: number | null
+}
+
+/** What the billing predicates (shared/nodeState.ts) read, from a row. */
+function rowFacts(r: NodeRow): NodeCostFacts {
+  return {
+    state: r.state,
+    instanceId: r.instance_id,
+    destroyedAt: r.destroyed_at,
+    createUnknownSince: r.create_unknown_since,
+    dphTotal: r.dph_total
+  }
 }
 
 /** What the scheduler currently has in flight on a node. */
@@ -289,7 +349,12 @@ function rowToSnapshot(r: NodeRow): NodeSnapshot {
     octaneNeedsManualLogin: false,
     blenderVersions: JSON.parse(r.blender_versions) as string[],
     lastError: r.last_error,
-    metrics: metricsByNode.get(r.id) ?? null
+    metrics: metricsByNode.get(r.id) ?? null,
+    // Without these two every destroyed node would read as billing, and a
+    // create of unknown outcome as not billing (shared/nodeState.ts).
+    destroyedAt: r.destroyed_at,
+    createUnknownSince: r.create_unknown_since,
+    label: r.label
   }
 }
 
@@ -310,6 +375,20 @@ class ManagedNode {
     return this.row.state
   }
 
+  /** What the billing predicates read (shared/nodeState.ts), without a whole snapshot. */
+  get facts(): NodeCostFacts {
+    return rowFacts(this.row)
+  }
+
+  /**
+   * SSH has answered on this node at least once (its host key is pinned).
+   * Nothing, OctaneServer included, can have been started on one where it
+   * never has.
+   */
+  get sshEverAnswered(): boolean {
+    return this.row.host_key != null
+  }
+
   /**
    * Destroying or destroyed: the node is on its way out, and no lifecycle
    * step still running for it may move it back into the fleet.
@@ -324,12 +403,12 @@ class ManagedNode {
    * from an await: whether the node has left `held`, the state the step last
    * found it in or put it in. While a step holds a node nothing but a destroy
    * moves it: destroyNode ('destroying', then 'destroyed', or 'failed' when
-   * its DELETE threw and the instance may still be billing). The step must
-   * then stop without writing a state over the destroy's, or a node the user
-   * destroyed comes back into the fleet, and a destroyed one gets a second
-   * DELETE. Not `gone`: a 'failed' destroy is not gone, and a row left
-   * 'destroying' by the last exit is resumed like any other. Plan 2.2 makes
-   * every transition a compare-and-set instead.
+   * Vast never confirmed the instance gone and it may still be billing). The
+   * step must then stop without writing a state over the destroy's, or a
+   * node the user destroyed comes back into the fleet, and a destroyed one
+   * gets a second DELETE. Not `gone`: a 'failed' destroy is not gone. A row
+   * the last exit left 'destroying' is never held by a step: init destroys
+   * it instead. Plan 2.2 makes every transition a compare-and-set instead.
    */
   movedOn(held: NodeState): boolean {
     return this.state !== held
@@ -397,91 +476,184 @@ export class NodeManager {
   private blacklist = new Set<number>()
   private costTimer: NodeJS.Timeout | null = null
   private metricsTimer: NodeJS.Timeout | null = null
+  private destroyTimer: NodeJS.Timeout | null = null
   private balance: number | null = null
+  /**
+   * ensureInstanceGone calls in flight, by instance id. A second caller for
+   * the same instance (the retry timer, clearFailed, the destroy button
+   * pressed again) waits on the first instead of sending its own DELETE.
+   */
+  private goneChecks = new Map<number, Promise<boolean>>()
+  /** Instances whose unconfirmed destroy has been alerted this session. */
+  private unconfirmedAlerted = new Set<number>()
+  private retryingDestroys = false
+  /** Nodes whose createInstance is in flight right now (rentOffer). */
+  private creating = new Set<string>()
+  /**
+   * Rows the last run left with a create of unknown outcome. init's sweep
+   * settles them against the account's instances (reconcileOrphans).
+   */
+  private unknownAtBoot = new Set<string>()
   /** Phase 3 hook: called when a node reaches SSH-reachable. */
   onReady: ((node: { id: string; ssh: SshConnection }) => Promise<void>) | null = null
 
   init(): void {
     const rows = getDb().prepare('SELECT * FROM nodes').all() as NodeRow[]
     for (const r of rows) {
-      if (r.state === 'destroyed') continue
+      const facts = rowFacts(r)
+      // A destroyed row is done with, unless Vast never confirmed its
+      // instance gone: an older build's destroy, whose 200 was taken on
+      // trust, or a create cut short by a quit after its destroy.
+      if (r.state === 'destroyed' && !holdsInstance(facts)) continue
       const n = new ManagedNode(r.id)
       this.nodes.set(r.id, n)
+      if (createOutcomeUnknown(facts)) this.unknownAtBoot.add(r.id)
       // Anything mid-lifecycle at boot needs re-verification against vast.
-      if (r.instance_id && r.state !== 'failed') {
+      // Not a node the last run was destroying, or had failed: resuming one
+      // re-provisioned it back into the fleet (#168). retryDestroys below
+      // finishes its destroy instead.
+      if (r.instance_id != null && holdsInstance(facts) && !DESTROY_STATES.has(r.state)) {
         void this.resumeNode(n)
       }
     }
     this.costTimer = setInterval(() => void this.accrueCosts(), 60_000)
     this.metricsTimer = setInterval(() => void this.pollMetrics(), 15_000)
+    this.destroyTimer = setInterval(() => void this.retryDestroys(0), DESTROY_RETRY_MS)
+    void this.retryDestroys(DESTROY_BUDGET_MS)
     void this.reconcileOrphans()
   }
 
   /**
    * Billing-leak protection: destroy any instance this profile rented that
-   * no live node row tracks (e.g. a node marked failed before its destroy
-   * completed, or created moments before a crash). Never touches instances
-   * without our label — the account may host unrelated workloads — nor
-   * labelled ones another installation or profile rented (below).
+   * no node row holds (e.g. one whose create reply was lost, or created
+   * moments before a crash). An instance a row holds, in any state, is not
+   * the sweep's: a live node's, or one retryDestroys is destroying. Never
+   * touches instances without our label — the account may host unrelated
+   * workloads — nor labelled ones another installation or profile rented
+   * (below).
    */
   private async reconcileOrphans(): Promise<void> {
     try {
+      // Before the list is asked for. An instance held when Vast answers is
+      // left alone even if its row is confirmed gone meanwhile: the list
+      // predates that destroy, and a second one here would be announced as
+      // an orphan.
+      const held = new Set<number>()
+      for (const n of this.nodes.values()) {
+        const f = n.facts
+        if (f.instanceId != null && holdsInstance(f)) held.add(f.instanceId)
+      }
       const instances = await listInstances()
-      const tracked = new Set(
-        [...this.nodes.values()]
-          .filter((n) => !['destroyed', 'failed'].includes(n.state))
-          .map((n) => n.snapshot.instanceId)
-      )
+      const rows = getDb().prepare('SELECT id, instance_id FROM nodes').all() as Array<{
+        id: string
+        instance_id: number | null
+      }>
       // Labels carry the first 8 chars of OUR node id, and the node row is
       // written before the instance is created, so every instance this profile
       // ever rented has a row here. One without is another installation's —
       // a packaged app and a dev build, or a second profile, on the same
       // account — and destroying it would kill that app's live render.
-      const ours = new Set(
-        (getDb().prepare('SELECT id FROM nodes').all() as Array<{ id: string }>).map((r) =>
-          r.id.slice(0, 8)
-        )
-      )
+      const ours = new Map(rows.map((r) => [r.id.slice(0, 8), r]))
       const labelled = instances.filter((i) => i.label?.startsWith('vastai-blender'))
       // One stdout line so a scripted run can confirm what the sweep saw.
       console.log(
         `[orphans] ${labelled.length} vastai-blender instance(s) on the account, ` +
-          `${labelled.filter((i) => tracked.has(i.id)).length} tracked here: ` +
+          `${labelled.filter((i) => held.has(i.id)).length} tracked here: ` +
           labelled.map((i) => `${i.id}(${i.label})`).join(', ')
       )
+      // Rows a listed instance's label names: their create went through.
+      const found = new Set<string>()
       for (const inst of labelled) {
         if (!inst.label?.startsWith('vastai-blender')) continue
-        if (tracked.has(inst.id)) continue
+        if (held.has(inst.id) || this.goneChecks.has(inst.id)) continue
         const prefix = inst.label.slice('vastai-blender '.length).trim()
-        if (!ours.has(prefix)) {
+        const row = ours.get(prefix)
+        if (!row) {
           emit('alert', {
             level: 'warn',
             message: `instance ${inst.id} (${inst.label}) was not rented by this profile — left running; destroy it from its own app or the Vast.ai console if it is stray`
           })
           continue
         }
+        found.add(row.id)
+        // This session's rental, whose create has not answered yet: the
+        // instance is the rental's, and rentOffer takes it from here.
+        if (this.creating.has(row.id)) continue
         emit('alert', {
           level: 'warn',
           message: `destroying orphaned instance ${inst.id} (${inst.label})`
         })
-        try {
-          await destroyInstance(inst.id)
-          getDb().prepare("UPDATE nodes SET state = 'destroyed' WHERE instance_id = ?").run(inst.id)
-        } catch (e) {
-          emit('alert', {
-            level: 'error',
-            message: `orphan destroy failed for ${inst.id}: ${(e as Error).message} — check the Vast.ai console!`
-          })
-        }
+        await this.ensureInstanceGone(inst.id, { node: this.claim(row, inst.id) })
       }
+      this.settleUnknownCreates(found)
     } catch {
       // no key / offline — retried implicitly on next app start
+    }
+  }
+
+  /**
+   * An orphan the sweep found under the label of one of our rows: record it
+   * on that row, so that until Vast confirms it gone it counts against the
+   * caps, is metered and is retried like any other failed destroy. The row
+   * either never learned the instance id (a create whose reply was lost, or
+   * one a crash cut short) or took a destroy as confirmed that Vast now
+   * contradicts by listing the instance. A row that holds a different
+   * instance keeps it: this one is destroyed with no row to show for it.
+   */
+  private claim(
+    row: { id: string; instance_id: number | null },
+    instanceId: number
+  ): ManagedNode | undefined {
+    if (row.instance_id != null && row.instance_id !== instanceId) return undefined
+    getDb()
+      .prepare(
+        'UPDATE nodes SET instance_id = ?, destroyed_at = NULL, create_unknown_since = NULL WHERE id = ?'
+      )
+      .run(instanceId, row.id)
+    let node = this.nodes.get(row.id)
+    if (!node) {
+      node = new ManagedNode(row.id)
+      this.nodes.set(row.id, node)
+    }
+    node.emitChanged()
+    return node
+  }
+
+  /**
+   * Rows the last run left with a create of unknown outcome whose label the
+   * account's instances do not carry: that create rented nothing, so they
+   * stop counting as billing. Without this, each such row (a crash mid-create,
+   * a create whose reply was a 5xx) would hold a place under maxActiveNodes
+   * and the spend cap for good. Only rows from before this session: the last
+   * run is gone, so any create it sent has been answered by now. A create of
+   * this session with no known outcome keeps counting until plan 1.4's label
+   * lookup settles it.
+   */
+  private settleUnknownCreates(found: ReadonlySet<string>): void {
+    for (const id of this.unknownAtBoot) {
+      this.unknownAtBoot.delete(id)
+      if (found.has(id)) continue
+      const node = this.nodes.get(id)
+      if (!node || !createOutcomeUnknown(node.facts)) continue
+      const state = node.state
+      if (state === 'requested') {
+        node.update({
+          state: 'failed',
+          create_unknown_since: null,
+          last_error: 'the app stopped while renting; Vast has no instance under its label'
+        })
+      } else if (state === 'destroying') {
+        node.update({ state: 'destroyed', create_unknown_since: null })
+      } else {
+        node.update({ create_unknown_since: null })
+      }
     }
   }
 
   shutdown(): void {
     if (this.costTimer) clearInterval(this.costTimer)
     if (this.metricsTimer) clearInterval(this.metricsTimer)
+    if (this.destroyTimer) clearInterval(this.destroyTimer)
     for (const n of this.nodes.values()) n.closeSsh()
   }
 
@@ -569,10 +741,29 @@ export class NodeManager {
     return this.nodes.get(id)
   }
 
+  /**
+   * The nodes that count against maxActiveNodes and the spend cap, and their
+   * $/hr: every node that may be billing (shared/nodeState.ts
+   * countsTowardCaps). That is booting, working and being destroyed, and
+   * also 'failed' with its destroy unconfirmed, or with a create whose
+   * outcome is unknown. Leaving those out, as each inline list of states
+   * here once did, let the scheduler rent a replacement next to an instance
+   * that was still billing (#64 #194). scalePolicy can read the same from
+   * list() through capacityBudget: snapshots carry destroyedAt and
+   * createUnknownSince.
+   */
+  capUsage(): { nodes: number; perHour: number } {
+    return capUsage([...this.nodes.values()].map((n) => n.facts))
+  }
+
+  /** Nodes that count against maxActiveNodes: see capUsage. */
   activeCount(): number {
-    return [...this.nodes.values()].filter(
-      (n) => !['destroyed', 'destroying', 'failed'].includes(n.state)
-    ).length
+    return this.capUsage().nodes
+  }
+
+  /** $/hr of every node that may be billing: see capUsage. */
+  billingPerHour(): number {
+    return this.capUsage().perHour
   }
 
   /** Rent the best matching offer and drive it to ready. */
@@ -619,7 +810,7 @@ export class NodeManager {
       if (failures >= 3) break
       if (this.activeCount() >= settings.maxActiveNodes) break
       if (opts.respectSpendCap !== false && settings.spendCapPerHour != null) {
-        if (this.activePerHour() >= settings.spendCapPerHour) break
+        if (this.billingPerHour() >= settings.spendCapPerHour) break
       }
       if (usedMachines.has(offer.machineId) || this.blacklist.has(offer.machineId)) continue
       usedMachines.add(offer.machineId)
@@ -634,27 +825,23 @@ export class NodeManager {
     return ids
   }
 
-  /** $/hr of every node that is (or may still be) billing. */
-  private activePerHour(): number {
-    return [...this.nodes.values()]
-      .map((n) => n.snapshot)
-      .filter((s) => !['destroyed', 'destroying', 'failed'].includes(s.state))
-      .reduce((a, s) => a + (s.dphTotal ?? 0), 0)
-  }
-
   /** Create an instance from one offer and start driving it to ready. */
   private async rentOffer(offer: Offer, diskGb: number): Promise<string> {
     const id = randomUUID()
+    const label = `vastai-blender ${id.slice(0, 8)}`
     getDb()
       .prepare(
-        `INSERT INTO nodes (id, state, gpu_name, num_gpus, dph_total, accumulated_cost, blender_versions, geolocation)
-         VALUES (?, 'requested', ?, ?, ?, 0, '[]', ?)`
+        `INSERT INTO nodes (id, state, gpu_name, num_gpus, dph_total, accumulated_cost, blender_versions, geolocation, label, create_unknown_since)
+         VALUES (?, 'requested', ?, ?, ?, 0, '[]', ?, ?, ?)`
       )
       // The offer is the only place vast.ai ever tells us where the machine is
       // — /instances/ doesn't report it — so capture it at rent time or lose it.
-      .run(id, offer.gpuName, offer.numGpus, offer.dphTotal, offer.geolocation)
+      // create_unknown_since: from here until Vast answers, an instance may
+      // exist under `label` that no row knows the id of.
+      .run(id, offer.gpuName, offer.numGpus, offer.dphTotal, offer.geolocation, label, Date.now())
     const node = new ManagedNode(id)
     this.nodes.set(id, node)
+    this.creating.add(id)
     emit('node:changed', node.snapshot)
 
     try {
@@ -664,29 +851,44 @@ export class NodeManager {
         diskGb,
         onstart: ONSTART,
         env: { NVIDIA_DRIVER_CAPABILITIES: 'all' },
-        label: `vastai-blender ${id.slice(0, 8)}`
+        label
       })
-      node.update({ instance_id: instanceId })
+      node.update({ instance_id: instanceId, create_unknown_since: null })
       // The row is in the Fleet, destroy button and all, from before the
       // create; a destroy that landed while it was in flight found no
-      // instance id and so destroyed nothing. The instance is ours to kill.
+      // instance id and so destroyed nothing (and nothing else would ever
+      // touch the instance: the orphan sweep leaves an instance its row
+      // holds alone). The instance is ours to kill.
       if (node.gone) {
-        await this.destroyAbandoned(node, instanceId)
+        await this.ensureInstanceGone(instanceId, { node })
         return id
       }
       void this.driveToReady(node, offer.machineId)
     } catch (e) {
+      // Vast answered, so the outcome is known: a refusal (a 4xx, a reply
+      // with a reason and no contract) rented nothing, and a create that was
+      // never sent (no API key) neither. Otherwise, a lost reply, a 5xx or a
+      // timeout, the row keeps create_unknown_since and so keeps counting as
+      // billing (the Phase 0 review's note on cancelledCreateUnknown).
+      const unknown = classify(e, { via: 'vast' }).outcomeUnknown
       // Destroyed while the create was in flight, and the create then
       // threw. The user cancelled this rental: that is no fault of the
       // machine's (no blacklist), and it must not be replaced by the next
       // offer (return, as the success path above does).
       if (node.gone) {
-        if (!createRefused(e)) this.cancelledCreateUnknown(node, e as Error)
+        if (unknown) this.cancelledCreateUnknown(node, e as Error)
+        else node.update({ create_unknown_since: null })
         return id
       }
-      node.setState('failed', (e as Error).message)
+      node.update({
+        state: 'failed',
+        last_error: (e as Error).message,
+        ...(unknown ? {} : { create_unknown_since: null })
+      })
       this.blacklist.add(offer.machineId)
       throw e
+    } finally {
+      this.creating.delete(id)
     }
     return id
   }
@@ -697,9 +899,11 @@ export class NodeManager {
    * to nobody (a lost reply). destroyNode had no id and ended the node
    * 'destroyed', so nothing would ever look for it. The node goes back to
    * 'failed', the state that says "may still be billing", and the user is
-   * told. Its row, which the next start's orphan sweep matches that label
-   * against, is kept whatever its state. Finding the instance now, by the
-   * label, is plan 1.4.
+   * told. Its create_unknown_since stays set, so it counts against the caps
+   * and in the fleet $/hr like the instance it may have made (plan 1.2).
+   * Its row, which the next start's orphan sweep matches that label against,
+   * is kept whatever its state. Finding the instance now, by the label, is
+   * plan 1.4.
    */
   private cancelledCreateUnknown(node: ManagedNode, e: Error): void {
     const label = `vastai-blender ${node.id.slice(0, 8)}`
@@ -714,26 +918,191 @@ export class NodeManager {
   }
 
   /**
-   * Destroy the instance of a node that was destroyed before its instance id
-   * was recorded. destroyNode had no id to destroy, so it marked the node
-   * destroyed and moved on — and after that nothing else would ever touch
-   * the instance: accrueCosts, the Fleet and History all skip 'destroyed'
-   * rows, and the orphan sweep only runs at start-up.
+   * Make sure a Vast instance is gone, and record that only once it is: the
+   * one destroy path (plan 1.2), for destroyNode, clearFailed, the failure
+   * paths of driveToReady and recoverUnreachable, a rental destroyed while
+   * its create was in flight, the retry timer and the orphan sweep. Each of
+   * those used to send one DELETE of its own and trust the answer, so one
+   * Vast blip left an instance billing that the app had written off, and a
+   * 404 on an instance already gone raised a false "check the console" (#34
+   * #64 #140 #194).
+   *
+   * - With `node`, and SSH having answered on it, OctaneServer is stopped
+   *   first, bounded, so it can release its floating license. The node's
+   *   connection is then closed: nothing may use it on a dying box.
+   * - DELETE is retried with backoff on anything classify() calls transient
+   *   (a network error, a 5xx, a 429, a timeout) for `budgetMs`. A 404 means
+   *   gone. A DELETE Vast accepted is confirmed with showInstance, since a
+   *   200 can leave the instance running.
+   * - Confirmed: every row holding the instance is stamped destroyed_at and
+   *   set 'destroyed'. That stamp is what stops a node counting as billing
+   *   (shared/nodeState.ts holdsInstance), and nothing else stamps it.
+   * - Not confirmed: every row holding it is 'failed', still counted against
+   *   the caps and metered, and retryDestroys tries again every minute until
+   *   it is confirmed. The user is told; the retries (`quiet`) do not tell
+   *   them again, and they hear when it is confirmed.
+   *
+   * Resolves true once the instance is confirmed gone; never rejects. A call
+   * for an instance already being destroyed waits on that one.
    */
-  private async destroyAbandoned(node: ManagedNode, instanceId: number): Promise<void> {
+  ensureInstanceGone(
+    instanceId: number,
+    opts: { node?: ManagedNode; budgetMs?: number; quiet?: boolean } = {}
+  ): Promise<boolean> {
+    const running = this.goneChecks.get(instanceId)
+    if (running) return running
+    const check = this.destroyUntilGone(instanceId, opts).finally(() =>
+      this.goneChecks.delete(instanceId)
+    )
+    this.goneChecks.set(instanceId, check)
+    return check
+  }
+
+  private async destroyUntilGone(
+    instanceId: number,
+    opts: { node?: ManagedNode; budgetMs?: number; quiet?: boolean }
+  ): Promise<boolean> {
+    const { node } = opts
+    if (node) {
+      // Best effort: nothing about the license may stand between the
+      // instance and its DELETE.
+      await this.stopOctane(node).catch(() => {})
+      node.closeSsh()
+    }
+    let last: unknown = null
     try {
-      await destroyInstance(instanceId)
-      node.setState('destroyed')
+      await retryWithBackoff(
+        async () => {
+          try {
+            await destroyInstance(instanceId)
+          } catch (e) {
+            if (e instanceof VastError && e.status === 404) return
+            last = e
+            throw e
+          }
+          let still: RawInstance | null
+          try {
+            still = await showInstance(instanceId)
+          } catch (e) {
+            last = e
+            throw e
+          }
+          if (still) {
+            last = new InstanceStillListed(instanceId, still.actual_status)
+            throw last
+          }
+        },
+        {
+          budgetMs: opts.budgetMs ?? DESTROY_BUDGET_MS,
+          initialDelayMs: DESTROY_FIRST_DELAY_MS,
+          maxDelayMs: DESTROY_MAX_DELAY_MS,
+          isRetryable: (e) =>
+            e instanceof InstanceStillListed || classify(e, { via: 'vast' }).kind === 'transient'
+        }
+      )
     } catch (e) {
-      // As destroyNode does when its destroy throws: 'failed', with the
-      // instance id on the row, is the state that says "may still be
-      // billing" — clearFailed retries the destroy, and the orphan sweep
-      // counts a failed row's instance as untracked and destroys it.
-      node.setState('failed', `destroy failed: ${(e as Error).message}`)
+      this.destroyUnconfirmed(instanceId, last ?? e, opts.quiet === true)
+      return false
+    }
+    this.instanceGone(instanceId)
+    return true
+  }
+
+  /**
+   * Stop OctaneServer before its instance goes, so its floating license is
+   * released rather than held until OTOY times it out. Only where SSH has
+   * answered (nothing can run on a node where it never has) and over the
+   * node's own connection, which exec reconnects if it dropped. The script
+   * runs only when the node has an OctaneServer pidfile, and a wedged or dead
+   * node holds the destroy up for OCTANE_STOP_BUDGET_MS at most.
+   */
+  private async stopOctane(node: ManagedNode): Promise<void> {
+    const ssh = node.ssh
+    if (!ssh || !node.sshEverAnswered) return
+    const { closeVncTunnel, stopOctaneServer } = await import('../octane/octaneLicense')
+    closeVncTunnel(node.id)
+    await stopOctaneServer(ssh, { timeoutMs: OCTANE_STOP_BUDGET_MS, onlyIfStarted: true })
+  }
+
+  /** The managed nodes whose row holds `instanceId` unconfirmed. */
+  private holders(instanceId: number): ManagedNode[] {
+    const ids = getDb()
+      .prepare('SELECT id FROM nodes WHERE instance_id = ? AND destroyed_at IS NULL')
+      .all(instanceId) as Array<{ id: string }>
+    return ids.map((r) => {
+      // Every row that holds an instance is managed (init, claim); a row
+      // that somehow is not joins the map, so the retry timer finds it.
+      let n = this.nodes.get(r.id)
+      if (!n) {
+        n = new ManagedNode(r.id)
+        this.nodes.set(r.id, n)
+      }
+      return n
+    })
+  }
+
+  /**
+   * Vast confirmed the instance gone: a 404, or showInstance no longer finds
+   * it. Stamp destroyed_at on every row holding it; only this settles them.
+   */
+  private instanceGone(instanceId: number, lastError: string | null = null): void {
+    const now = Date.now()
+    for (const n of this.holders(instanceId)) {
+      n.update({ state: 'destroyed', destroyed_at: now, last_error: lastError })
+    }
+    if (this.unconfirmedAlerted.delete(instanceId)) {
+      emit('alert', {
+        level: 'info',
+        message: `Instance ${instanceId} is destroyed now: Vast has confirmed it gone`
+      })
+    }
+  }
+
+  /**
+   * The destroy went unconfirmed: Vast refused it, kept failing, or still
+   * lists the instance. Its rows go (or stay) 'failed' holding the instance,
+   * which counts it and meters it, and retryDestroys goes on trying.
+   */
+  private destroyUnconfirmed(instanceId: number, e: unknown, quiet: boolean): void {
+    const reason =
+      e instanceof InstanceStillListed ? e.message : classify(e, { via: 'vast' }).reason
+    const holders = this.holders(instanceId)
+    for (const n of holders) n.update({ state: 'failed', last_error: `destroy failed: ${reason}` })
+    if (holders.length === 0) {
+      // Only the orphan sweep destroys an instance no row holds.
       emit('alert', {
         level: 'error',
-        message: `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
+        message: `orphan destroy failed for ${instanceId}: ${reason} — check the Vast.ai console!`
       })
+      return
+    }
+    if (quiet && this.unconfirmedAlerted.has(instanceId)) return
+    this.unconfirmedAlerted.add(instanceId)
+    emit('alert', {
+      level: 'error',
+      message: `Destroy failed for instance ${instanceId} (${reason}). It may still be billing; the app retries every minute — check the Vast.ai console!`
+    })
+  }
+
+  /**
+   * Try again to destroy every node whose destroy Vast has not confirmed:
+   * one the app was destroying, one that failed holding its instance, and
+   * one 'destroyed' by a build that took the DELETE's word for it. From
+   * init with a full budget, then from the timer with one attempt per node
+   * per round. One node at a time: Vast rate-limits DELETE, and a round
+   * still running when the timer fires again is left to finish.
+   */
+  private async retryDestroys(budgetMs: number): Promise<void> {
+    if (this.retryingDestroys) return
+    this.retryingDestroys = true
+    try {
+      for (const node of [...this.nodes.values()]) {
+        const f = node.facts
+        if (f.instanceId == null || !holdsInstance(f) || !DESTROY_STATES.has(f.state)) continue
+        await this.ensureInstanceGone(f.instanceId, { node, budgetMs, quiet: true })
+      }
+    } finally {
+      this.retryingDestroys = false
     }
   }
 
@@ -746,11 +1115,10 @@ export class NodeManager {
     // reads the id from the row and destroys the instance itself). So a node
     // already gone here was destroyed before its instance id was recorded,
     // the race rentOffer checks for too, and nothing has destroyed the
-    // instance. A caller that broke that rule would send a second DELETE
-    // alongside destroyNode's: a false "Destroy failed" alert and a 'failed'
-    // row until plan 1.2's ensureInstanceGone takes the 404 as done.
+    // instance. A caller that broke that rule would only join destroyNode's
+    // ensureInstanceGone, or find the instance gone (a 404, which is done).
     if (node.gone) {
-      await this.destroyAbandoned(node, instanceId)
+      await this.ensureInstanceGone(instanceId, { node })
       return
     }
     // The state this run holds the node in: 'requested' until SSH answers,
@@ -847,22 +1215,14 @@ export class NodeManager {
       // or the connection destroyNode closed failed a command. Neither is the
       // node failing. No 'failed' over the destroy's state, no blacklisted
       // machine, no error alert, and no second destroy racing destroyNode's.
-      // A destroy whose DELETE threw has left the node 'failed' with its
-      // instance id, which clearFailed and the orphan sweep retry.
+      // A destroy Vast never confirmed has left the node 'failed' with its
+      // instance id, which the retry timer and clearFailed retry.
       if (node.movedOn(held)) return
       node.setState('failed', (e as Error).message)
       if (machineId != null) this.blacklist.add(machineId)
       emit('alert', { level: 'error', message: `Node failed: ${(e as Error).message}` })
       // Clean up the rented instance — never leave a failed node billing.
-      try {
-        await destroyInstance(instanceId)
-        node.setState('destroyed')
-      } catch {
-        emit('alert', {
-          level: 'error',
-          message: `Could not destroy instance ${instanceId} — check the Vast.ai console!`
-        })
-      }
+      await this.ensureInstanceGone(instanceId, { node })
     }
   }
 
@@ -882,7 +1242,8 @@ export class NodeManager {
       const inst = await showInstance(instanceId)
       if (node.movedOn(held)) return
       if (!inst) {
-        node.setState('destroyed', 'instance missing at resume')
+        // Vast no longer knows the instance: that confirms it gone.
+        this.instanceGone(instanceId, 'instance missing at resume')
         return
       }
       if (inst.actual_status !== 'running') {
@@ -950,8 +1311,8 @@ export class NodeManager {
     } catch (e) {
       // Destroyed meanwhile: destroyNode closed the connection the reconnect
       // was retrying on, which is what ended it. The destroy is not this
-      // node failing, and destroying the instance again here would be a
-      // second DELETE, a 404 raised as "Could not destroy".
+      // node failing, and destroying the instance again here would only
+      // join destroyNode's.
       if (node.movedOn(held)) return
       node.setState('failed', (e as Error).message)
       // A node that dies mid-render never reaches destroyNode, so the
@@ -960,97 +1321,98 @@ export class NodeManager {
       // onto a surviving node.
       forgetNodeProvider?.(node.id)
       // ...and then stop paying for it. Same guarantee as driveToReady's catch:
-      // nothing else ever destroys a node that fails this way — scale-down
-      // filters 'failed' out, accrueCosts stops metering it (so the leak is
-      // invisible in History), and activeCount() ignores it, so a replacement is
-      // rented immediately while this instance keeps billing until the next
-      // app start's orphan reconcile. Destroy it directly rather than via
-      // destroyNode(), whose Octane drain would await a dead SSH connection.
+      // nothing else destroys a node that fails this way, since scale-down
+      // takes only idle nodes. Its connection is the one that just died, so
+      // it is closed first: an Octane stop over it would only wait out its
+      // budget before the destroy.
       const instanceId = node.snapshot.instanceId
       node.closeSsh()
-      if (instanceId) {
-        try {
-          await destroyInstance(instanceId)
-          node.setState('destroyed')
-        } catch {
-          emit('alert', {
-            level: 'error',
-            message: `Could not destroy unreachable instance ${instanceId} — check the Vast.ai console!`
-          })
-        }
-      }
+      if (instanceId) await this.ensureInstanceGone(instanceId, { node })
     }
   }
 
-  async destroyNode(id: string): Promise<void> {
+  /**
+   * Destroy a node's instance (ensureInstanceGone). Resolves once Vast has
+   * confirmed it gone, or once `budgetMs` (default DESTROY_BUDGET_MS) of
+   * retrying transient failures has passed without that: the node is then
+   * 'failed', still counted as billing, and the retry timer carries on. A
+   * caller with a deadline of its own (quit's destroy-all) passes it; 0 is
+   * one attempt. A refused DELETE (a 4xx) is never retried within the call.
+   */
+  async destroyNode(id: string, opts: { budgetMs?: number } = {}): Promise<void> {
     const node = this.nodes.get(id)
     if (!node) return
+    const facts = node.facts
+    // Already confirmed gone (the button pressed twice, #113): nothing to do,
+    // and a second DELETE would only be a 404.
+    if (facts.state === 'destroyed' && !holdsInstance(facts)) return
+    const instanceId = facts.instanceId
+    // A create that ended with no answer (cancelledCreateUnknown, or one
+    // that failed so): there is no id to destroy. The row stays 'failed',
+    // visible and counted as billing, until the instance is found by its
+    // label (plan 1.4, and the next start's orphan sweep). 'destroyed' would
+    // hide from the Fleet a row that still counts against the caps.
+    if (instanceId == null && createOutcomeUnknown(facts) && !this.creating.has(id)) {
+      emit('alert', {
+        level: 'warn',
+        message: `Node ${id.slice(0, 8)} has no instance id to destroy: Vast never answered its create. Check the Vast.ai console for "${node.snapshot.label ?? `vastai-blender ${id.slice(0, 8)}`}".`
+      })
+      return
+    }
     forgetNodeProvider?.(id)
-    const instanceId = node.snapshot.instanceId
     node.setState('destroying')
-    // Octane drain ordering: a clean OctaneServer exit releases the floating
-    // license — do it BEFORE destroying the instance.
-    if (node.snapshot.octaneReady && node.ssh) {
-      const { stopOctaneServer, closeVncTunnel } = await import('../octane/octaneLicense')
-      closeVncTunnel(id)
-      await stopOctaneServer(node.ssh)
+    if (instanceId == null) {
+      // Not rented yet: its create is still in flight, and rentOffer destroys
+      // whatever that returns once it sees the node gone.
+      node.closeSsh()
+      node.setState('destroyed')
+      return
     }
-    node.closeSsh()
-    if (instanceId) {
-      try {
-        await destroyInstance(instanceId)
-      } catch (e) {
-        node.setState('failed', `destroy failed: ${(e as Error).message}`)
-        emit('alert', {
-          level: 'error',
-          message: `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
-        })
-        return
-      }
-    }
-    node.setState('destroyed')
+    // Octane drain ordering (a clean OctaneServer exit releases the floating
+    // license before the instance goes) is ensureInstanceGone's.
+    await this.ensureInstanceGone(instanceId, { node, budgetMs: opts.budgetMs })
   }
 
   /**
    * Retire every 'failed' node. A failed node can still own a billing
-   * instance (a destroy that threw), so re-attempt the destroy rather than
-   * just hiding the row; one that still won't die stays 'failed' and alerts.
-   * Bypasses destroyNode(): its Octane drain would await a dead SSH connection.
+   * instance (a destroy Vast never confirmed), so re-attempt the destroy
+   * rather than just hiding the row; one that still won't die stays 'failed'
+   * and alerts. One whose create has an unknown outcome has no id to destroy
+   * and stays too (see destroyNode). Returns how many were retired.
    */
   async clearFailed(): Promise<number> {
     const failed = [...this.nodes.values()].filter((n) => n.state === 'failed')
     const results = await Promise.allSettled(
       failed.map(async (node) => {
         forgetNodeProvider?.(node.id)
-        node.closeSsh()
-        const instanceId = node.snapshot.instanceId
-        if (instanceId) {
-          try {
-            await destroyInstance(instanceId)
-          } catch (e) {
-            emit('alert', {
-              level: 'error',
-              message: `Destroy failed for instance ${instanceId} — check the Vast.ai console!`
-            })
-            throw e
-          }
+        const f = node.facts
+        if (f.instanceId != null && holdsInstance(f)) {
+          return this.ensureInstanceGone(f.instanceId, { node })
         }
+        if (createOutcomeUnknown(f)) return false
+        node.closeSsh()
         node.setState('destroyed')
+        return true
       })
     )
-    return results.filter((r) => r.status === 'fulfilled').length
+    return results.filter((r) => r.status === 'fulfilled' && r.value).length
   }
 
   /** Accumulate $ cost from dph × elapsed and push the fleet totals. */
   private async accrueCosts(): Promise<void> {
     const db = getDb()
     const ts = Date.now() // one timestamp for the tick, so buckets line up
-    let perHour = 0
     const usage: UsageRow[] = []
+    const facts: NodeCostFacts[] = []
     for (const node of this.nodes.values()) {
       const s = node.snapshot
-      if (['destroyed', 'failed'].includes(s.state) || s.dphTotal == null || !s.startedAt) continue
-      perHour += s.dphTotal
+      facts.push(s)
+      // Metered while it may be billing, whatever its state: a 'failed' node
+      // whose destroy Vast never confirmed is billed all the same, and
+      // skipping it hid the leak from History and the session total (#64).
+      // From when Vast started it: a node still booting is in the fleet
+      // $/hr below but not yet charged here.
+      if (!holdsInstance(s) || s.dphTotal == null || !s.startedAt) continue
       const delta = s.dphTotal / 60 // one minute tick
       node.update({ accumulated_cost: s.accumulatedCost + delta })
       db.prepare(
@@ -1073,7 +1435,8 @@ export class NodeManager {
       // keep last known balance (no key / offline)
     }
     emit('fleet:cost', {
-      perHour,
+      // The fleet rate the caps use: every node that may be billing.
+      perHour: capUsage(facts).perHour,
       sessionTotal,
       sessionWh: sessionEnergyWh(),
       sessionCo2g: sessionCo2Grams(),
