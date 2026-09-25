@@ -225,7 +225,7 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
   }
 
   // 'partial' included: resubmitting a spec HEALS a half-done job
-  // (failed chunks revived below) instead of duplicating it.
+  // (its missing frames queued again below) instead of duplicating it.
   const allJobs = listJobs()
   const active = allJobs.filter((j) => ['queued', 'running', 'partial'].includes(j.state))
   let created = 0
@@ -250,13 +250,24 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
     const existing = active.find((j) => j.blendPath === blend.path)
     if (existing) {
       // Revive permanently-failed chunks (retry budget exhausted, e.g.
-      // by a since-fixed dispatch bug) so the scheduler re-runs only
-      // the missing work (jobs/revive.ts).
-      const revived = reviveFailedChunks(existing.id)
-      console.log(
-        `[spec] skip (already active): ${blend.path}` +
-          (revived ? ` — revived ${revived} failed chunk(s)` : '')
-      )
+      // by a since-fixed dispatch bug), narrowed to the frames still
+      // missing, so the scheduler re-runs only the missing work
+      // (jobs/revive.ts). A job whose rows it cannot narrow is part of the
+      // campaign that will not finish, and the exit status says so.
+      try {
+        const revived = reviveFailedChunks(existing.id)
+        console.log(
+          `[spec] skip (already active): ${blend.path}` +
+            (revived.frames
+              ? ` — ${revived.frames} missing frame(s) queued again in ${revived.chunks} chunk(s)`
+              : '')
+        )
+      } catch (e) {
+        console.error(
+          `[spec] could not revive ${existing.id} (${(e as Error).message}): ${blend.path}`
+        )
+        deps.unsubmitted.push(`${blend.path}: revive failed: ${(e as Error).message}`)
+      }
       continue
     }
     // One blend createJob refuses (missing file, impossible range) must
