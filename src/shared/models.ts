@@ -139,6 +139,10 @@ export interface NodeWorkRef {
    * it is not pinned — a single-GPU node, per-GPU slots off, or not started yet.
    */
   gpu?: number | null
+  /** the job's name, for the Fleet screen's rows (scheduler.activeWorkForNode fills it) */
+  jobName?: string
+  /** media:// URL of the job's latest frame preview; null = none yet */
+  thumbUrl?: string | null
 }
 
 export interface NodeSnapshot {
@@ -1231,6 +1235,41 @@ export interface ChunkProgressEvent {
   currentFrame: number | null
   framesDone: number
   framesTotal: number
+  /** the agent's state for the chunk */
+  status?: 'rendering' | 'encoding' | 'done' | 'failed'
+  /**
+   * Blender's latest output line (not the agent's VR_* markers), as written;
+   * absent before Blender has said anything.
+   */
+  lastLine?: string | null
+  /** `lastLine` read as Blender's status line; null when it is not one */
+  renderStatus?: RenderStatus | null
+  /** epoch ms of the last real progress on the node (a frame started or saved) */
+  lastProgressAt?: number | null
+  /** mean seconds per frame over this chunk's frames the render driver timed; null = none yet */
+  avgFrameS?: number | null
+}
+
+/**
+ * Blender's status line, read (scheduler/blenderStatus.ts). Every field is
+ * null when the line does not carry it.
+ */
+export interface RenderStatus {
+  frame: number | null
+  /** Blender's own memory, MB, and its peak */
+  memMb: number | null
+  peakMemMb: number | null
+  /** time on this frame so far, and Blender's estimate of what is left of it, s */
+  elapsedS: number | null
+  remainingS: number | null
+  /** Cycles: the render device's memory, MB, and its peak */
+  deviceMemMb: number | null
+  devicePeakMemMb: number | null
+  /** samples done of the frame, of `samples` */
+  sample: number | null
+  samples: number | null
+  /** what it is doing, in Blender's words: "Sample 32/256", "Synchronizing object · Cube" */
+  phase: string | null
 }
 
 /** Low-rate: a chunk's lifecycle state moved. Safe to invalidate on. */

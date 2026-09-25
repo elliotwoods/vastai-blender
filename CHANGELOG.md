@@ -22,6 +22,14 @@ stalled the app).
 
 ### Added
 
+- **Blender's live status, and whose work a node is doing.** `chunk:progress`
+  now carries Blender's latest status line (never the agent's `VR_*` markers),
+  read into frame, sample x/y, time and time left, memory and phase
+  (`scheduler/blenderStatus.ts`, Cycles and EEVEE), plus the agent's status,
+  its last real progress and the chunk's mean seconds per frame. Each node's
+  `currentWork` names the job and carries its latest preview, both
+  memoised so the 15-second fleet snapshot stays cheap.
+
 - **A render queue you can reorder, group and tidy.** Jobs have a place in
   the queue (`queue_pos`, schema v9, existing jobs in submit order) that the
   scheduler now follows instead of submit time; a revived job goes to the

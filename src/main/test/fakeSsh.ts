@@ -144,6 +144,7 @@ export interface AgentStateFile {
   /** What the real agent adds (scheduler's AgentState), for a test that writes it. */
   errorKind?: string | null
   logTail?: string[]
+  lastLine?: string
   lastProgressAt?: number
   engine?: string | null
   oom?: boolean

@@ -2,6 +2,7 @@ import { createHash } from 'crypto'
 import { existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { afterEach, describe, expect, it } from 'vitest'
+import type { ChunkProgressEvent } from '../../shared/models'
 import { REMOTE_ROOT } from '../test/fakeSsh'
 import { setup, type AgentSpec, type App, type FakeMachine, type World } from '../test/harness'
 
@@ -196,6 +197,63 @@ describe('stale runs', () => {
     expect(chunkStates(chunk.id).at(-1)).toBe('cancelled')
     // Dispatched once, and never again.
     expect(chunkStates(chunk.id).filter((s) => s === 'assigned')).toHaveLength(1)
+  })
+
+  it("carries Blender's status line to chunk:progress, and names the job on its node", async () => {
+    const { app, nodeId, machine } = await oneNode()
+    const jobId = await w.submitJob(app, { name: 'shot 10' })
+    const chunk = onlyChunk(jobId)
+    app.scheduler.kick()
+    await w.until(() => chunkRow(chunk.id).state === 'rendering', 'chunk rendering')
+    expect(app.scheduler.activeWorkForNode(nodeId)).toEqual([
+      expect.objectContaining({ chunkId: chunk.id, jobId, jobName: 'shot 10', thumbUrl: null })
+    ])
+
+    const line =
+      'Fra:2 Mem:1234.56M (Peak 1400.00M) | Time:00:05.12 | Remaining:00:31.44 | Mem:800.12M, Peak:812.00M | Scene, ViewLayer | Sample 32/256'
+    machine.agent.writeState(chunk.id, {
+      status: 'rendering',
+      framesDone: 1,
+      currentFrame: 2,
+      lastLine: line,
+      lastProgressAt: Date.now() / 1000,
+      timings: { loadS: 4, frames: 1, evalS: 1, syncS: 2, sampleS: 30, saveS: 1 }
+    })
+    const seen = (): ChunkProgressEvent[] =>
+      w.eventsOf('chunk:progress').filter((p) => p.chunkId === chunk.id && p.lastLine != null)
+    await w.until(() => seen().length > 0, 'progress with a status line')
+    expect(seen().at(-1)).toMatchObject({
+      status: 'rendering',
+      lastLine: line,
+      renderStatus: { frame: 2, sample: 32, samples: 256, remainingS: 31.44 },
+      lastProgressAt: expect.any(Number),
+      avgFrameS: 34
+    })
+
+    // A marker line after it is the agent's, not Blender's: the status stays.
+    machine.agent.writeState(chunk.id, {
+      status: 'rendering',
+      framesDone: 1,
+      currentFrame: 2,
+      lastLine: 'VR_FRAME {"frame": 2}'
+    })
+    const count = seen().length
+    await w.until(() => seen().length > count, 'the next progress')
+    expect(seen().at(-1)?.lastLine).toBe(line)
+
+    // The Fleet row's thumbnail follows the previews as they land.
+    const { emit } = await import('../events')
+    emit('asset:added', {
+      jobId,
+      chunkId: chunk.id,
+      kind: 'thumb',
+      frame: 2,
+      path: '/x/thumbs/0002.jpg',
+      mediaUrl: `media://job/${jobId}/thumbs/0002.jpg`
+    })
+    expect(app.scheduler.activeWorkForNode(nodeId)[0].thumbUrl).toBe(
+      `media://job/${jobId}/thumbs/0002.jpg`
+    )
   })
 
   it('stamps when the job started and finished, and when each frame landed', async () => {

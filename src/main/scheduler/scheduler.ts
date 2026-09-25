@@ -16,7 +16,8 @@ import { promises as fsp } from 'fs'
 import { posix } from 'path'
 import { getDb, readAppState, writeAppState } from '../db/db'
 import { classify, describeError, type AgentFailure, type Classification } from '../errors'
-import { emit } from '../events'
+import { emit, on } from '../events'
+import { jobFileMediaUrl } from '../mediaUrl'
 import {
   emitChunkChanged,
   emitChunksChanged,
@@ -89,6 +90,7 @@ import {
 } from './gpuLanes'
 import { planScaling, type ScalingPlan } from './scaling'
 import { recordScenePerf, renderVramMb, type AgentTimings, type AgentVram } from './scenePerf'
+import { isMarkerLine, parseStatusLine } from './blenderStatus'
 import { decide, hardCap, initialState, recordNodeSlots, type SlotState } from './slotController'
 import type {
   AlertEvent,
@@ -99,6 +101,7 @@ import type {
   JobAttention,
   JobAttentionKind,
   NodeSnapshot,
+  NodeWorkRef,
   OctaneState
 } from '../../shared/models'
 import { capacityBudget, isBooting, isDispatchable } from '../../shared/nodeState'
@@ -468,6 +471,8 @@ interface AgentState {
   errorKind?: string | null
   /** the chunk log's last lines, on a failed state */
   logTail?: string[]
+  /** the last line Blender (or the agent's driver) printed, trimmed to 300 characters */
+  lastLine?: string
   /** epoch seconds of the last real progress (a frame saved or started) */
   lastProgressAt?: number
   /** the engine the scene really renders with, once Blender loaded it */
@@ -798,6 +803,12 @@ class ChunkRun {
   private stateReadAt: number | null = null
   /** The agent's status at the last state read: null until it took the spec. */
   private agentStatus: AgentState['status'] | null = null
+  /**
+   * Blender's latest line that is not one of the agent's VR_* markers: the
+   * agent's lastLine is whichever it printed last, and a marker follows every
+   * frame, so a poll would often see nothing else.
+   */
+  private statusLine: string | null = null
   /** Since when the spec has waited in the inbox with no render of ours on the node (epoch ms). */
   private unclaimedSince: number | null = null
   /**
@@ -1501,13 +1512,24 @@ class ChunkRun {
           nodeManager.get(this.nodeId)?.emitChanged()
         }
         if (state.pinFailed === true) scheduler.pinFailedOn(this.nodeId)
+        if (typeof state.lastLine === 'string' && state.lastLine.trim() !== '') {
+          if (!isMarkerLine(state.lastLine)) this.statusLine = state.lastLine.trim()
+        }
         emit('chunk:progress', {
           chunkId: this.chunkId,
           jobId: this.jobId,
           nodeId: this.nodeId,
           currentFrame: state.currentFrame,
           framesDone: state.framesDone,
-          framesTotal
+          framesTotal,
+          status: state.status,
+          lastLine: this.statusLine,
+          renderStatus: parseStatusLine(this.statusLine),
+          lastProgressAt:
+            typeof state.lastProgressAt === 'number'
+              ? Math.round(state.lastProgressAt * 1000)
+              : null,
+          avgFrameS: meanFrameSeconds(state.timings)
         })
         if (state.status === 'rendering') {
           this.sampleRate(state.framesDone, scheduler.rendersOnNode(this.nodeId))
@@ -1896,6 +1918,57 @@ class ChunkRun {
 }
 
 const EMPTY_RUNS: ReadonlySet<ChunkRun> = new Set()
+
+/** Mean seconds per frame of a chunk the render driver timed; null = none timed. */
+function meanFrameSeconds(t: AgentTimings | null | undefined): number | null {
+  if (!t || !(t.frames > 0)) return null
+  const sum = [t.evalS, t.syncS, t.sampleS, t.saveS].reduce(
+    (a, v) => a + (typeof v === 'number' && Number.isFinite(v) ? v : 0),
+    0
+  )
+  return sum > 0 ? sum / t.frames : null
+}
+
+/** Memoised job names and latest previews (Scheduler.activeWorkForNode). */
+class JobLabels {
+  private names = new Map<string, string>()
+  private thumbs = new Map<string, string | null>()
+
+  constructor() {
+    on('asset:added', (e) => {
+      if (e.kind === 'thumb' && e.mediaUrl) this.thumbs.set(e.jobId, e.mediaUrl)
+    })
+  }
+
+  name(jobId: string): string | undefined {
+    let n = this.names.get(jobId)
+    if (n === undefined) {
+      const row = getDb().prepare('SELECT name FROM jobs WHERE id = ?').get(jobId) as
+        { name: string } | undefined
+      if (!row) return undefined
+      n = row.name
+      this.names.set(jobId, n)
+    }
+    return n
+  }
+
+  thumb(jobId: string): string | null {
+    if (this.thumbs.has(jobId)) return this.thumbs.get(jobId) ?? null
+    const row = getDb()
+      .prepare(
+        `SELECT j.output_dir AS output_dir, f.thumb_path AS thumb_path, MAX(f.frame) AS frame
+           FROM frames f JOIN jobs j ON j.id = f.job_id
+          WHERE f.job_id = ? AND f.thumb_path IS NOT NULL`
+      )
+      .get(jobId) as { output_dir: string | null; thumb_path: string | null } | undefined
+    const url =
+      row?.thumb_path && row.output_dir
+        ? jobFileMediaUrl(jobId, row.output_dir, row.thumb_path)
+        : null
+    this.thumbs.set(jobId, url)
+    return url
+  }
+}
 
 class Scheduler {
   private runs = new Map<string, ChunkRun>() // chunkId → run
@@ -2611,11 +2684,25 @@ class Scheduler {
    * "current chunk" text and the per-job cost split in accrueCosts — a node
    * with two runs in flight has its minute divided between them.
    */
-  activeWorkForNode(nodeId: string): Array<{ chunkId: string; jobId: string; gpu: number | null }> {
+  activeWorkForNode(nodeId: string): NodeWorkRef[] {
     const s = this.byNode.get(nodeId)
     if (!s || s.size === 0) return []
-    return [...s].map((r) => ({ chunkId: r.chunkId, jobId: r.jobId, gpu: r.gpu }))
+    return [...s].map((r) => ({
+      chunkId: r.chunkId,
+      jobId: r.jobId,
+      gpu: r.gpu,
+      jobName: this.jobLabels.name(r.jobId),
+      thumbUrl: this.jobLabels.thumb(r.jobId)
+    }))
   }
+
+  /**
+   * Each job's name and latest preview, for the Fleet screen's rows: the
+   * node snapshot is rebuilt every 15 s and on every change, so neither is
+   * read from the database each time. A name never changes; a preview is
+   * read once, then follows asset:added.
+   */
+  private jobLabels = new JobLabels()
 
   /** Does job `jobId` have a run in flight (dispatching, rendering, downloading)? */
   hasJobRuns(jobId: string): boolean {
@@ -2650,7 +2737,7 @@ class Scheduler {
    * scaled by. A run only downloading beside the next one's render took no
    * GPU from it (#180).
    */
-  rendersOnNode(nodeId: string): Array<{ chunkId: string; jobId: string; gpu: number | null }> {
+  rendersOnNode(nodeId: string): NodeWorkRef[] {
     return this.activeWorkForNode(nodeId).filter((w) => !this.runs.get(w.chunkId)?.renderEnded)
   }
 

@@ -68,6 +68,7 @@ import { scheduler } from './scheduler/scheduler'
 import { co2Grams, intensityFor } from './carbon/intensity'
 import { getDb } from './db/db'
 import { jobFileMediaUrl, toMediaUrl } from './mediaUrl'
+import { parseStatusLine } from './scheduler/blenderStatus'
 import { estimateJobTiming } from '../shared/jobTiming'
 import { resolveRange, summary as historySummary } from './history/history'
 import { REMOTE_ROOT } from './nodes/provisioner'
@@ -404,9 +405,27 @@ const mockNodes = (): NodeSnapshot[] => [
     // Deliberately one multi-slot node AND one retry id — the two shapes the
     // old currentChunkId regex could not parse.
     currentWork: [
-      { chunkId: 'job1abcd-51-75', jobId: 'job-1' },
-      { chunkId: 'job1abcd-76-100-r1', jobId: 'job-1' },
-      { chunkId: 'job2abcd-1-25', jobId: 'job-2' }
+      {
+        chunkId: 'job1abcd-51-75',
+        jobId: 'job-1',
+        gpu: 0,
+        jobName: 'hero_shot_v12',
+        thumbUrl: 'media://fixtures/thumbs/0002.jpg'
+      },
+      {
+        chunkId: 'job1abcd-76-100-r1',
+        jobId: 'job-1',
+        gpu: 1,
+        jobName: 'hero_shot_v12',
+        thumbUrl: 'media://fixtures/thumbs/0002.jpg'
+      },
+      {
+        chunkId: 'job2abcd-1-25',
+        jobId: 'job-2',
+        gpu: null,
+        jobName: 'lookdev_turntable',
+        thumbUrl: null
+      }
     ],
     // 3 of 4 — deliberately leaves one idle slot visible in the panel.
     slotsInUse: 3,
@@ -981,6 +1000,49 @@ function historyQuery(
  * it holds a run (paid but idle), and a gap where the node was unreachable;
  * node-b is newer and idle.
  */
+/**
+ * VR_MOCK: Blender's live status for node-a's rendering chunks, as
+ * chunk:progress carries it from a real agent: one sampling its way through
+ * a frame, one syncing its scene, whose last progress is old enough to read
+ * as stale.
+ */
+function startMockProgress(): void {
+  const started = Date.now()
+  const tick = (): void => {
+    const now = Date.now()
+    const t = Math.floor((now - started) / 2_000)
+    const sample = ((t * 8) % 256) + 1
+    const frame = 69 + Math.floor((t * 8) / 256)
+    const sampling = `Fra:${frame} Mem:1234.56M (Peak 1400.00M) | Time:00:${String(
+      Math.floor((sample / 256) * 40)
+    ).padStart(2, '0')}.12 | Remaining:00:${String(40 - Math.floor((sample / 256) * 40)).padStart(
+      2,
+      '0'
+    )}.44 | Mem:8120.12M, Peak:8512.00M | Scene, ViewLayer | Sample ${sample}/256`
+    const syncing =
+      'Fra:79 Mem:2210.40M (Peak 2210.40M) | Time:00:03.60 | Mem:0.00M, Peak:0.00M | Scene, ViewLayer | Synchronizing object | Crowd_Agent.412'
+    for (const [chunkId, line, framesDone, framesTotal, lastProgressAt] of [
+      ['job1abcd-51-75', sampling, frame - 51, 25, now - 3_000],
+      ['job1abcd-76-100-r1', syncing, 3, 25, now - 47_000]
+    ] as const) {
+      emit('chunk:progress', {
+        chunkId,
+        jobId: 'job-1',
+        nodeId: 'node-a',
+        currentFrame: parseStatusLine(line)?.frame ?? null,
+        framesDone,
+        framesTotal,
+        status: 'rendering',
+        lastLine: line,
+        renderStatus: parseStatusLine(line),
+        lastProgressAt,
+        avgFrameS: 41.3
+      })
+    }
+  }
+  setInterval(tick, 2_000).unref?.()
+}
+
 function startMockMetrics(): void {
   const STEP = 15_000 // the real probe cadence: a coarser backfill leaves every other 30 s bucket empty
   const reading = (nodeId: string, ts: number): Parameters<typeof recordMetrics>[1] => {
@@ -1068,7 +1130,10 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   scheduler.onHoldsChanged((holds) => sendPush('fleet:holds', holds))
   nodeManager.onUnclaimedChanged((list) => sendPush('fleet:unclaimed', list))
   onSample((sample) => sendPush('node:metricsSample', sample))
-  if (MOCK) startMockMetrics()
+  if (MOCK) {
+    startMockMetrics()
+    startMockProgress()
+  }
   // An error or billing risk nobody is looking at: an OS notification too.
   // This runs inside emit, before the windows hear the alert, so a failure
   // here is logged and goes no further. It must never cost the user the
