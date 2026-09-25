@@ -24,6 +24,30 @@ describe('scale-up against the plan', () => {
     expect(app.scheduler.scaleStatus()?.status).toBe('rent')
   })
 
+  it('1.5 cap headroom: under a $2/h cap with $1.95/h running, scale-up rents only what the $0.05 left buys', async () => {
+    // The cap used to be tested against the fleet as it stood, so the next
+    // rental could be any price: an $8/h box on top of $1.95/h (audit A7).
+    w = await setup({ settings: { maxActiveNodes: 4, spendCapPerHour: 2 } })
+    const app = await w.boot()
+    const busy = await w.readyNode(app, { dph_total: 1.95 })
+    w.vast.addOffer({ dph_total: 8, dlperf_per_dphtotal: 900 })
+    const cheap = w.vast.addOffer({ dph_total: 0.04 })
+    w.machineFor(busy).onSpec = () => {}
+    await w.submitJob(app, { frameStart: 1, frameEnd: 2, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => w.vast.count('createInstance') === 2, 'a second rental', {
+      timeoutMs: 5 * 60_000
+    })
+    const [, second] = w.vast.argsOf('createInstance')
+    expect((second[0] as { offerId: number }).offerId).toBe(cheap.id)
+    // The search itself asked for no more than what the cap leaves.
+    const searches = w.vast.argsOf('searchOffers').map((a) => a[0] as Record<string, unknown>)
+    expect(searches.at(-1)?.dph_total).toMatchObject({ lte: 0.05 })
+    await w.advance(2 * 60_000, 1_000)
+    expect(w.vast.count('createInstance')).toBe(2)
+    expect(app.nodeManager.capUsage().perHour).toBeCloseTo(1.99, 6)
+  })
+
   it('1.17: scale-up that keeps failing backs off, says why, and rents again once it can', async () => {
     w = await setup({ settings: { maxActiveNodes: 2, spendCapPerHour: 10 } })
     w.vast.addOffer()

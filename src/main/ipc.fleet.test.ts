@@ -170,16 +170,14 @@ describe('the Phase 1 IPC contract in main', () => {
   it('1.17: job:resume releases a job the breaker held; scheduler:scaleStatus says why scale-up rents or not', async () => {
     const app = await w.boot()
     const jobId = await w.submitJob(app)
-    w.db
-      .prepare('UPDATE jobs SET attention = ? WHERE id = ?')
-      .run(
-        JSON.stringify({
-          kind: 'repeatedFailure',
-          message: 'the same failure on 2 nodes',
-          since: 1
-        }),
-        jobId
-      )
+    w.db.prepare('UPDATE jobs SET attention = ? WHERE id = ?').run(
+      JSON.stringify({
+        kind: 'repeatedFailure',
+        message: 'the same failure on 2 nodes',
+        since: 1
+      }),
+      jobId
+    )
     expect(await w.invoke('job:resume', jobId)).toBe(true)
     expect(
       w.get<{ attention: string | null }>('SELECT attention FROM jobs WHERE id = ?', jobId)
