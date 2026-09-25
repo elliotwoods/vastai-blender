@@ -789,6 +789,38 @@ export interface JobDetail extends JobSummary {
    * reading the file.
    */
   sceneChanged?: boolean | null
+  /**
+   * Where this scene's render time went, one row per GPU model it rendered
+   * on (scene_perf). Empty until a chunk rendered through the agent's render
+   * driver; absent from older builds.
+   */
+  renderTimes?: SceneRenderTimes[]
+}
+
+/**
+ * Where one scene's render time goes on one GPU model, measured by the
+ * agent's render driver (remote/blender/render_driver.py). Per-frame phases
+ * are means over every frame timed; null = none timed yet.
+ */
+export interface SceneRenderTimes {
+  gpuName: string
+  /** mean seconds from Blender's launch to the scene loaded and its scripts run, per chunk */
+  loadS: number | null
+  /** chunks behind loadS */
+  loads: number
+  /** frames behind the per-frame means */
+  frames: number
+  /** render depsgraph: animation, modifiers, geometry nodes */
+  evalS: number | null
+  /** Cycles' scene sync, BVH build and upload: the GPU mostly idle */
+  syncS: number | null
+  /** path tracing: the GPU busy */
+  sampleS: number | null
+  /** compositing and writing the file */
+  saveS: number | null
+  /** the most GPU memory one render of it used, MB; null = not measured */
+  peakVramMb: number | null
+  updatedAt: number
 }
 
 /** What job:retryMissing queued again (plan 1.15). */

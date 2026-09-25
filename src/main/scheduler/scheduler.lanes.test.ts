@@ -80,9 +80,12 @@ function reportMemory(machine: FakeMachine, load: { vram: number; ram: number })
   return load
 }
 
-/** The node's exclusive runs right now. */
+/**
+ * The node's exclusive runs rendering right now: one whose render ended is
+ * only downloading, and has left its lane to the next (#180).
+ */
 function inFlight(app: App, nodeId: string): number {
-  return app.scheduler.activeWorkForNode(nodeId).length
+  return app.scheduler.rendersOnNode(nodeId).length
 }
 
 describe('1.11 #229 #235: lanes by engine', () => {
@@ -174,7 +177,8 @@ describe('1.11 #229 #235: lanes by engine', () => {
 
     machine.agent.finish(eevee.id)
     await w.until(() => specs.length === 6, 'Cycles dispatched once EEVEE is done')
-    expect(app.scheduler.activeWorkForNode(nodeId)).toHaveLength(1)
+    // Rendering alone: the EEVEE chunk may still be downloading (#180).
+    expect(app.scheduler.rendersOnNode(nodeId)).toHaveLength(1)
   })
 
   it('scale-up counts one lane per node for EEVEE work', async () => {
@@ -437,5 +441,26 @@ describe('1.11 #228 #230: what a node shows it can take', () => {
     machine.onSpec = (spec) => machine.agent.finish(spec.chunkId)
     machine.agent.finish(specs[4].chunkId)
     await w.until(() => jobState(jobId) === 'complete', 'job complete')
+  })
+})
+
+describe('#180: the next chunk does not wait for the last one to download', () => {
+  it('an exclusive lane is free once its render ends, one tail a lane', async () => {
+    const { app, machine } = await gpuNode(1)
+    const specs = recordSpecs(machine)
+    const jobId = await submit(app, 'cycles', 3)
+    app.scheduler.kick()
+    await w.until(() => specs.length === 1, 'first chunk')
+    const [first] = chunksOf(jobId)
+    // Blender has exited; the agent is encoding the previews on the CPU.
+    machine.agent.writeState(first.id, { status: 'encoding', framesDone: 1, currentFrame: 1 })
+    await w.until(() => specs.length === 2, 'second chunk while the first encodes')
+    expect(chunksOf(jobId)[0].state).toBe('encoding')
+    // One render and one tail on the one lane: the third waits.
+    await w.advance(20_000)
+    expect(specs).toHaveLength(2)
+    machine.agent.finish(first.id)
+    machine.agent.finish(specs[1].chunkId)
+    await w.until(() => specs.length === 3, 'third chunk once the lane frees')
   })
 })

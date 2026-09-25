@@ -11,6 +11,7 @@ import { hostPathFlavour } from '../paths'
 import { getSettings } from '../settings'
 import { sha256File } from '../ssh/sftp'
 import { autoChunkSize, framesIn, splitFrames } from '../scheduler/chunker'
+import { sceneRenderTimes } from '../scheduler/scenePerf'
 import { validateSubmission } from '../../shared/jobValidation'
 import type {
   ChunkSnapshot,
@@ -178,7 +179,8 @@ export function getJob(id: string): JobDetail | null {
     ...rowToSummary(row),
     chunks: chunks.map(rowToChunk),
     addonIds: JSON.parse(row.addon_ids) as string[],
-    sceneChanged: sceneChangedNow(row)
+    sceneChanged: sceneChangedNow(row),
+    renderTimes: row.blend_sha256 ? sceneRenderTimes(row.blend_sha256) : []
   }
 }
 

@@ -83,6 +83,7 @@ import {
   type LanePlan
 } from './gpuLanes'
 import { planScaling, type ScalingPlan } from './scaling'
+import { recordScenePerf, renderVramMb, type AgentTimings, type AgentVram } from './scenePerf'
 import { decide, hardCap, initialState, recordNodeSlots, type SlotState } from './slotController'
 import type {
   AlertEvent,
@@ -482,6 +483,10 @@ interface AgentState {
   oom?: boolean
   /** the app asked for a pinned render and the agent could not pin it */
   pinFailed?: boolean
+  /** where the render's time went, from the render driver (renderDriver specs) */
+  timings?: AgentTimings | null
+  /** the GPU memory the render used, from the agent's nvidia-smi watch */
+  vram?: AgentVram | null
   /** preflight.py's report (plan 1.16) */
   preflight?: {
     ok: boolean
@@ -782,6 +787,8 @@ class ChunkRun {
   private stopTail: (() => void) | null = null
   private dispatchedAt = Date.now()
   private engineNoted = false
+  /** The run's final state went into scene_perf (notePerf); once per run. */
+  private perfNoted = false
   /** Since when the state file has been missing / every read of it failed, in a row (epoch ms). */
   private missingSince: number | null = null
   private unreadSince: number | null = null
@@ -836,6 +843,15 @@ class ChunkRun {
     /** the job's engine when it was assigned, which `lanes` was planned for */
     readonly engine: EngineId
   ) {}
+
+  /**
+   * Blender has exited on the node: the agent is encoding the chunk's
+   * previews, or done and this computer is downloading its frames. Neither
+   * needs the GPU, and the agent no longer counts it against a lane.
+   */
+  get renderEnded(): boolean {
+    return this.agentStatus === 'encoding' || this.agentStatus === 'done'
+  }
 
   /**
    * Measured frames/sec, or null while it is still unknown. This is the
@@ -926,6 +942,27 @@ class ChunkRun {
    * Blender renders an Octane scene with another engine, #85), so the job
    * keeps its engine and fails, with the reason: the returned failure.
    */
+  /**
+   * Put the render's timings and GPU memory into scene_perf, once, from its
+   * final state: a failed one too, since an out of memory is exactly the
+   * figure that says a second render will not fit beside it.
+   */
+  private notePerf(state: AgentState): void {
+    if (this.perfNoted) return
+    this.perfNoted = true
+    const sha = this.job().blend_sha256
+    const gpuName = nodeManager.get(this.nodeId)?.snapshot?.gpuName
+    if (!sha || !gpuName) return
+    const alone =
+      this.gpu != null && this.gpuRunsSamples > 0 && this.gpuRunsSum / this.gpuRunsSamples <= 1
+    try {
+      recordScenePerf(sha, gpuName, state.timings, renderVramMb(state.vram, alone))
+    } catch (e) {
+      // A measurement: never worth failing the chunk over.
+      console.warn(`[scheduler] scene_perf for ${this.chunkId}: ${describeError(e)}`)
+    }
+  }
+
   private noteEngine(engine: string | null | undefined): ChunkFailure | null {
     if (this.engineNoted || typeof engine !== 'string' || engine === '') return null
     this.engineNoted = true
@@ -1139,6 +1176,10 @@ class ChunkRun {
       // too, to the least-loaded GPU. Older agents ignore both keys.
       lanes: lanes.lanes,
       pinGpus: lanes.pin,
+      // Cycles through the agent's render driver, which times each frame's
+      // phases (state "timings", scene_perf). Older agents ignore the key
+      // and render with -a, as does a node without the driver.
+      renderDriver: job.engine === 'cycles',
       extraArgs: [],
       pythonExprs: bootstrapExprs,
       encode: {
@@ -1453,6 +1494,7 @@ class ChunkRun {
         // Every state, the done one included: a one-frame chunk's frame is
         // timed by the read that finds it done.
         this.noteProgress(state)
+        if (state.status === 'done' || state.status === 'failed') this.notePerf(state)
         // Re-read the range every iteration rather than computing it once:
         // requeue() can narrow this chunk mid-flight, and a cached total then
         // reports progress against a range that no longer exists.
@@ -1474,7 +1516,7 @@ class ChunkRun {
           framesTotal
         })
         if (state.status === 'rendering') {
-          this.sampleRate(state.framesDone, scheduler.activeWorkForNode(this.nodeId))
+          this.sampleRate(state.framesDone, scheduler.rendersOnNode(this.nodeId))
         }
         const mismatch = this.noteEngine(state.engine)
         if (mismatch) {
@@ -2582,6 +2624,16 @@ class Scheduler {
   }
 
   /**
+   * activeWorkForNode without the runs whose render has ended (renderEnded):
+   * the renders sharing the node's GPUs, which is what a run's throughput is
+   * scaled by. A run only downloading beside the next one's render took no
+   * GPU from it (#180).
+   */
+  rendersOnNode(nodeId: string): Array<{ chunkId: string; jobId: string; gpu: number | null }> {
+    return this.activeWorkForNode(nodeId).filter((w) => !this.runs.get(w.chunkId)?.renderEnded)
+  }
+
+  /**
    * Runs of ours on `run`'s node, besides it, whose render the agent has
    * taken and not yet finished (ChunkRun.holdsLane): what a spec waiting in
    * the node's inbox may be waiting behind (ChunkRun.checkUnclaimed).
@@ -3056,12 +3108,19 @@ class Scheduler {
    */
   private occupancy(nodeId: string, engine?: EngineId | null): NodeOccupancy {
     const runs = this.runsOn(nodeId)
+    const lanes = this.exclusiveLanes(nodeId, engine)
+    // A run whose render has ended (encoding, or downloading) leaves its lane
+    // to the next chunk, which loads its scene while the frames come down: the
+    // GPU used to idle through every chunk's encode and download (#180). At
+    // most one such run per lane, so downloads, which share the node's one
+    // SFTP connection, cannot pile up behind renders that outpace them.
+    const tails = [...runs].filter((r) => r.renderEnded).length
     return {
-      inFlight: runs.size,
+      inFlight: runs.size - Math.min(tails, Math.max(1, lanes)),
       hasExclusive: [...runs].some((r) => !r.shareNode),
       reservedFor: this.reservation?.nodeId === nodeId ? this.reservation.chunkId : null,
       slotTarget: this.slotTargetFor(nodeId),
-      exclusiveLanes: this.exclusiveLanes(nodeId, engine)
+      exclusiveLanes: lanes
     }
   }
 

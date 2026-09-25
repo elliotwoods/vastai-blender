@@ -48,6 +48,10 @@ Job spec:
                       refuses an unbaked simulation when > 1),
     "preflight": "enforce"|"warn"|"off" (the scene preflight; absent =
                       enforce, see remote/blender/preflight.py),
+    "renderDriver": bool (Cycles: render through blender/render_driver.py,
+                      which reports where each frame's time goes (state
+                      "timings"), rather than Blender's own -a/-f; absent =
+                      false),
     "encode": null | {"sdr": bool, "hdr": bool, "proxy": bool,
                        "codec": "hevc"|"av1", "fps": float,
                        "thumbs": bool, "thumbWidth": int} }
@@ -99,7 +103,20 @@ added, so an older app reads a newer agent's state):
                               spec's engine is only the app's label for it,
     "preflight": {...}|null   preflight.py's report once Blender ran it:
                               {ok, summary, missing: [{kind, name, path,
-                              packable}], problems, warnings} }
+                              packable}], problems, warnings},
+    "timings": {...}|null     where the time went, from render_driver.py
+                              (renderDriver only): {"loadS": launch to the
+                              scene loaded and every script run, "frames": N
+                              frames timed, "evalS", "syncS", "sampleS",
+                              "saveS": each phase summed over those frames;
+                              see render_driver.py},
+    "vram": {...}|null        GPU memory this render used, sampled every
+                              VRAM_POLL_S while Blender lives: {"peakMb": this
+                              Blender's own peak, null when nvidia-smi does not
+                              list its pid (a container often cannot), "gpu":
+                              the card it is pinned to, "cardBaseMb" and
+                              "cardPeakMb": that card's use as Blender started
+                              and at its peak, every render on it included} }
   A failed state keeps every field it had and adds:
     "error": str              one readable line,
     "errorKind": "scene"|"job"|"machine"|"transient"   see ERROR_KINDS,
@@ -137,6 +154,8 @@ CONTROL = os.path.join(ROOT, "control")
 BLENDER_ROOT = os.path.join(ROOT, "blender")
 OCTANE_BLENDER = "/usr/local/OctaneBlender/blender"
 ENCODE_SCRIPT = os.path.join(ROOT, "encode", "encode_preview.py")
+# In blender/ beside the other scripts; see the spec's renderDriver.
+RENDER_DRIVER = "render_driver.py"
 LIVE_SCRIPT = os.path.join(ROOT, "encode", "live_preview.py")
 
 # Consecutive per-frame preview encode failures before the worker stands down.
@@ -191,6 +210,10 @@ GPU_RE = re.compile(r"\bVR_GPU (\{.*\})")
 VIEWS_RE = re.compile(r"\bVR_VIEWS (\[.*\])")
 PREFLIGHT_RE = re.compile(r"\bVR_PREFLIGHT (\{.*\})")
 STARTUP_FAILED_RE = re.compile(r"\bVR_STARTUP_FAILED (\{.*\})")
+DRIVER_RE = re.compile(r"\bVR_DRIVER (\{.*\})")
+FRAME_TIMES_RE = re.compile(r"\bVR_FRAME (\{.*\})")
+# The phases of a frame render_driver.py times, as VR_FRAME names them.
+FRAME_PHASES = ("evalS", "syncS", "sampleS", "saveS")
 # scene.render.engine ids in the app's words (the spec's "engine"). EEVEE's id
 # was BLENDER_EEVEE_NEXT from 4.2 until 5.0 renamed it back.
 ENGINE_NAMES = {
@@ -341,6 +364,10 @@ VERIFY_RETRY = 600.0
 # in_progress, at module level so the watchdog can tell an idle node from a
 # busy one.
 IN_PROGRESS = {}
+# The spec filenames in IN_PROGRESS whose render has ended: all that is left
+# of them is the encode, on the CPU, so they no longer hold a GPU lane or a
+# slot (main). The GPU used to idle through every chunk's encode (#180).
+RENDER_ENDED = set()
 
 
 def lease_path():
@@ -1454,6 +1481,21 @@ def frame_arg(frames):
     return ",".join(str(a) if a == b else f"{a}..{b}" for a, b in runs)
 
 
+def driver_runs(spec, frames, listed):
+    """render_driver.py's VR_DRIVER_RUNS: [[start, end, step]], rendered in
+    order. The chunk's grid as -s/-e/-j would render it, or for a frame list
+    each run of consecutive frames, as -f renders them (frame_arg)."""
+    if not listed:
+        return [[int(spec["frameStart"]), int(spec["frameEnd"]), int(spec.get("frameStep") or 1)]]
+    runs = []
+    for f in frames:
+        if runs and f == runs[-1][1] + 1:
+            runs[-1][1] = f
+        else:
+            runs.append([f, f, 1])
+    return runs
+
+
 def unannounced_frames(frames_dir, spec, since, recorded):
     """Files this attempt wrote to frames/ whose "Saved:" line the parser missed.
 
@@ -1553,8 +1595,48 @@ def scan_line(line, state, seen, now=None):
     m = STARTUP_FAILED_RE.search(line)
     if m:
         seen["startupFailed"] = parse_marker(m.group(1))
+    m = DRIVER_RE.search(line)
+    if m:
+        event = parse_marker(m.group(1))
+        if event.get("event") == "ready":
+            fold_load_time(state, event.get("t"), seen.get("attemptStarted"))
+        elif event.get("event") == "failed":
+            seen["driverFailed"] = str(event.get("error") or "").strip()[:300]
+    m = FRAME_TIMES_RE.search(line)
+    if m:
+        fold_frame_times(state, parse_marker(m.group(1)))
     state["lastLine"] = line.strip()[:300]
     return saved, save_failed
+
+
+def timings_of(state):
+    """A copy of the state's timings, to change and put back whole: the
+    heartbeat thread may be serialising the one in the state."""
+    return dict(state.get("timings") or {
+        "loadS": None, "frames": 0, **{phase: 0.0 for phase in FRAME_PHASES},
+    })
+
+
+def fold_load_time(state, ready_at, started_at):
+    """render_driver.py's "ready" (epoch s): the load took from the attempt's
+    launch to there. Both on this node's clock."""
+    if not isinstance(ready_at, (int, float)) or not isinstance(started_at, (int, float)):
+        return
+    timings = timings_of(state)
+    timings["loadS"] = round(max(0.0, ready_at - started_at), 3)
+    state["timings"] = timings
+
+
+def fold_frame_times(state, report):
+    """Add one VR_FRAME to the state's timings. A phase the driver could not
+    time (null) adds nothing to its sum."""
+    timings = timings_of(state)
+    timings["frames"] += 1
+    for phase in FRAME_PHASES:
+        value = report.get(phase)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            timings[phase] = round(timings[phase] + value, 3)
+    state["timings"] = timings
 
 
 def parse_marker(text):
@@ -1595,6 +1677,10 @@ def classify_exit(code, save_failed, seen, state):
                 f"startup script {startup.get('script')!r} in the .blend raised"
                 f" {startup.get('error') or 'an error'} (exit {code})"
             )
+        if script == RENDER_DRIVER:
+            # The agent's own, and it catches what the render raises (below):
+            # this is the driver's fault, not the scene's.
+            return "transient", f"the agent's render driver raised (exit {code}); see log"
         if failed == "expr" and what == NO_OVERWRITE_EXPR.splitlines()[0]:
             # The agent's own, not the job's; see NO_OVERWRITE_EXPR.
             return "transient", f"the agent's Overwrite-off expression raised (exit {code}); see log"
@@ -1613,6 +1699,8 @@ def classify_exit(code, save_failed, seen, state):
             f"blender could not save {os.path.basename(save_failed[0])} (exit {code})"
             " — disk full or I/O error; see log"
         )
+    if seen.get("driverFailed"):
+        return "transient", f"the render failed (exit {code}): {seen['driverFailed']}"
     return "transient", f"blender exited {code}"
 
 
@@ -1683,6 +1771,16 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         log_line(chunk_id, f"no {preflight}: rendering without the scene preflight")
         preflight = None
 
+    # The frame loop in Python, for its timings (see render_driver.py), or
+    # Blender's own -a/-f. Cycles only, as the app asks it: a node whose
+    # remote/ tree predates the driver renders the old way.
+    driver = None
+    if spec.get("renderDriver") is True and is_cycles(spec):
+        driver = os.path.join(ROOT, "blender", RENDER_DRIVER)
+        if not os.path.exists(driver):
+            log_line(chunk_id, f"no {driver}: rendering with Blender's own frame loop")
+            driver = None
+
     def build_cmd(gpu_backend=None):
         # --python-exit-code makes script exceptions FATAL. Without it Blender
         # renders on after a failed -P script (verified on 5.1: exit 0, frame
@@ -1710,6 +1808,12 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         # which neither the app's manifest check nor its frame parser accept,
         # so every frame was rendered, never counted, and rendered again (#249).
         cmd += ["-o", os.path.join(frames_dir, "####"), "-x", "1"]
+        if driver:
+            # After -o and -x, which set the pattern it renders to; the frames
+            # come in VR_DRIVER_RUNS.
+            cmd += list(spec.get("extraArgs") or [])
+            cmd += ["-P", driver]
+            return cmd
         if listed:
             # An explicit list from the app: exactly those frames, which -f
             # renders in order. -s/-e/-j only shape -a.
@@ -1748,6 +1852,8 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         "engine": None,
         "preflight": None,
         "oom": False,
+        "timings": None,
+        "vram": None,
     })
     write_state(chunk_id, state)
 
@@ -1767,6 +1873,8 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
     if spec.get("cpuRender") is True:
         # enable_gpu.py otherwise refuses a Cycles render it cannot put on a GPU.
         env["VR_CPU_RENDER"] = "1"
+    if driver:
+        env["VR_DRIVER_RUNS"] = json.dumps(driver_runs(spec, frames, listed))
 
     # When the current attempt launched Blender; the end-of-render sweep only
     # adopts files modified since. Set by run_once.
@@ -1786,8 +1894,10 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
         discard_unmanifested(chunk_id, chunk_dir, tracker.recorded)
         attempt_started = time.time()
         # A new Blender has made no progress yet, and the app's watchdog times
-        # its scene load and first frame from here.
+        # its scene load and first frame from here. So does the driver's load
+        # time (fold_load_time).
         state["lastProgressAt"] = attempt_started
+        seen["attemptStarted"] = attempt_started
         with open(log_path, "a") as log:
             log.write(f"=== {time.strftime('%F %T')} render start: {' '.join(cmd)}\n")
             log.flush()
@@ -1823,6 +1933,8 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
                             log_line(chunk_id, f"[agent] heartbeat write failed: {e}")
 
             threading.Thread(target=_heartbeat, daemon=True).start()
+            if spec.get("cpuRender") is not True:
+                threading.Thread(target=watch_vram, args=(proc, gpu, state), daemon=True).start()
             last_state_write = 0.0
             stopped_for_oom = False
             try:
@@ -2038,6 +2150,8 @@ def process(spec_path, gpu=None):
             log_line(chunk_id,
                      f"not pinned to a GPU as the app asked: {why}; lanes run one at a time")
         run_render(spec, log_path, tracker, gpu, state)
+        # Blender has exited: the next spec may have this one's lane.
+        RENDER_ENDED.add(os.path.basename(spec_path))
         # Stop and join BEFORE the definitive encode: the worker reads the same
         # frames and there is no reason to have both competing for the CPU
         # once the render itself has finished.
@@ -2117,6 +2231,60 @@ def gpu_vram_mb(engine=None):
     if not vals:
         return None
     return sum(vals) if engine in (None, "", "cycles") else min(vals)
+
+
+# How often watch_vram asks nvidia-smi while a render runs. Scene data stays on
+# the card from the first frame to the last (Cycles' persistent data), so a
+# slow poll still sees the peak that matters: what a second render beside
+# this one would have to fit around.
+VRAM_POLL_S = 5.0
+
+
+def nvidia_rows(query):
+    """nvidia-smi's rows for one --query-* flag, each a list of ints (MiB,
+    pid, index). Raises when nvidia-smi cannot run."""
+    out = subprocess.run(
+        ["nvidia-smi", query, "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=10,
+    ).stdout
+    rows = []
+    for line in out.strip().splitlines():
+        try:
+            rows.append([int(float(p)) for p in line.split(",")])
+        except ValueError:
+            continue
+    return rows
+
+
+def watch_vram(proc, gpu, state):
+    """Publish this Blender's GPU memory in state["vram"] while it lives.
+
+    Its own peak comes from the compute apps nvidia-smi lists by pid. Inside a
+    container nvidia-smi often lists none, or host pids, so for a render
+    pinned to one card the card's use is kept too, from as Blender started
+    (cardBaseMb) to its peak: the app can tell this render's share from it
+    when nothing else ran on that card. Never raises; ends at the first
+    nvidia-smi that cannot run, or with Blender.
+    """
+    vram = {"peakMb": None, "gpu": gpu, "cardBaseMb": None, "cardPeakMb": None}
+    while proc.poll() is None:
+        try:
+            apps = nvidia_rows("--query-compute-apps=pid,used_memory")
+            cards = nvidia_rows("--query-gpu=index,memory.used") if gpu is not None else []
+        except Exception:  # noqa: BLE001 — no nvidia-smi: nothing to watch
+            return
+        vram = dict(vram)
+        own = [row[1] for row in apps if len(row) >= 2 and row[0] == proc.pid]
+        if own:
+            vram["peakMb"] = max(vram["peakMb"] or 0, sum(own))
+        card = [row[1] for row in cards if len(row) >= 2 and row[0] == gpu]
+        if card:
+            if vram["cardBaseMb"] is None:
+                vram["cardBaseMb"] = card[0]
+            vram["cardPeakMb"] = max(vram["cardPeakMb"] or 0, card[0])
+        # Whole, never changed in place: the heartbeat may be writing it out.
+        state["vram"] = vram
+        time.sleep(VRAM_POLL_S)
 
 
 # A failed nvidia-smi is asked again after this many seconds, never cached for
@@ -2310,6 +2478,13 @@ def plan_launches(parsed, running, gpu_count, slots):
     return launches
 
 
+def renders_running(in_progress):
+    """plan_launches' `running`: [(exclusive, gpu)] of the chunks in progress
+    whose Blender still runs. One only encoding holds no lane (RENDER_ENDED)."""
+    return [(excl, gpu) for name, (_t, excl, gpu) in in_progress.items()
+            if name not in RENDER_ENDED]
+
+
 def is_exclusive(spec):
     """Must this chunk have the node to itself?
 
@@ -2339,6 +2514,7 @@ def main():
         for name, (t, _excl, _gpu) in list(in_progress.items()):
             if not t.is_alive():
                 del in_progress[name]
+                RENDER_ENDED.discard(name)
         # FIFO by spec mtime, not filename: alphabetical order starves jobs
         # whose ids sort late whenever the inbox holds more specs than slots.
         def spec_mtime(name):
@@ -2364,8 +2540,9 @@ def main():
             parsed.append((name, spec))
             slots = max(slots, slot_limit(spec))
         # Exclusive and shared work never mix; exclusive chunks take one GPU
-        # lane each (the whole node when lanes = 1). See plan_launches.
-        running = [(excl, gpu) for _t, excl, gpu in in_progress.values()]
+        # lane each (the whole node when lanes = 1). See plan_launches. A
+        # chunk only encoding holds neither (RENDER_ENDED).
+        running = renders_running(in_progress)
         launched = False
         specs_by_name = dict(parsed)
         gpu_count = len(gpu_list())

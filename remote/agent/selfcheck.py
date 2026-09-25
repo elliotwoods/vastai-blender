@@ -267,9 +267,16 @@ out = os.path.dirname(argv[argv.index("-o") + 1])
 exprs = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--python-expr"]
 # Overwrite off: unchecked in the .blend, or turned off by an expression.
 no_overwrite = script.get("noOverwrite") or any("use_overwrite" in e for e in exprs)
+# render_driver.py in place of -a/-f: the frames come in VR_DRIVER_RUNS.
+driver = any(a.endswith("render_driver.py") for a in argv)
 
 
 def frames():
+    if driver:
+        found = []
+        for a, b, step in json.loads(os.environ["VR_DRIVER_RUNS"]):
+            found += range(a, b + 1, step)
+        return found
     if "-f" in argv:
         found = []
         for part in argv[argv.index("-f") + 1].split(","):
@@ -286,6 +293,9 @@ for line in attempt.get("bytes", []):
     # Written as Latin-1: bytes that are not UTF-8, as a path in a .blend can be.
     sys.stdout.buffer.write(line.encode("latin-1") + b"\n")
     sys.stdout.buffer.flush()
+if driver:
+    import time
+    print('VR_DRIVER {"event": "ready", "t": %f}' % time.time(), flush=True)
 if "render" in attempt:
     # The frames argv asks for, as -a or -f renders them; with "views", one
     # file per view, and a frame is skipped when any one of them exists.
@@ -300,6 +310,9 @@ if "render" in attempt:
             with open(path, "w") as f:
                 f.write("%s%d%s" % (attempt["render"], n, view))
             print("Saved: '%s'" % path, flush=True)
+        if driver:
+            print('VR_FRAME {"frame": %d, "evalS": 1.0, "syncS": 2.0, "sampleS": 10.0,'
+                  ' "saveS": 0.5, "t": 0}' % n, flush=True)
 for entry in attempt.get("write", []):
     name, body, announce = entry[:3]
     for line in entry[3:]:
@@ -343,6 +356,9 @@ def fake_node():
     encoded, after "print". "pidFile" gets a JSON list of the fake's pid and,
     with "child", that of a process it starts; "ignoreTerm" makes the fake
     ignore SIGTERM.
+    With render_driver.py on the command line, the frames come from
+    VR_DRIVER_RUNS, and the fake prints the driver's "ready" line first and a
+    VR_FRAME line (evalS 1, syncS 2, sampleS 10, saveS 0.5) after each frame.
     Overwrite is off, skipping any frame already on disk, when `noOverwrite`
     says the .blend has it unchecked or a --python-expr sets use_overwrite.
     "record" appends each run's argv and VR_* environment to a JSON-lines file.
@@ -1024,7 +1040,7 @@ def blender_script(name, bpy, env=None):
     try:
         with contextlib.redirect_stdout(out):
             runpy.run_path(os.path.join(REMOTE, "blender", name), run_name="__main__")
-    except Exception as e:  # noqa: BLE001
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — sys.exit is how a script fails Blender
         err = e
     finally:
         for k, v in saved_env.items():
@@ -1791,6 +1807,34 @@ def test_plan_launches():
           == [("a", None), ("b", None)])
 
 
+def test_lane_freed_for_the_encode():
+    """#180: a chunk held its GPU lane through its encode, on the CPU, so the
+    next chunk's render waited with the GPU idle."""
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        seen = {}
+        real = nr.run_encode
+
+        def encode(spec, state, log_path):
+            seen["ended"] = "c1.json" in nr.RENDER_ENDED
+        nr.run_encode = encode
+        try:
+            state, _ = run_chunk(tmp, {"default": {"render": "f"}})
+        finally:
+            nr.run_encode = real
+            nr.RENDER_ENDED.discard("c1.json")
+        check("lane: the render is marked ended before the encode starts",
+              seen.get("ended") is True and state.get("status") == "done")
+    in_progress = {"a.json": (None, True, 0), "b.json": (None, True, 1)}
+    nr.RENDER_ENDED.add("a.json")
+    try:
+        running = nr.renders_running(in_progress)
+    finally:
+        nr.RENDER_ENDED.discard("a.json")
+    check("lane: a chunk only encoding is not running for plan_launches",
+          running == [(True, 1)])
+
+
 def test_pinning_is_cycles_only():
     """1.11 / #229 #235: EEVEE and Octane pick their own GPU, so their "pinned"
     lanes piled onto one card while the Fleet screen showed one per GPU."""
@@ -2254,6 +2298,215 @@ def test_lease_stops_octane():
             nr.ROOT, nr.STATE = saved
 
 
+def driver_bpy(fail_at=None, stats=None):
+    """A stand-in bpy for render_driver.py. render(animation=True) renders the
+    scene's frame range, calling the render handlers as Blender does, with
+    `stats` as Cycles' status texts for each frame; it raises Blender's
+    RuntimeError at frame `fail_at`. Returns (bpy, rendered frames)."""
+    stats = stats if stats is not None else [
+        "Mem: 0M | Synchronizing object | Cube", "Mem: 2M | Sample 0/64",
+        "Mem: 20M | Sample 32/64", "Mem: 24M | Finished",
+    ]
+    handlers = NS(render_pre=[], render_stats=[], render_post=[])
+    scene = NS(frame_start=1, frame_end=250, frame_step=1, frame_current=1)
+    rendered = []
+
+    def render(animation=False):
+        assert animation, "the driver renders as -a does, not one still at a time"
+        for f in range(scene.frame_start, scene.frame_end + 1, scene.frame_step):
+            if f == fail_at:
+                raise RuntimeError("Error: Cannot render, no camera\n")
+            scene.frame_current = f
+            for fn in handlers.render_pre:
+                fn(scene, None)
+            for text in stats:
+                for fn in handlers.render_stats:
+                    fn(text)
+            rendered.append(f)
+            for fn in handlers.render_post:
+                fn(scene, None)
+        return {"FINISHED"}
+
+    bpy = types.ModuleType("bpy")
+    bpy.context = NS(scene=scene)
+    bpy.app = NS(handlers=handlers)
+    bpy.ops = NS(render=NS(render=render))
+    return bpy, rendered
+
+
+def markers(printed, tag):
+    return [json.loads(line[len(tag) + 1:]) for line in printed.splitlines()
+            if line.startswith(tag + " ")]
+
+
+def test_render_driver_script():
+    """Loading the scene, not sampling it, looked like most of a render's time,
+    and nothing measured which part: render_driver.py renders the frames -a
+    would, and times each one's phases."""
+    bpy, rendered = driver_bpy()
+    err, printed = blender_script("render_driver.py", bpy,
+                                  {"VR_DRIVER_RUNS": json.dumps([[1, 3, 1], [7, 11, 2]])})
+    frames = markers(printed, "VR_FRAME")
+    check("driver: renders each run in order, as -a over its range and step would",
+          err is None and rendered == [1, 2, 3, 7, 9, 11])
+    check("driver: a Fra: line and a VR_FRAME line for each frame",
+          [f["frame"] for f in frames] == rendered
+          and [ln for ln in printed.splitlines() if ln.startswith("Fra:")]
+          == [f"Fra:{f} | VR driver" for f in rendered])
+    check("driver: every phase of a Cycles frame is timed",
+          all(isinstance(f[p], float) and f[p] >= 0 for f in frames for p in nr.FRAME_PHASES))
+    events = [m["event"] for m in markers(printed, "VR_DRIVER")]
+    check("driver: ready before the first frame, done after the last",
+          events == ["ready", "done"] and printed.index("VR_DRIVER") < printed.index("Fra:"))
+    scene = bpy.context.scene
+    check("driver: the scene's own range is put back, and its handlers removed",
+          (scene.frame_start, scene.frame_end, scene.frame_step) == (1, 250, 1)
+          and not any(bpy.app.handlers.render_pre + bpy.app.handlers.render_stats
+                      + bpy.app.handlers.render_post))
+
+    bpy, _ = driver_bpy(stats=["Mem: 0M | Rendering"])
+    err, printed = blender_script("render_driver.py", bpy,
+                                  {"VR_DRIVER_RUNS": json.dumps([[5, 5, 1]])})
+    frame = (markers(printed, "VR_FRAME") or [{}])[0]
+    check("driver: a phase whose status never came is null, not a guess",
+          err is None and frame.get("syncS") is None and frame.get("sampleS") is None
+          and isinstance(frame.get("evalS"), float))
+
+    bpy, rendered = driver_bpy(fail_at=2)
+    err, printed = blender_script("render_driver.py", bpy,
+                                  {"VR_DRIVER_RUNS": json.dumps([[1, 3, 1]])})
+    failed = [m for m in markers(printed, "VR_DRIVER") if m["event"] == "failed"]
+    check("driver: a failed render says why and exits 1, not the guard's exit code",
+          isinstance(err, SystemExit) and err.code == 1 and rendered == [1]
+          and failed and "Cannot render, no camera" in failed[0]["error"])
+
+
+def test_frame_timings_fold():
+    """The agent sums the driver's frames into state["timings"]."""
+    state, seen = {}, {"attemptStarted": 1000.0}
+    nr.scan_line('VR_DRIVER {"event": "ready", "t": 1042.5}\n', state, seen)
+    nr.scan_line('VR_FRAME {"frame": 1, "evalS": 1.5, "syncS": 3, "sampleS": 60,'
+                 ' "saveS": 0.25, "t": 0}\n', state, seen)
+    nr.scan_line('VR_FRAME {"frame": 2, "evalS": 0.5, "syncS": null, "sampleS": 58,'
+                 ' "saveS": 0.25, "t": 0}\n', state, seen)
+    check("timings: load from launch to ready, each phase summed over the frames",
+          state.get("timings") == {"loadS": 42.5, "frames": 2, "evalS": 2.0, "syncS": 3.0,
+                                   "sampleS": 118.0, "saveS": 0.5})
+    check("timings: VR_FRAME lines are not frame progress, nor an out of memory",
+          "lastProgressAt" not in state and not state.get("oom"))
+    seen = {}
+    nr.scan_line('VR_DRIVER {"event": "failed", "error": "RuntimeError: Error: no camera"}\n',
+                 state, seen)
+    check("timings: the driver's failure is the error of a render that exits 1",
+          nr.classify_exit(1, [], seen, state)
+          == ("transient", "the render failed (exit 1): RuntimeError: Error: no camera"))
+    seen = {"scriptFailed": "file",
+            "scriptFailedWhat": "/root/vastai/blender/render_driver.py"}
+    check("timings: the driver itself raising is the agent's fault, not the scene's",
+          nr.classify_exit(nr.GUARD_EXIT, [], seen, {})[0] == "transient")
+
+
+def test_watch_vram():
+    """Two renders on a card only help when both fit: the agent reports what
+    each one used."""
+    proc = NS(pid=4242, polls=0)
+
+    def poll():
+        proc.polls += 1
+        return None if proc.polls <= 3 else 0
+
+    proc.poll = poll
+    answers = iter([
+        ("4242, 900\n77, 5000\n", "0, 1000\n1, 6100\n"),
+        ("4242, 7100\n77, 5000\n", "0, 1000\n1, 12300\n"),
+        ("4242, 6500\n", "0, 1000\n1, 11700\n"),
+    ])
+    real, sleep = nr.subprocess.run, nr.VRAM_POLL_S
+    current = {}
+
+    def run(cmd, **_kw):
+        if "--query-compute-apps=pid,used_memory" in cmd:
+            current["apps"], current["cards"] = next(answers)
+            return NS(stdout=current["apps"], returncode=0)
+        return NS(stdout=current["cards"], returncode=0)
+
+    nr.subprocess.run, nr.VRAM_POLL_S = run, 0
+    state = {"vram": None}
+    try:
+        nr.watch_vram(proc, 1, state)
+    finally:
+        nr.subprocess.run, nr.VRAM_POLL_S = real, sleep
+    check("vram: this Blender's own peak, and its card's from launch to peak",
+          state["vram"] == {"peakMb": 7100, "gpu": 1, "cardBaseMb": 6100, "cardPeakMb": 12300})
+
+    def missing(cmd, **_kw):
+        raise FileNotFoundError("nvidia-smi")
+
+    nr.subprocess.run = missing
+    state = {"vram": None}
+    proc.polls = 0
+    try:
+        nr.watch_vram(proc, None, state)
+    finally:
+        nr.subprocess.run = real
+    check("vram: no nvidia-smi, nothing reported and nothing raised", state["vram"] is None)
+
+
+def test_agent_uses_the_driver():
+    """renderDriver: the agent renders a Cycles chunk through render_driver.py,
+    and publishes its timings."""
+    def install_driver():
+        open(os.path.join(nr.BLENDER_ROOT, nr.RENDER_DRIVER), "w").close()
+
+    with fake_node() as tmp:
+        install_driver()
+        cdir = make_chunk(tmp)
+        rec = os.path.join(tmp, "runs.jsonl")
+        state, entries = run_chunk(tmp, {"record": rec, "default": {"render": "d"}},
+                                   grid=(1, 5, 2), renderDriver=True)
+        with open(rec) as f:
+            run = json.loads(f.readline())
+        argv = run["argv"]
+        check("driver: -P render_driver.py last, after -o and -x, and no -a or -f",
+              argv[-2:] == ["-P", os.path.join(nr.BLENDER_ROOT, nr.RENDER_DRIVER)]
+              and argv.index("-x") < argv.index(argv[-1]) and "-a" not in argv
+              and "-f" not in argv)
+        check("driver: the chunk's grid in VR_DRIVER_RUNS",
+              json.loads(run["env"].get("VR_DRIVER_RUNS", "null")) == [[1, 5, 2]])
+        check("driver: the frames are rendered and manifested as ever",
+              sorted(disk(cdir)) == ["0001.exr", "0003.exr", "0005.exr"]
+              and len(entries) == 3 and state.get("status") == "done")
+        timings = state.get("timings") or {}
+        check("driver: the state carries the frames' timings and the load time",
+              timings.get("frames") == 3 and timings.get("sampleS") == 30.0
+              and timings.get("syncS") == 6.0 and isinstance(timings.get("loadS"), float))
+    with fake_node() as tmp:
+        install_driver()
+        make_chunk(tmp)
+        rec = os.path.join(tmp, "runs.jsonl")
+        run_chunk(tmp, {"record": rec, "default": {"render": "d"}}, grid=(1, 9, 1),
+                  frames=[9, 1, 2, 3, 7], renderDriver=True)
+        with open(rec) as f:
+            env = json.loads(f.readline())["env"]
+        check("driver: a frame list as runs of consecutive frames, as -f renders them",
+              json.loads(env.get("VR_DRIVER_RUNS", "null"))
+              == [[1, 3, 1], [7, 7, 1], [9, 9, 1]])
+    for engine, installed in (("eevee", True), ("cycles", False)):
+        with fake_node() as tmp:
+            if installed:
+                install_driver()
+            make_chunk(tmp)
+            rec = os.path.join(tmp, "runs.jsonl")
+            state, _ = run_chunk(tmp, {"record": rec, "default": {"render": "d"}},
+                                 engine=engine, renderDriver=True)
+            with open(rec) as f:
+                argv = json.loads(f.readline())["argv"]
+            why = "an EEVEE job" if installed else "a node without the driver"
+            check(f"driver: {why} renders with -a, as before",
+                  "-a" in argv and not any(a.endswith(nr.RENDER_DRIVER) for a in argv)
+                  and state.get("status") == "done" and state.get("timings") is None)
+
+
 def run(fn):
     """Run one case. A case that raises is a failure, not the end of the suite."""
     try:
@@ -2281,6 +2534,9 @@ def main():
         test_preflight_reads_only_what_renders,
         test_startup_script_marker,
         test_enable_gpu,
+        test_render_driver_script,
+        test_frame_timings_fold,
+        test_watch_vram,
         test_lease_credentials,
         test_lease_node_busy,
         test_lease_fresh_never_destroys,
@@ -2315,6 +2571,8 @@ def main():
         test_agent_runs_the_preflight,
         test_agent_gpu_and_engine,
         test_out_of_memory,
+        test_agent_uses_the_driver,
+        test_lane_freed_for_the_encode,
         test_pin_failure_is_reported,
         test_lease_stops_octane,
     ):

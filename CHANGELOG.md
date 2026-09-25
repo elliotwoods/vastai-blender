@@ -22,6 +22,18 @@ stalled the app).
 
 ### Added
 
+- **Where the render time goes.** Cycles chunks now render through a small
+  driver script (`remote/blender/render_driver.py`) in place of Blender's own
+  `-a`/`-f`, with the same frames and output (verified pixel for pixel on
+  Blender 5.1). It times every frame's phases: the scene load, evaluation,
+  Cycles' sync and BVH build, sampling and the save. The agent also samples
+  each render's GPU memory with nvidia-smi. The job screen shows the split per
+  GPU model under *where the time goes*, with how much of each frame the GPU
+  spends sampling and the peak VRAM of one render; `scene_perf` keeps it per
+  scene and GPU model. It is the measurement the next steps (reusing a loaded
+  Blender across chunks, two renders a card taking turns, admitted by
+  measured VRAM) are decided on.
+
 - **A campaign can be handed to the running app.** A `VR_JOB_SPEC` launch on
   a profile the app already has open used to submit nothing and exit 1. It now
   hands its spec to the running app, which submits it, and exits 0 when the
@@ -118,6 +130,14 @@ stalled the app).
 - The Settings key test says which of the app's permissions the API key has.
 
 ### Changed
+
+- **The next chunk no longer waits for the last one's encode and download
+  (#180).** An exclusive chunk held its GPU lane until its frames were
+  downloaded, and on the node until its previews were encoded, so the GPU sat
+  idle at every chunk boundary. The lane is now free as soon as Blender
+  exits: the next chunk loads its scene while the last one encodes and
+  downloads. At most one such tail per lane, so downloads cannot pile up, and
+  throughput learning counts only the renders sharing a card.
 
 - **The spend cap is a budget at rent time.** It checked only the fleet's
   current rate, so the last rental could go over, and *+ request node*

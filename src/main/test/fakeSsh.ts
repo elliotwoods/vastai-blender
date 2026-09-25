@@ -148,6 +148,20 @@ export interface AgentStateFile {
   engine?: string | null
   oom?: boolean
   pinFailed?: boolean
+  timings?: {
+    loadS: number | null
+    frames: number
+    evalS: number
+    syncS: number
+    sampleS: number
+    saveS: number
+  } | null
+  vram?: {
+    peakMb: number | null
+    gpu: number | null
+    cardBaseMb: number | null
+    cardPeakMb: number | null
+  } | null
 }
 
 const ok = (stdout = ''): ExecResult => ({ code: 0, stdout, stderr: '' })

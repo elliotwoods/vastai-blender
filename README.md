@@ -41,7 +41,13 @@ Vast.ai balance in view on every screen.*
   in Settings; *Min GPUs per node* in the offer filters. EEVEE and Octane
   chunks take the whole node, and a Cycles chunk that finds a node with cards
   to spare (the tail of a job, say) runs across all of them. A node that runs
-  out of GPU memory with two renders on a card drops to one per card.
+  out of GPU memory with two renders on a card drops to one per card. A
+  lane is free as soon as its render ends, so the next chunk loads while the
+  last one's frames download.
+- **Render timing** — Cycles frames are timed phase by phase (load,
+  evaluation, sync/BVH, sampling, save) and each render's peak VRAM is
+  measured; the job screen shows where the time goes and how busy the GPU
+  really was.
 - **Engines** — Cycles (OptiX/CUDA), EEVEE (per-node capability
   probe), Octane (see `docs/OCTANE.md`).
 - **Automatic Blender version matching** — the app reads each `.blend`'s

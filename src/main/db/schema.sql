@@ -197,6 +197,26 @@ CREATE TABLE IF NOT EXISTS gpu_slots (
   num_gpus INTEGER                    -- as gpu_perf.num_gpus
 );
 
+-- Where a scene's render time goes, per GPU model (scenePerf.ts): the phases
+-- the agent's render driver times (remote/blender/render_driver.py), summed,
+-- and the most GPU memory one render of the scene used. Keyed by the scene's
+-- snapshot hash (jobs.blend_sha256), so every job of one .blend adds to one
+-- row, and an edited scene starts a new one.
+CREATE TABLE IF NOT EXISTS scene_perf (
+  scene_sha TEXT NOT NULL,
+  gpu_name TEXT NOT NULL,
+  loads INTEGER NOT NULL DEFAULT 0,   -- chunks whose load was timed
+  load_s REAL NOT NULL DEFAULT 0,     -- summed over them
+  frames INTEGER NOT NULL DEFAULT 0,  -- frames timed
+  eval_s REAL NOT NULL DEFAULT 0,     -- each phase summed over those frames
+  sync_s REAL NOT NULL DEFAULT 0,
+  sample_s REAL NOT NULL DEFAULT 0,
+  save_s REAL NOT NULL DEFAULT 0,
+  peak_vram_mb INTEGER,               -- null = never measured
+  updated_at INTEGER NOT NULL,        -- epoch ms
+  PRIMARY KEY (scene_sha, gpu_name)
+);
+
 CREATE TABLE IF NOT EXISTS cost_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   node_id TEXT NOT NULL,

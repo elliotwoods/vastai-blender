@@ -23,6 +23,7 @@ import { CHUNK_TONE, SCALE, STATUS_VARS, TOKENS } from '../../lib/theme'
 import { Filmstrip } from '../../media/Filmstrip'
 import type { ChunkSnapshot } from '../../../../shared/models'
 import { JobActions, JobAttentionNote, SceneChangedNote } from './JobActions'
+import { RenderTimes } from './RenderTimes'
 
 function ChunkCell({ chunk }: { chunk: ChunkSnapshot }): React.JSX.Element {
   const openPreview = usePreview((s) => s.open)
@@ -333,6 +334,7 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
               <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>No chunks.</span>
             ) : null}
           </div>
+          {job?.renderTimes ? <RenderTimes times={job.renderTimes} /> : null}
         </div>
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <LogPanel nodeIds={nodeIds} />
