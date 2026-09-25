@@ -280,16 +280,19 @@ for line in attempt.get("bytes", []):
     sys.stdout.buffer.write(line.encode("latin-1") + b"\n")
     sys.stdout.buffer.flush()
 if "render" in attempt:
-    # The frames argv asks for, as -a or -f renders them.
+    # The frames argv asks for, as -a or -f renders them; with "views", one
+    # file per view, and a frame is skipped when any one of them exists.
+    views = attempt.get("views") or [""]
     for n in frames():
-        path = os.path.join(out, "%04d.exr" % n)
-        if no_overwrite and os.path.exists(path):
-            print('skipping existing frame "%s"' % path, flush=True)
+        paths = [os.path.join(out, "%04d%s.exr" % (n, v)) for v in views]
+        if no_overwrite and any(os.path.exists(p) for p in paths):
+            print('skipping existing frame "%s"' % paths[0], flush=True)
             continue
         print("Fra:%d Mem:1.00M | Rendering" % n, flush=True)
-        with open(path, "w") as f:
-            f.write("%s%d" % (attempt["render"], n))
-        print("Saved: '%s'" % path, flush=True)
+        for path, view in zip(paths, views):
+            with open(path, "w") as f:
+                f.write("%s%d%s" % (attempt["render"], n, view))
+            print("Saved: '%s'" % path, flush=True)
 for entry in attempt.get("write", []):
     name, body, announce = entry[:3]
     for line in entry[3:]:
@@ -324,7 +327,8 @@ def fake_node():
     opengl` and an attempt is {"print": [line], "render": body,
     "write": [[name, body, announce]], "exit": code}, acted out in that order.
     "render" renders the frames argv asks for (-s/-e/-j, or -f) as NNNN.exr
-    holding body + the frame number, with "Fra:" and "Saved:" lines. In
+    holding body + the frame number, with "Fra:" and "Saved:" lines; with
+    "views" (["_L", "_R"]), as one NNNN_L.exr per view, as Blender does. In
     "write", `announce` True prints Blender's "Saved:" line, and "error" its
     "cannot save" line, after which the fake stops writing, as Blender does;
     any further items in an entry are lines printed before it is written.
@@ -914,6 +918,58 @@ def test_explicit_frame_list():
         check("frame list: an empty list is done without starting Blender or the encoder",
               state.get("status") == "done" and state.get("framesTotal") == 0
               and not os.path.exists(rec) and "nothing to encode" in render_log())
+
+
+def test_no_overwrite_expr_runs():
+    """Review of 1.9: the fake Blender only looks for "use_overwrite" in argv,
+    so nothing ran the expression itself. Blender runs --python-expr with one
+    namespace today; with a locals dict of its own, the comprehension it was
+    raised NameError on a Python before 3.12, and every render failed."""
+    for render in (NS(use_overwrite=True, use_placeholder=True), NS(use_overwrite=True)):
+        bpy = types.ModuleType("bpy")
+        bpy.context = NS(scene=NS(render=render))
+        saved = sys.modules.get("bpy")
+        sys.modules["bpy"] = bpy
+        err = None
+        try:
+            exec(nr.NO_OVERWRITE_EXPR, {}, {})
+        except Exception as e:  # noqa: BLE001
+            err = e
+        finally:
+            if saved is None:
+                sys.modules.pop("bpy", None)
+            else:
+                sys.modules["bpy"] = saved
+        check(f"the Overwrite expression runs, with {len(vars(render))} of its properties",
+              err is None and render.use_overwrite is False
+              and getattr(render, "use_placeholder", False) is False)
+    check("the Overwrite expression is one line", "\n" not in nr.NO_OVERWRITE_EXPR)
+
+
+def test_multiview_frames_are_whole():
+    """Review of 1.9: with Overwrite off, Blender skips a stereo frame when any
+    one view file exists. A left view manifested alone, before a kill, stayed
+    on disk, and every later attempt skipped the frame: no right view, ever."""
+    views = 'VR_VIEWS ["_L", "_R"]'
+    with fake_node() as tmp:
+        cdir = make_chunk(tmp)
+        state, entries = run_chunk(tmp, {"default": {"print": [views], "write": [
+            ["0001_L.exr", "l1", True], ["0001_R.exr", "r1", True],
+            ["0002_L.exr", "l2", True]], "exit": 1}})
+        check("stereo: a frame's views are manifested together, or not at all",
+              sorted(e["file"] for e in entries) == ["frames/0001_L.exr", "frames/0001_R.exr"]
+              and sorted(disk(cdir)) == ["0001_L.exr", "0001_R.exr"])
+        state, entries = run_chunk(tmp, {"default": {"print": [views], "render": "new",
+                                                     "views": ["_L", "_R"]}})
+        on_disk = disk(cdir)
+        check("stereo: the chunk sent again renders the frame it was killed in, both views",
+              state.get("status") == "done"
+              and sorted(on_disk) == ["0001_L.exr", "0001_R.exr", "0002_L.exr", "0002_R.exr",
+                                      "0003_L.exr", "0003_R.exr"]
+              and on_disk["0002_R.exr"] == "new2_R" and on_disk["0001_L.exr"] == "l1")
+        check("stereo: every manifest line matches the bytes on disk",
+              sorted(e["file"][7:] for e in entries) == sorted(on_disk)
+              and all(e.get("sha256") == sha(on_disk[e["file"][7:]]) for e in entries))
 
 
 def test_never_a_stand_in_blender():
@@ -1551,6 +1607,26 @@ def test_enable_gpu():
           err is None and printed.startswith("VR_ENGINE BLENDER_EEVEE_NEXT\n")
           and marker(printed, "VR_GPU") is None and cycles.device == "CPU")
 
+    def views(**render):
+        bpy, _, _ = gpu_bpy(engine="BLENDER_EEVEE_NEXT")
+        vs = [NS(name="left", file_suffix="_L", use=True), NS(name="right", file_suffix="_R", use=True),
+              NS(name="top", file_suffix="_T", use=True), NS(name="off", file_suffix="_O", use=False)]
+        fields = dict(use_multiview=True, views_format="STEREO_3D", views=vs,
+                      image_settings=NS(views_format="INDIVIDUAL"))
+        fields.update(render)
+        for k, v in fields.items():
+            setattr(bpy.context.scene.render, k, v)
+        err, printed = blender_script("enable_gpu.py", bpy)
+        return err, printed.count("VR_VIEWS"), marker(printed, "VR_VIEWS")
+
+    check("views: stereo saved as one file per view names its two suffixes",
+          views() == (None, 1, ["_L", "_R"]))
+    check("views: multiview names every view it renders",
+          views(views_format="MULTIVIEW") == (None, 1, ["_L", "_R", "_T"]))
+    check("views: one file per frame says nothing",
+          views(image_settings=NS(views_format="STEREO_3D"))[1] == 0
+          and views(use_multiview=False)[1] == 0)
+
 
 def test_agent_gpu_and_engine():
     """1.16: the machine, not the scene, is blamed for a missing GPU, and the
@@ -1838,6 +1914,7 @@ def main():
         test_sweep_filters,
         test_preview_sequence,
         test_log_tail,
+        test_no_overwrite_expr_runs,
         test_last_progress_at,
         test_preflight_files,
         test_preflight_simulations,
@@ -1864,6 +1941,7 @@ def main():
         test_render_publishes_last_progress,
         test_restart_renders_only_missing_frames,
         test_explicit_frame_list,
+        test_multiview_frames_are_whole,
         test_never_a_stand_in_blender,
         test_agent_runs_the_preflight,
         test_agent_gpu_and_engine,

@@ -57,9 +57,11 @@ order: run_startup_scripts.py (the scene's own "startup*" blocks),
 enable_gpu.py (Cycles on the GPU, or no render at all) and preflight.py
 (files the scene needs and did not pack, simulations it cannot step, movie
 output). Each reports on a line of its own ("VR_STARTUP_FAILED {...}",
-"VR_ENGINE <id>", "VR_GPU {...}", "VR_PREFLIGHT {...}") before it raises,
-and Blender then exits GUARD_EXIT; the agent turns the report into the error
-and its errorKind.
+"VR_ENGINE <id>", "VR_VIEWS [...]", "VR_GPU {...}", "VR_PREFLIGHT {...}")
+before it raises, and Blender then exits GUARD_EXIT; the agent turns the
+report into the error and its errorKind. VR_VIEWS names the file suffix of
+each view of a stereo or multiview frame saved as one file per view; the
+manifest then lists a frame's view files only once all of them are saved.
 
 Chunk state (state/<chunkId>.json, rewritten atomically; fields are only ever
 added, so an older app reads a newer agent's state):
@@ -177,6 +179,7 @@ SCRIPT_FAILED_RE = re.compile(r"script failed, (file|expr): '(.*?)(?:', exiting\
 # One-line reports from the scripts in remote/blender/; see each script.
 ENGINE_RE = re.compile(r"\bVR_ENGINE (\S+)")
 GPU_RE = re.compile(r"\bVR_GPU (\{.*\})")
+VIEWS_RE = re.compile(r"\bVR_VIEWS (\[.*\])")
 PREFLIGHT_RE = re.compile(r"\bVR_PREFLIGHT (\{.*\})")
 STARTUP_FAILED_RE = re.compile(r"\bVR_STARTUP_FAILED (\{.*\})")
 # scene.render.engine ids in the app's words (the spec's "engine"). EEVEE's id
@@ -229,10 +232,13 @@ BLENDER_STOP_GRACE = 10.0
 # and a frame rewritten before the app had downloaded it no longer matched
 # its manifest line, which failed verification until the chunk ran out of
 # retries (#79, #145, #183). hasattr: never fail a render over a renamed
-# property.
+# property. Plain statements on one line: a comprehension here reads `r` as a
+# global, which a Python before 3.12 cannot find if the expression is run with
+# a locals dict of its own; and classify_exit knows it by its one line.
 NO_OVERWRITE_EXPR = (
     "import bpy; r = bpy.context.scene.render; "
-    "[setattr(r, k, False) for k in ('use_overwrite', 'use_placeholder') if hasattr(r, k)]"
+    "hasattr(r, 'use_overwrite') and setattr(r, 'use_overwrite', False); "
+    "hasattr(r, 'use_placeholder') and setattr(r, 'use_placeholder', False)"
 )
 
 
@@ -405,6 +411,9 @@ class FrameTracker:
         self.pending = []  # absolute paths reported by "Saved:" lines
         self.recorded = manifest_files(chunk_dir, kind="frame")
         self.lock = threading.Lock()
+        # The file suffixes of a frame's views (enable_gpu.py's VR_VIEWS), when
+        # the scene saves one file per view; None when a frame is one file.
+        self.views = None
         # Called with each newly-manifested frame path. The manifest is the
         # right hook: a frame is only listed once it is size-stable, so the
         # preview encoder never reads a half-written file.
@@ -428,17 +437,54 @@ class FrameTracker:
         with self.lock:
             self.pending = []
 
+    def frames(self, pending):
+        """`pending` as frames: [(paths, whole)]. A frame is one file, or, with
+        views, one file per view, and is whole once every view is announced.
+
+        With Overwrite off Blender skips a frame when any one of its view files
+        exists. Were the left view recorded alone and Blender killed before the
+        right one, the left would stay (manifested files are never deleted),
+        and every later attempt would skip the frame: its right view never
+        rendered. So no view is recorded before all of them can be.
+        """
+        if not self.views:
+            return [([path], True) for path in pending]
+        suffixes = sorted(self.views, key=len, reverse=True)
+        known = {os.path.basename(p) for p in pending}
+        known |= {os.path.basename(r) for r in self.recorded}
+        groups = {}
+        for path in pending:
+            stem, ext = os.path.splitext(os.path.basename(path))
+            suffix = next((s for s in suffixes if stem.endswith(s)), None)
+            if suffix is None:
+                groups[path] = None  # not a view file: a frame on its own
+                continue
+            key = (stem[:len(stem) - len(suffix)], ext)
+            groups.setdefault(key, []).append(path)
+        found = []
+        for key, paths in groups.items():
+            if paths is None:
+                found.append(([key], True))
+            else:
+                base, ext = key
+                found.append((paths, all(base + s + ext in known for s in self.views)))
+        return found
+
     def flush(self, final=False):
-        """Move stable pending files into the manifest. Returns #recorded."""
+        """Move stable pending frames into the manifest. Returns #files recorded."""
         with self.lock:
             pending = list(self.pending)
         count = 0
         still = []
-        for path in pending:
-            rel = os.path.relpath(path, self.chunk_dir)
-            if rel in self.recorded:
+        for paths, whole in self.frames(pending):
+            todo = [p for p in paths if os.path.relpath(p, self.chunk_dir) not in self.recorded]
+            if not todo:
                 continue
-            if size_stable(path, wait=1.0 if not final else 0.5):
+            if not whole or not all(size_stable(p, wait=1.0 if not final else 0.5) for p in todo):
+                still += todo
+                continue
+            for path in todo:
+                rel = os.path.relpath(path, self.chunk_dir)
                 append_manifest(
                     self.chunk_dir,
                     {
@@ -456,8 +502,6 @@ class FrameTracker:
                         self.on_frame(path)
                     except Exception:  # noqa: BLE001 — previews never break rendering
                         pass
-            else:
-                still.append(path)
         with self.lock:
             self.pending = still + [p for p in self.pending if p not in pending]
         return count
@@ -959,7 +1003,9 @@ def discard_unmanifested(chunk_id, chunk_dir, recorded):
     truncated bytes, which the app verifies against and accepts.
 
     Manifested frames are kept: the app may not have downloaded them yet, and
-    their size and hash are already promised to it. This is the one place the
+    their size and hash are already promised to it. A stereo or multiview
+    frame's views are recorded only together (FrameTracker.frames), so what is
+    kept is whole frames, which Blender with Overwrite off skips. This is the one place the
     agent deletes paid-for output, so it errs towards keeping: files are matched
     by NAME, not by the manifest's relative path, so a path spelled differently
     cannot cost a finished frame; and `recorded` is unioned with a fresh
@@ -1112,6 +1158,14 @@ def scan_line(line, state, seen, now=None):
     m = GPU_RE.search(line)
     if m:
         seen["gpu"] = parse_marker(m.group(1))
+    m = VIEWS_RE.search(line)
+    if m:
+        try:
+            views = json.loads(m.group(1))
+        except ValueError:
+            views = None
+        if isinstance(views, list) and len(views) > 1 and all(isinstance(v, str) for v in views):
+            seen["views"] = views
     m = PREFLIGHT_RE.search(line)
     if m:
         # For the app to show, pass or fail: the report is the scene's.
@@ -1395,6 +1449,7 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
                 for line in proc.stdout:
                     log.write(line)
                     saved, failed = scan_line(line, state, seen)
+                    tracker.views = seen.get("views")
                     if seen.get("oom"):
                         # Out of memory: the frame in flight may still be
                         # written and announced, black or cut short, and so may

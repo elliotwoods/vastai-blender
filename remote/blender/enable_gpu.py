@@ -5,11 +5,16 @@ Octane is handled by the OctaneBlender build itself.
 
 It reports, one line each:
     VR_ENGINE <scene.render.engine>   always, first
+    VR_VIEWS ["_L", "_R"]             the file suffix of each view, when a
+                                      frame is saved as one file per view
     VR_GPU {"ok": bool, "backend": str, "devices": [str], "reason": str}
                                       Cycles only
 VR_ENGINE is the engine the scene really renders with, after its startup
 blocks: the app's Engine picker is only a label, and the EEVEE OpenGL retry
-used to key on that label (#248).
+used to key on that label (#248). VR_VIEWS lets the agent treat a stereo or
+multiview frame as one: with Overwrite off, Blender skips a frame when any one
+of its view files exists, so a frame whose left view alone was kept after a
+kill would never get its right one.
 
 A Cycles render with no GPU enabled raises (after its VR_GPU line), unless
 the job renders on the CPU by design (VR_CPU_RENDER=1, the spec's cpuRender).
@@ -121,9 +126,34 @@ def enable_gpus(cycles):
     return backend, enabled
 
 
+def view_suffixes(render):
+    """The suffixes of a frame's view files ("0001_L.exr", "0001_R.exr"), or []
+    when each frame is one file. The same test Blender's Overwrite-off skip
+    makes: multiview on and views saved as individual files, over the views it
+    renders (left and right only, in stereo mode)."""
+    if not getattr(render, "use_multiview", False):
+        return []
+    settings = getattr(render, "image_settings", None)
+    if getattr(settings, "views_format", "INDIVIDUAL") != "INDIVIDUAL":
+        return []
+    stereo = getattr(render, "views_format", "STEREO_3D") == "STEREO_3D"
+    suffixes = [
+        view.file_suffix for view in render.views
+        if getattr(view, "use", True) and (not stereo or view.name in ("left", "right"))
+    ]
+    return suffixes if len(suffixes) > 1 else []
+
+
 scene = bpy.context.scene
 cycles = getattr(scene, "cycles", None)
 print(f"VR_ENGINE {scene.render.engine}", flush=True)
+try:
+    views = view_suffixes(scene.render)
+except Exception as e:  # noqa: BLE001 — the agent then treats each file on its own
+    views = []
+    print(f"could not read the scene's views: {e}")
+if views:
+    print("VR_VIEWS " + json.dumps(views), flush=True)
 
 if scene.render.engine == "CYCLES" and cycles is not None:
     if os.environ.get("VR_CPU_RENDER") == "1":
