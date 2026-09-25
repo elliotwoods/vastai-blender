@@ -32,7 +32,7 @@ vi.mock('electron', () => ({
 }))
 
 /** db.ts's SCHEMA_VERSION: what applySchema records. */
-const SCHEMA_VERSION = 7
+const SCHEMA_VERSION = 8
 const NOW = 1_700_000_000_000
 const MINUTE = 60_000
 const T0 = NOW - 30 * 24 * 60 * MINUTE
@@ -512,6 +512,53 @@ describe.each([
     expect(get(db, "SELECT value FROM history_meta WHERE key = 'gpu_units_v1'")).toEqual({
       value: String(NOW)
     })
+  })
+
+  it('fills in job and frame times from what the rows already say (v8)', () => {
+    const hasAssignedAt = version >= 3
+    const db = legacyDb(sql, version, (d) => {
+      seed(d)
+      d.prepare(
+        `INSERT INTO jobs (id, name, blend_path, engine, frame_start, frame_end, frame_step, state,
+           blender_version, addon_ids, chunk_size, output_dir, cost_so_far, submitted_at)
+         VALUES ('job-d', 'done job', '/scenes/d.blend', 'cycles', 1, 2, 1, 'complete', '4.2.3',
+           '[]', 2, '/renders/job-d', 0.5, ?)`
+      ).run(T0)
+      d.prepare(
+        `INSERT INTO chunks (id, job_id, frame_start, frame_end, state, frames_done, retries)
+         VALUES ('d-1-2', 'job-d', 1, 2, 'complete', 2, 0)`
+      ).run()
+      if (hasAssignedAt) {
+        d.prepare("UPDATE chunks SET assigned_at = ? WHERE id = 'd-1-2'").run(T0 + MINUTE)
+      }
+      const frame = d.prepare(
+        `INSERT INTO frames (job_id, frame, chunk_id, state, local_path, size_bytes)
+         VALUES ('job-d', ?, 'd-1-2', 'downloaded', ?, 100)`
+      )
+      frame.run(1, '/renders/job-d/frames/0001.exr')
+      frame.run(2, '/renders/job-d/frames/0002.exr')
+      const asset = d.prepare(
+        `INSERT INTO assets (job_id, chunk_id, kind, abs_path, created_at)
+         VALUES ('job-d', 'd-1-2', ?, ?, ?)`
+      )
+      asset.run('frame', '/renders/job-d/frames/0001.exr', T0 + 3 * MINUTE)
+      asset.run('frame', '/renders/job-d/frames/0002.exr', T0 + 4 * MINUTE)
+      asset.run('previewSdr', '/renders/job-d/previews/d-1-2.mp4', T0 + 5 * MINUTE)
+    })
+    applySchema(db)
+    expect(all(db, 'SELECT id, started_at, finished_at FROM jobs ORDER BY id')).toEqual([
+      { id: 'job-d', started_at: hasAssignedAt ? T0 + MINUTE : null, finished_at: T0 + 5 * MINUTE },
+      // Still running: not finished, and its start was never recorded.
+      { id: 'job1', started_at: null, finished_at: null }
+    ])
+    expect(
+      all(db, 'SELECT job_id, frame, downloaded_at FROM frames ORDER BY job_id, frame')
+    ).toEqual([
+      { job_id: 'job-d', frame: 1, downloaded_at: T0 + 3 * MINUTE },
+      { job_id: 'job-d', frame: 2, downloaded_at: T0 + 4 * MINUTE },
+      // Downloaded with no asset row to say when.
+      { job_id: 'job1', frame: 1, downloaded_at: null }
+    ])
   })
 
   it("marks a cancelled job's open chunks cancelled, once, keeping real failures (v7)", () => {

@@ -22,6 +22,17 @@ stalled the app).
 
 ### Added
 
+- **Elapsed, remaining and ETA per job, and a job thumbnail.** Jobs record
+  when their first chunk went out (`started_at`), when they ended
+  (`finished_at`), and each frame when it landed (`downloaded_at`); upgrades
+  fill these from what the database already knew (schema v8). Each
+  `JobSummary` carries elapsed/remaining/ETA from `shared/jobTiming.ts`: the
+  rate of the last 30 frames to land (all nodes at once, falling off when
+  frames stop), else the live runs' measured rates, else the scene's measured
+  seconds per frame times the renders running. It also carries a `thumbUrl`,
+  the preview of its latest frame. The Jobs list reads its frame counts for
+  every job in two queries, where it ran two per job.
+
 - **Where the render time goes.** Cycles chunks now render through a small
   driver script (`remote/blender/render_driver.py`) in place of Blender's own
   `-a`/`-f`, with the same frames and output (verified pixel for pixel on

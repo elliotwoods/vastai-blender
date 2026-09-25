@@ -7,12 +7,14 @@ import { resolveJobBlenderVersion } from '../blender/blendInfo'
 import { getDb } from '../db/db'
 import { describeError } from '../errors'
 import { emit } from '../events'
+import { jobFileMediaUrl } from '../mediaUrl'
 import { hostPathFlavour } from '../paths'
 import { getSettings } from '../settings'
 import { sha256File } from '../ssh/sftp'
 import { autoChunkSize, framesIn, splitFrames } from '../scheduler/chunker'
 import { sceneRenderTimes } from '../scheduler/scenePerf'
 import { validateSubmission } from '../../shared/jobValidation'
+import { estimateJobTiming, isLiveJob, type JobTiming } from '../../shared/jobTiming'
 import type {
   ChunkSnapshot,
   ChunkState,
@@ -47,6 +49,10 @@ interface JobRow {
   scene_path: string | null
   /** JSON JobAttention, or null (plans 1.16, 1.17) */
   attention: string | null
+  /** epoch ms of the first dispatch; null = not yet */
+  started_at: number | null
+  /** epoch ms it reached a final state; null = not final */
+  finished_at: number | null
 }
 
 interface ChunkRow {
@@ -115,24 +121,137 @@ export function noteChunkError(chunkId: string, reason: string | null): void {
   else lastErrors.set(chunkId, reason)
 }
 
-function rowToSummary(r: JobRow): JobSummary {
+/** What a job's own rate is right now, from the scheduler's runs (setJobRateProvider). */
+export interface JobRate {
+  /** sum of the job's live runs' measured rates, frames/s; null = none measured yet */
+  framesPerSec: number | null
+  /** runs of the job rendering now (Blender running) */
+  lanes: number
+}
+
+/** Injected by index.ts (the scheduler imports this module). */
+let jobRateProvider: ((jobId: string) => JobRate) | null = null
+export function setJobRateProvider(fn: ((jobId: string) => JobRate) | null): void {
+  jobRateProvider = fn
+}
+
+/** Per job: its frame counts and newest preview, read for many jobs in one pass. */
+interface FrameCounts {
+  total: number
+  done: number
+  cancelled: number
+  thumb: string | null
+}
+
+/**
+ * Frame counts and the latest preview of the jobs asked for (all when
+ * `jobId` is undefined), in two queries rather than several per job: the
+ * Jobs list and every job:changed read them.
+ */
+function frameCounts(jobId?: string): Map<string, FrameCounts> {
   const db = getDb()
-  const total = (
-    db.prepare('SELECT COUNT(*) AS n FROM frames WHERE job_id = ?').get(r.id) as { n: number }
-  ).n
-  const done = (
-    db
-      .prepare("SELECT COUNT(*) AS n FROM frames WHERE job_id = ? AND state = 'downloaded'")
-      .get(r.id) as { n: number }
-  ).n
-  const cancelled = (
-    db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM frames f JOIN chunks c ON c.id = f.chunk_id
-          WHERE f.job_id = ? AND f.state != 'downloaded' AND c.state = 'cancelled'`
-      )
-      .get(r.id) as { n: number }
-  ).n
+  const where = jobId === undefined ? '' : 'WHERE f.job_id = ?'
+  const args = jobId === undefined ? [] : [jobId]
+  const out = new Map<string, FrameCounts>()
+  const counts = db
+    .prepare(
+      `SELECT f.job_id AS job_id, COUNT(*) AS total,
+              SUM(CASE WHEN f.state = 'downloaded' THEN 1 ELSE 0 END) AS done,
+              SUM(CASE WHEN f.state != 'downloaded' AND c.state = 'cancelled' THEN 1 ELSE 0 END)
+                AS cancelled
+         FROM frames f LEFT JOIN chunks c ON c.id = f.chunk_id
+         ${where}
+        GROUP BY f.job_id`
+    )
+    .all(...args) as Array<{ job_id: string; total: number; done: number; cancelled: number }>
+  for (const r of counts) {
+    out.set(r.job_id, {
+      total: Number(r.total),
+      done: Number(r.done ?? 0),
+      cancelled: Number(r.cancelled ?? 0),
+      thumb: null
+    })
+  }
+  // The preview of the highest frame that has one (SQLite takes thumb_path
+  // from the row MAX picked).
+  const thumbs = db
+    .prepare(
+      `SELECT f.job_id AS job_id, f.thumb_path AS thumb_path, MAX(f.frame) AS frame
+         FROM frames f
+        WHERE f.thumb_path IS NOT NULL ${jobId === undefined ? '' : 'AND f.job_id = ?'}
+        GROUP BY f.job_id`
+    )
+    .all(...args) as Array<{ job_id: string; thumb_path: string }>
+  for (const r of thumbs) {
+    const c = out.get(r.job_id)
+    if (c) c.thumb = r.thumb_path
+  }
+  return out
+}
+
+/** How many of a job's latest downloads the ETA reads. */
+const TIMING_WINDOW = 30
+
+/**
+ * The scene's measured seconds per frame on one render, over every GPU model
+ * it was timed on (scene_perf): each chunk's load spread over its frames,
+ * plus the frame's phases. Null = never timed.
+ */
+function sceneSecondsPerFrame(sceneSha: string | null): number | null {
+  if (!sceneSha) return null
+  let seconds = 0
+  let frames = 0
+  for (const t of sceneRenderTimes(sceneSha)) {
+    if (t.frames <= 0) continue
+    const phases = (t.evalS ?? 0) + (t.syncS ?? 0) + (t.sampleS ?? 0) + (t.saveS ?? 0)
+    seconds += phases * t.frames + (t.loadS ?? 0) * t.loads
+    frames += t.frames
+  }
+  return frames > 0 && seconds > 0 ? seconds / frames : null
+}
+
+function timingOf(r: JobRow, c: FrameCounts, now: number): JobTiming {
+  const live = isLiveJob(r.state)
+  let recentDownloads: number[] = []
+  let rate: JobRate = { framesPerSec: null, lanes: 0 }
+  let secondsPerFrame: number | null = null
+  // Only a live job has anything to estimate; a finished one needs nothing
+  // more than its row.
+  if (live) {
+    recentDownloads = (
+      getDb()
+        .prepare(
+          `SELECT downloaded_at FROM frames
+            WHERE job_id = ? AND downloaded_at IS NOT NULL
+            ORDER BY downloaded_at DESC LIMIT ?`
+        )
+        .all(r.id, TIMING_WINDOW) as Array<{ downloaded_at: number }>
+    ).map((d) => d.downloaded_at)
+    rate = jobRateProvider?.(r.id) ?? rate
+    if (rate.framesPerSec == null && rate.lanes > 0) {
+      secondsPerFrame = sceneSecondsPerFrame(r.blend_sha256)
+    }
+  }
+  return estimateJobTiming({
+    now,
+    state: r.state,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at,
+    framesDone: c.done,
+    framesTotal: c.total,
+    framesCancelled: c.cancelled,
+    recentDownloads,
+    liveFramesPerSec: rate.framesPerSec,
+    secondsPerFrame,
+    liveLanes: rate.lanes
+  })
+}
+
+function rowToSummary(r: JobRow, counts?: FrameCounts): JobSummary {
+  const c = counts ??
+    frameCounts(r.id).get(r.id) ?? { total: 0, done: 0, cancelled: 0, thumb: null }
+  const now = Date.now()
+  const t = timingOf(r, c, now)
   return {
     id: r.id,
     name: r.name,
@@ -142,16 +261,25 @@ function rowToSummary(r: JobRow): JobSummary {
     frameEnd: r.frame_end,
     frameStep: r.frame_step,
     state: r.state,
-    framesDone: done,
-    framesTotal: total,
-    framesCancelled: cancelled,
+    framesDone: c.done,
+    framesTotal: c.total,
+    framesCancelled: c.cancelled,
     costSoFar: r.cost_so_far,
     submittedAt: r.submitted_at,
     outputDir: r.output_dir,
     blenderVersion: r.blender_version,
     shareNode: r.share_node === 1,
     attention: parseAttention(r.attention),
-    blendSha256: r.blend_sha256
+    blendSha256: r.blend_sha256,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at,
+    elapsedMs: t.elapsedMs,
+    remainingMs: t.remainingMs,
+    etaAt: t.etaAt,
+    framesPerHour: t.framesPerHour,
+    timingBasis: t.basis,
+    timingAt: now,
+    thumbUrl: c.thumb ? jobFileMediaUrl(r.id, r.output_dir, c.thumb) : null
   }
 }
 
@@ -175,7 +303,9 @@ function rowToChunk(r: ChunkRow): ChunkSnapshot {
 
 export function listJobs(): JobSummary[] {
   const rows = getDb().prepare('SELECT * FROM jobs ORDER BY submitted_at DESC').all() as JobRow[]
-  return rows.map(rowToSummary)
+  const counts = frameCounts()
+  const none: FrameCounts = { total: 0, done: 0, cancelled: 0, thumb: null }
+  return rows.map((r) => rowToSummary(r, counts.get(r.id) ?? none))
 }
 
 export function getJob(id: string): JobDetail | null {
@@ -465,6 +595,13 @@ export function setJobShareNode(jobId: string, shareNode: boolean): void {
   emitJobChanged(jobId)
 }
 
+/** Stamp the job's first dispatch (jobs.started_at), once. */
+export function markJobStarted(jobId: string, at = Date.now()): void {
+  getDb()
+    .prepare('UPDATE jobs SET started_at = ? WHERE id = ? AND started_at IS NULL')
+    .run(at, jobId)
+}
+
 /** Frames of a job that have not landed on the local disk. */
 function undownloadedFrameCount(jobId: string): number {
   return (
@@ -494,6 +631,9 @@ export function refreshJobState(jobId: string): void {
   const row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId) as JobRow | undefined
   if (!row) return
   if (row.state === 'cancelled' || row.state === 'failed') {
+    if (row.finished_at == null) {
+      db.prepare('UPDATE jobs SET finished_at = ? WHERE id = ?').run(Date.now(), jobId)
+    }
     emitJobChanged(jobId)
     return
   }
@@ -514,8 +654,16 @@ export function refreshJobState(jobId: string): void {
   // finished with frames still missing is a job with holes: 'partial', not a
   // 'complete' the user only finds out about when assembling the sequence.
   if (state === 'complete' && undownloadedFrameCount(jobId) > 0) state = 'partial'
-  if (state !== row.state) {
-    db.prepare('UPDATE jobs SET state = ? WHERE id = ?').run(state, jobId)
+  // Final (every chunk settled) is stamped once; back in the queue (a
+  // revive) is not finished any more.
+  const final = state === 'complete' || state === 'partial'
+  const finishedAt = final ? (row.finished_at ?? Date.now()) : null
+  if (state !== row.state || finishedAt !== row.finished_at) {
+    db.prepare('UPDATE jobs SET state = ?, finished_at = ? WHERE id = ?').run(
+      state,
+      finishedAt,
+      jobId
+    )
   }
   emitJobChanged(jobId)
 }

@@ -45,7 +45,7 @@ export function applySchema(db: Db): void {
   markCancelledChunks(db)
 }
 
-const SCHEMA_VERSION = 7
+const SCHEMA_VERSION = 8
 
 /**
  * Column additions, which `CREATE TABLE IF NOT EXISTS` in schema.sql cannot
@@ -159,13 +159,46 @@ function migrate(db: Db): void {
     ).run(Date.now())
   })
 
+  // v8: job timing (elapsed, ETA). Only what the database already says is
+  // filled in; the rest stays null rather than guessed.
+  // started_at: the earliest dispatch its chunks still record (a requeue
+  // clears a chunk's assigned_at, so this can be late).
+  addColumn(db, 'jobs', 'started_at', 'INTEGER', () => {
+    db.prepare(
+      `UPDATE jobs SET started_at =
+         (SELECT MIN(assigned_at) FROM chunks WHERE chunks.job_id = jobs.id)`
+    ).run()
+  })
+  // finished_at, for jobs already final: when their last file landed.
+  addColumn(db, 'jobs', 'finished_at', 'INTEGER', () => {
+    db.prepare(
+      `UPDATE jobs SET finished_at =
+         (SELECT MAX(created_at) FROM assets WHERE assets.job_id = jobs.id)
+       WHERE state IN ('complete', 'partial', 'failed', 'cancelled')`
+    ).run()
+  })
+  // downloaded_at: each downloaded frame's file was recorded as a 'frame'
+  // asset as it landed.
+  addColumn(db, 'frames', 'downloaded_at', 'INTEGER', () => {
+    db.prepare(
+      `UPDATE frames SET downloaded_at =
+         (SELECT MIN(a.created_at) FROM assets a
+           WHERE a.job_id = frames.job_id AND a.kind = 'frame' AND a.abs_path = frames.local_path)
+       WHERE state = 'downloaded' AND local_path IS NOT NULL`
+    ).run()
+  })
+  // Not in the step: a fresh database has the column from schema.sql, and
+  // skips it.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_frames_downloaded ON frames(job_id, downloaded_at)')
+
   db.prepare('UPDATE schema_meta SET version = ?').run(SCHEMA_VERSION)
 }
 
 /**
  * One migration step: add `column` unless it is there, then run `backfill`,
- * in one transaction. `backfill` is also where an index on the column goes,
- * which cannot live in schema.sql (see there). The step is guarded by the
+ * in one transaction. An index on the column goes after the step, with
+ * CREATE INDEX IF NOT EXISTS, not in it: a fresh database has the column
+ * from schema.sql and skips the step. The step is guarded by the
  * column alone, so a backfill that threw after its ALTER had committed would
  * never run again; in one transaction, a failure takes the column with it
  * and the whole step runs again at the next launch.

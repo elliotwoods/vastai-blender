@@ -500,14 +500,14 @@ export class ChunkDownloader {
     const views = this.listedViews
     if (views.size < 2) return
     const mark = getDb().prepare(
-      `UPDATE frames SET state='downloaded', local_path=?, size_bytes=? WHERE job_id=? AND frame=?`
+      `UPDATE frames SET state='downloaded', local_path=?, size_bytes=?, downloaded_at=? WHERE job_id=? AND frame=?`
     )
     for (const [frame, landed] of this.viewFrames) {
       if (landed.size < views.size) continue
       // One file stands for the frame, as for any other: the first view's.
       const first = [...landed.keys()].sort()[0]
       const file = landed.get(first)!
-      mark.run(file.path, file.size, this.target.jobId, frame)
+      mark.run(file.path, file.size, Date.now(), this.target.jobId, frame)
     }
   }
 
@@ -829,8 +829,8 @@ export class ChunkDownloader {
       const frame = name?.frame ?? null
       if (name && name.view === '') {
         db.prepare(
-          `UPDATE frames SET state='downloaded', local_path=?, size_bytes=? WHERE job_id=? AND frame=?`
-        ).run(localPath, entry.size, jobId, name.frame)
+          `UPDATE frames SET state='downloaded', local_path=?, size_bytes=?, downloaded_at=? WHERE job_id=? AND frame=?`
+        ).run(localPath, entry.size, Date.now(), jobId, name.frame)
       } else if (name) {
         // One view of several: the frame is marked by settleViewFrames.
         const landed = this.viewFrames.get(name.frame) ?? new Map()

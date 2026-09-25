@@ -378,6 +378,7 @@ export class World {
       target: scheduler.displaySlotTarget(nodeId)
     }))
     nm.setForgetNodeProvider((nodeId) => scheduler.forgetNode(nodeId))
+    jobs.setJobRateProvider((jobId) => scheduler.jobRate(jobId))
     this.app = { nodeManager: nm.nodeManager, scheduler, jobs }
     if (opts.start !== false) {
       nm.nodeManager.init()

@@ -36,6 +36,7 @@ import { externalUrl, isAppPage, type AppPage } from './app/windowPolicy'
 import { resolveBlenderRelease } from './blender/blendInfo'
 import { closeDb, getDb } from './db/db'
 import { emit } from './events'
+import { setJobRateProvider } from './jobs/jobs'
 import { registerIpc } from './ipc'
 import {
   nodeManager,
@@ -499,6 +500,7 @@ app.whenReady().then(() => {
     target: scheduler.displaySlotTarget(nodeId)
   }))
   setForgetNodeProvider((nodeId) => scheduler.forgetNode(nodeId))
+  setJobRateProvider((jobId) => scheduler.jobRate(jobId))
   nodeManager.init()
   scheduler.start()
   // Stitch job clips for any job whose chunk clips outran them — e.g. chunks

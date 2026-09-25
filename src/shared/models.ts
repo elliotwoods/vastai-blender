@@ -655,6 +655,13 @@ export interface HistorySummary {
 export type JobState = 'queued' | 'running' | 'complete' | 'partial' | 'failed' | 'cancelled'
 
 /**
+ * What a job's timing estimate is from (shared/jobTiming.ts): the frames
+ * landing, the live runs' measured rates, the scene's measured seconds per
+ * frame, or nothing yet.
+ */
+export type JobTimingBasis = 'downloads' | 'live' | 'scenePerf' | 'none'
+
+/**
  * A chunk's lifecycle. 'failed' is a chunk that ran out of retries, or one a
  * failed job settled; 'cancelled' is one the user's cancel stopped before it
  * finished. Both are final until "re-render missing" reopens them
@@ -765,6 +772,30 @@ export interface JobSummary {
    * snapshots existed, so it renders whatever `blendPath` holds now.
    */
   blendSha256?: string | null
+  /** epoch ms the first chunk was dispatched; null = not yet (or never recorded) */
+  startedAt: number | null
+  /** epoch ms the job reached a final state; null while it is queued or running */
+  finishedAt: number | null
+  /**
+   * Timing as of `timingAt` (shared/jobTiming.ts estimateJobTiming). Project
+   * it to now with projectTiming rather than reading it raw: a live job's
+   * elapsed runs on and its remaining counts down between updates.
+   *  - elapsedMs: startedAt to finishedAt, or to timingAt; null = never started
+   *  - remainingMs: 0 once complete; null = no estimate (nothing rendering
+   *    yet, or a job that will not finish: failed, partial, cancelled)
+   *  - etaAt: epoch ms it should be done; finishedAt once complete
+   *  - framesPerHour: the rate behind the estimate; a finished job's average
+   */
+  elapsedMs: number | null
+  remainingMs: number | null
+  etaAt: number | null
+  framesPerHour: number | null
+  /** what the estimate is from (see jobTiming.ts) */
+  timingBasis: JobTimingBasis
+  /** epoch ms (main's clock) the timing fields were worked out */
+  timingAt: number
+  /** media:// URL of the preview of the job's latest frame that has one; null = none yet */
+  thumbUrl: string | null
 }
 
 export interface ChunkSnapshot {

@@ -343,7 +343,8 @@ async function load(
     listJobs: () => opts.jobs ?? [],
     createJob: opts.createJob ?? (async () => 'job-1'),
     emitChunksChanged: () => {},
-    refreshJobState: () => {}
+    refreshJobState: () => {},
+    setJobRateProvider: () => {}
   }))
   vi.spyOn(process, 'on').mockImplementation(((event: string, fn: () => void) => {
     out.signals.set(event, fn)

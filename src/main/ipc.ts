@@ -56,6 +56,7 @@ import { scheduler } from './scheduler/scheduler'
 import { co2Grams, intensityFor } from './carbon/intensity'
 import { getDb } from './db/db'
 import { jobFileMediaUrl, toMediaUrl } from './mediaUrl'
+import { estimateJobTiming } from '../shared/jobTiming'
 import { resolveRange, summary as historySummary } from './history/history'
 import { REMOTE_ROOT } from './nodes/provisioner'
 import { shq } from './ssh/shq'
@@ -444,64 +445,132 @@ const mockNodes = (): NodeSnapshot[] => [
   }
 ]
 
-const mockJobs = (): JobSummary[] => [
-  {
-    id: 'job-1',
-    name: 'hero_shot_v12',
-    blendPath: 'C:/scenes/hero_shot_v12.blend',
-    engine: 'cycles',
-    frameStart: 1,
-    frameEnd: 250,
-    frameStep: 1,
-    state: 'running',
-    framesDone: 117,
-    framesTotal: 250,
-    framesCancelled: 0,
-    costSoFar: 1.24,
-    submittedAt: Date.now() - 55 * 60_000,
-    outputDir: 'C:/renders/job-1',
-    blenderVersion: '4.5.3',
-    shareNode: false
-  },
-  {
-    id: 'job-2',
-    name: 'lookdev_turntable',
-    blendPath: 'C:/scenes/lookdev_turntable.blend',
-    engine: 'eevee',
-    frameStart: 1,
-    frameEnd: 120,
-    frameStep: 1,
-    state: 'queued',
-    framesDone: 0,
-    framesTotal: 120,
-    framesCancelled: 0,
-    costSoFar: 0,
-    submittedAt: Date.now() - 4 * 60_000,
-    outputDir: 'C:/renders/job-2',
-    blenderVersion: '4.3.2',
-    shareNode: true
-  },
-  // Cancelled part-way, with one chunk that had failed for good before the
-  // cancel: the job screen shows failed and cancelled chunks apart.
-  {
-    id: 'job-3',
-    name: 'fx_smoke_r3',
-    blendPath: 'C:/scenes/fx_smoke_r3.blend',
-    engine: 'cycles',
-    frameStart: 1,
-    frameEnd: 200,
-    frameStep: 1,
-    state: 'cancelled',
-    framesDone: 80,
-    framesTotal: 200,
-    framesCancelled: 100,
-    costSoFar: 0.61,
-    submittedAt: Date.now() - 3 * 3_600_000,
-    outputDir: 'C:/renders/job-3',
-    blenderVersion: '4.5.3',
-    shareNode: false
-  }
-]
+/** A mock job's row, before its timing and thumbnail are worked out (mockJobs). */
+type MockJobRow = Omit<
+  JobSummary,
+  'elapsedMs' | 'remainingMs' | 'etaAt' | 'framesPerHour' | 'timingBasis' | 'timingAt' | 'thumbUrl'
+> & { thumb: string | null; downloadGapMs?: number }
+
+/**
+ * The mock jobs, each timed by the real estimate (shared/jobTiming.ts):
+ * job-1 renders with an ETA from frames landing every ~9 s; job-2 waits for
+ * a node; job-3 was cancelled part-way; job-4 is complete.
+ */
+const mockJobs = (now = Date.now()): JobSummary[] => {
+  const rows: MockJobRow[] = [
+    {
+      id: 'job-1',
+      name: 'hero_shot_v12',
+      blendPath: 'C:/scenes/hero_shot_v12.blend',
+      engine: 'cycles',
+      frameStart: 1,
+      frameEnd: 250,
+      frameStep: 1,
+      state: 'running',
+      framesDone: 117,
+      framesTotal: 250,
+      framesCancelled: 0,
+      costSoFar: 1.24,
+      submittedAt: now - 55 * 60_000,
+      outputDir: 'C:/renders/job-1',
+      blenderVersion: '4.5.3',
+      shareNode: false,
+      startedAt: now - 52 * 60_000,
+      finishedAt: null,
+      thumb: 'media://fixtures/thumbs/0002.jpg',
+      downloadGapMs: 9_000
+    },
+    {
+      id: 'job-2',
+      name: 'lookdev_turntable',
+      blendPath: 'C:/scenes/lookdev_turntable.blend',
+      engine: 'eevee',
+      frameStart: 1,
+      frameEnd: 120,
+      frameStep: 1,
+      state: 'queued',
+      framesDone: 0,
+      framesTotal: 120,
+      framesCancelled: 0,
+      costSoFar: 0,
+      submittedAt: now - 4 * 60_000,
+      outputDir: 'C:/renders/job-2',
+      blenderVersion: '4.3.2',
+      shareNode: true,
+      startedAt: null,
+      finishedAt: null,
+      thumb: null
+    },
+    // Cancelled part-way, with one chunk that had failed for good before the
+    // cancel: the job screen shows failed and cancelled chunks apart.
+    {
+      id: 'job-3',
+      name: 'fx_smoke_r3',
+      blendPath: 'C:/scenes/fx_smoke_r3.blend',
+      engine: 'cycles',
+      frameStart: 1,
+      frameEnd: 200,
+      frameStep: 1,
+      state: 'cancelled',
+      framesDone: 80,
+      framesTotal: 200,
+      framesCancelled: 100,
+      costSoFar: 0.61,
+      submittedAt: now - 3 * 3_600_000,
+      outputDir: 'C:/renders/job-3',
+      blenderVersion: '4.5.3',
+      shareNode: false,
+      startedAt: now - 3 * 3_600_000 + 2 * 60_000,
+      finishedAt: now - 2 * 3_600_000,
+      thumb: 'media://fixtures/thumbs/0003.jpg'
+    },
+    {
+      id: 'job-4',
+      name: 'bg_plate_a',
+      blendPath: 'C:/scenes/bg_plate_a.blend',
+      engine: 'cycles',
+      frameStart: 1,
+      frameEnd: 96,
+      frameStep: 1,
+      state: 'complete',
+      framesDone: 96,
+      framesTotal: 96,
+      framesCancelled: 0,
+      costSoFar: 0.88,
+      submittedAt: now - 26 * 3_600_000,
+      outputDir: 'C:/renders/job-4',
+      blenderVersion: '4.5.3',
+      shareNode: false,
+      startedAt: now - 26 * 3_600_000 + 3 * 60_000,
+      finishedAt: now - 24 * 3_600_000 - 17 * 60_000,
+      thumb: 'media://fixtures/thumbs/0004.jpg'
+    }
+  ]
+  return rows.map(({ thumb, downloadGapMs, ...row }) => {
+    const t = estimateJobTiming({
+      now,
+      state: row.state,
+      startedAt: row.startedAt,
+      finishedAt: row.finishedAt,
+      framesDone: row.framesDone,
+      framesTotal: row.framesTotal,
+      framesCancelled: row.framesCancelled,
+      recentDownloads: downloadGapMs
+        ? Array.from({ length: 30 }, (_, i) => now - 4_000 - i * downloadGapMs)
+        : []
+    })
+    return {
+      ...row,
+      elapsedMs: t.elapsedMs,
+      remainingMs: t.remainingMs,
+      etaAt: t.etaAt,
+      framesPerHour: t.framesPerHour,
+      timingBasis: t.basis,
+      timingAt: now,
+      thumbUrl: thumb
+    }
+  })
+}
 
 /** Chunks of the mock jobs that no mock node holds (job-3's, all settled). */
 const mockSettledChunks = (jobId: string): ChunkSnapshot[] => {

@@ -7,7 +7,8 @@
 --  - a column added to an existing table goes at the end of it, in the order
 --    migrate() adds it, so a fresh and an upgraded database end up alike
 --    (db.test.ts compares them);
---  - an index on such a column is created in its migrate() step, never here:
+--  - an index on such a column is created in migrate(), after the step that
+--    adds the column (outside it, so a fresh database gets it too), never here:
 --    on an older database the column does not exist yet when this runs, and
 --    the CREATE INDEX would throw before migrate() could add it.
 
@@ -41,7 +42,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- Why the job is waiting on the user instead of rendering: the same class
   -- of error on two or more nodes (plan 1.17's breaker), or a scene that
   -- failed preflight (1.16). Shown as written. Null = nothing needs the user.
-  attention TEXT
+  attention TEXT,
+  -- When the job's first chunk was dispatched, and when it reached a final
+  -- state (complete, partial, failed, cancelled); a revive clears
+  -- finished_at. Epoch ms; null = not yet, or before they were recorded.
+  started_at INTEGER,
+  finished_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -84,6 +90,10 @@ CREATE TABLE IF NOT EXISTS frames (
   -- re-points only not-yet-downloaded rows, so a downloaded frame keeps the old
   -- chunk id while the narrowed chunk's range moves off it.
   thumb_path TEXT,
+  -- When the frame landed on this computer (epoch ms), behind the job's ETA
+  -- (shared/jobTiming.ts). Null = not downloaded, or before it was recorded.
+  -- Indexed with job_id by db.ts.
+  downloaded_at INTEGER,
   PRIMARY KEY (job_id, frame)
 );
 CREATE INDEX IF NOT EXISTS idx_frames_chunk ON frames(chunk_id);

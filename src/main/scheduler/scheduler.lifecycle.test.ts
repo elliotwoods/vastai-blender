@@ -198,6 +198,41 @@ describe('stale runs', () => {
     expect(chunkStates(chunk.id).filter((s) => s === 'assigned')).toHaveLength(1)
   })
 
+  it('stamps when the job started and finished, and when each frame landed', async () => {
+    const { app, machine } = await oneNode()
+    machine.agent.autoFinish()
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 2 })
+    const submittedAt = Date.now()
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+
+    const job = w.get<{ started_at: number; finished_at: number }>(
+      'SELECT started_at, finished_at FROM jobs WHERE id = ?',
+      jobId
+    )!
+    const firstDispatch = w.get<{ t: number }>(
+      'SELECT MIN(assigned_at) AS t FROM chunks WHERE job_id = ?',
+      jobId
+    )!.t
+    expect(job.started_at).toBeGreaterThanOrEqual(submittedAt)
+    expect(job.started_at).toBeLessThanOrEqual(firstDispatch)
+    const landed = w
+      .all<{ downloaded_at: number | null }>(
+        'SELECT downloaded_at FROM frames WHERE job_id = ? ORDER BY frame',
+        jobId
+      )
+      .map((f) => f.downloaded_at)
+    expect(landed.every((t) => t != null && t >= job.started_at && t <= job.finished_at)).toBe(true)
+    const summary = (await w.invoke('jobs:list')).find((j) => j.id === jobId)!
+    expect(summary).toMatchObject({
+      startedAt: job.started_at,
+      finishedAt: job.finished_at,
+      elapsedMs: job.finished_at - job.started_at,
+      remainingMs: 0,
+      etaAt: job.finished_at
+    })
+  })
+
   it("a cancel marks the job's open chunks cancelled, and re-render missing picks them up", async () => {
     const { app, machine } = await oneNode()
     const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 2 })

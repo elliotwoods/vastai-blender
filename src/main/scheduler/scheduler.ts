@@ -21,8 +21,10 @@ import {
   emitChunkChanged,
   emitChunksChanged,
   emitJobChanged,
+  markJobStarted,
   noteChunkError,
-  refreshJobState
+  refreshJobState,
+  type JobRate
 } from '../jobs/jobs'
 import {
   agentAlive,
@@ -1014,6 +1016,7 @@ class ChunkRun {
     const lanes = this.lanes
 
     this.setChunk({ state: 'assigned', node_id: this.nodeId, assigned_at: Date.now() })
+    markJobStarted(this.jobId)
     // State only: setState would also wipe the node's last error, which is how
     // a node that kept refusing dispatches showed nothing wrong between them.
     node.update({ state: 'rendering' })
@@ -2608,6 +2611,27 @@ class Scheduler {
     const s = this.byNode.get(nodeId)
     if (!s || s.size === 0) return []
     return [...s].map((r) => ({ chunkId: r.chunkId, jobId: r.jobId, gpu: r.gpu }))
+  }
+
+  /**
+   * What job `jobId` renders at right now (jobs.ts setJobRateProvider, the
+   * ETA's fallbacks before frames land): the sum of its runs' measured rates,
+   * and how many of its runs have not finished their render.
+   */
+  jobRate(jobId: string): JobRate {
+    let lanes = 0
+    let sum = 0
+    let measured = false
+    for (const r of this.runs.values()) {
+      if (r.jobId !== jobId || r.renderEnded) continue
+      lanes++
+      const rate = r.rate()
+      if (rate != null) {
+        sum += rate
+        measured = true
+      }
+    }
+    return { framesPerSec: measured ? sum : null, lanes }
   }
 
   /**
