@@ -253,33 +253,57 @@ describe('provisioner.ts, what it makes of an answer', () => {
     expect(await restartAgent(s.ssh, 'node-1')).toEqual({ restarted: true, reason: null })
   })
 
-  it('1.7: agentStatus is null for a tree without agent-status, and throws when the connection went', async () => {
+  // A command that ended without an exit status. ssh2 1.17 closes the channel
+  // of a connection that went with no exit status at all (undefined), and that
+  // of a command a signal killed with null; SshConnection passes either on.
+  // Only null used to be read as no answer: the harness's value, not ssh2's.
+  const NO_EXIT: Array<[string, number | null]> = [
+    ['the connection went (ssh2: undefined)', undefined as unknown as null],
+    ['a signal killed it (ssh2: null)', null]
+  ]
+
+  it('1.7: agentStatus is null for a tree without agent-status', async () => {
     const usage = stub({ code: 1, stdout: 'usage: provision.sh deps …\n', stderr: '' })
     await expect(agentStatus(usage.ssh)).resolves.toBeNull()
     const missing = stub({ code: 127, stdout: '', stderr: 'No such file' })
     await expect(agentStatus(missing.ssh)).resolves.toBeNull()
-    const dropped = stub({ code: null, stdout: '', stderr: '' })
-    await expect(agentStatus(dropped.ssh)).rejects.toBeInstanceOf(ConnectionLostError)
   })
 
-  it('1.7: a restart-agent or agent-status whose connection went reads as the link lost, not a verdict', async () => {
-    // What ssh2 hands back for a channel whose connection dropped: no exit
-    // status. Neither the restart's outcome nor the status is known, and the
-    // alert must not read "unrecognised error".
-    const dropped = stub({ code: null, stdout: '', stderr: '' })
-    const errors = await Promise.all([
-      restartAgent(dropped.ssh, 'node-1').catch((e: unknown) => e),
-      agentStatus(dropped.ssh).catch((e: unknown) => e)
-    ])
-    expect(dropped.calls).toHaveLength(2) // no second restart-agent on a dropped link
-    for (const e of errors) {
-      expect(e).toBeInstanceOf(ConnectionLostError)
-      expect(classify(e, { via: 'ssh' })).toMatchObject({ kind: 'machine', rule: 'ssh-lost' })
-      expect(classify(e)).toMatchObject({ rule: 'ssh-lost' })
+  it.each(NO_EXIT)(
+    '1.7: a restart-agent or agent-status that ended with no exit status (%s) reads as the link lost, not a verdict',
+    async (_what, code) => {
+      // Neither the restart's outcome nor the status is known, and the alert
+      // must not read "unrecognised error". On real ssh2 a dropped link read
+      // as "restart-agent failed (exit undefined)", and the node that had
+      // just come back was destroyed for it; a dropped agent-status read as a
+      // tree without one, and the whole of onReady killed the live renders.
+      const dropped = stub({ code, stdout: '', stderr: '' })
+      const errors = await Promise.all([
+        restartAgent(dropped.ssh, 'node-1').catch((e: unknown) => e),
+        agentStatus(dropped.ssh).catch((e: unknown) => e)
+      ])
+      expect(dropped.calls).toHaveLength(2) // no second restart-agent on a dropped link
+      for (const e of errors) {
+        expect(e).toBeInstanceOf(ConnectionLostError)
+        expect(classify(e, { via: 'ssh' })).toMatchObject({ kind: 'machine', rule: 'ssh-lost' })
+        expect(classify(e)).toMatchObject({ rule: 'ssh-lost' })
+      }
+      expect((errors[0] as Error).message).toBe(
+        'connection closed under provision.sh restart-agent'
+      )
+      expect((errors[1] as Error).message).toBe('connection closed under provision.sh agent-status')
     }
-    expect((errors[0] as Error).message).toBe('connection closed under provision.sh restart-agent')
-    expect((errors[1] as Error).message).toBe('connection closed under provision.sh agent-status')
-  })
+  )
+
+  it.each(NO_EXIT)(
+    '1.7: a step with no exit status (%s) fails reading "(exit null)", as the job breaker and node-setup rule read it',
+    async (_what, code) => {
+      const dropped = stub({ code, stdout: '', stderr: '' })
+      const e = await installBlender(dropped.ssh, 'node-1', '5.1.0').catch((err: unknown) => err)
+      expect((e as Error).message).toBe('install blender 5.1.0 failed (exit null)')
+      expect(classify(e, { via: 'ssh' })).toMatchObject({ rule: 'node-setup' })
+    }
+  )
 
   it('1.8: installBlender and probeEevee each pass a deadline and a label, never command text', async () => {
     const s = stub({ code: 0, stdout: 'PROBE_OK\n', stderr: '' })
@@ -352,10 +376,15 @@ describe.skipIf(process.platform === 'win32')('agentAlive', () => {
     expect(await agentAlive(onNode().ssh)).toBe(false)
   })
 
-  it('1.7: a check that never ran is not a dead agent', async () => {
+  it.each([
+    ['the connection went (ssh2: undefined)', undefined as unknown as null],
+    ['a signal killed it (ssh2: null)', null]
+  ])('1.7: a check that never ran (%s) is not a dead agent', async (_what, code) => {
     const dropped = new ScriptSsh(null as unknown as RemoteNode)
-    dropped.reply = () => ({ code: null, stdout: '', stderr: '' })
-    await expect(agentAlive(dropped.ssh)).rejects.toThrow(/did not answer/)
+    dropped.reply = () => ({ code, stdout: '', stderr: '' })
+    await expect(agentAlive(dropped.ssh)).rejects.toThrow(
+      'agent heartbeat check did not answer (exit null)'
+    )
     expect(dropped.calls[0].opts).toEqual({ timeoutMs: 30_000, label: 'agent heartbeat' })
   })
 })

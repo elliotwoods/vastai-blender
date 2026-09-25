@@ -81,10 +81,27 @@ function logLine(nodeId: string, line: string): void {
 }
 
 /**
+ * A command's exit code, or null when it ended without one. ssh2 1.17 closes
+ * the channel of a connection that went with no exit status at all
+ * (undefined), and that of a command a signal killed with null; SshConnection
+ * passes either on as it is. Neither is an answer from the command. Only
+ * null was checked, what the test harness hands back for a dropped link, so
+ * on real ssh2 a dropped link read as a command that failed with a verdict
+ * ("exit undefined"), and a node brought back from a blip was destroyed for
+ * it.
+ * Messages keep reading "(exit null)" for such a command, as errors.ts's
+ * node-setup rule and admission.ts's breaker key expect.
+ */
+export function exitStatus(code: number | null | undefined): number | null {
+  return code ?? null
+}
+
+/**
  * Run a provisioning command, streaming its output to the node's log, and
  * return its lines and exit code. Past `timeoutMs` the command's channel is
  * closed and this rejects with the timeout, naming `label`, never the command
- * text. A connection that drops under it ends it with exit code null.
+ * text. A command that ended with no exit status has code null (see
+ * exitStatus).
  */
 async function runCaptured(
   ssh: SshConnection,
@@ -103,7 +120,7 @@ async function runCaptured(
     },
     { timeoutMs, label }
   )
-  const code = await done
+  const code = exitStatus(await done)
   return { code, lines }
 }
 
@@ -127,9 +144,10 @@ export interface AgentRestart {
 
 /**
  * A command whose connection went before it answered: ssh2 ends its channel
- * with no exit status. What the command did on the node is not known, and
- * nothing it would have answered was heard, so it is no verdict on the node,
- * only on the link. Worded as sshConnection words a closed connection, so
+ * with no exit status (exitStatus: null). What the command did on the node is
+ * not known, and nothing it would have answered was heard, so it is no
+ * verdict on the node, only on the link. A command a signal killed ends the
+ * same way, and is read the same way: it answered nothing either. Worded as sshConnection words a closed connection, so
  * classify() reads it as the SSH connection lost (ssh-lost). It read as an
  * unrecognised error, and a node brought back from a blip was destroyed for
  * one more.
@@ -325,8 +343,9 @@ export async function agentStatus(ssh: SshConnection): Promise<AgentStatus | nul
     timeoutMs: AGENT_STATUS_TIMEOUT_MS,
     label
   })
-  if (r.code === null) throw new ConnectionLostError(label)
-  return r.code === 0 ? parseAgentStatus(r.stdout) : null
+  const code = exitStatus(r.code)
+  if (code === null) throw new ConnectionLostError(label)
+  return code === 0 ? parseAgentStatus(r.stdout) : null
 }
 
 /** Install a Blender release (idempotent) and record it on the node row. */
@@ -439,5 +458,5 @@ export async function agentAlive(ssh: SshConnection): Promise<boolean> {
   )
   if (/\balive\b/.test(r.stdout)) return true
   if (/\bdead\b/.test(r.stdout)) return false
-  throw new Error(`agent heartbeat check did not answer (exit ${r.code})`)
+  throw new Error(`agent heartbeat check did not answer (exit ${exitStatus(r.code)})`)
 }
