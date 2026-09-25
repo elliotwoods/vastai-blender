@@ -740,10 +740,11 @@ describe('1.17: the job breaker, the same failure on two nodes', () => {
       message: expect.stringMatching(/on 2 nodes .*blender exited -11/)
     })
     expect(w.alerts('error').filter((a) => a.includes('is held'))).toHaveLength(1)
-    // It names the way out this build has: nothing here can resume it yet.
-    expect(w.alerts('error').find((a) => a.includes('is held'))).toMatch(
-      /cancel the job and submit it again/
-    )
+    // It names the way out: resuming it (job:resume), never cancelling and
+    // submitting again, which pays for every rendered frame once more.
+    const held = w.alerts('error').find((a) => a.includes('is held'))
+    expect(held).toMatch(/until you resume it from the job's page/)
+    expect(held).not.toMatch(/submit it again/)
     // A crash is the render's failure: each attempt before the hold cost a
     // render retry, and it held after a handful, not after every chunk had
     // spent all of its (4 chunks x 5 attempts).
