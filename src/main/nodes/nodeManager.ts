@@ -1650,6 +1650,7 @@ export class NodeManager {
   }
 
   private async probe(node: ManagedNode, ssh: SshConnection): Promise<void> {
+    // Still out at PROBE_SLOW_MS: does the node answer at all?
     let alive: Promise<string | null> | null = null
     const slow = setTimeout(() => {
       alive = ssh
@@ -1678,7 +1679,6 @@ export class NodeManager {
     }
     clearTimeout(slow)
     if (node.ssh !== ssh) return
-    this.slowProbes.delete(node.id)
     // What ssh2 hands back for a channel whose connection went: no exit
     // status (undefined; null for a signal) and no output. Only null was
     // read so, and on real ssh2 a probe the link dropped under reset the
@@ -1688,6 +1688,7 @@ export class NodeManager {
       return
     }
     this.probeAnswered(node)
+    this.slowProbes.delete(node.id)
     const [gpuPart, cpuPart, memPart, beatPart] = r.stdout.split('----')
     this.heartbeatSeen(node, heartbeatAge(beatPart))
     try {
