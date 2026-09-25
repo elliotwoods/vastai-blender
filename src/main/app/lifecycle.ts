@@ -86,6 +86,16 @@ export const DESTROY_BUDGET_MS = 20_000
  */
 export const OCTANE_STOP_MS = 20_000
 
+/**
+ * The gap between one node's destroy and the next. Vast allows one request
+ * per endpoint every 3 s for each API key (its rate-limit docs; a DELETE's
+ * 429 says "threshold=3.0"), and vastClient retries a 429 inside the call,
+ * after 3, 6, 9 and 12 s. Six DELETEs sent at once were answered one by one
+ * down that ladder, and the last were still waiting when their budget ran
+ * out, reported as maybe billing.
+ */
+export const DESTROY_STAGGER_MS = 3_000
+
 /** A headless run's exit status when instances it rented may still be billing. */
 export const EXIT_BILLING_LEFT = 3
 
@@ -384,6 +394,8 @@ export interface DestroyOptions {
   pollMs?: number
   /** Rounds before giving up on a fleet that keeps growing. */
   maxRounds?: number
+  /** Gap between the start of one node's destroy and the next. Default DESTROY_STAGGER_MS. */
+  staggerMs?: number
 }
 
 function defaultBudget(n: NodeSnapshot): number {
@@ -455,9 +467,10 @@ async function settleNode(
 /**
  * Destroy every node that may be billing, in rounds, until a round finds no
  * billing node it has not tried (see the header: anything that slips past
- * stopScheduling). Each round destroys its nodes in parallel, each within
- * its budget. Returns what is still billing, with the reason where a destroy
- * was tried.
+ * stopScheduling). Each round starts its nodes' destroys one
+ * DESTROY_STAGGER_MS apart, dearest first, and lets them overlap; each has
+ * its own budget from its own start. Returns what is still billing, with the
+ * reason where a destroy was tried.
  *
  * The answer is only as fresh as the last await. A caller that exits on an
  * empty answer must look at the fleet again in the same synchronous run as
@@ -470,13 +483,20 @@ export async function destroyFleet(
   const budget = opts.budgetMs ?? defaultBudget
   const pollMs = opts.pollMs ?? 250
   const maxRounds = opts.maxRounds ?? 5
+  const staggerMs = opts.staggerMs ?? DESTROY_STAGGER_MS
   const reasons = new Map<string, string | null>()
   for (let round = 0; round < maxRounds; round++) {
-    const fresh = fleet.list().filter((n) => holdsInstance(n) && !reasons.has(n.id))
+    const fresh = fleet
+      .list()
+      .filter((n) => holdsInstance(n) && !reasons.has(n.id))
+      .sort((a, b) => (b.dphTotal ?? 0) - (a.dphTotal ?? 0))
     if (fresh.length === 0) break
     for (const n of fresh) reasons.set(n.id, null)
     const results = await Promise.allSettled(
-      fresh.map((n) => settleNode(fleet, n.id, budget(n), pollMs))
+      fresh.map(async (n, i) => {
+        if (i > 0) await sleep(i * staggerMs)
+        return settleNode(fleet, n.id, budget(n), pollMs)
+      })
     )
     results.forEach((r, i) => {
       reasons.set(fresh[i].id, r.status === 'fulfilled' ? r.value : String(r.reason))

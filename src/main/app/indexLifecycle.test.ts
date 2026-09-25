@@ -334,11 +334,15 @@ describe('index.ts installs the quit lifecycle (plan 1.1, field incident A1)', (
     expect(r.closedDb).toBe(1)
   })
 
-  it('"Destroy all & quit": nodeManager.destroyNode for each node, then app.exit(0)', async () => {
+  it('"Destroy all & quit": nodeManager.destroyNode for each node, 3 s apart, then app.exit(0)', async () => {
     const r = await load([node(), node({ id: 'node-2-abcdef', instanceId: 778 })])
     quit(r)
     r.answer(0)
     await vi.advanceTimersByTimeAsync(0)
+    // Vast takes one DELETE every 3 s.
+    expect(r.destroyed).toHaveLength(1)
+    expect(r.exits).toEqual([])
+    await vi.advanceTimersByTimeAsync(3_000)
 
     expect(r.destroyed.sort()).toEqual(['node-1-abcdef', 'node-2-abcdef'])
     expect(r.exits).toEqual([0])

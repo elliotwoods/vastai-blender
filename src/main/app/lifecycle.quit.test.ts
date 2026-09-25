@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { setup, type App, type World } from '../test/harness'
+import { rateLimitDestroys } from '../test/vastRateLimit'
 import type { FleetPort, Lifecycle, Prompt, QuitPolicy } from './lifecycle'
 
 // Plan 1.1 on the lifecycle harness: the real nodeManager and scheduler, a
@@ -314,6 +315,34 @@ describe('Destroy all that cannot confirm a destroy (plan 1.1)', () => {
     await w.until(() => r.app.exits.length > 0, 'the app to exit')
     expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
     expect(w.vast.count('destroyInstance')).toBe(2)
+  })
+})
+
+describe('Destroy all against what Vast is really like (plan 1.1)', () => {
+  it("six nodes and Vast's 3 s DELETE limit: all destroyed on the first pass, none listed", async () => {
+    // 1.1 review: every DELETE went out at once, and Vast takes one every
+    // 3 s. vastClient's 429 retry (3, 6, 9, 12 s, in the call) answered
+    // them one by one, and the last ran past the quit's budget.
+    w = await setup({ settings: { maxActiveNodes: 6, spendCapPerHour: 10 } })
+    const engine = await w.boot()
+    const ids: string[] = []
+    for (let i = 0; i < 6; i++) ids.push(await w.readyNode(engine))
+    const instances = ids.map(instanceOf)
+    const { VastError } = await import('../vast/vastClient')
+    const limit = rateLimitDestroys(w.vast, (m, status) => new VastError(m, status))
+    const r = await rig(engine)
+    r.answers.push(DESTROY)
+
+    r.app.quit()
+    await w.until(
+      () => r.app.exits.length > 0 || r.dialogs.length > 1,
+      'the app to exit, or the failure list',
+      { timeoutMs: 5 * 60_000 }
+    )
+
+    expect(r.dialogs.map((d) => d.message)).toEqual(['6 nodes are billing $2.40/hr'])
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+    expect(limit.gaveUp).toBe(0)
   })
 })
 
