@@ -227,16 +227,24 @@ describe('retry policy (plan 1.17)', () => {
       expect(breakerKey(f('localFs', 'local-sink'))).toBeNull()
     })
 
-    it('a render that failed on the machine, by rule, once the stage says it rendered', () => {
-      expect(breakerKey(f('machine', 'agent-oom'), 'render')).toBe('render:agent-oom')
-      expect(breakerKey(f('machine', 'agent-stalled'), 'render')).toBe('render:agent-stalled')
-      expect(breakerKey(f('machine', 'agent-gpu'), 'render')).toBe('render:agent-gpu')
+    it('a render that failed on the machine, by rule, once its chunk failed that way before', () => {
+      expect(breakerKey(f('machine', 'agent-oom'), 'render', true)).toBe('render:agent-oom')
+      expect(breakerKey(f('machine', 'agent-stalled'), 'render', true)).toBe('render:agent-stalled')
+      expect(breakerKey(f('machine', 'agent-killed'), 'render', true)).toBe('render:agent-killed')
       // 1d59516c: the machines failing before anything rendered never are.
-      expect(breakerKey(f('machine', 'ssh-unreachable'), 'dispatch')).toBeNull()
-      expect(breakerKey(f('machine', 'node-gone'), 'node')).toBeNull()
-      expect(breakerKey(f('transient', 'frames-lost'), 'download')).toBeNull()
+      expect(breakerKey(f('machine', 'ssh-unreachable'), 'dispatch', true)).toBeNull()
+      expect(breakerKey(f('machine', 'node-gone'), 'node', true)).toBeNull()
+      expect(breakerKey(f('transient', 'frames-lost'), 'download', true)).toBeNull()
       // The job's own failures keep their key whatever the stage.
       expect(breakerKey(f('job', 'agent-exit'), 'render')).toBe('job')
+    })
+
+    it("not a chunk's first render the machine failed: that is as likely the node's packing", () => {
+      // Every lane of a 4-GPU node loads a heavy scene at once, and the
+      // kernel kills one; the lane guard steps down after exactly that.
+      expect(breakerKey(f('machine', 'agent-killed'), 'render')).toBeNull()
+      expect(breakerKey(f('machine', 'agent-oom'), 'render', false)).toBeNull()
+      expect(breakerKey(f('machine', 'agent-gpu'), 'render', false)).toBeNull()
     })
 
     it('not a setup step whose connection went before it exited', () => {

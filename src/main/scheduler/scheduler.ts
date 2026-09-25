@@ -1064,9 +1064,10 @@ class Scheduler {
    * What each chunk has failed for a machine's reason, until it completes or
    * fails for good: the nodes (it goes back to one of them only when no other
    * node can take it: pickChunk), and the rules of the renders that failed
-   * (the same one again is charged to the render: admission.ts chargeFor).
-   * The chunks a requeue splits it into share its entry. In memory only: a
-   * restart forgets it, and the budgets still bound every chunk.
+   * (the same one again is charged to the render, admission.ts chargeFor,
+   * and counted by the breaker, breakerKey). The chunks a requeue splits it
+   * into share its entry. In memory only: a restart forgets it, and the
+   * budgets still bound every chunk.
    */
   private failedOn = new Map<string, { nodes: Set<string>; renderRules: Set<string> }>()
   /** The same failure on two nodes holds its job for the user (plan 1.17). */
@@ -2093,7 +2094,10 @@ class Scheduler {
     const history = this.failedOn.get(chunkId)
     const repeat = renderOnMachine(f.c, f.stage) && history?.renderRules.has(f.c.rule) === true
     const budget = chargeFor(f.c, f.stage, repeat)
-    const key = breakerKey(f.c, f.stage)
+    // A render the machine failed counts only when its chunk failed that way
+    // before: one on each of two nodes is as likely their packing as the
+    // scene (breakerKey).
+    const key = breakerKey(f.c, f.stage, repeat)
     if (key && job.attention == null && this.breaker.record(chunk.job_id, key, f.nodeId)) {
       const hold = this.holdJob(chunk.job_id, job.name, key, f)
       if (hold) alerts.push(hold)

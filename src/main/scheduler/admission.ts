@@ -209,17 +209,23 @@ export function nodeRestMs(failures: number): number {
  *   gone or unreadable). Its disk is the same whichever node is asking, so
  *   two failures hold the job, on one node or several.
  * - render:<rule>: a render that ran and failed for the machine's reason
- *   (renderOnMachine), by rule. One node running out of GPU memory, or
- *   stalling, is that node; two is a scene too big or too heavy for the
- *   fleet's GPUs, and every further attempt pays for another render. Only
- *   with the `stage` given: without it, every machine rule but node-setup
- *   reads as the node's, as a dispatch's does.
+ *   (renderOnMachine), by rule, once its chunk has failed that way before
+ *   (`repeat`, as chargeFor reads it). A first such failure is as likely
+ *   the node's packing as the scene: every lane of a 4-GPU node loading a
+ *   heavy scene at once, or shared slots learned on a lighter scene, which
+ *   the lane guard and the slot controller step down from after exactly
+ *   that failure. Counted from the first, one kill on each of two such
+ *   nodes held a job whose every retry would have rendered. Repeats on two
+ *   nodes, with nothing of the job rendering in between, are a scene too big
+ *   or too heavy for the fleet's GPUs, and every further attempt pays for
+ *   another render. Only with the `stage` given: without it, every machine
+ *   rule but node-setup reads as the node's, as a dispatch's does.
  */
-export function breakerKey(c: FailureClass, stage?: AttemptStage): string | null {
+export function breakerKey(c: FailureClass, stage?: AttemptStage, repeat = false): string | null {
   if (c.kind === 'job') return 'job'
   if (c.rule === 'node-setup') return /\(exit null\)/.test(c.reason ?? '') ? null : 'node-setup'
   if (c.kind === 'localFs' && c.rule !== 'local-sink') return 'localFs'
-  if (stage && renderOnMachine(c, stage)) return `render:${c.rule}`
+  if (stage && repeat && renderOnMachine(c, stage)) return `render:${c.rule}`
   return null
 }
 
@@ -230,9 +236,10 @@ export const BREAKER_NODES = 2
  * Per job: the breaker keys seen since the job last rendered a chunk, and on
  * which nodes. A chunk that renders resets its job's count: a scene that
  * cannot render fails every attempt, while a Blender that crashes once in a
- * while does so between chunks that finish. The count lives only as long as
- * the process: after a restart the breaker starts again, and the render and
- * infrastructure budgets still bound every chunk.
+ * while, or a node packed too tight for one render, does so between chunks
+ * that finish. The count lives only as long as the process: after a restart
+ * the breaker starts again, and the render and infrastructure budgets still
+ * bound every chunk.
  */
 export class JobBreaker {
   private seen = new Map<string, Map<string, { nodes: Set<string>; count: number }>>()

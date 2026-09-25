@@ -699,12 +699,14 @@ describe('1.17: the job breaker, the same failure on two nodes', () => {
     const sent = dispatched()
     await w.advance(10 * 60_000)
 
-    // Each attempt is a paid render. The same failure on the second node is
-    // taken as the scene's, not 2 chunks x 9 attempts on the machines' budget
-    // (a dispatch already under way when it tripped runs its course).
+    // Each attempt is a paid render. A chunk failing the same way a second
+    // time counts, and that on 2 nodes is taken as the scene's: here each
+    // chunk twice on the node it began on (the other was busy each time it
+    // came back), with one more attempt already under way when it tripped.
+    // Not 2 chunks x 9 attempts on the machines' budget.
     expect(dispatched()).toBe(sent)
     expect(specs.length).toBeLessThanOrEqual(sent)
-    expect(sent).toBeLessThanOrEqual(3)
+    expect(sent).toBeLessThanOrEqual(5)
     const job = await w.invoke('job:get', jobId)
     expect(job?.attention).toMatchObject({
       kind: 'repeatedFailure',
@@ -713,6 +715,45 @@ describe('1.17: the job breaker, the same failure on two nodes', () => {
     })
     expect(w.alerts('error').filter((a) => a.includes('is held'))).toHaveLength(1)
     expect(w.vast.count('createInstance')).toBe(2)
+  })
+
+  it('1.17: one host-RAM kill on each 4-GPU node, as every lane loads the scene, never holds the job', async () => {
+    w = await setup({ settings: { maxActiveNodes: 2 } })
+    const app = await w.boot()
+    const ids = [await w.readyNode(app, { num_gpus: 4 }), await w.readyNode(app, { num_gpus: 4 })]
+    const specs: AgentSpec[] = []
+    for (const id of ids) {
+      const machine = w.machineFor(id)
+      let killed = false
+      machine.onSpec = (spec) => {
+        specs.push(spec)
+        if (!killed) {
+          killed = true
+          // Four Blenders load the scene at once, and the kernel's OOM killer
+          // takes one of them. Every render after that has the room.
+          setTimeout(() => machine.agent.fail(spec.chunkId, 'blender exited -9', -9), 10_000)
+        } else {
+          setTimeout(() => {
+            if (machine.agent.spec(spec.chunkId)) machine.agent.finish(spec.chunkId)
+          }, 120_000)
+        }
+      }
+    }
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 16, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => settled(jobId), 'job settled', { timeoutMs: 60 * 60_000 })
+
+    // One kill on each node, before any chunk of the job had rendered, is
+    // each node's packing, not the scene: both killed chunks render on the
+    // other node, and nothing waits on the user.
+    expect(jobState(jobId)).toBe('complete')
+    expect(attentionOf(jobId)).toBeNull()
+    expect(w.alerts('error').filter((a) => a.includes('is held'))).toEqual([])
+    expect(downloaded(jobId)).toEqual(Array.from({ length: 16 }, (_, i) => i + 1))
+    const chunks = chunksOf(jobId)
+    expect(chunks.map((c) => c.retries)).toEqual(chunks.map(() => 0))
+    expect(chunks.filter((c) => c.infra_retries > 0)).toHaveLength(2)
+    expect(specs).toHaveLength(18)
   })
 
   it('1.17: on a one-node fleet, a render out of GPU memory every time stops at its render retries', async () => {
