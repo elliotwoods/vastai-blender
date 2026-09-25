@@ -10,13 +10,22 @@
  * - click outside it to centre it there (and keep dragging to pan);
  * - Ctrl/⌘ + wheel zooms about the cursor, a plain wheel pans;
  * - keyboard: ←/→ pan (Shift for a page), +/− zoom, Home/End, 0 for all.
+ *
+ * The columns come from segmentsFromChunks, the same segments the job's
+ * summary ProgressBar draws, so the two agree frame for frame: a stretch no
+ * chunk covers any more (a retry narrowed its chunk to the missing frames)
+ * is done on both.
  */
 
 import { useEffect, useMemo, useRef } from 'react'
+import {
+  segmentsFromChunks,
+  type ProgressSegment,
+  type SegmentTone
+} from '../components/progressSegments'
 import { CHUNK_TONE, TOKENS, type StatusTone } from '../lib/theme'
 import type { FrameDomain } from './frame-domain'
 import {
-  chunkSpans,
   clampView,
   dragEdge,
   minimapColumns,
@@ -26,15 +35,35 @@ import {
   wholeView,
   zoomAround,
   type LiveProgress,
+  type StateSpan,
   type View
 } from './zoom-window'
-import type { ChunkSnapshot } from '../../../shared/models'
+import type { ChunkSnapshot, ChunkState } from '../../../shared/models'
 
 export type { LiveProgress }
 
 /** Grab width of each view-window edge, px. */
 const HANDLE = 6
 const HEIGHT = 20
+
+/** A segment's tone as the chunk state the columns are coloured by. */
+const STATE_OF: Record<SegmentTone, ChunkState> = {
+  done: 'complete',
+  working: 'rendering',
+  queued: 'pending',
+  failed: 'failed',
+  cancelled: 'cancelled'
+}
+
+/** The bar's segments as the minimap's spans; nothing before the job has chunks. */
+function spansFromSegments(segments: readonly ProgressSegment[]): StateSpan[] {
+  return segments.map((s) => ({
+    from: s.start,
+    to: s.start + s.frames - 1,
+    state: STATE_OF[s.tone],
+    done: s.done
+  }))
+}
 
 type Drag = { kind: 'from' | 'to'; start: View } | { kind: 'pan'; start: View; grab: number }
 
@@ -63,7 +92,16 @@ export function FrameMinimap({
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const spans = useMemo(
-    () => chunkSpans(domain, chunks, liveProgress),
+    () =>
+      chunks && chunks.length > 0
+        ? spansFromSegments(
+            segmentsFromChunks(chunks, liveProgress, {
+              frameStart: domain.start,
+              frameEnd: domain.end,
+              frameStep: domain.step
+            })
+          )
+        : [],
     [domain, chunks, liveProgress]
   )
 

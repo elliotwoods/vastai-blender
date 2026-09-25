@@ -1,197 +1,123 @@
+/**
+ * One job, in full. On a wide window every job is listed down the left
+ * (JobsSidebar) so moving between them is one click, or Alt+↑/↓. The rest
+ * is one scrolling column, in the order a question about a job is usually
+ * asked: how is it set up (settings, node sharing), how far along is it
+ * (summary bar, time, counts), what is rendering right now (live: node, GPU,
+ * frame, Blender's status), what has it made (the zoomable filmstrip), and
+ * the detail: where the time goes, the chunks and the node logs, side by
+ * side when the column has the room.
+ */
+
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
-import { Icon } from '../../components/Icon'
+import { useWidth } from '../../components/charts/useWidth'
 import { OpenInExplorerButton } from '../../components/OpenInExplorerButton'
-import {
-  btn,
-  iconBtn,
-  logLine,
-  mono,
-  panel,
-  readout,
-  sectionLabel,
-  segmented
-} from '../../lib/controls'
+import { segmentTotals, segmentsFromChunks } from '../../components/progressSegments'
+import { btn, mono, readout } from '../../lib/controls'
 import { basename, fmtFrames, fmtMoney } from '../../lib/format'
-import { ipc } from '../../lib/ipc'
-import { useLogStore } from '../../lib/logStore'
 import { useNav } from '../../lib/nav'
-import { usePreview } from '../../lib/preview'
-import { useChunkProgress } from '../../lib/progressStore'
-import { useJob, useResumeJob, useRetryMissing, useSetJobShareNode } from '../../lib/queries'
+import { isPreviewOpen, usePreview } from '../../lib/preview'
+import { useJobProgress } from '../../lib/progressStore'
+import {
+  useAddons,
+  useCancelJob,
+  useJob,
+  useJobs,
+  useNodes,
+  useQueue,
+  useRemoveJob,
+  useResumeJob,
+  useRetryMissing,
+  useSetJobShareNode,
+  useUngroupJob
+} from '../../lib/queries'
 import { describeResume, describeRetry, ipcErrorText } from '../../lib/recovery'
-import { CHUNK_TONE, SCALE, STATUS_VARS, TOKENS } from '../../lib/theme'
-import { Filmstrip } from '../../media/Filmstrip'
-import type { ChunkSnapshot } from '../../../../shared/models'
+import { SCALE, TOKENS } from '../../lib/theme'
+import { useMediaQuery } from '../../lib/useMediaQuery'
+import { ZoomFilmstrip } from '../../media/ZoomFilmstrip'
+import { ChunkGrid } from './ChunkGrid'
 import { JobActions, JobAttentionNote, SceneChangedNote } from './JobActions'
+import { JobSettingsPanel } from './JobSettingsPanel'
+import { JobsSidebar } from './JobsSidebar'
+import { JobSummaryPanel } from './JobSummaryPanel'
+import { LiveProgressPanel } from './LiveProgressPanel'
+import { LOG_HEIGHT, LogPanel } from './LogPanel'
 import { RenderTimes } from './RenderTimes'
+import { Section } from './Section'
+import {
+  isActiveChunk,
+  neighbourJob,
+  nodeLabel,
+  readFlag,
+  SETTINGS_KEY,
+  SIDEBAR_KEY,
+  sidebarOrder,
+  writeFlag
+} from './jobDetailModel'
 
-function ChunkCell({ chunk }: { chunk: ChunkSnapshot }): React.JSX.Element {
-  const openPreview = usePreview((s) => s.open)
-  const live = useChunkProgress(chunk.id)
-  const tone = STATUS_VARS[CHUNK_TONE[chunk.state]]
-  const total = chunk.frameEnd - chunk.frameStart + 1
-  // The DB column is a floor: it only moves when the poller writes it. Live
-  // progress leads it, so prefer whichever is further along.
-  const done = Math.max(chunk.framesDone, live?.framesDone ?? 0)
-  const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0
-  // Openable as soon as there is anything to see, not only when complete —
-  // watching a chunk render is the point of the live preview.
-  const clickable = done > 0 || chunk.state !== 'pending'
-  return (
-    <div
-      onClick={clickable ? () => openPreview({ jobId: chunk.jobId, chunkId: chunk.id }) : undefined}
-      title={`${chunk.id}${chunk.nodeId ? ` on ${chunk.nodeId.slice(0, 8)}` : ''}${chunk.retries ? ` (retry ${chunk.retries})` : ''}`}
-      style={{
-        border: `1px solid ${tone.border}`,
-        background: tone.fill,
-        color: tone.text,
-        borderRadius: SCALE.radiusSm,
-        padding: '6px 8px',
-        minWidth: 92,
-        cursor: clickable ? 'pointer' : 'default'
-      }}
-    >
-      <div style={{ ...mono, fontSize: SCALE.textXs }}>
-        {chunk.frameStart}–{chunk.frameEnd}
-      </div>
-      <div style={{ fontSize: 'var(--text-2xs)', opacity: 0.8 }}>{chunk.state}</div>
-      <div
-        style={{ height: 2, background: 'rgba(255,255,255,0.25)', borderRadius: 1, marginTop: 4 }}
-      >
-        <div
-          style={{
-            height: '100%',
-            width: `${pct}%`,
-            background: 'rgba(255,255,255,0.9)',
-            borderRadius: 1
-          }}
-        />
-      </div>
-    </div>
-  )
+/** The window width at which the jobs sidebar shows. */
+export const SIDEBAR_QUERY = '(min-width: 1280px)'
+/** The column width at which the chunks and the log sit side by side. */
+export const SIDE_BY_SIDE_PX = 1100
+
+/** A key event aimed at something that takes arrow keys itself. */
+function inField(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  const tag = target.tagName
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable
 }
 
-const LINE_H = 16
-
-function LogPanel({ nodeIds }: { nodeIds: string[] }): React.JSX.Element {
-  const byNode = useLogStore((s) => s.byNode)
-  const [selected, setSelected] = useState<string | null>(null)
-  const [autoscroll, setAutoscroll] = useState(true)
-  const scrollRef = useRef<HTMLDivElement>(null)
-  const [range, setRange] = useState({ from: 0, to: 200 })
-
-  const activeNode = selected ?? nodeIds[0] ?? null
-  const lines = useMemo(() => (activeNode ? (byNode[activeNode] ?? []) : []), [byNode, activeNode])
-
-  // Manual windowing: fixed line height, render only the visible slice.
-  const onScroll = (): void => {
-    const el = scrollRef.current
-    if (!el) return
-    const from = Math.max(0, Math.floor(el.scrollTop / LINE_H) - 20)
-    const to = Math.min(lines.length, from + Math.ceil(el.clientHeight / LINE_H) + 40)
-    setRange({ from, to })
-    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - LINE_H * 2
-    setAutoscroll(atBottom)
-  }
-
-  useEffect(() => {
-    const el = scrollRef.current
-    if (el && autoscroll) {
-      el.scrollTop = el.scrollHeight
-      const from = Math.max(0, lines.length - Math.ceil(el.clientHeight / LINE_H) - 40)
-      setRange({ from, to: lines.length })
-    }
-  }, [lines.length, autoscroll])
-
-  return (
-    <div style={{ ...panel(), display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1 }}>
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: SCALE.space2,
-          padding: SCALE.space2,
-          borderBottom: `1px solid ${TOKENS.border}`
-        }}
-      >
-        <span style={sectionLabel()}>logs</span>
-        {nodeIds.map((id, i) => (
-          <button
-            key={id}
-            style={segmented({
-              active: id === activeNode,
-              position:
-                nodeIds.length === 1
-                  ? 'only'
-                  : i === 0
-                    ? 'first'
-                    : i === nodeIds.length - 1
-                      ? 'last'
-                      : 'middle'
-            })}
-            onClick={() => setSelected(id)}
-          >
-            <span style={mono}>{id.slice(0, 8)}</span>
-          </button>
-        ))}
-        <span style={{ flex: 1 }} />
-        <button
-          title="Autoscroll"
-          aria-label="Autoscroll"
-          aria-pressed={autoscroll}
-          style={iconBtn({ size: 'sm', active: autoscroll })}
-          onClick={() => setAutoscroll(!autoscroll)}
-        >
-          <Icon name="autoscroll" />
-        </button>
-      </div>
-      <div
-        ref={scrollRef}
-        onScroll={onScroll}
-        style={{ flex: 1, overflow: 'auto', padding: SCALE.space2, minHeight: 0 }}
-      >
-        <div style={{ height: lines.length * LINE_H, position: 'relative' }}>
-          {lines.slice(range.from, range.to).map((l, i) => (
-            <div
-              key={range.from + i}
-              style={{
-                ...logLine(),
-                position: 'absolute',
-                top: (range.from + i) * LINE_H,
-                left: 0,
-                right: 0,
-                height: LINE_H,
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis'
-              }}
-            >
-              {l.line}
-            </div>
-          ))}
-        </div>
-        {lines.length === 0 ? (
-          <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
-            No log output yet.
-          </span>
-        ) : null}
-      </div>
-    </div>
-  )
+function useFlag(key: string, fallback: boolean): [boolean, () => void] {
+  const [v, setV] = useState(() => readFlag(key, fallback))
+  return [
+    v,
+    () =>
+      setV((prev) => {
+        writeFlag(key, !prev)
+        return !prev
+      })
+  ]
 }
 
 export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element {
-  const { data: job } = useJob(jobId)
+  const { data: job, isLoading } = useJob(jobId)
+  const { data: jobs } = useJobs()
+  const { data: queue } = useQueue()
+  const { data: nodes } = useNodes()
+  const { data: addons } = useAddons()
+  const progress = useJobProgress(jobId)
   const { navigate } = useNav()
-  const setShare = useSetJobShareNode()
   const openPreview = usePreview((s) => s.open)
 
-  const nodeIds = useMemo(() => {
-    const ids = new Set<string>()
-    for (const c of job?.chunks ?? []) if (c.nodeId) ids.add(c.nodeId)
-    return [...ids]
-  }, [job])
+  const wide = useMediaQuery(SIDEBAR_QUERY)
+  const [sidebarOpen, toggleSidebar] = useFlag(SIDEBAR_KEY, true)
+  const [settingsOpen, toggleSettings] = useFlag(SETTINGS_KEY, true)
+  const order = useMemo(() => sidebarOrder(jobs ?? []), [jobs])
+
+  // Alt+↑/↓: the previous or next job, in the sidebar's order, whether or
+  // not the sidebar is showing. Not while the preview overlay has the keys.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (!e.altKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return
+      if (isPreviewOpen() || inField(e.target)) return
+      const next = neighbourJob(order, jobId, e.key === 'ArrowUp' ? -1 : 1)
+      if (!next) return
+      e.preventDefault()
+      navigate({ screen: 'job', jobId: next })
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [order, jobId, navigate])
+
+  const columnRef = useRef<HTMLDivElement>(null)
+  const columnWidth = useWidth(columnRef)
+  const sideBySide = columnWidth >= SIDE_BY_SIDE_PX
+
+  const setShare = useSetJobShareNode()
+  const ungroup = useUngroupJob()
+  const cancel = useCancelJob()
+  const remove = useRemoveJob()
 
   // "Re-render missing" (plan 1.15): what it queued, or why main refused,
   // beside the button. Kept per job, so another job's screen starts clean.
@@ -209,6 +135,53 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
       (r) => setNote({ jobId, text: describeResume(r) }),
       (e: unknown) => setNote({ jobId, text: ipcErrorText(e) })
     )
+  const onRemove = (): Promise<void> =>
+    remove.mutateAsync(jobId).then(
+      () => navigate({ screen: 'jobs' }),
+      (e: unknown) => setNote({ jobId, text: ipcErrorText(e) })
+    )
+
+  // The frame picked in the filmstrip, per job like the note.
+  const [picked, setPicked] = useState<{ jobId: string; frame: number } | null>(null)
+  const currentFrame = picked?.jobId === jobId ? picked.frame : undefined
+  const openFrame = (frame: number): void => {
+    const owner = job?.chunks.find((c) => frame >= c.frameStart && frame <= c.frameEnd)
+    if (owner) openPreview({ jobId, chunkId: owner.id, frame })
+  }
+
+  const segments = useMemo(
+    () => segmentsFromChunks(job?.chunks, progress, job ?? undefined),
+    [job, progress]
+  )
+  const totals = useMemo(() => segmentTotals(segments), [segments])
+
+  const nodeIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const c of job?.chunks ?? []) if (c.nodeId) ids.add(c.nodeId)
+    return [...ids]
+  }, [job])
+  const labelOf = (id: string): string =>
+    nodeLabel(
+      nodes?.find((n) => n.id === id),
+      id
+    )
+  const hasActive = (job?.chunks ?? []).some((c) => isActiveChunk(c.state))
+
+  const chunks = job ? (
+    <Section title="chunks">
+      <ChunkGrid
+        chunks={job.chunks}
+        step={job.frameStep}
+        nodeLabel={labelOf}
+        maxHeight={sideBySide ? LOG_HEIGHT : undefined}
+      />
+    </Section>
+  ) : null
+  const logs = (
+    <Section title="node logs">
+      <LogPanel nodeIds={nodeIds} />
+    </Section>
+  )
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -227,7 +200,8 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
                 job={job}
                 onResume={onResume}
                 onRetryMissing={onRetryMissing}
-                onCancel={() => ipc.invoke('job:cancel', jobId)}
+                onCancel={() => cancel.mutateAsync(jobId)}
+                onRemove={onRemove}
                 note={note?.jobId === jobId ? note.text : null}
               />
             </>
@@ -245,97 +219,116 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
             <span style={{ fontSize: SCALE.textSm, color: TOKENS.textSecondary }}>
               {job ? job.name || basename(job.blendPath) : jobId}
             </span>
-            {job?.blenderVersion ? (
-              <span style={{ ...mono, fontSize: 'var(--text-2xs)', color: TOKENS.textFaint }}>
-                blender {job.blenderVersion}
-              </span>
-            ) : null}
-            {job ? <OpenInExplorerButton path={job.blendPath} /> : null}
             {job ? (
-              <label
-                title={
-                  'Let this job run alongside other renders on one node. Takes effect for chunks ' +
-                  'not yet assigned — anything already rendering keeps its current placement.'
-                }
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 5,
-                  fontSize: SCALE.textXs,
-                  color: TOKENS.textMuted,
-                  cursor: setShare.isPending ? 'wait' : 'pointer'
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={job.shareNode}
-                  disabled={setShare.isPending}
-                  onChange={(e) => setShare.mutate({ jobId, shareNode: e.target.checked })}
-                />
-                share node
-              </label>
+              <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>{job.state}</span>
             ) : null}
             {job ? <JobAttentionNote job={job} /> : null}
             {job ? <SceneChangedNote job={job} /> : null}
           </>
         }
       />
-      <div
-        style={{ flex: 1, display: 'flex', gap: SCALE.space4, padding: SCALE.space4, minHeight: 0 }}
-      >
-        <div
-          style={{
-            flex: '0 0 58%',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: SCALE.space3,
-            minHeight: 0
-          }}
-        >
-          {job ? (
-            <>
-              <span style={sectionLabel()}>frames</span>
-              <div style={{ ...panel(), padding: SCALE.space2 }}>
-                <Filmstrip
-                  jobId={jobId}
-                  frameStart={job.frameStart}
-                  frameEnd={job.frameEnd}
-                  frameStep={job.frameStep}
-                  chunks={job.chunks}
-                  onSelect={(frame) => {
-                    const owner = job.chunks.find(
-                      (c) => frame >= c.frameStart && frame <= c.frameEnd
-                    )
-                    if (owner) openPreview({ jobId, chunkId: owner.id, frame })
-                  }}
-                />
-              </div>
-            </>
-          ) : null}
-
-          <span style={sectionLabel()}>chunks</span>
+      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+        {wide ? (
+          <JobsSidebar
+            jobs={order}
+            currentId={jobId}
+            open={sidebarOpen}
+            onToggle={toggleSidebar}
+            onOpen={(id) => navigate({ screen: 'job', jobId: id })}
+          />
+        ) : null}
+        <div style={{ flex: 1, minWidth: 0, overflowY: 'auto' }}>
           <div
+            ref={columnRef}
             style={{
-              ...panel(),
-              padding: SCALE.space3,
               display: 'flex',
-              flexWrap: 'wrap',
-              gap: SCALE.space2,
-              alignContent: 'flex-start',
-              overflow: 'auto'
+              flexDirection: 'column',
+              gap: SCALE.space5,
+              padding: SCALE.space4,
+              minWidth: 0
             }}
           >
-            {(job?.chunks ?? []).map((c) => (
-              <ChunkCell key={c.id} chunk={c} />
-            ))}
-            {job && job.chunks.length === 0 ? (
-              <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>No chunks.</span>
-            ) : null}
+            {job ? (
+              <>
+                <Section title="settings" open={settingsOpen} onToggle={toggleSettings}>
+                  <JobSettingsPanel
+                    job={job}
+                    onShareChange={(shareNode) => setShare.mutate({ jobId, shareNode })}
+                    sharePending={setShare.isPending}
+                    queue={queue}
+                    jobs={jobs}
+                    addons={addons}
+                    onUngroup={() => ungroup.mutate(jobId)}
+                    ungroupPending={ungroup.isPending}
+                  />
+                </Section>
+
+                <Section title="progress">
+                  <JobSummaryPanel job={job} segments={segments} totals={totals} />
+                </Section>
+
+                {hasActive ? (
+                  <Section title="rendering now">
+                    <LiveProgressPanel
+                      chunks={job.chunks}
+                      step={job.frameStep}
+                      progress={progress}
+                      nodes={nodes}
+                    />
+                  </Section>
+                ) : null}
+
+                <Section
+                  title="frames"
+                  right={
+                    <span style={{ fontSize: 'var(--text-2xs)', color: TOKENS.textFaint }}>
+                      click to pick · double-click or Enter to preview · ←/→ step
+                    </span>
+                  }
+                >
+                  <ZoomFilmstrip
+                    jobId={jobId}
+                    frameStart={job.frameStart}
+                    frameEnd={job.frameEnd}
+                    frameStep={job.frameStep}
+                    chunks={job.chunks}
+                    liveProgress={progress}
+                    currentFrame={currentFrame}
+                    onSelect={(frame) => setPicked({ jobId, frame })}
+                    onOpen={openFrame}
+                  />
+                </Section>
+
+                {job.renderTimes?.some((t) => t.frames > 0) ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: SCALE.space2 }}>
+                    <RenderTimes times={job.renderTimes} />
+                  </div>
+                ) : null}
+
+                {sideBySide ? (
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+                      gap: SCALE.space4
+                    }}
+                  >
+                    {chunks}
+                    {logs}
+                  </div>
+                ) : (
+                  <>
+                    {chunks}
+                    {logs}
+                  </>
+                )}
+              </>
+            ) : (
+              <span style={{ fontSize: SCALE.textSm, color: TOKENS.textFaint }}>
+                {isLoading ? 'Loading job…' : 'This job is not in the list any more.'}
+              </span>
+            )}
           </div>
-          {job?.renderTimes ? <RenderTimes times={job.renderTimes} /> : null}
-        </div>
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-          <LogPanel nodeIds={nodeIds} />
         </div>
       </div>
     </div>
