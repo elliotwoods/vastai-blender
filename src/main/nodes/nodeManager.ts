@@ -3119,8 +3119,13 @@ export class NodeManager {
       if (inst === undefined) return
       held = node.state
       if (!inst) {
-        // Vast no longer knows the instance: that confirms it gone.
-        this.instanceGone(instanceId, 'instance missing at resume')
+        // Vast no longer knows the instance, or answered without it: its
+        // DELETE's 404 confirms it gone, as in lost(). showInstance's null is
+        // no proof on its own, and the row, stamped destroyed on it, stopped
+        // counting while the instance could bill on.
+        const reason = 'instance missing at resume'
+        node.setState('destroying', reason)
+        await this.ensureInstanceGone(instanceId, { node, reason })
         return
       }
       if (inst.actual_status !== 'running') {

@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NodeState } from '../../shared/models'
+import type { RawInstance } from '../vast/types'
 import { FakeSshConnection } from '../test/fakeSsh'
 import { setup, type App, type FakeMachine, type World } from '../test/harness'
 
@@ -226,6 +227,26 @@ describe('destroy while a restart re-provisions the node (resumeNode)', () => {
     expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
     expect(w.vast.machine(instanceId).connects).toBe(0)
     expect(w.alerts('error')).toEqual([])
+  })
+})
+
+describe('an instance Vast does not list at resume', () => {
+  it('is destroyed until its DELETE confirms it, not written off on one answer (review of 1.7)', async () => {
+    // showInstance reads a 200 without an instance as "gone", the same as a
+    // 404. Taken on trust, the row was stamped destroyed while the instance
+    // billed on.
+    const { app, id, instanceId } = await restartWith('ready', () => {
+      const show = w.vast.showInstance.bind(w.vast)
+      vi.spyOn(w.vast, 'showInstance')
+        .mockImplementationOnce(() => Promise.resolve(null as unknown as RawInstance))
+        .mockImplementation((i: number) => show(i))
+    })
+    await w.until(() => app.nodeManager.get(id)?.state === 'destroyed', 'node let go')
+    expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
+    expect(w.vast.live()).toEqual([])
+    expect(w.get('SELECT last_error FROM nodes WHERE id = ?', id)).toEqual({
+      last_error: 'instance missing at resume'
+    })
   })
 })
 

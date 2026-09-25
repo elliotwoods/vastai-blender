@@ -211,7 +211,8 @@ describe('1.6 resumeNode: Vast down at start-up is not the instance gone (#33)',
       w.get<{ destroyed_at: number | null }>('SELECT destroyed_at FROM nodes WHERE id = ?', id)
         ?.destroyed_at
     ).not.toBeNull()
-    expect(w.vast.count('destroyInstance')).toBe(1) // the test's own
+    // The test's own, then the app's, whose 404 is what confirms it gone.
+    expect(w.vast.count('destroyInstance')).toBe(2)
     expect(app.nodeManager.activeCount()).toBe(0)
   })
 })
