@@ -63,6 +63,11 @@ export async function cancelJob(jobId: string): Promise<void> {
   await done
 }
 
+/** Is a cancel of `jobId` still stopping its renders on the nodes? */
+export function isCancelling(jobId: string): boolean {
+  return cancelling.has(jobId)
+}
+
 /**
  * Queue again every frame of `jobId` not yet downloaded (see
  * reviveFailedChunks, whose refusals it passes on). A job the breaker held

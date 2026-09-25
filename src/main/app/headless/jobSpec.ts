@@ -333,7 +333,9 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
 
   // 'partial' included: resubmitting a spec HEALS a half-done job
   // (its missing frames queued again below) instead of duplicating it.
-  const allJobs = listJobs()
+  // Jobs the user removed from the list included: removing one must not
+  // have the next run of the campaign render it again.
+  const allJobs = listJobs({ includeHidden: true })
   const active = allJobs.filter((j) => ['queued', 'running', 'partial'].includes(j.state))
   let created = 0
   for (const blend of blends) {

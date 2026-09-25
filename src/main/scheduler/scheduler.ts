@@ -73,6 +73,7 @@ import {
   type NodeOccupancy,
   type RetryBudget
 } from './admission'
+import { entryKey, orderQueue, type JobProgress } from './queueOrder'
 import {
   dispatchLanePlan,
   guardedLanePlan,
@@ -390,6 +391,9 @@ interface PendingChunk extends ChunkRow {
   blender_version: string | null
   /** frames of its range not yet downloaded: what a node would render for it */
   frames_left: number
+  /** the job's place in the render queue (jobs/queue.ts), and its group */
+  queue_pos: number | null
+  group_id: string | null
 }
 
 /**
@@ -2613,6 +2617,12 @@ class Scheduler {
     return [...s].map((r) => ({ chunkId: r.chunkId, jobId: r.jobId, gpu: r.gpu }))
   }
 
+  /** Does job `jobId` have a run in flight (dispatching, rendering, downloading)? */
+  hasJobRuns(jobId: string): boolean {
+    for (const r of this.runs.values()) if (r.jobId === jobId) return true
+    return false
+  }
+
   /**
    * What job `jobId` renders at right now (jobs.ts setJobRateProvider, the
    * ETA's fallbacks before frames land): the sum of its runs' measured rates,
@@ -2973,7 +2983,9 @@ class Scheduler {
   }
 
   /**
-   * Pending chunks with frames left to render, oldest job first, carrying
+   * Pending chunks with frames left to render, in render-queue order
+   * (jobs/queue.ts: queue_pos, then submission; a group's chunks
+   * interleaved towards equal progress by queueOrder.ts), carrying
    * their job's sharing flag and blender version. Joining here rather than
    * re-querying per candidate keeps the assignment loop to one query per tick
    * instead of one per (node, candidate) pair.
@@ -2987,18 +2999,43 @@ class Scheduler {
   private pendingChunks(): PendingChunk[] {
     const rows = getDb()
       .prepare(
-        `SELECT c.*, j.share_node, j.engine, j.blender_version,
+        `SELECT c.*, j.share_node, j.engine, j.blender_version, j.queue_pos, j.group_id,
                 (SELECT COUNT(*) FROM ${UNDOWNLOADED_OF_C}) AS frames_left
            FROM chunks c JOIN jobs j ON j.id = c.job_id
           WHERE c.state = 'pending' AND j.state IN ('queued', 'running')
             AND j.attention IS NULL
-          ORDER BY j.submitted_at, c.frame_start`
+          ORDER BY j.queue_pos IS NULL, j.queue_pos, j.submitted_at, c.job_id, c.frame_start`
       )
       .all() as PendingChunk[]
     // Work a campaign did not name, left in a narrowed recovery hold.
     const withheld =
       this.recoveryPerJob && this.recoveryHold ? new Set(this.recoveryHold.jobIds) : null
-    return rows.filter((c) => c.frames_left > 0 && !withheld?.has(c.job_id))
+    const offered = rows.filter((c) => c.frames_left > 0 && !withheld?.has(c.job_id))
+    return orderQueue(offered, this.groupProgress(offered))
+  }
+
+  /**
+   * For the grouped jobs among `pending`: every frame, and those not waiting
+   * in a pending chunk (rendered, rendering, or on disk), which queueOrder
+   * evens out across a group.
+   */
+  private groupProgress(pending: readonly PendingChunk[]): Map<string, JobProgress> {
+    const out = new Map<string, JobProgress>()
+    const grouped = [...new Set(pending.filter((c) => c.group_id != null).map((c) => c.job_id))]
+    if (grouped.length === 0) return out
+    const totals = getDb()
+      .prepare(
+        `SELECT job_id, COUNT(*) AS n FROM frames
+          WHERE job_id IN (${grouped.map(() => '?').join(', ')}) GROUP BY job_id`
+      )
+      .all(...grouped) as Array<{ job_id: string; n: number }>
+    const waiting = new Map<string, number>()
+    for (const c of pending) waiting.set(c.job_id, (waiting.get(c.job_id) ?? 0) + c.frames_left)
+    for (const t of totals) {
+      const total = Number(t.n)
+      out.set(t.job_id, { total, committed: Math.max(0, total - (waiting.get(t.job_id) ?? 0)) })
+    }
+    return out
   }
 
   /**
@@ -3396,8 +3433,10 @@ class Scheduler {
 
   /**
    * Index of the best pending chunk for this node, or -1 if it may take none.
-   * Queue order (oldest job first) breaks ties, so an admissible chunk is only
-   * passed over for one that saves a Blender install.
+   * Queue order breaks ties, so an admissible chunk is only passed over for
+   * one that saves a Blender install, and only for one of the same queue
+   * entry (its job, or its group): Blender affinity never lets work further
+   * down the queue go ahead of the first the node could take.
    *
    * A chunk goes back to a node it failed on for a machine's or the
    * network's reason only when no other node this tick could take it: the
@@ -3421,14 +3460,19 @@ class Scheduler {
       }
       return o
     }
+    let entry: string | null = null
     for (let i = 0; i < pending.length; i++) {
       const c = pending[i]
+      if (entry != null && entryKey(c) !== entry) break
       if (!this.takesEngine(node.id, c.engine)) continue
       if (!admits(occupancy(c.engine), { id: c.id, sharesNode: c.share_node === 1 })) continue
       const avoid = this.failedOn.get(c.id)?.nodes
       if (avoid?.has(node.id) && this.anotherTakes(c, avoid, eligible)) continue
       if (!c.blender_version || node.blenderVersions.includes(c.blender_version)) return i
-      if (fallback < 0) fallback = i
+      if (fallback < 0) {
+        fallback = i
+        entry = entryKey(c)
+      }
     }
     return fallback
   }

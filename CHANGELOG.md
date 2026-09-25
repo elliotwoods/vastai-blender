@@ -22,6 +22,18 @@ stalled the app).
 
 ### Added
 
+- **A render queue you can reorder, group and tidy.** Jobs have a place in
+  the queue (`queue_pos`, schema v9, existing jobs in submit order) that the
+  scheduler now follows instead of submit time; a revived job goes to the
+  end. Grouped jobs share one place and have their chunks handed out in turn
+  towards equal progress (`scheduler/queueOrder.ts`); a job leaves its group
+  when it ends. A finished job can be removed from the Jobs list and
+  restored; its files stay, and a campaign resubmitting it still finds it.
+  New IPC: `queue:list`, `job:move`, `job:group`, `job:ungroup`,
+  `job:remove`, `job:restore`, and `jobs:list` takes `{includeHidden}`.
+  Blender-version affinity no longer lets a node take work from further
+  down the queue than the first chunk it could take.
+
 - **Elapsed, remaining and ETA per job, and a job thumbnail.** Jobs record
   when their first chunk went out (`started_at`), when they ended
   (`finished_at`), and each frame when it landed (`downloaded_at`); upgrades

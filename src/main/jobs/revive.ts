@@ -226,6 +226,16 @@ export function reviveFailedChunks(jobId: string): RetryMissingResult {
     if (queued > 0 && job.state === 'cancelled') {
       db.prepare(`UPDATE jobs SET state = 'queued' WHERE id = ?`).run(jobId)
     }
+    // A finished job queued again joins the end of the queue (jobs/queue.ts),
+    // behind what was waiting meanwhile, and is listed again if the user had
+    // removed it. One still queued or running keeps its place.
+    if (queued > 0 && job.state !== 'queued' && job.state !== 'running') {
+      db.prepare(
+        `UPDATE jobs SET queue_pos = (SELECT COALESCE(MAX(queue_pos), 0) + 1 FROM jobs),
+                hidden_at = NULL, group_id = NULL
+          WHERE id = ?`
+      ).run(jobId)
+    }
   })()
 
   emitChunksChanged(touched)

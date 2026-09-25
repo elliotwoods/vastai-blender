@@ -47,7 +47,16 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- state (complete, partial, failed, cancelled); a revive clears
   -- finished_at. Epoch ms; null = not yet, or before they were recorded.
   started_at INTEGER,
-  finished_at INTEGER
+  finished_at INTEGER,
+  -- The render queue (jobs/queue.ts). queue_pos orders the queued and
+  -- running jobs, 1 first; the members of a group share one queue_pos and
+  -- the scheduler interleaves their chunks towards equal progress. group_id
+  -- is null for a job on its own; a job leaves its group when it ends.
+  -- hidden_at: removed from the Jobs list by the user (epoch ms); its files
+  -- and rows stay, and a campaign resubmitting it still finds it.
+  queue_pos INTEGER,
+  group_id TEXT,
+  hidden_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS chunks (

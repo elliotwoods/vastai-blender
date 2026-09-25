@@ -796,6 +796,29 @@ export interface JobSummary {
   timingAt: number
   /** media:// URL of the preview of the job's latest frame that has one; null = none yet */
   thumbUrl: string | null
+  /**
+   * Where the job stands in the render queue (jobs/queue.ts): lower goes
+   * first; every member of a group has the same one. Only meaningful while
+   * the job is queued or running; a finished job keeps its last. null = a
+   * job from before the queue whose position was never set.
+   */
+  queuePos: number | null
+  /** the group whose members share one priority and render in step; null = on its own */
+  groupId: string | null
+  /** epoch ms the user removed it from the Jobs list (job:remove); null = listed */
+  hiddenAt: number | null
+}
+
+/**
+ * One place in the render queue: a job on its own, or a group whose members
+ * share it (queue:list, job:move). Only queued and running jobs are in it.
+ */
+export interface QueueEntry {
+  /** 1-based, in dispatch order */
+  position: number
+  groupId: string | null
+  /** the job, or the group's members in the order they were submitted */
+  jobIds: string[]
 }
 
 export interface ChunkSnapshot {

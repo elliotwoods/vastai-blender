@@ -16,6 +16,7 @@ import {
   isBillingRisk
 } from '../shared/ipc'
 import type {
+  QueueEntry,
   AlertEvent,
   AssetIndex,
   ChunkSnapshot,
@@ -36,7 +37,7 @@ import type {
   ThumbAsset
 } from '../shared/models'
 import { applySettingsPatch, describeFieldErrors, type GateOptions } from './app/settingsGate'
-import { cancelJob, reprovisionNode, retryMissing } from './app/recovery'
+import { cancelJob, isCancelling, reprovisionNode, retryMissing } from './app/recovery'
 import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
 import { dismissAlerts, emit, onAlertSurfaced, onEvent, recentAlerts } from './events'
 import { hostPathFlavour } from './paths'
@@ -52,6 +53,17 @@ import {
 } from './nodes/metricsHistory'
 import { listAddons, registerAddon, removeAddon } from './addons/addons'
 import { createJob, getJob, listJobs, setJobShareNode } from './jobs/jobs'
+import { groupJobs, moveJob, queueEntries, removeJob, restoreJob, ungroupJob } from './jobs/queue'
+import {
+  groupInQueue,
+  inQueue,
+  moveInQueue,
+  placements,
+  queueOf,
+  QueueRefusal,
+  ungroupInQueue,
+  type QueueRow
+} from './jobs/queueModel'
 import { scheduler } from './scheduler/scheduler'
 import { co2Grams, intensityFor } from './carbon/intensity'
 import { getDb } from './db/db'
@@ -448,8 +460,72 @@ const mockNodes = (): NodeSnapshot[] => [
 /** A mock job's row, before its timing and thumbnail are worked out (mockJobs). */
 type MockJobRow = Omit<
   JobSummary,
-  'elapsedMs' | 'remainingMs' | 'etaAt' | 'framesPerHour' | 'timingBasis' | 'timingAt' | 'thumbUrl'
+  | 'elapsedMs'
+  | 'remainingMs'
+  | 'etaAt'
+  | 'framesPerHour'
+  | 'timingBasis'
+  | 'timingAt'
+  | 'thumbUrl'
+  | 'queuePos'
+  | 'groupId'
+  | 'hiddenAt'
 > & { thumb: string | null; downloadGapMs?: number }
+
+/**
+ * The mock jobs' places in the queue, which the mock queue channels change
+ * (so the Jobs screen's drag, group and remove can be tried under VR_MOCK).
+ * job-1 and job-5 start grouped.
+ */
+const mockQueue = new Map<
+  string,
+  { queuePos: number | null; groupId: string | null; hiddenAt: number | null }
+>([
+  ['job-1', { queuePos: 1, groupId: 'mock-group-1', hiddenAt: null }],
+  ['job-5', { queuePos: 1, groupId: 'mock-group-1', hiddenAt: null }],
+  ['job-2', { queuePos: 2, groupId: null, hiddenAt: null }],
+  ['job-3', { queuePos: 3, groupId: null, hiddenAt: null }],
+  ['job-4', { queuePos: 4, groupId: null, hiddenAt: null }]
+])
+
+function mockQueueRows(): QueueRow[] {
+  return mockJobs().map((j) => ({
+    id: j.id,
+    state: j.state,
+    queuePos: j.queuePos,
+    groupId: j.groupId,
+    submittedAt: j.submittedAt
+  }))
+}
+
+function mockJobOrThrow(jobId: string): JobSummary {
+  const job = mockJobs().find((j) => j.id === jobId)
+  if (!job) throw new QueueRefusal('not_found', `no job ${jobId}`)
+  return job
+}
+
+/** Write a mock queue back and announce every live mock job, as queue.ts does. */
+function mockWriteQueue(entries: QueueEntry[]): QueueEntry[] {
+  for (const [id, p] of placements(entries)) {
+    const q = mockQueue.get(id)
+    if (q) Object.assign(q, p)
+  }
+  for (const j of mockJobs()) if (inQueue(j.state)) emit('job:changed', j)
+  return entries
+}
+
+function mockSetHidden(jobId: string, hidden: boolean): void {
+  const job = mockJobOrThrow(jobId)
+  if (hidden && inQueue(job.state)) {
+    throw new QueueRefusal(
+      'active',
+      `job ${jobId} is ${job.state}; cancel it before removing it from the list`
+    )
+  }
+  const q = mockQueue.get(jobId)
+  if (q) q.hiddenAt = hidden ? (q.hiddenAt ?? Date.now()) : null
+  emit('job:changed', mockJobOrThrow(jobId))
+}
 
 /**
  * The mock jobs, each timed by the real estimate (shared/jobTiming.ts):
@@ -479,6 +555,29 @@ const mockJobs = (now = Date.now()): JobSummary[] => {
       finishedAt: null,
       thumb: 'media://fixtures/thumbs/0002.jpg',
       downloadGapMs: 9_000
+    },
+    // Grouped with job-1 (mockQueue): the two render in step.
+    {
+      id: 'job-5',
+      name: 'crowd_sim_b',
+      blendPath: 'C:/scenes/crowd_sim_b.blend',
+      engine: 'cycles',
+      frameStart: 1,
+      frameEnd: 120,
+      frameStep: 1,
+      state: 'running',
+      framesDone: 54,
+      framesTotal: 120,
+      framesCancelled: 0,
+      costSoFar: 0.52,
+      submittedAt: now - 40 * 60_000,
+      outputDir: 'C:/renders/job-5',
+      blenderVersion: '4.5.3',
+      shareNode: true,
+      startedAt: now - 38 * 60_000,
+      finishedAt: null,
+      thumb: 'media://fixtures/thumbs/0001.jpg',
+      downloadGapMs: 21_000
     },
     {
       id: 'job-2',
@@ -567,7 +666,10 @@ const mockJobs = (now = Date.now()): JobSummary[] => {
       framesPerHour: t.framesPerHour,
       timingBasis: t.basis,
       timingAt: now,
-      thumbUrl: thumb
+      thumbUrl: thumb,
+      queuePos: mockQueue.get(row.id)?.queuePos ?? null,
+      groupId: mockQueue.get(row.id)?.groupId ?? null,
+      hiddenAt: mockQueue.get(row.id)?.hiddenAt ?? null
     }
   })
 }
@@ -1168,7 +1270,11 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   })
 
   // -- jobs -----------------------------------------------------------------
-  handle('jobs:list', () => (MOCK ? mockJobs() : listJobs()))
+  handle('jobs:list', (opts) =>
+    MOCK
+      ? mockJobs().filter((j) => opts?.includeHidden || j.hiddenAt == null)
+      : listJobs({ includeHidden: opts?.includeHidden === true })
+  )
   handle('job:get', (id) => (MOCK ? mockJobDetail(id) : getJob(id)))
   handle('job:create', async (sub) => {
     // createJob refuses a scene that is not a file on this computer
@@ -1194,6 +1300,40 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   // ended in cancel and resubmit: a new output folder, and every frame
   // already rendered paid for again.
   handle('job:resume', (id) => (MOCK ? false : scheduler.resumeJob(id)))
+
+  // -- the render queue (jobs/queue.ts) ---------------------------------------
+  // A refusal throws QueueRefusal, whose message is "code: message".
+  handle('queue:list', () => (MOCK ? queueOf(mockQueueRows()) : queueEntries()))
+  handle('job:move', ({ jobId, before }) => {
+    if (MOCK) return mockWriteQueue(moveInQueue(queueOf(mockQueueRows()), jobId, before))
+    const queue = moveJob(jobId, before)
+    // The next chunk handed out follows the new order.
+    scheduler.kick()
+    return queue
+  })
+  handle('job:group', ({ jobId, withJobId }) => {
+    if (MOCK) {
+      const r = groupInQueue(queueOf(mockQueueRows()), jobId, withJobId, `mock-group-${Date.now()}`)
+      mockWriteQueue(r.entries)
+      return { groupId: r.groupId }
+    }
+    const r = groupJobs(jobId, withJobId)
+    scheduler.kick()
+    return r
+  })
+  handle('job:ungroup', (jobId) => {
+    if (MOCK) {
+      mockWriteQueue(ungroupInQueue(queueOf(mockQueueRows()), jobId))
+      return
+    }
+    ungroupJob(jobId)
+    scheduler.kick()
+  })
+  handle('job:remove', (jobId) => {
+    if (MOCK) return mockSetHidden(jobId, true)
+    removeJob(jobId, { liveRuns: scheduler.hasJobRuns(jobId) || isCancelling(jobId) })
+  })
+  handle('job:restore', (jobId) => (MOCK ? mockSetHidden(jobId, false) : restoreJob(jobId)))
 
   // -- scheduler ------------------------------------------------------------
   handle('scheduler:recoveryHold', () => {

@@ -45,7 +45,7 @@ export function applySchema(db: Db): void {
   markCancelledChunks(db)
 }
 
-const SCHEMA_VERSION = 8
+const SCHEMA_VERSION = 9
 
 /**
  * Column additions, which `CREATE TABLE IF NOT EXISTS` in schema.sql cannot
@@ -190,6 +190,18 @@ function migrate(db: Db): void {
   // Not in the step: a fresh database has the column from schema.sql, and
   // skips it.
   db.exec('CREATE INDEX IF NOT EXISTS idx_frames_downloaded ON frames(job_id, downloaded_at)')
+
+  // v9: the render queue. Existing jobs queue in the order they were
+  // submitted, as the scheduler has always taken them.
+  addColumn(db, 'jobs', 'queue_pos', 'INTEGER', () => {
+    db.prepare(
+      `UPDATE jobs SET queue_pos = ranked.pos
+       FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY submitted_at, id) AS pos FROM jobs) AS ranked
+       WHERE jobs.id = ranked.id`
+    ).run()
+  })
+  addColumn(db, 'jobs', 'group_id', 'TEXT')
+  addColumn(db, 'jobs', 'hidden_at', 'INTEGER')
 
   db.prepare('UPDATE schema_meta SET version = ?').run(SCHEMA_VERSION)
 }

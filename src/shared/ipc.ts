@@ -35,6 +35,7 @@ import type {
   NodeMetricsHistory,
   NodeMetricsHistoryQuery,
   NodeSnapshot,
+  QueueEntry,
   ReprovisionResult,
   RequestNodeOptions,
   RetryMissingResult,
@@ -152,7 +153,8 @@ export interface IpcInvokeMap {
   'preview:subscribe': { args: [{ chunkId: string; on: boolean }]; result: void }
 
   // jobs
-  'jobs:list': { args: []; result: JobSummary[] }
+  /** Every job, newest first; those removed from the list (job:remove) only with includeHidden. */
+  'jobs:list': { args: [opts?: { includeHidden?: boolean }]; result: JobSummary[] }
   'job:get': { args: [string]; result: JobDetail | null }
   'job:create': { args: [JobSubmission]; result: { jobId: string } }
   'job:cancel': { args: [string]; result: void }
@@ -173,6 +175,30 @@ export interface IpcInvokeMap {
    * outright (attention scene, engine or extension) stays failed.
    */
   'job:resume': { args: [string]; result: boolean }
+
+  // the render queue (jobs/queue.ts). A refusal rejects with "code: message",
+  // code one of not_found | conflict | active | bad_request.
+  /** The queued and running jobs in dispatch order; a group is one entry. */
+  'queue:list': { args: []; result: QueueEntry[] }
+  /**
+   * Move a job, with its whole group, to just before `before`'s place, or to
+   * the end when `before` is null. Resolves with the queue as it now is.
+   */
+  'job:move': { args: [{ jobId: string; before: string | null }]; result: QueueEntry[] }
+  /**
+   * Put `jobId` in `withJobId`'s group (made if it has none), at that
+   * group's place: they share one priority and render in step.
+   */
+  'job:group': { args: [{ jobId: string; withJobId: string }]; result: { groupId: string } }
+  /** Take a job out of its group, to the place just after it. */
+  'job:ungroup': { args: [string]; result: void }
+  /**
+   * Remove a finished job from the Jobs list; its files and rows stay.
+   * Rejects "active: …" while the job is queued or running (cancel it first).
+   */
+  'job:remove': { args: [string]; result: void }
+  /** List a removed job again. */
+  'job:restore': { args: [string]; result: void }
 
   // scheduler
   /**

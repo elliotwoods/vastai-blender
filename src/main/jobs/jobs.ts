@@ -53,6 +53,11 @@ interface JobRow {
   started_at: number | null
   /** epoch ms it reached a final state; null = not final */
   finished_at: number | null
+  /** the render queue (jobs/queue.ts); null = never placed */
+  queue_pos: number | null
+  group_id: string | null
+  /** epoch ms the user removed it from the list; null = listed */
+  hidden_at: number | null
 }
 
 interface ChunkRow {
@@ -279,7 +284,10 @@ function rowToSummary(r: JobRow, counts?: FrameCounts): JobSummary {
     framesPerHour: t.framesPerHour,
     timingBasis: t.basis,
     timingAt: now,
-    thumbUrl: c.thumb ? jobFileMediaUrl(r.id, r.output_dir, c.thumb) : null
+    thumbUrl: c.thumb ? jobFileMediaUrl(r.id, r.output_dir, c.thumb) : null,
+    queuePos: r.queue_pos,
+    groupId: r.group_id,
+    hiddenAt: r.hidden_at
   }
 }
 
@@ -301,8 +309,18 @@ function rowToChunk(r: ChunkRow): ChunkSnapshot {
   }
 }
 
-export function listJobs(): JobSummary[] {
-  const rows = getDb().prepare('SELECT * FROM jobs ORDER BY submitted_at DESC').all() as JobRow[]
+/**
+ * Every job, newest first. Leaves out the ones the user removed from the
+ * list (job:remove) unless `includeHidden`: a campaign resubmitting one must
+ * still find it, or removing a job from the list would render it again.
+ */
+export function listJobs(opts: { includeHidden?: boolean } = {}): JobSummary[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM jobs ${opts.includeHidden ? '' : 'WHERE hidden_at IS NULL'}
+        ORDER BY submitted_at DESC`
+    )
+    .all() as JobRow[]
   const counts = frameCounts()
   const none: FrameCounts = { total: 0, done: 0, cancelled: 0, thumb: null }
   return rows.map((r) => rowToSummary(r, counts.get(r.id) ?? none))
@@ -537,8 +555,9 @@ export async function createJob(sub: JobSubmission): Promise<string> {
     db.prepare(
       `INSERT INTO jobs (id, name, blend_path, engine, frame_start, frame_end, frame_step,
                          state, blender_version, addon_ids, chunk_size, output_dir, cost_so_far, submitted_at,
-                         share_node, blend_sha256, scene_path)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?, ?, ?, ?)`
+                         share_node, blend_sha256, scene_path, queue_pos)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, 0, ?, ?, ?, ?,
+               (SELECT COALESCE(MAX(queue_pos), 0) + 1 FROM jobs))`
     ).run(
       id,
       name,
@@ -595,6 +614,27 @@ export function setJobShareNode(jobId: string, shareNode: boolean): void {
   emitJobChanged(jobId)
 }
 
+/**
+ * Take `jobId` out of its group (jobs/queue.ts), and dissolve the group if
+ * one member is left: a group of one is a job on its own. Returns the other
+ * jobs it changed, for the caller to announce once it has written the rest.
+ * Here rather than in queue.ts, which imports this module: refreshJobState
+ * calls it as a job ends.
+ */
+export function leaveGroup(jobId: string): string[] {
+  const db = getDb()
+  const row = db.prepare('SELECT group_id FROM jobs WHERE id = ?').get(jobId) as
+    { group_id: string | null } | undefined
+  if (!row?.group_id) return []
+  db.prepare('UPDATE jobs SET group_id = NULL WHERE id = ?').run(jobId)
+  const rest = db.prepare('SELECT id FROM jobs WHERE group_id = ?').all(row.group_id) as Array<{
+    id: string
+  }>
+  if (rest.length !== 1) return []
+  db.prepare('UPDATE jobs SET group_id = NULL WHERE id = ?').run(rest[0].id)
+  return [rest[0].id]
+}
+
 /** Stamp the job's first dispatch (jobs.started_at), once. */
 export function markJobStarted(jobId: string, at = Date.now()): void {
   getDb()
@@ -634,7 +674,9 @@ export function refreshJobState(jobId: string): void {
     if (row.finished_at == null) {
       db.prepare('UPDATE jobs SET finished_at = ? WHERE id = ?').run(Date.now(), jobId)
     }
+    const partners = leaveGroup(jobId)
     emitJobChanged(jobId)
+    for (const id of partners) emitJobChanged(id)
     return
   }
   const chunks = db
@@ -665,5 +707,7 @@ export function refreshJobState(jobId: string): void {
       jobId
     )
   }
+  const partners = final ? leaveGroup(jobId) : []
   emitJobChanged(jobId)
+  for (const id of partners) emitJobChanged(id)
 }

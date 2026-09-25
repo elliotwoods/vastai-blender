@@ -32,7 +32,7 @@ vi.mock('electron', () => ({
 }))
 
 /** db.ts's SCHEMA_VERSION: what applySchema records. */
-const SCHEMA_VERSION = 8
+const SCHEMA_VERSION = 9
 const NOW = 1_700_000_000_000
 const MINUTE = 60_000
 const T0 = NOW - 30 * 24 * 60 * MINUTE
@@ -558,6 +558,27 @@ describe.each([
       { job_id: 'job-d', frame: 2, downloaded_at: T0 + 4 * MINUTE },
       // Downloaded with no asset row to say when.
       { job_id: 'job1', frame: 1, downloaded_at: null }
+    ])
+  })
+
+  it('queues existing jobs in the order they were submitted (v9)', () => {
+    const db = legacyDb(sql, version, (d) => {
+      seed(d)
+      const job = d.prepare(
+        `INSERT INTO jobs (id, name, blend_path, engine, frame_start, frame_end, frame_step, state,
+           blender_version, addon_ids, chunk_size, output_dir, cost_so_far, submitted_at)
+         VALUES (?, ?, '/scenes/q.blend', 'cycles', 1, 2, 1, ?, '4.2.3', '[]', 2, ?, 0, ?)`
+      )
+      job.run('job-late', 'late', 'queued', '/renders/late', T0 + 2 * MINUTE)
+      job.run('job-early', 'early', 'complete', '/renders/early', T0 - MINUTE)
+    })
+    applySchema(db)
+    expect(
+      all(db, 'SELECT id, queue_pos, group_id, hidden_at FROM jobs ORDER BY queue_pos')
+    ).toEqual([
+      { id: 'job-early', queue_pos: 1, group_id: null, hidden_at: null },
+      { id: 'job1', queue_pos: 2, group_id: null, hidden_at: null },
+      { id: 'job-late', queue_pos: 3, group_id: null, hidden_at: null }
     ])
   })
 
