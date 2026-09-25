@@ -18,7 +18,7 @@ import { ipc } from '../../lib/ipc'
 import { ipcErrorText } from '../../lib/recovery'
 import { SCALE, TOKENS } from '../../lib/theme'
 import type { NodeSnapshot, VncTunnelInfo } from '../../../../shared/models'
-import { octaneStateOf } from './octane'
+import { vncLoginKey } from './octane'
 
 const field: CSSProperties = {
   ...mono,
@@ -64,12 +64,18 @@ function CopyField({
 }
 
 export function VncLogin({ node }: { node: NodeSnapshot }): React.JSX.Element | null {
+  // Keyed, so a tunnel's address and password live only as long as the
+  // sign-in and the connection they were opened for (vncLoginKey).
+  const key = vncLoginKey(node)
+  return key == null ? null : <VncLoginPanel key={key} node={node} />
+}
+
+function VncLoginPanel({ node }: { node: NodeSnapshot }): React.JSX.Element {
   const [info, setInfo] = useState<VncTunnelInfo | null>(null)
   const [opening, setOpening] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [reveal, setReveal] = useState(false)
   const [flash, setFlash] = useState<string | null>(null)
-  if (octaneStateOf(node) !== 'needsLogin') return null
 
   const open = async (): Promise<void> => {
     setOpening(true)
