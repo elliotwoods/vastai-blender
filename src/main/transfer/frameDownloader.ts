@@ -496,7 +496,7 @@ export class ChunkDownloader {
       // sit in 'downloading' forever.
       const r = await this.target.ssh.exec(
         `cat '${this.target.remoteChunkDir}/manifest.jsonl' 2>/dev/null`,
-        { timeoutMs: MANIFEST_READ_TIMEOUT_MS }
+        { timeoutMs: MANIFEST_READ_TIMEOUT_MS, label: 'read manifest' }
       )
       // Exit 1 with nothing on stdout is cat's answer for a manifest the agent
       // has not written yet: nothing is listed, and that IS the manifest. A

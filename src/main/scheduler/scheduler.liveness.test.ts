@@ -77,7 +77,10 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
     // The node renders whatever it is sent from here on.
     machine.agent.autoFinish()
 
-    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 30 * 60_000 })
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 30 * 60_000,
+      stepMs: 5_000
+    })
     // Each lost chunk went back in the queue, charged to the machines, not
     // to the render, and was rendered on the lanes it had held.
     for (const id of lost) {
@@ -98,7 +101,7 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
     app.scheduler.kick()
     await w.until(() => machine.agent.inbox().length === 1, 'spec queued')
     // Behind busy slots for half an hour: no state, the agent alive.
-    await w.advance(30 * 60_000)
+    await w.advance(30 * 60_000, 5_000)
     expect(chunksOf(jobId)[0]).toMatchObject({ state: 'rendering', infra_retries: 0 })
     expect(assignedTo(ids[0])).toBe(1)
     machine.agent.finish(chunksOf(jobId)[0].id)
@@ -122,7 +125,8 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
       .find((c) => c.state === 'assigned' && c.nodeId === dead)!.chunkId
 
     await w.until(() => nodeState(dead) === 'destroyed', 'the dead node let go', {
-      timeoutMs: 20 * 60_000
+      timeoutMs: 20 * 60_000,
+      stepMs: 5_000
     })
     // Before the queue ran out: nothing but the dead agent kept it from work.
     expect(chunksOf(jobId).some((c) => c.state === 'pending')).toBe(true)
@@ -133,7 +137,10 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
     )
     expect(w.alerts('error').join('\n')).toMatch(/agent is not running.*Nothing more is sent to it/)
 
-    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 60 * 60_000 })
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 60 * 60_000,
+      stepMs: 5_000
+    })
     expect(chunksOf(jobId).find((c) => c.id === stranded)).toMatchObject({
       state: 'complete',
       node_id: live,
@@ -180,7 +187,10 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
     )
     w.machineFor(other).agent.autoFinish()
 
-    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 30 * 60_000 })
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 30 * 60_000,
+      stepMs: 5_000
+    })
     expect(chunksOf(jobId)[0]).toMatchObject({ node_id: other, retries: 0, infra_retries: 1 })
     expect(w.alerts('warn').join('\n')).toMatch(
       /has not answered for 10 min \(.*Channel open failure.*requeued without charging the render/
@@ -238,7 +248,10 @@ describe('1.7: a hung Blender', () => {
     const startedAt = Date.now()
     app.scheduler.kick()
 
-    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 90 * 60_000 })
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 90 * 60_000,
+      stepMs: 5_000
+    })
     stop()
     // The node's failure the first time: charged to the machines, and the
     // retry leaves out the frame that had already landed.
@@ -252,7 +265,7 @@ describe('1.7: a hung Blender', () => {
       /Blender made no progress \(no frame started or saved\) for 4\d min while it kept running/
     )
     expect(Date.now() - startedAt).toBeLessThan(55 * 60_000)
-  })
+  }, 20_000)
 
   it('frames that take twenty minutes each, and one that takes fifty, are not taken for a hang', async () => {
     const { app, ids } = await fleet(1)
@@ -277,12 +290,29 @@ describe('1.7: a hung Blender', () => {
     const jobId = await w.submitJob(app)
     app.scheduler.kick()
     await w.until(() => jobState(jobId) === 'complete', 'job complete', {
-      timeoutMs: 120 * 60_000
+      timeoutMs: 120 * 60_000,
+      stepMs: 5_000
     })
     stop()
     expect(specs).toHaveLength(1)
     expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 0 })
     expect(w.alerts().join('\n')).not.toMatch(/no progress/)
+  }, 20_000)
+})
+
+describe('1.8: a spec write with no answer', () => {
+  it('fails at its deadline, and the chunk is sent again, charged to the machines', async () => {
+    const { app, ids } = await fleet(1)
+    const machine = w.machineFor(ids[0])
+    // The first spec write goes out on an SFTP channel that never answers
+    // it, as a channel another transfer's stall reset does (#244, #245).
+    machine.onSftp('writeFile', HANG, 1)
+    machine.agent.autoFinish()
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 10 * 60_000 })
+    expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
+    expect(w.alerts('warn').join('\n')).toMatch(/SFTP write \S+\.tmp\.json: no answer for 30s/)
   })
 })
 
@@ -297,7 +327,7 @@ describe('1.8: a node prep that hangs', () => {
     const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 1 })
     app.scheduler.kick()
     await w.until(() => assignedTo(stuckId) === 4, 'four lanes in node prep')
-    await w.advance(55 * 60_000)
+    await w.advance(55 * 60_000, 5_000)
     expect(chunksOf(jobId).map((c) => c.state)).toEqual([
       'assigned',
       'assigned',
@@ -329,10 +359,14 @@ describe('1.8: a node prep that hangs', () => {
 
     // Sent nothing more, it is let go of while work is still queued.
     await w.until(() => nodeState(stuckId) === 'destroyed', 'the stuck node let go', {
-      timeoutMs: 20 * 60_000
+      timeoutMs: 20 * 60_000,
+      stepMs: 5_000
     })
     expect(chunksOf(jobId).some((c) => c.state === 'pending')).toBe(true)
     expect(assignedTo(stuckId)).toBe(4)
-    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 60 * 60_000 })
-  })
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 60 * 60_000,
+      stepMs: 5_000
+    })
+  }, 20_000)
 })

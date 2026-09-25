@@ -27,7 +27,7 @@ import { agentAlive, installBlender, installExtension, REMOTE_ROOT } from '../no
 import { listAddons } from '../addons/addons'
 import { nodeManager } from '../nodes/nodeManager'
 import { getSettings } from '../settings'
-import { sftpRename, sftpWriteFile, uploadFileVerified } from '../ssh/sftp'
+import { uploadFileVerified, writeRemoteFileAtomic } from '../ssh/sftp'
 import { recordThroughput } from '../vast/offers'
 import type { SshConnection } from '../ssh/sshConnection'
 import { ChunkDownloader, localSinkHold } from '../transfer/frameDownloader'
@@ -850,12 +850,23 @@ class ChunkRun {
     // state written by the attempt it is polling. (Observed failure: chunks
     // re-dispatched after a crash sat queued behind busy slots while the
     // watchdog read the dead attempt's frozen state and burned every retry.)
-    await this.ssh.exec(`rm -f ${REMOTE_ROOT}/state/${this.chunkId}.json`).catch(() => {})
+    await this.ssh
+      .exec(`rm -f ${REMOTE_ROOT}/state/${this.chunkId}.json`, {
+        timeoutMs: 30_000,
+        label: 'clear agent state'
+      })
+      .catch(() => {})
     if (this.abandoned('before queueing the spec')) return
-    const sftp = await this.ssh.sftp()
+    // Written to a name the agent ignores, then moved over the spec's (mv -f
+    // semantics), each request on the connection's current SFTP channel and
+    // under a deadline (writeRemoteFileAtomic). On a channel another
+    // transfer's stall had reset, the write held one wrapper across both
+    // requests and was never answered, so the dispatch hung with its chunk
+    // 'assigned' and its lane taken (#244, #245).
     const inbox = posix.join(REMOTE_ROOT, 'jobs', 'inbox')
-    await sftpWriteFile(sftp, `${inbox}/${this.chunkId}.tmp.json`, JSON.stringify(spec))
-    await sftpRename(sftp, `${inbox}/${this.chunkId}.tmp.json`, `${inbox}/${this.chunkId}.json`)
+    await writeRemoteFileAtomic(this.ssh, `${inbox}/${this.chunkId}.json`, JSON.stringify(spec), {
+      tmpPath: `${inbox}/${this.chunkId}.tmp.json`
+    })
     // The spec is now live: from here the agent may pick it up at any moment, so
     // a cancel that landed during the write has to be retracted rather than just
     // returned from.
@@ -905,7 +916,9 @@ class ChunkRun {
             chunkId: this.chunkId,
             line,
             ts: Date.now()
-          })
+          }),
+        // No deadline: it runs for the chunk's life, and stop() ends it.
+        { label: 'log tail' }
       )
       this.stopTail = stop
     } catch {
@@ -2095,7 +2108,15 @@ class Scheduler {
       // A shell touch/rm rather than SFTP: it creates the directory in the
       // same round trip, and sftpWriteFile does no mkdir (unlike
       // uploadFileVerified, which calls remoteMkdirp).
-      await ssh.exec(on ? `mkdir -p ${posix.dirname(path)} && touch '${path}'` : `rm -f '${path}'`)
+      // Under a deadline: dispatch awaits this after the spec is live, and
+      // on a wedged connection an exec never returns.
+      await ssh.exec(
+        on ? `mkdir -p ${posix.dirname(path)} && touch '${path}'` : `rm -f '${path}'`,
+        {
+          timeoutMs: 30_000,
+          label: 'preview flag'
+        }
+      )
     } catch {
       // Best effort: a missed flag costs a preview, never a render.
     }
@@ -3190,9 +3211,12 @@ class Scheduler {
       const node = nodeManager.get(run.nodeId)
       if (node?.ssh) {
         // Remove queued spec + kill any in-flight blender for this chunk.
+        // Under a deadline, as retractSpec: a wedged node held the rest of
+        // the cancel, and every node after it, for good.
         await node.ssh
           .exec(
-            `rm -f ${REMOTE_ROOT}/jobs/inbox/${run.chunkId}.json; pkill -f '${run.chunkId}' || true`
+            `rm -f ${REMOTE_ROOT}/jobs/inbox/${run.chunkId}.json; pkill -f '${run.chunkId}' || true`,
+            { timeoutMs: 30_000, label: 'cancel chunk' }
           )
           .catch(() => {})
       }
