@@ -199,7 +199,10 @@ interface MetricsState {
   beginSeed: (nodeId: string) => boolean
   /** The seed's readings, under whatever was heard meanwhile. */
   seed: (nodeId: string, readings: readonly MetricsReading[], bucketMs: number) => void
-  /** The seed could not be read: the next row to show the node asks again. */
+  /**
+   * The seed could not be read: it may be claimed again (watchNodeReadings
+   * in queries.ts asks again while a row still shows the node).
+   */
   seedFailed: (nodeId: string) => void
   /** Drop a node, once it is gone for good. */
   forget: (nodeId: string) => void

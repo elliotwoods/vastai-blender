@@ -207,29 +207,79 @@ export function useNodeMetricsHistory(
 /** Buckets for a seed: the store's hour at main's narrowest bucket, 30 s. */
 const SEED_POINTS = RING_MS / 30_000
 
+/** A seed that could not be read is asked for again this long after. */
+export const SEED_RETRY_MS = 30_000
+
+/** How many callers show each node's readings now. */
+const watching = new Map<string, number>()
+/** A failed seed's next try, per node. */
+const seedRetries = new Map<string, ReturnType<typeof setTimeout>>()
+
+function seedReadings(nodeId: string): void {
+  if (!useMetricsStore.getState().beginSeed(nodeId)) return
+  const toMs = Date.now()
+  ipc
+    .invoke('node:metricsHistory', {
+      nodeId,
+      fromMs: toMs - RING_MS,
+      toMs,
+      maxPoints: SEED_POINTS
+    })
+    .then((h) => useMetricsStore.getState().seed(nodeId, readingsOfHistory(h), h.bucketMs))
+    .catch((e: unknown) => {
+      useMetricsStore.getState().seedFailed(nodeId)
+      console.warn(`node:metricsHistory for ${nodeId} failed`, e)
+      // Asked again while something still shows the node. A row stays
+      // mounted for as long as its node is listed, so waiting for the next
+      // mount left it on live samples alone, no hour behind them, for the
+      // node's whole life.
+      if (!watching.has(nodeId) || seedRetries.has(nodeId)) return
+      seedRetries.set(
+        nodeId,
+        setTimeout(() => {
+          seedRetries.delete(nodeId)
+          if (watching.has(nodeId)) seedReadings(nodeId)
+        }, SEED_RETRY_MS)
+      )
+    })
+}
+
+/**
+ * Show a node's readings: the first caller for a node seeds the store from
+ * node:metricsHistory, and a seed that fails is asked for again every
+ * SEED_RETRY_MS while any caller is still showing the node. Returns the
+ * function that stops showing it. useNodeReadings' effect; apart from it so
+ * the retry can be tested without a DOM.
+ */
+export function watchNodeReadings(nodeId: string): () => void {
+  watching.set(nodeId, (watching.get(nodeId) ?? 0) + 1)
+  seedReadings(nodeId)
+  let done = false
+  return () => {
+    if (done) return
+    done = true
+    const left = (watching.get(nodeId) ?? 1) - 1
+    if (left > 0) {
+      watching.set(nodeId, left)
+      return
+    }
+    watching.delete(nodeId)
+    const retry = seedRetries.get(nodeId)
+    if (retry !== undefined) {
+      clearTimeout(retry)
+      seedRetries.delete(nodeId)
+    }
+  }
+}
+
 /**
  * One node's last hour of GPU use, live (lib/metricsStore): the stored array
  * by reference, so only this node's samples re-render the caller. The first
  * caller for a node seeds the store from node:metricsHistory, since a
- * window opened mid-session has heard none of the hour.
+ * window opened mid-session has heard none of the hour (watchNodeReadings).
  */
 export function useNodeReadings(nodeId: string): readonly MetricsReading[] {
-  useEffect(() => {
-    if (!useMetricsStore.getState().beginSeed(nodeId)) return
-    const toMs = Date.now()
-    ipc
-      .invoke('node:metricsHistory', {
-        nodeId,
-        fromMs: toMs - RING_MS,
-        toMs,
-        maxPoints: SEED_POINTS
-      })
-      .then((h) => useMetricsStore.getState().seed(nodeId, readingsOfHistory(h), h.bucketMs))
-      .catch((e: unknown) => {
-        useMetricsStore.getState().seedFailed(nodeId)
-        console.warn(`node:metricsHistory for ${nodeId} failed`, e)
-      })
-  }, [nodeId])
+  useEffect(() => watchNodeReadings(nodeId), [nodeId])
   return useMetricsStore((s) => s.byNode[nodeId] ?? NO_READINGS)
 }
 
