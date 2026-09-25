@@ -181,6 +181,12 @@ describe('1.3 periodic reconcile', () => {
     await w.until(() => list.reached, 'the reconcile asking for the list')
     gate.release()
     const [id] = await renting
+    // Vast reports a start date older than the 2-minute guard (its clock,
+    // or a slow boot report): only the holders read afresh for each listed
+    // instance keep the pass from taking the node's own instance for an
+    // orphan. The holders read before the list was asked for predate the
+    // create's answer.
+    w.vast.patchInstance(w.vast.created[0], { start_date: vastTime(10 * 60_000) })
     list.release()
     await pass
 
@@ -188,6 +194,82 @@ describe('1.3 periodic reconcile', () => {
     expect(w.vast.count('destroyInstance')).toBe(0)
     expect(app.nodeManager.listUnclaimed()).toEqual([])
     expect(w.alerts('warn')).toEqual([])
+  })
+
+  it('an instance Vast still lists within 2 minutes of its confirmed destroy is not destroyed again', async () => {
+    const app = await started()
+    // This profile's row, its instance confirmed gone half a minute ago; Vast
+    // lists it a little longer.
+    const id = randomUUID()
+    const label = labelOf(id)
+    const inst = w.vast.addInstance({ label, start_date: vastTime(60 * 60_000) })
+    w.db
+      .prepare(
+        `INSERT INTO nodes (id, state, instance_id, gpu_name, num_gpus, dph_total, accumulated_cost,
+           blender_versions, label, destroyed_at)
+         VALUES (?, 'destroyed', ?, 'RTX 4090', 1, 0.4, 0, '[]', ?, ?)`
+      )
+      .run(id, inst.id, label, Date.now() - 30_000)
+
+    await app.nodeManager.reconcile()
+
+    expect(w.vast.count('destroyInstance')).toBe(0)
+    expect(app.nodeManager.listUnclaimed()).toEqual([])
+    expect(w.alerts()).toEqual([])
+    expect(row(id)).toMatchObject({ state: 'destroyed', instance_id: inst.id })
+
+    // Still listed once the 2 minutes are up: Vast contradicts the
+    // confirmation, and the row takes it back as an orphan to destroy.
+    await w.advance(2 * 60_000, 5_000)
+    await app.nodeManager.reconcile()
+    await w.until(() => w.vast.live().length === 0, 'the orphan destroyed')
+    expect(w.vast.argsOf('destroyInstance')).toEqual([[inst.id]])
+    expect(w.alerts('warn')).toEqual([`destroying orphaned instance ${inst.id} (${label})`])
+    expect(row(id).state).toBe('destroyed')
+  })
+})
+
+describe('1.3 labels from before install ids', () => {
+  it("the legacy label finds its row: a row the migration labelled, and an older build's with no label", async () => {
+    // Rows of the last run whose creates got no answer, and the instances
+    // Vast rented for them under the legacy `vastai-blender <node8>`:
+    //  - `backfilled`: the migration wrote the label every build rented under
+    //  - `unlabelled`: an older build ran on this profile after the migration
+    //    and wrote no label (nor create_unknown_since), so only its id names it
+    const backfilled = randomUUID()
+    const unlabelled = randomUUID()
+    const insert = w.db.prepare(
+      `INSERT INTO nodes (id, state, gpu_name, num_gpus, dph_total, accumulated_cost,
+         blender_versions, label, create_unknown_since)
+       VALUES (?, 'failed', 'RTX 4090', 1, 0.4, 0, '[]', ?, ?)`
+    )
+    insert.run(backfilled, `vastai-blender ${backfilled.slice(0, 8)}`, Date.now() - 60 * 60_000)
+    insert.run(unlabelled, null, null)
+    const a = w.vast.addInstance({
+      label: `vastai-blender ${backfilled.slice(0, 8)}`,
+      start_date: vastTime(60 * 60_000)
+    })
+    const b = w.vast.addInstance({
+      label: `vastai-blender ${unlabelled.slice(0, 8)}`,
+      start_date: vastTime(60 * 60_000)
+    })
+    // Another install's rental whose node part happens to match the
+    // unlabelled row: the id prefix names legacy labels only.
+    const foreign = w.vast.addInstance({
+      label: `vastai-blender 0bad0bad:${unlabelled.slice(0, 8)}`,
+      start_date: vastTime(60 * 60_000)
+    })
+
+    const app = await started()
+    await w.until(() => w.vast.live().length === 1, 'both orphans destroyed')
+
+    expect(w.vast.live()).toEqual([foreign.id])
+    expect(row(backfilled)).toMatchObject({ state: 'destroyed', instance_id: a.id })
+    expect(row(unlabelled)).toMatchObject({ state: 'destroyed', instance_id: b.id })
+    expect(app.nodeManager.activeCount()).toBe(0)
+    expect(app.nodeManager.listUnclaimed()).toMatchObject([
+      { instanceId: foreign.id, owner: 'otherVastRender' }
+    ])
   })
 })
 
@@ -309,6 +391,7 @@ describe('1.3 on waking, and after an API key is saved', () => {
   })
 
   it('a key saved after a start with none: the orphan the start could not see is destroyed', async () => {
+    await w.dispose()
     w = await setup({ secrets: { vastApiKey: undefined } })
     // An orphan of the last run: its row's create never heard back.
     const id = randomUUID()
