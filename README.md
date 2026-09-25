@@ -1,7 +1,12 @@
-# Vast Render
+<p align="center"><img src="docs/icon.png" width="128" height="128" alt="Vast Render icon"></p>
 
-A desktop app (Electron) that renders Blender projects on [Vast.ai](https://vast.ai)
-GPU fleets. Point it at a `.blend`, and it rents the best-value machines,
+<h1 align="center">Vast Render</h1>
+
+<p align="center"><b>Render Blender animations on a fleet of rented GPUs — from your desktop.</b><br>
+macOS · Windows · <a href="https://github.com/elliotwoods/vastai-blender/releases/latest">Download</a></p>
+
+Vast Render is a desktop app for macOS and Windows that renders Blender projects on
+[Vast.ai](https://vast.ai) GPU fleets. Point it at a `.blend`, and it rents the best-value machines,
 provisions them (matching Blender version, ffmpeg, render agent), splits the
 animation into frame chunks across the fleet, streams frames and HDR preview
 clips back to your disk as they finish, and destroys the machines when done.
@@ -14,7 +19,9 @@ API key: no manual SSH, no third-party file sync.
 
 *The fleet: one row per rented machine with live %GPU, %VRAM, %CPU, %RAM,
 watts, $/hr and accumulated cost. Expanding a row shows the full node panel —
-gauges, ssh access, what it's rendering, and its console.*
+gauges, ssh access, what it's rendering, and its console. The toolbar keeps the
+whole fleet's $/hr, live GPU power draw, session spend and energy, and your
+Vast.ai balance in view on every screen.*
 
 ## Features
 
@@ -54,23 +61,40 @@ gauges, ssh access, what it's rendering, and its console.*
   can also carry `startup*` text blocks, executed before rendering.
 - **Live telemetry** — %GPU, %VRAM, true %CPU (from `/proc/stat` deltas, not
   load average), %RAM, GPU watts, and Wh of energy per node.
-- **Cost control** — live $/hr, per-node accumulated cost and realised $/hr,
+- **History** — spend, account balance, fleet GPU power and fleet size over
+  1 day / 7 days / 30 days / all time, with the jobs that cost the most and an
+  estimated CO₂ figure behind every energy readout.
+- **Cost control** — live $/hr and fleet power draw, per-node accumulated cost and realised $/hr,
   session spend and session energy, account balance, idle timeout
   auto-destroy, spend cap, and boot-time reconciliation that destroys any
   orphaned instances this app created.
 
-## Install and run
+![History screen](docs/screenshots/history.png)
 
-Prebuilt Windows installer:
-[latest release](https://github.com/elliotwoods/vastai-blender/releases/latest).
-It is unsigned, so SmartScreen will ask for a confirmation on first run.
+*History: fleet GPU draw over the last week, with energy, CO₂e, average and
+peak draw, and the jobs that cost the most.*
 
-From source:
+## Install
+
+Download the latest build from
+[Releases](https://github.com/elliotwoods/vastai-blender/releases/latest):
+
+| Platform | File | Notes |
+| --- | --- | --- |
+| macOS (Apple Silicon) | `vastai-blender-<version>.dmg` | Signed with a Developer ID and notarized by Apple — open the DMG and drag *Vast Render* to Applications. |
+| Windows 10/11 (x64) | `vastai-blender-<version>-setup.exe` | Unsigned, so SmartScreen asks for a confirmation on first run (*More info → Run anyway*). |
+
+You need a [Vast.ai](https://vast.ai) account with some credit and an API key —
+see [First run](#first-run).
+
+## Build from source
 
 ```bash
 npm install
 npm run dev          # development (Vite + Electron, hot reload)
 npm run build:win    # packaged Windows build (electron-builder)
+npm run build:mac    # packaged macOS build — signs with your Developer ID;
+                     # set APPLE_KEYCHAIN_PROFILE to a notarytool profile to notarize
 npm test             # unit tests
 npm run typecheck    # main + renderer type checks
 ```
@@ -82,8 +106,9 @@ was interrupted — see `docs/hdr-notes.md` for the manual fix.
 
 1. **Settings → Vast.ai API** — paste your API key (from
    [cloud.vast.ai](https://cloud.vast.ai) → Account). It's stored encrypted
-   with your OS user credentials (DPAPI on Windows). An SSH keypair is
-   generated on first use and registered with your Vast.ai account.
+   with your OS user credentials (DPAPI on Windows, the Keychain on macOS). An
+   SSH keypair is generated on first use and registered with your Vast.ai
+   account.
 2. **Settings → General** — set the project root (where renders land), max
    active nodes, spend cap ($/hr), idle timeout, and (optionally) a cap on
    render slots per node — leave it blank to let the app judge concurrency.
