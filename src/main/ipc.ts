@@ -26,8 +26,10 @@ import type {
   NodeSnapshot,
   ThumbAsset
 } from '../shared/models'
+import { applySettingsPatch, describeFieldErrors, type GateOptions } from './app/settingsGate'
 import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
 import { dismissAlerts, onAlertSurfaced, onEvent, recentAlerts } from './events'
+import { hostPathFlavour } from './paths'
 import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
 import { currentUser } from './vast/vastClient'
@@ -653,6 +655,16 @@ function showNotification(body: string, createWindow: (() => void) | undefined):
   n.show()
 }
 
+/** settings.ts, as the settings gate reads and saves it. */
+const settingsStore = {
+  getSettings: () => getSettings(),
+  updateSettings: (patch: Parameters<typeof updateSettings>[0]) => updateSettings(patch)
+}
+
+function gateOptions(): GateOptions {
+  return { pathFlavour: hostPathFlavour() }
+}
+
 export interface RegisterIpcOptions {
   /**
    * index.ts's createWindow, for a notification clicked while no window is
@@ -692,7 +704,16 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   // throwaway profile, and without this Fleet renders its "no API key" empty
   // state instead of the mock nodes, so the mocks are unreachable.
   handle('settings:get', () => (MOCK ? { ...getSettings(), hasVastApiKey: true } : getSettings()))
-  handle('settings:set', (patch) => updateSettings(patch))
+  // Every patch from the renderer goes through the sanitizer, and only what
+  // passed is saved (plan 1.14, app/settingsGate.ts). settings:update says
+  // which fields did not and why; settings:set keeps its contract for its
+  // callers and only logs them.
+  handle('settings:set', (patch) => {
+    const { settings, errors } = applySettingsPatch(patch, settingsStore, gateOptions())
+    if (errors.length) console.warn(`[settings] not saved as sent: ${describeFieldErrors(errors)}`)
+    return settings
+  })
+  handle('settings:update', (patch) => applySettingsPatch(patch, settingsStore, gateOptions()))
   handle('settings:setSecret', (key, value) => setSecret(key, value))
 
   // -- shell / dialogs (real) ----------------------------------------------
@@ -782,7 +803,12 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
     await scheduler.setPreviewSubscription(chunkId, on)
   })
   handle('fleet:setMaxNodes', (n) => {
-    updateSettings({ maxActiveNodes: n })
+    // Through the gate like any settings change: "1e3" or NaN from a
+    // stepper is refused, not saved as 1000 or as a number no reader
+    // expects. A refusal rejects the invoke, so the caller hears of it.
+    const { errors } = applySettingsPatch({ maxActiveNodes: n }, settingsStore, gateOptions())
+    const refused = errors.filter((e) => e.outcome === 'rejected')
+    if (refused.length) throw new Error(describeFieldErrors(refused))
   })
   handle('fleet:requestNode', async () => {
     await nodeManager.requestNode()

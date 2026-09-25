@@ -18,6 +18,7 @@
 
 import * as nodePath from 'path'
 import type { PlatformPath } from 'path'
+import type { PathFlavour } from '../shared/settingsSanitize'
 
 /** Device names Win32 opens from any directory, whatever the extension. */
 const WIN_DEVICE = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)$/i
@@ -83,4 +84,13 @@ export function isInside(root: string, absPath: string, path: PlatformPath = nod
   const rel = path.relative(path.resolve(root), path.resolve(absPath))
   // relative() speaks the platform's separator; resolveInside speaks '/'.
   return resolveInside(root, rel.split(path.sep).join('/'), path) !== null
+}
+
+/**
+ * How this computer spells an absolute path, for sanitizeSettingsPatch and
+ * localPathProblem (plan 1.14). Given none, they accept both spellings, and
+ * `C:\Renders` would pass on macOS, where it is a relative file name.
+ */
+export function hostPathFlavour(platform: NodeJS.Platform = process.platform): PathFlavour {
+  return platform === 'win32' ? 'win32' : 'posix'
 }
