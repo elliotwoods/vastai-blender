@@ -1302,7 +1302,9 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
     return scheduler.releaseHold(kind)
   })
   // GPU usage over time (Feature G).
-  handle('fleet:gpuHistory', (q) => fleetGpuHistory(historyQuery(q)))
+  handle('fleet:gpuHistory', (q) =>
+    fleetGpuHistory({ ...historyQuery(q), perGpu: q?.perGpu === true })
+  )
   handle('node:metricsHistory', (q) => {
     if (typeof q?.nodeId !== 'string') throw new Error('node:metricsHistory needs a nodeId')
     return nodeHistory({ ...historyQuery(q), nodeId: q.nodeId })

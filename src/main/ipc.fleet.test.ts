@@ -164,6 +164,26 @@ describe('the Phase 1 IPC contract in main', () => {
       maxPoints: 20
     })
     expect(fleet.points.some((p) => (p.gpusRented ?? 0) === 2)).toBe(true)
+    expect(fleet.summary.gpuHours).toBeGreaterThan(0)
+    expect(fleet.gpus).toBeUndefined()
+    // perGpu is taken only as true; anything else over IPC is no.
+    const perGpu = await w.invoke('fleet:gpuHistory', {
+      fromMs: now - 10 * 60_000,
+      toMs: now,
+      maxPoints: 20,
+      perGpu: true
+    })
+    expect(perGpu.gpus?.map((g) => [g.nodeId, g.gpuIndex])).toEqual([
+      [nodeId, 0],
+      [nodeId, 1]
+    ])
+    const junk = await w.invoke('fleet:gpuHistory', {
+      fromMs: now - 10 * 60_000,
+      toMs: now,
+      maxPoints: 20,
+      perGpu: 'yes' as never
+    })
+    expect(junk.gpus).toBeUndefined()
     await expect(w.invoke('node:metricsHistory', {} as never)).rejects.toThrow(/nodeId/)
   })
 

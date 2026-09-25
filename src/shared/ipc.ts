@@ -21,6 +21,7 @@ import type {
   ChunkProgressEvent,
   FleetCost,
   FleetGpuHistory,
+  FleetGpuHistoryQuery,
   FleetHoldKind,
   FleetHolds,
   HistoryRange,
@@ -29,7 +30,6 @@ import type {
   JobSubmission,
   JobSummary,
   LogLineEvent,
-  MetricsHistoryQuery,
   MetricsSample,
   NodeChunkView,
   NodeMetricsHistory,
@@ -112,7 +112,7 @@ export interface IpcInvokeMap {
    * Phase 1 (Feature G). The whole fleet's GPU use over a window: GPUs
    * rented and busy, mean utilisation, and the $/hr paid for idle GPUs.
    */
-  'fleet:gpuHistory': { args: [MetricsHistoryQuery]; result: FleetGpuHistory }
+  'fleet:gpuHistory': { args: [FleetGpuHistoryQuery]; result: FleetGpuHistory }
   'node:destroy': { args: [string]; result: void }
   /**
    * Restart the node's agent and requeue what was in flight on it (plan

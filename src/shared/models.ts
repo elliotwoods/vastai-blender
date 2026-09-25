@@ -544,6 +544,42 @@ export interface FleetGpuPoint {
   idlePerHour: number | null
 }
 
+/** fleet:gpuHistory's query: a range, and whether to add each GPU's own line. */
+export interface FleetGpuHistoryQuery extends MetricsHistoryQuery {
+  /** add `gpus`, one utilisation series per GPU (at most FLEET_GPU_SERIES_MAX) */
+  perGpu?: boolean
+}
+
+/** The most per-GPU series fleet:gpuHistory returns; the rest are counted in `gpusOmitted`. */
+export const FLEET_GPU_SERIES_MAX = 64
+
+/** Figures over the whole range fleet:gpuHistory was asked for. */
+export interface FleetGpuSummary {
+  /**
+   * Mean utilisation (%) over every reading of every GPU in the range: each
+   * GPU weighted by the time it was rented and read, gaps (no reading) left
+   * out. What the Fleet screen's "mean util" shows for the range. null = no
+   * reading in the range.
+   */
+  meanUtil: number | null
+  /** GPU-hours rented in the range (Σ over buckets of GPUs rented × bucket width) */
+  gpuHours: number
+  /** of those, GPU-hours busy (above GPU_BUSY_UTIL_PCT, or with a run) */
+  busyGpuHours: number
+  /** $ paid for GPUs that were not busy, over the range */
+  idleCost: number
+}
+
+/** One GPU's utilisation over fleet:gpuHistory's buckets (with perGpu). */
+export interface FleetGpuSeries {
+  nodeId: string
+  /** nvidia-smi index */
+  gpuIndex: number
+  /** e.g. "RTX 4090 · 1a2b3c4d #0" */
+  label: string
+  util: MetricsPoint[]
+}
+
 /** The result of fleet:gpuHistory. */
 export interface FleetGpuHistory {
   fromMs: number
@@ -551,6 +587,11 @@ export interface FleetGpuHistory {
   /** width of one bucket (ms) */
   bucketMs: number
   points: FleetGpuPoint[]
+  summary: FleetGpuSummary
+  /** with perGpu: each GPU's line, by node then index; absent otherwise */
+  gpus?: FleetGpuSeries[]
+  /** with perGpu: GPUs left out past FLEET_GPU_SERIES_MAX (the least-read ones) */
+  gpusOmitted?: number
 }
 
 // ---------------------------------------------------------------------------

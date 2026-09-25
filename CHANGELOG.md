@@ -22,6 +22,13 @@ stalled the app).
 
 ### Added
 
+- **Fleet GPU history over the whole range, and per GPU.** `fleet:gpuHistory`
+  returns a `summary` for the range asked for: mean utilisation over every
+  reading of every GPU in it (so the Fleet screen's *mean util* can be the
+  range's, not the latest bucket's), GPU-hours rented and busy, and the $
+  paid for idle GPUs. With `perGpu: true` it adds each GPU's own utilisation
+  line (at most 64).
+
 - **Blender's live status, and whose work a node is doing.** `chunk:progress`
   now carries Blender's latest status line (never the agent's `VR_*` markers),
   read into frame, sample x/y, time and time left, memory and phase

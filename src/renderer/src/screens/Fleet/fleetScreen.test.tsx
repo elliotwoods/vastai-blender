@@ -384,7 +384,8 @@ describe('Feature G: GPU use over time', () => {
       points: [
         { ts: now - 90_000, gpusRented: 24, gpusBusy: 20, meanUtil: 70, idlePerHour: 1.1 },
         { ts: now - 60_000, gpusRented: 24, gpusBusy: 17, meanUtil: 61, idlePerHour: 2.4 }
-      ]
+      ],
+      summary: { meanUtil: 65.5, gpuHours: 0.4, busyGpuHours: 0.31, idleCost: 0.03 }
     }
     const html = withCache(
       (qc) => {

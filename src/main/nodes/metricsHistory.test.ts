@@ -476,6 +476,125 @@ describe('the fleet over time', () => {
     expect(hist.points.map((p) => p.idlePerHour)).toEqual([null, 0, 2, 2, 2, 2, 2, 2])
   })
 
+  /**
+   * C, 1 GPU at $1/hr, at 80% for ten minutes; D, 4 GPUs at $4/hr, all at
+   * 20% for five minutes, then unreachable (a gap) for the last five.
+   */
+  function oneAndFour(): void {
+    addNode('C', 1, 1)
+    addNode('D', 4, 4)
+    for (let t = T0 - 10 * MINUTE; t < T0; t += 15 * SECOND) {
+      vi.setSystemTime(t)
+      mh.record('C', metrics(t, [gpu(0, 80)]), mh.runsPerGpu([], 1), { numGpus: 1 })
+      const dUp = t < T0 - 5 * MINUTE
+      mh.record(
+        'D',
+        dUp
+          ? metrics(
+              t,
+              [0, 1, 2, 3].map((i) => gpu(i, 20))
+            )
+          : null,
+        mh.runsPerGpu([], 4),
+        { numGpus: 4 }
+      )
+    }
+    vi.setSystemTime(T0)
+  }
+
+  it('the summary’s mean util is over every reading in the range, not the last bucket', () => {
+    oneAndFour()
+    const hist = mh.fleetGpuHistory({ fromMs: T0 - 10 * MINUTE, toMs: T0, maxPoints: 6 })
+    // Readings: C 40 × 80%, D 20 polls × 4 GPUs × 20%; the gap adds none.
+    expect(hist.summary.meanUtil).toBeCloseTo((40 * 80 + 80 * 20) / 120, 9)
+    expect(hist.points.at(-1)?.meanUtil).toBe(80)
+    // Rented: C and D's four GPUs for ten minutes, the gap included.
+    expect(hist.summary.gpuHours).toBeCloseTo((5 * 10) / 60, 9)
+    // Busy: C throughout, D's four for their five minutes up.
+    expect(hist.summary.busyGpuHours).toBeCloseTo((1 * 10 + 4 * 5) / 60, 9)
+    // Idle: D's four GPUs at $4/hr through the gap.
+    expect(hist.summary.idleCost).toBeCloseTo((4 * 5) / 60, 9)
+    expect(hist.gpus).toBeUndefined()
+  })
+
+  it('the summary over a range memory and the table share is what memory alone says', async () => {
+    oneAndFour()
+    const q = { fromMs: T0 - 10 * MINUTE, toMs: T0, maxPoints: 6 }
+    const fromMemory = mh.fleetGpuHistory(q).summary
+    vi.resetModules()
+    const fresh = await import('./metricsHistory')
+    const fromTable = fresh.fleetGpuHistory(q).summary
+    expect(fromTable.meanUtil).toBeCloseTo(fromMemory.meanUtil!, 9)
+    expect(fromTable.gpuHours).toBeCloseTo(fromMemory.gpuHours, 9)
+    expect(fromTable.busyGpuHours).toBeCloseTo(fromMemory.busyGpuHours, 9)
+    expect(fromTable.idleCost).toBeCloseTo(fromMemory.idleCost, 9)
+  })
+
+  it('the summary spans the table and the ring: the first hour from one, the rest from the other', () => {
+    addNode('A', 2, 1)
+    for (let t = T0; t < T0 + 7 * HOUR; t += 15 * SECOND) {
+      vi.setSystemTime(t)
+      mh.record('A', metrics(t, [gpu(0, t < T0 + HOUR ? 50 : 0)]), mh.runsPerGpu([], 1))
+    }
+    vi.setSystemTime(T0 + 7 * HOUR)
+    const hist = mh.fleetGpuHistory({ fromMs: T0, toMs: T0 + 7 * HOUR, maxPoints: 8, perGpu: true })
+    expect(hist.summary.meanUtil).toBeCloseTo(50 / 7, 9)
+    expect(hist.summary.gpuHours).toBeCloseTo(7, 9)
+    expect(hist.summary.busyGpuHours).toBeCloseTo(1, 9)
+    expect(hist.summary.idleCost).toBeCloseTo(6 * 2, 9)
+    expect(hist.gpus?.map((g) => g.util.map((p) => p.mean))).toEqual([[50, 0, 0, 0, 0, 0, 0]])
+  })
+
+  it('per GPU: a line for each GPU of each node, broken where it had no reading', () => {
+    oneAndFour()
+    const q = { fromMs: T0 - 10 * MINUTE, toMs: T0, maxPoints: 6, perGpu: true }
+    const hist = mh.fleetGpuHistory(q)
+    expect(hist.gpusOmitted).toBe(0)
+    expect(hist.gpus?.map((g) => [g.nodeId, g.gpuIndex, g.label])).toEqual([
+      ['C', 0, 'GPU · C #0'],
+      ['D', 0, 'GPU · D #0'],
+      ['D', 1, 'GPU · D #1'],
+      ['D', 2, 'GPU · D #2'],
+      ['D', 3, 'GPU · D #3']
+    ])
+    expect(hist.gpus![0].util.map((p) => p.mean)).toEqual([80, 80, 80, 80, 80])
+    // Up for the first five minutes: the bucket the gap starts in keeps its readings.
+    expect(hist.gpus![1].util.map((p) => p.mean)).toEqual([20, 20, 20, null, null])
+    expect(hist.gpus![1].util).toHaveLength(hist.points.length)
+  })
+
+  it('per GPU: at most 64 lines, the ones with the fewest readings left out', () => {
+    for (let n = 0; n < 17; n++) addNode(`N${String(n).padStart(2, '0')}`, 1, 4)
+    for (let t = T0 - 2 * MINUTE; t < T0; t += 15 * SECOND) {
+      vi.setSystemTime(t)
+      for (let n = 0; n < 17; n++) {
+        // N16 only reads its GPUs once.
+        const up = n < 16 || t === T0 - 2 * MINUTE
+        mh.record(
+          `N${String(n).padStart(2, '0')}`,
+          up
+            ? metrics(
+                t,
+                [0, 1, 2, 3].map((i) => gpu(i, 50))
+              )
+            : null,
+          mh.runsPerGpu([], 4),
+          { numGpus: 4 }
+        )
+      }
+    }
+    vi.setSystemTime(T0)
+    const hist = mh.fleetGpuHistory({
+      fromMs: T0 - 2 * MINUTE,
+      toMs: T0,
+      maxPoints: 4,
+      perGpu: true
+    })
+    expect(hist.gpus).toHaveLength(64)
+    expect(hist.gpusOmitted).toBe(4)
+    expect(hist.gpus!.some((g) => g.nodeId === 'N16')).toBe(false)
+  })
+
   it('Feature G: no node at all is an empty graph, not an error', () => {
     const hist = mh.fleetGpuHistory({ fromMs: T0 - HOUR, toMs: T0, maxPoints: 61 })
     expect(hist.points).toHaveLength(60)

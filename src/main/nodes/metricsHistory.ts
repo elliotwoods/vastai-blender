@@ -34,9 +34,13 @@
 
 import { getDb } from '../db/db'
 import {
+  FLEET_GPU_SERIES_MAX,
   GPU_BUSY_UTIL_PCT,
   type FleetGpuHistory,
+  type FleetGpuHistoryQuery,
   type FleetGpuPoint,
+  type FleetGpuSeries,
+  type FleetGpuSummary,
   type GpuSample,
   type GpuSeries,
   type MetricsHistoryQuery,
@@ -671,7 +675,7 @@ interface NodeBucket {
  * polled is all null. A node's $/hr is its row's (dph_total), which is fixed
  * for its life.
  */
-export function fleetGpuHistory(q: MetricsHistoryQuery, now = Date.now()): FleetGpuHistory {
+export function fleetGpuHistory(q: FleetGpuHistoryQuery, now = Date.now()): FleetGpuHistory {
   const { fromMs, toMs, maxPoints } = rangeOf(q, now)
   const grid = bucketGrid(fromMs, toMs, maxPoints, MIN_BUCKET_MS)
   const perNode = new Map<string, Array<NodeBucket | null>>()
@@ -749,6 +753,14 @@ export function fleetGpuHistory(q: MetricsHistoryQuery, now = Date.now()): Fleet
     }
   }
   const points: FleetGpuPoint[] = []
+  // The range's summary: utilisation over every reading in it (each one a
+  // GPU for one poll, so GPUs and time weigh alike), and GPU-hours and idle
+  // $ over the part of each bucket inside the range.
+  let rangeUtilSum = 0
+  let rangeUtilN = 0
+  let gpuHours = 0
+  let busyGpuHours = 0
+  let idleCost = 0
   for (let b = 0; b < grid.count; b++) {
     let polled = false
     let rented = 0
@@ -760,19 +772,137 @@ export function fleetGpuHistory(q: MetricsHistoryQuery, now = Date.now()): Fleet
       const s = row[b]
       if (!s || s.polls === 0) continue
       polled = true
+      rangeUtilSum += s.utilSum
+      rangeUtilN += s.utilN
       rented += s.rented / s.polls
       busy += s.busy / s.polls
       utilSum += s.utilSum / s.polls
       utilN += s.utilN / s.polls
       idlePerHour += (s.idleShare / s.polls) * (dph.get(nodeId) ?? 0)
     }
+    const ts = grid.start + b * grid.bucketMs
+    if (polled) {
+      const hours = Math.max(0, Math.min(ts + grid.bucketMs, toMs) - Math.max(ts, fromMs)) / HOUR
+      gpuHours += rented * hours
+      busyGpuHours += busy * hours
+      idleCost += idlePerHour * hours
+    }
     points.push({
-      ts: grid.start + b * grid.bucketMs,
+      ts,
       gpusRented: polled ? rented : null,
       gpusBusy: polled ? busy : null,
       meanUtil: polled && utilN > 0 ? utilSum / utilN : null,
       idlePerHour: polled ? idlePerHour : null
     })
   }
-  return { fromMs, toMs, bucketMs: grid.bucketMs, points }
+  const summary: FleetGpuSummary = {
+    meanUtil: rangeUtilN > 0 ? rangeUtilSum / rangeUtilN : null,
+    gpuHours,
+    busyGpuHours,
+    idleCost
+  }
+  const out: FleetGpuHistory = { fromMs, toMs, bucketMs: grid.bucketMs, points, summary }
+  if (q.perGpu === true) {
+    const { gpus, omitted } = perGpuUtil(grid, fromMs, toMs, cutoff)
+    out.gpus = gpus
+    out.gpusOmitted = omitted
+  }
+  return out
+}
+
+/**
+ * Every GPU's utilisation on the fleet graph's buckets (fleet:gpuHistory
+ * with perGpu): memory for its part of the range, the table for the rest, as
+ * the rest of the graph. At most FLEET_GPU_SERIES_MAX series, the GPUs with
+ * the most readings kept, then ordered by node and index.
+ */
+function perGpuUtil(
+  grid: BucketGrid,
+  fromMs: number,
+  toMs: number,
+  cutoff: number
+): { gpus: FleetGpuSeries[]; omitted: number } {
+  const series = new Map<
+    string,
+    { nodeId: string; index: number; accs: Array<Acc | null>; n: number }
+  >()
+  const of = (nodeId: string, index: number): { accs: Array<Acc | null>; n: number } => {
+    const key = `${nodeId}\u0000${index}`
+    let s = series.get(key)
+    if (!s) {
+      s = { nodeId, index, accs: emptyAccs(grid.count), n: 0 }
+      series.set(key, s)
+    }
+    return s
+  }
+  if (fromMs < cutoff) {
+    try {
+      const rows = getDb()
+        .prepare(
+          `SELECT node_id AS nodeId, gpu_index AS g, CAST((ts - ?) / ? AS INTEGER) AS b,
+                  COUNT(util) AS n, SUM(util) AS s, MIN(util) AS lo, MAX(util) AS hi
+             FROM node_metrics WHERE ts >= ? AND ts < ?
+            GROUP BY node_id, gpu_index, b`
+        )
+        .all(grid.start, grid.bucketMs, fromMs, Math.min(toMs, cutoff)) as Array<{
+        nodeId: string
+        g: number
+        b: number
+        n: number
+        s: number | null
+        lo: number | null
+        hi: number | null
+      }>
+      for (const r of rows) {
+        const s = of(r.nodeId, Number(r.g))
+        // A GPU seen only in gaps still gets its (empty) line.
+        if (Number(r.n) > 0) {
+          merge(s.accs, Number(r.b), Number(r.n), Number(r.s), Number(r.lo), Number(r.hi))
+          s.n += Number(r.n)
+        }
+      }
+    } catch {
+      // No table to read: memory's part stands on its own.
+    }
+  }
+  for (const [nodeId, ring] of rings) {
+    for (const sample of ring) {
+      if (sample.ts < Math.max(fromMs, cutoff) || sample.ts >= toMs) continue
+      const b = bucketOf(grid, sample.ts)
+      for (let i = 0; i < gpuCount(sample); i++) {
+        const s = of(nodeId, i)
+        const g = sample.gpus ? gpuAt(sample, i) : null
+        const util = g && Number.isFinite(g.util) ? g.util : null
+        add(s.accs, b, util)
+        if (util != null) s.n++
+      }
+    }
+  }
+  const names = new Map<string, string>()
+  if (series.size > 0) {
+    try {
+      for (const r of getDb().prepare('SELECT id, gpu_name FROM nodes').all() as Array<{
+        id: string
+        gpu_name: string | null
+      }>) {
+        if (r.gpu_name) names.set(r.id, r.gpu_name)
+      }
+    } catch {
+      // Labelled without the model.
+    }
+  }
+  const all = [...series.values()]
+  const kept = [...all]
+    .sort((a, b) => b.n - a.n)
+    .slice(0, FLEET_GPU_SERIES_MAX)
+    .sort((a, b) => a.nodeId.localeCompare(b.nodeId) || a.index - b.index)
+  return {
+    gpus: kept.map((s) => ({
+      nodeId: s.nodeId,
+      gpuIndex: s.index,
+      label: `${names.get(s.nodeId) ?? 'GPU'} · ${s.nodeId.slice(0, 8)} #${s.index}`,
+      util: toPoints(grid, s.accs)
+    })),
+    omitted: all.length - kept.length
+  }
 }
