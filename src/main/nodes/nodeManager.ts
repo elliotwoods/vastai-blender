@@ -1274,7 +1274,7 @@ export class NodeManager {
   /** When each listed instance was first seen, for one Vast gives no start date. */
   private firstSeen = new Map<number, number>()
   /** Instances of another install or profile already announced this session. */
-  private foreignAlerted = new Set<number>()
+  private foreignAlerted = new Set<string>()
   /** Why each unconfirmed destroy failed, by instance, until it is confirmed. */
   private destroyErrors = new Map<number, string>()
   /**
@@ -1621,8 +1621,14 @@ export class NodeManager {
       if (young) continue
       const owner = this.ownerOf(inst.label)
       unclaimed.set(inst.id, this.unclaimedEntry(inst, owner, now))
-      if (owner !== 'unlabelled' && !this.foreignAlerted.has(inst.id)) {
-        this.foreignAlerted.add(inst.id)
+      // Once per other install, not per instance: the reconcile runs every
+      // 5 minutes, and another Vast Render on the account (Elliot's second
+      // checkout) raised a sticky warning for each node it rented, all
+      // session long (n3 review). Its later rentals are in the Unclaimed
+      // list, with their rate, and count toward the credit guard's runway.
+      const key = this.foreignKey(inst, owner)
+      if (key && !this.foreignAlerted.has(key)) {
+        this.foreignAlerted.add(key)
         emit('alert', { level: 'warn', message: this.foreignMessage(inst, owner) })
       }
     }
@@ -1689,7 +1695,20 @@ export class NodeManager {
     if (owner === 'thisProfile') {
       return `instance ${inst.id} (${inst.label}) carries this install's id but no node here knows it — left running; destroy it from the Vast.ai console if it is stray`
     }
-    return `instance ${inst.id} (${inst.label}) was not rented by this profile — left running; destroy it from its own app or the Vast.ai console if it is stray`
+    return `instance ${inst.id} (${inst.label}) was not rented by this profile — left running; destroy it from its own app or the Vast.ai console if it is stray. Its install's other rentals are listed under Fleet › Unclaimed without another alert`
+  }
+
+  /**
+   * What the one-off alert for an unclaimed instance is keyed by: another
+   * install's id, so that install is announced once however many nodes it
+   * rents; the instance itself for a legacy label with no install id, or one
+   * carrying this install's id; none for an instance with no Vast Render
+   * label, which is listed and never announced.
+   */
+  private foreignKey(inst: RawInstance, owner: UnclaimedOwner): string | null {
+    if (owner === 'unlabelled') return null
+    const install = parseRentalLabel(inst.label)?.install
+    return owner === 'otherVastRender' && install ? `install:${install}` : `instance:${inst.id}`
   }
 
   /**

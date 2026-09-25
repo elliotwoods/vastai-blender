@@ -319,6 +319,34 @@ describe('1.3 unclaimed instances', () => {
     expect(app.nodeManager.activeCount()).toBe(0)
   })
 
+  it("n3 review: another install's later rentals are listed, not announced one by one", async () => {
+    // Every 5-minute pass announced each new instance another Vast Render
+    // on the account rented, with a sticky warning, all session long.
+    w.vast.addInstance({
+      label: 'vastai-blender 0bad0bad:11111111',
+      start_date: vastTime(30 * 60_000)
+    })
+    const app = await started()
+    expect(w.alerts('warn')).toHaveLength(1)
+    expect(w.alerts('warn')[0]).toMatch(/listed under Fleet › Unclaimed without another alert/)
+    for (const node of ['22222222', '33333333', '44444444']) {
+      w.vast.addInstance({
+        label: `vastai-blender 0bad0bad:${node}`,
+        start_date: vastTime(30 * 60_000)
+      })
+    }
+    // A second install is announced once too.
+    w.vast.addInstance({
+      label: 'vastai-blender 0ddba11a:55555555',
+      start_date: vastTime(30 * 60_000)
+    })
+    await w.advance(6 * 60_000, 5_000)
+    expect(app.nodeManager.listUnclaimed()).toHaveLength(5)
+    expect(w.alerts('warn')).toHaveLength(2)
+    expect(w.alerts('warn')[1]).toContain('0ddba11a:55555555')
+    expect(w.vast.count('destroyInstance')).toBe(0)
+  })
+
   it("one under this install's id that no row names is this profile's: listed, not destroyed, not sent to 'its own app'", async () => {
     // A lost or reset database, or a settings file copied to another
     // machine: the label is this install's, and nothing here rented it.
