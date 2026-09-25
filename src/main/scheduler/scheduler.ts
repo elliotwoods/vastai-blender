@@ -548,6 +548,18 @@ const PROGRESS_READ_GAP_MS = 2 * 60_000
 const STATE_MISSING_MS = 3 * 60_000
 
 /**
+ * How long a spec may wait in the inbox of a live agent while no render of
+ * ours runs on the node (ChunkRun.checkMissingState). The agent takes a
+ * spec within seconds of a lane coming free, and a render of ours ending is
+ * what frees one; with none running, whatever holds its lanes is nothing
+ * this app watches: a render it had stopped and requeued, relaunched by the
+ * agent (noderunner's EEVEE retry on OpenGL), or an agent whose main loop
+ * has wedged while its heartbeat beats on. The spec waited with no bound,
+ * the 81fe2875 shape again: paid GPUs held by work nobody watches.
+ */
+const SPEC_UNCLAIMED_MS = 15 * 60_000
+
+/**
  * Every read of the state failing (exec throws, times out or loses its
  * channel) for this long, and the run gives its chunk back. A node that
  * stops answering was otherwise polled every 5 s for good, its chunk
@@ -616,6 +628,10 @@ class ChunkRun {
   private timedFrame = false
   /** When the last state read came back (epoch ms, this computer's clock). */
   private stateReadAt: number | null = null
+  /** The agent's status at the last state read: null until it took the spec. */
+  private agentStatus: AgentState['status'] | null = null
+  /** Since when the spec has waited in the inbox with no render of ours on the node (epoch ms). */
+  private unclaimedSince: number | null = null
 
   /** EWMA of frames/sec while rendering; null until two progress samples land. */
   private framesPerSec: number | null = null
@@ -1096,14 +1112,18 @@ class ChunkRun {
   /**
    * No state file STATE_MISSING_MS after the spec was queued: is the spec
    * still in the agent's inbox, and is the agent alive (its heartbeat)?
-   * - both: it is waiting its turn behind busy slots; wait on.
+   * - both, with a render of ours running on the node: it is waiting its
+   *   turn behind it; wait on. With none, for SPEC_UNCLAIMED_MS: whatever
+   *   holds the agent's lanes is nothing we watch. The spec is withdrawn,
+   *   the chunk goes to another node, and this one is sent nothing more and
+   *   let go once idle (Scheduler.agentDownOn), which ends what holds it.
    * - the agent is not alive: nothing will ever take the spec. It is
    *   withdrawn, the chunk goes to another node, and the node is sent
    *   nothing more once a second look confirms it (Scheduler.suspectAgentDown).
    * - the spec is gone with nothing written for it: something else emptied
    *   the inbox, as a second launch of the app re-provisioning the node did
    *   (81fe2875). The chunk goes back in the queue.
-   * Neither costs a render retry: no render was paid for. True when it has
+   * None costs a render retry: no render was paid for. True when it has
    * settled the run.
    */
   private async checkMissingState(): Promise<boolean> {
@@ -1111,7 +1131,7 @@ class ChunkRun {
     if (this.stopped) return true
     // One of the checks did not answer: nothing can be told this time.
     if (queued == null || alive == null) return false
-    if (queued && alive) return false
+    if (queued && alive) return this.checkUnclaimed()
     if (!alive) {
       await this.retractSpec()
       if (this.stopped) return true
@@ -1138,6 +1158,51 @@ class ChunkRun {
       )
     )
     return true
+  }
+
+  /**
+   * The spec waits in the inbox of a live agent. Behind a render of ours
+   * that is its turn coming, however long that render takes (each has its
+   * own bounds, and its end frees the lane). With none of ours running
+   * there, the wait is bounded (SPEC_UNCLAIMED_MS). True when it has
+   * settled the run.
+   */
+  private async checkUnclaimed(): Promise<boolean> {
+    if (scheduler.rendersBeside(this) > 0) {
+      this.unclaimedSince = null
+      return false
+    }
+    this.unclaimedSince ??= Date.now()
+    if (Date.now() - this.unclaimedSince < SPEC_UNCLAIMED_MS) return false
+    await this.retractSpec()
+    if (this.stopped) return true
+    await this.downloader?.drain()
+    if (this.stopped) return true
+    const min = Math.round(SPEC_UNCLAIMED_MS / 60_000)
+    // Before the requeue, so the chunk is not sent straight back to it.
+    scheduler.agentDownOn(
+      this.nodeId,
+      `its agent left a chunk in its inbox for ${min} min with nothing of this app's ` +
+        'rendering there, so something else holds its GPUs'
+    )
+    this.fail(
+      'dispatch',
+      own(
+        'machine',
+        'spec-unclaimed',
+        `the node's agent did not take the chunk in ${min} min, with nothing else of this ` +
+          "app's rendering on the node"
+      )
+    )
+    return true
+  }
+
+  /**
+   * Has the agent taken this run's spec, and not yet finished its render?
+   * Its lane on the node is taken while so (Scheduler.rendersBeside).
+   */
+  holdsLane(): boolean {
+    return !this.stopped && (this.agentStatus === 'rendering' || this.agentStatus === 'encoding')
   }
 
   /** Is this chunk's spec still in the agent's inbox? null when that could not be read. */
@@ -1174,6 +1239,7 @@ class ChunkRun {
         const state = read.state
         this.missingSince = null
         this.unreadSince = null
+        this.agentStatus = state.status
         // Every state, the done one included: a one-frame chunk's frame is
         // timed by the read that finds it done.
         this.noteProgress(state)
@@ -1598,7 +1664,9 @@ class Scheduler {
    * cost an infrastructure retry, and nothing brings the agent back by
    * itself, so such a node is sent nothing more and is let go of once idle
    * (scalePolicy). Restarting its agent is the node supervisor's (plan 1.7);
-   * forgetNode clears the mark when a node comes back.
+   * forgetNode clears the mark when a node comes back. Also nodes whose
+   * live agent left a spec unclaimed with nothing of ours running there
+   * (ChunkRun.checkUnclaimed): whatever holds their lanes ends with them.
    */
   private agentDown = new Map<string, { since: number; reason: string }>()
   /**
@@ -1982,6 +2050,17 @@ class Scheduler {
     const s = this.byNode.get(nodeId)
     if (!s || s.size === 0) return []
     return [...s].map((r) => ({ chunkId: r.chunkId, jobId: r.jobId, gpu: r.gpu }))
+  }
+
+  /**
+   * Runs of ours on `run`'s node, besides it, whose render the agent has
+   * taken and not yet finished (ChunkRun.holdsLane): what a spec waiting in
+   * the node's inbox may be waiting behind (ChunkRun.checkUnclaimed).
+   */
+  rendersBeside(run: ChunkRun): number {
+    let n = 0
+    for (const r of this.runsOn(run.nodeId)) if (r !== run && r.holdsLane()) n += 1
+    return n
   }
 
   /** GPU a live chunk is pinned to, or null (not live, unpinned, not started). */

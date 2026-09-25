@@ -129,18 +129,75 @@ describe('1.7 field incident 81fe2875: phantom runs', () => {
     expect(app.scheduler.activeWorkForNode(ids[0])).toEqual([])
   })
 
-  it('a spec waiting its turn in the inbox of a live agent is left alone', async () => {
-    const { app, ids } = await fleet(1)
+  it('a spec waiting its turn behind a render of ours, in the inbox of a live agent, is left alone', async () => {
+    // Two lanes planned, and an agent that runs one render at a time (it
+    // counts its lanes otherwise, as its memory ceiling may): the second
+    // spec waits in its inbox for the first render to end.
+    const { app, ids } = await fleet(1, { num_gpus: 2 })
     const machine = w.machineFor(ids[0])
-    const jobId = await w.submitJob(app)
+    let first: string | null = null
+    let stop = (): void => {}
+    machine.onSpec = (spec) => {
+      if (first != null) return
+      first = spec.chunkId
+      stop = heartbeat(machine, spec.chunkId, savedAt(Date.now() / 1000, []))
+    }
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 2, chunkSize: 1 })
     app.scheduler.kick()
-    await w.until(() => machine.agent.inbox().length === 1, 'spec queued')
-    // Behind busy slots for half an hour: no state, the agent alive.
+    await w.until(() => machine.agent.inbox().length === 2, 'both specs queued')
+    // Behind a render of ours for half an hour: no state, the agent alive.
     await w.advance(30 * 60_000, 5_000)
-    expect(chunksOf(jobId)[0]).toMatchObject({ state: 'rendering', infra_retries: 0 })
-    expect(assignedTo(ids[0])).toBe(1)
-    machine.agent.finish(chunksOf(jobId)[0].id)
+    const waiting = chunksOf(jobId).find((c) => c.id !== first)!
+    expect(waiting).toMatchObject({ state: 'rendering', infra_retries: 0 })
+    expect(assignedTo(ids[0])).toBe(2)
+    stop()
+    machine.agent.finish(first!)
+    machine.agent.finish(waiting.id)
     await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(chunksOf(jobId).map((c) => c.infra_retries)).toEqual([0, 0])
+  })
+
+  it('a spec a live agent leaves in its inbox with nothing of ours rendering there: withdrawn, sent elsewhere, and the node let go', async () => {
+    // Review round 2: something the app does not watch holds the agent's
+    // lanes, as an EEVEE render the app had stopped and requeued does once
+    // noderunner relaunches it on OpenGL. The next spec to the node waited
+    // behind it with no bound, while the node billed for nothing we used.
+    // The other node idles until the chunk comes to it, and must still be there.
+    w = await setup({ settings: { maxActiveNodes: 2, idleTimeoutMinutes: 30 } })
+    const app = await w.boot()
+    const held = await w.readyNode(app)
+    // Its agent is alive and takes nothing: its one lane is busy.
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => w.machineFor(held).agent.inbox().length === 1, 'spec queued')
+    const queuedAt = Date.now()
+    const other = await w.readyNode(app)
+    w.machineFor(other).agent.autoFinish()
+
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 60 * 60_000,
+      stepMs: 5_000
+    })
+    // Given up on after its 15 minutes alone there, and charged to the machines.
+    expect(Date.now() - queuedAt).toBeLessThan(25 * 60_000)
+    expect(chunksOf(jobId)[0]).toMatchObject({ node_id: other, retries: 0, infra_retries: 1 })
+    expect(w.machineFor(held).agent.inbox()).toEqual([])
+    expect(w.machineFor(held).ran(new RegExp(`jobs/inbox/${chunk.id}\\.json; pkill`))).toHaveLength(
+      1
+    )
+    expect(app.scheduler.nodeUnfit(held)).toMatch(
+      /left a chunk in its inbox for 15 min with nothing of this app's rendering there/
+    )
+    expect(w.alerts('error').join('\n')).toMatch(
+      /something else holds its GPUs.*Nothing more is sent/
+    )
+    // Sent nothing more, it is let go of.
+    await w.until(() => nodeState(held) === 'destroyed', 'the held node let go', {
+      timeoutMs: 45 * 60_000,
+      stepMs: 5_000
+    })
+    expect(assignedTo(held)).toBe(1)
   })
 
   it('a node whose agent is dead: the spec is withdrawn, the chunk moves on, and the node is let go', async () => {
