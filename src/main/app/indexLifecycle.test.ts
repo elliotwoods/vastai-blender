@@ -1,4 +1,7 @@
 import { EventEmitter } from 'events'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NodeSnapshot } from '../../shared/models'
 
@@ -119,11 +122,13 @@ function node(patch: Partial<NodeSnapshot> = {}): NodeSnapshot {
 /**
  * Load index.ts as a launch with `env`, run its whenReady, with `nodes` in
  * the fleet. `createJob` stands in for jobs.createJob (the drivers' submit).
+ * `userData` runs the real settings.ts against a profile in that folder
+ * instead of a stub.
  */
 async function load(
   nodes: NodeSnapshot[],
   env: Record<string, string> = {},
-  opts: { createJob?: () => Promise<string> } = {}
+  opts: { createJob?: () => Promise<string>; userData?: string } = {}
 ): Promise<Loaded> {
   for (const k of ['VR_JOB_SPEC', 'VR_E2E_BLEND', 'VR_SHOT', 'VR_USERDATA', 'VR_QUIT_POLICY']) {
     vi.stubEnv(k, env[k] ?? '')
@@ -155,7 +160,12 @@ async function load(
   vi.doMock('electron', () => ({
     app: {
       setPath: () => {},
-      getPath: () => '/profiles/test',
+      getPath: (name: string) =>
+        opts.userData
+          ? name === 'userData'
+            ? opts.userData
+            : join(opts.userData, name)
+          : '/profiles/test',
       getAppPath: () => '/app',
       isPackaged: false,
       requestSingleInstanceLock: () => true,
@@ -181,6 +191,11 @@ async function load(
       }
     },
     powerMonitor: out.power,
+    safeStorage: {
+      isEncryptionAvailable: () => false,
+      encryptString: (v: string) => Buffer.from(v, 'utf-8'),
+      decryptString: (b: Buffer) => b.toString('utf-8')
+    },
     Notification: class {
       static isSupported(): boolean {
         return true
@@ -242,7 +257,9 @@ async function load(
     }
   }))
   vi.doMock('../transfer/jobClip', () => ({ jobClips: { catchUp: () => {} } }))
-  vi.doMock('../settings', () => ({ getSettings: () => ({}), updateSettings: () => {} }))
+  // A mock outlives resetModules, so an earlier load's stub is undone here.
+  if (opts.userData) vi.doUnmock('../settings')
+  else vi.doMock('../settings', () => ({ getSettings: () => ({}), updateSettings: () => {} }))
   vi.doMock('../db/db', () => ({
     closeDb: () => {
       out.closedDb++
@@ -554,5 +571,79 @@ describe('index.ts, headless (plan 1.1)', () => {
 
     expect(r.destroyed).toEqual(['node-1-abcdef'])
     expect(r.exits).toEqual([0])
+  })
+})
+
+describe("index.ts, a headless run's settings (plan 1.14)", () => {
+  // Field: two sessions of VR_JOB_SPEC runs rewrote Elliot's settings.json
+  // for good. The next time he opened the app it rented with a campaign's
+  // fleet size, cap and filters, none of which he had chosen.
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'vr-spec-'))
+  })
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it("are this run's alone: in the session overlay, and settings.json is never written", async () => {
+    const settingsFile = join(dir, 'settings.json')
+    writeFileSync(
+      settingsFile,
+      JSON.stringify(
+        {
+          public: {
+            maxActiveNodes: 2,
+            spendCapPerHour: 2,
+            noSpendCap: false,
+            eagerFleet: false,
+            installId: '0b9e3f4c-1d2a-4c3b-9e8f-7a6b5c4d3e2f'
+          },
+          secrets: {}
+        },
+        null,
+        2
+      )
+    )
+    const before = readFileSync(settingsFile, 'utf-8')
+    const spec = join(dir, 'campaign.json')
+    writeFileSync(
+      spec,
+      JSON.stringify({
+        blends: ['/scenes/hero.blend'],
+        maxActiveNodes: 30,
+        spendCapPerHour: 12,
+        eagerFleet: true,
+        slotsPerGpu: 2,
+        offerFilters: { minNumGpus: 4 }
+      })
+    )
+    const submitted: string[] = []
+    await load(
+      [],
+      { VR_JOB_SPEC: spec },
+      {
+        userData: dir,
+        createJob: async () => {
+          submitted.push('hero')
+          return 'job-1'
+        }
+      }
+    )
+    await vi.advanceTimersByTimeAsync(3_000)
+    await vi.dynamicImportSettled()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(submitted).toEqual(['hero'])
+    expect(readFileSync(settingsFile, 'utf-8')).toBe(before)
+    const { sessionOverlay } = await import('./settingsOverlay')
+    expect(sessionOverlay.fields()).toEqual({
+      maxActiveNodes: 30,
+      spendCapPerHour: 12,
+      noSpendCap: false,
+      eagerFleet: true,
+      slotsPerGpu: 2,
+      offerFilters: { minNumGpus: 4 }
+    })
   })
 })

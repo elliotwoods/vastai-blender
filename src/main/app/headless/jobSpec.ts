@@ -3,7 +3,8 @@
  * campaign at boot. It generalises VR_E2E_BLEND (pinned to one blend,
  * Cycles, frames 1-20, no addons, e2e.ts), so a scripted run can set the
  * engine, frame range, addon zips and fleet size. Moved here from index.ts
- * (plan 2.1's composition root), unchanged. Spec shape:
+ * (plan 2.1's composition root); its behaviour is unchanged but for the
+ * settings (below). Spec shape:
  *   {
  *     "blends": ["C:/.../suzanne.blend", ...]  // or "blendDir": "C:/.../blends/<cfg>"
  *     "engine": "eevee", "frameStart": 1, "frameEnd": 200, "frameStep": 1,
@@ -15,15 +16,29 @@
  *     "eagerFleet": true,     // buy ahead: rent to maxActiveNodes while any chunk is open
  *     "offerFilters": { "minNumGpus": 4 }  // partial override of the stored filters
  *   }
+ *
+ * The spec's settings are this run's alone (plan 1.14). They used to go
+ * through updateSettings, which saved them: two sessions of spec runs left
+ * Elliot's own settings.json rewritten for good, and the next time he opened
+ * the app it rented with a campaign's fleet size and filters. They now go
+ * through the same sanitizer as the Settings screen's and into the session
+ * overlay (app/settingsOverlay.ts), and settings.json is never written.
  */
 
 import { join } from 'path'
+import type { SettingsFieldError, SettingsPublic } from '../../../shared/models'
+import { sanitizeSettingsPatch } from '../../../shared/settingsSanitize'
+import { hostPathFlavour } from '../../paths'
+import { acceptedFields } from '../settingsGate'
+import { sessionOverlay, type OverlayFields, type SettingsOverlay } from '../settingsOverlay'
 
 export interface JobSpecDeps {
   /** Start the scheduler on what was submitted. */
   kick(): void
   /** Each part of the campaign that was not submitted, and why; the exit status reads it. */
   unsubmitted: string[]
+  /** Defaults to this process's. */
+  overlay?: SettingsOverlay
 }
 
 /**
@@ -43,9 +58,80 @@ export function specSettingsPatch(spec: Record<string, unknown>): Record<string,
   // Render slots per GPU on multi-GPU nodes (0 = one process on all GPUs).
   if (spec.slotsPerGpu != null) patch.slotsPerGpu = spec.slotsPerGpu
   // Partial offer-filter overrides (e.g. {"cpuBound": true}) merge over
-  // the stored filters via updateSettings' offerFilters merge.
+  // the stored filters, filter by filter.
   if (spec.offerFilters) patch.offerFilters = spec.offerFilters
   return patch
+}
+
+/** A field of the overlay that getSettings() does not hand out as set, with what it hands out. */
+interface NotInForce {
+  field: string
+  asked: unknown
+  inForce: unknown
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/** Fields of `fields` that `settings` does not carry as set. */
+function notInForce(fields: OverlayFields, settings: SettingsPublic): NotInForce[] {
+  const out: NotInForce[] = []
+  const now = settings as unknown as Record<string, unknown>
+  for (const [key, value] of Object.entries(fields)) {
+    if (key === 'offerFilters') {
+      const filters = (settings.offerFilters ?? {}) as unknown as Record<string, unknown>
+      for (const [f, v] of Object.entries(value as Record<string, unknown>)) {
+        if (!sameValue(filters[f], v)) {
+          out.push({ field: `offerFilters.${f}`, asked: v, inForce: filters[f] })
+        }
+      }
+    } else if (!sameValue(now[key], value)) {
+      out.push({ field: key, asked: value, inForce: now[key] })
+    }
+  }
+  return out
+}
+
+/**
+ * Put the spec's settings in force for this session: checked by the
+ * sanitizer against what is in force now, then laid over it in the
+ * overlay. Nothing is saved. Says on stderr what the sanitizer refused or
+ * clamped, and any field getSettings() does not then hand out as set, so a
+ * campaign never runs at settings other than it asked for without a word.
+ * Returns the fields put in force.
+ */
+export function applySpecSettings(
+  spec: Record<string, unknown>,
+  getSettings: () => SettingsPublic,
+  overlay: SettingsOverlay = sessionOverlay
+): OverlayFields {
+  const asked = specSettingsPatch(spec)
+  if (Object.keys(asked).length === 0) return {}
+  const result = sanitizeSettingsPatch(asked, getSettings(), { pathFlavour: hostPathFlavour() })
+  for (const e of result.errors) console.error(`[spec] setting ${describeOutcome(e)}`)
+  const fields = acceptedFields(asked, result)
+  overlay.set(fields)
+  console.log(
+    `[spec] settings for this run only (settings.json is left as it is) ${JSON.stringify(fields)}`
+  )
+  const missing = notInForce(fields, getSettings())
+  if (missing.length) {
+    console.error(
+      '[spec] not in force: this build does not apply a run-only setting, so these run ' +
+        `at the saved value: ${missing
+          .map(
+            (m) =>
+              `${m.field} ${JSON.stringify(m.inForce)} (the spec asked for ${JSON.stringify(m.asked)})`
+          )
+          .join(', ')}`
+    )
+  }
+  return fields
+}
+
+function describeOutcome(e: SettingsFieldError): string {
+  return `${e.outcome === 'clamped' ? 'clamped' : 'refused'}: ${e.message}`
 }
 
 /**
@@ -58,15 +144,11 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
   const { createJob, listJobs } = await import('../../jobs/jobs')
   const { reviveFailedChunks } = await import('../../jobs/revive')
   const { registerAddon } = await import('../../addons/addons')
-  const { updateSettings } = await import('../../settings')
+  const { getSettings } = await import('../../settings')
 
   const spec = JSON.parse(readFileSync(specPath, 'utf-8'))
 
-  const patch = specSettingsPatch(spec)
-  if (Object.keys(patch).length) {
-    updateSettings(patch)
-    console.log(`[spec] settings ${JSON.stringify(patch)}`)
-  }
+  applySpecSettings(spec, getSettings, deps.overlay)
 
   // Register each zip fresh: the registry keys on the manifest id and re-hashes the
   // file, so re-running after an extension rebuild replaces the stale entry even
