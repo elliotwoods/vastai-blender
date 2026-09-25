@@ -724,24 +724,34 @@ class ManagedNode {
     this.update({ state, last_error: lastError })
   }
 
-  /** Establish the pooled SSH connection (TOFU-pinning the host key). */
+  /**
+   * Establish the pooled SSH connection (TOFU-pinning the host key), and
+   * return it: the one this call connected, even if a destroy closed it and
+   * nulled `this.ssh` while it connected. It used to re-read `this.ssh` after
+   * the await and so returned null then, and the callers' check for exactly
+   * that (resumeNode, recoverUnreachable: "end the session it opened") threw
+   * instead of running, while a connect in flight, which ssh2 completes on a
+   * closed connection all the same, kept its session to the dying box.
+   */
   async connectSsh(): Promise<SshConnection> {
     const row = this.row
     if (!row.ssh_host || !row.ssh_port) throw new Error('no SSH endpoint yet')
-    if (!this.ssh) {
-      this.ssh = new SshConnection({
+    let ssh = this.ssh
+    if (!ssh) {
+      ssh = new SshConnection({
         host: row.ssh_host,
         port: row.ssh_port,
         username: 'root',
         privateKey: readPrivateKey(),
         pinnedHostKey: row.host_key
       })
-      this.ssh.on('hostKey', (hash: string) => {
+      ssh.on('hostKey', (hash: string) => {
         if (!this.row.host_key) this.update({ host_key: hash })
       })
+      this.ssh = ssh
     }
-    await this.ssh.acquire()
-    return this.ssh
+    await ssh.acquire()
+    return ssh
   }
 
   closeSsh(): void {

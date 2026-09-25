@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NodeState } from '../../shared/models'
+import { FakeSshConnection } from '../test/fakeSsh'
 import { setup, type App, type FakeMachine, type World } from '../test/harness'
 
 // Destroying a node while a restart re-attaches to it: resumeNode, and the
@@ -151,6 +152,56 @@ describe('destroy while a restart re-provisions the node (resumeNode)', () => {
     expect(errors[0]).toContain(`Destroy failed for instance ${instanceId}`)
     await expect(app.nodeManager.clearFailed()).resolves.toBe(1)
     expect(w.vast.live()).toEqual([])
+  })
+
+  it('a connect the destroy overtook has the session it opened ended (Phase 0 review, 1.7)', async () => {
+    // resumeNode's connect is under way when the destroy closes the node's
+    // connection, and completes all the same, as ssh2's does: its session to
+    // the dying box is open. connectSsh re-read the node's connection after
+    // the await, found the destroy's null there, and the check meant to end
+    // that session threw instead.
+    const acquire = FakeSshConnection.prototype.acquire
+    const close = FakeSshConnection.prototype.close
+    const connecting: FakeSshConnection[] = []
+    let land: () => void = () => {}
+    let landed = false
+    const closedAfterLanding: FakeSshConnection[] = []
+    const acquireSpy = vi
+      .spyOn(FakeSshConnection.prototype, 'acquire')
+      .mockImplementation(async function (this: FakeSshConnection) {
+        const machine = await acquire.call(this)
+        if (connecting.length === 0) {
+          connecting.push(this)
+          await new Promise<void>((r) => (land = r))
+        }
+        return machine
+      })
+    const closeSpy = vi.spyOn(FakeSshConnection.prototype, 'close').mockImplementation(function (
+      this: FakeSshConnection
+    ) {
+      if (landed) closedAfterLanding.push(this)
+      close.call(this)
+    })
+    try {
+      const { app, id } = await restartWith('ready', (a) => {
+        a.nodeManager.onReady = async () => {}
+      })
+      await w.until(() => connecting.length > 0, 'resume connecting')
+
+      const from = w.events.length
+      await app.nodeManager.destroyNode(id)
+      landed = true
+      land()
+      await w.advance(30_000)
+
+      expect(closedAfterLanding).toEqual(connecting)
+      expect(statesSince(id, from)).toEqual(['destroying', 'destroyed'])
+      expect(w.vast.count('destroyInstance')).toBe(1)
+      expect(w.alerts('error')).toEqual([])
+    } finally {
+      acquireSpy.mockRestore()
+      closeSpy.mockRestore()
+    }
   })
 
   it('a destroy while Vast is asked about the instance is not undone by the answer', async () => {
