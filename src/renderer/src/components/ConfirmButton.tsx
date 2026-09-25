@@ -15,12 +15,18 @@
  * settles, so a destroy already on its way can't be sent twice (#113).
  * Callers still pass `disabled` for states the button can't see, such as a
  * node another path is already destroying.
+ *
+ * `icon` puts an icon before the label. With `iconOnly` too, it rests as a
+ * square icon button (iconBtn) named by `label` for screen readers and the
+ * tooltip, and grows to show the question in words once armed: a row's trash
+ * button, say, that asks "cancel job?" in place.
  */
 
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react'
-import { btn, type BtnVariant, type ControlSize } from '../lib/controls'
+import { btn, iconBtn, type BtnVariant, type ControlSize } from '../lib/controls'
 import { TOKENS } from '../lib/theme'
 import { CONFIRM_WINDOW_MS, confirmClick, confirmKey, settleOf } from './confirm'
+import { Icon, type IconName } from './Icon'
 
 export interface ConfirmButtonProps {
   /** the resting label: "destroy", "cancel" */
@@ -36,6 +42,10 @@ export interface ConfirmButtonProps {
   style?: CSSProperties
   /** how long the armed state lasts */
   windowMs?: number
+  /** an icon before the label (and in place of it, with iconOnly) */
+  icon?: IconName
+  /** rest as a square icon button, `label` its accessible name; armed shows the question */
+  iconOnly?: boolean
 }
 
 export function ConfirmButton({
@@ -47,7 +57,9 @@ export function ConfirmButton({
   disabled = false,
   title,
   style,
-  windowMs = CONFIRM_WINDOW_MS
+  windowMs = CONFIRM_WINDOW_MS,
+  icon,
+  iconOnly = false
 }: ConfirmButtonProps): React.JSX.Element {
   const [armedAt, setArmedAt] = useState<number | null>(null)
   // The confirmed action is still in flight.
@@ -69,13 +81,17 @@ export function ConfirmButton({
   }, [armedAt, windowMs])
 
   const armed = armedAt != null && !off
+  // An icon-only button at rest: square, and named by its label.
+  const bare = iconOnly && icon != null && !armed
+  const iconSize = size === 'sm' ? 13 : 15
 
   return (
     <button
       type="button"
       disabled={off}
       aria-busy={pending || undefined}
-      title={armed ? 'click again to confirm' : title}
+      aria-label={bare ? label : undefined}
+      title={armed ? 'click again to confirm' : (title ?? (bare ? label : undefined))}
       onClick={(e) => {
         // These sit inside click-to-expand rows — never toggle the row.
         e.stopPropagation()
@@ -102,6 +118,7 @@ export function ConfirmButton({
       onBlur={() => setArmedAt(null)}
       style={{
         ...btn({ variant, size, disabled: off }),
+        ...(bare ? { ...iconBtn({ size, disabled: off }), ...colorsOf(variant, off) } : null),
         ...(armed
           ? { background: TOKENS.dangerBg, borderColor: TOKENS.danger, color: TOKENS.text }
           : null),
@@ -109,7 +126,17 @@ export function ConfirmButton({
       }}
     >
       {/* Announced when it changes, so a screen reader hears the question. */}
-      <span aria-live="polite">{armed ? (confirmLabel ?? `confirm ${label}?`) : label}</span>
+      {icon && !armed ? <Icon name={icon} size={iconSize} /> : null}
+      <span aria-live="polite">
+        {armed ? (confirmLabel ?? `confirm ${label}?`) : bare ? null : label}
+      </span>
     </button>
   )
+}
+
+/** The variant's colours on an icon button's square (iconBtn is always "default"). */
+function colorsOf(variant: BtnVariant, disabled: boolean): CSSProperties {
+  if (disabled) return {}
+  const { background, borderColor, color } = btn({ variant, size: 'sm' })
+  return { background, borderColor, color }
 }

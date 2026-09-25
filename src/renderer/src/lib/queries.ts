@@ -29,6 +29,7 @@ import type {
   NodeChunkView,
   NodeMetricsHistory,
   NodeSnapshot,
+  QueueEntry,
   RequestNodeOptions,
   RetryMissingResult,
   ScaleStatusInfo,
@@ -41,6 +42,7 @@ import type { IpcEventMap, IpcEventMapPending } from '../../../shared/ipc'
 import { holdsInstance } from '../../../shared/nodeState'
 import { useAlertStore } from './alertStore'
 import { ipc } from './ipc'
+import { groupInQueue, moveInQueue, ungroupInQueue, upsertJob, withQueue } from './jobQueue'
 import { useLogStore } from './logStore'
 import {
   NO_READINGS,
@@ -55,7 +57,11 @@ import { HISTORY_POINTS, rangeMs, type UsageRange } from './usageRange'
 export const qk = {
   settings: ['settings'] as const,
   nodes: ['nodes'] as const,
+  /** the Jobs list; every key under ['jobs'] is a jobs list, so invalidating this reaches them all */
   jobs: ['jobs'] as const,
+  /** the list with the jobs removed from it (job:remove) as well */
+  jobsWithHidden: ['jobs', 'withHidden'] as const,
+  queue: ['queue'] as const,
   job: (id: string) => ['job', id] as const,
   nodeChunks: (nodeId: string) => ['nodeChunks', nodeId] as const,
   thumbBucket: (jobId: string, bucket: number) => ['thumbs', jobId, bucket] as const,
@@ -66,7 +72,8 @@ export const qk = {
   holds: ['fleetHolds'] as const,
   scaleStatus: ['scaleStatus'] as const,
   unclaimed: ['unclaimed'] as const,
-  fleetGpuHistory: (range: UsageRange) => ['fleetGpuHistory', range] as const,
+  fleetGpuHistory: (range: UsageRange, perGpu = false) =>
+    ['fleetGpuHistory', range, perGpu ? 'perGpu' : 'combined'] as const,
   nodeMetricsHistory: (nodeId: string, range: UsageRange) =>
     ['nodeMetricsHistory', nodeId, range] as const
 }
@@ -158,17 +165,23 @@ function historyRefetchMs(range: UsageRange): number {
 /**
  * The whole fleet's GPU use over the last `range` (Feature G). The window
  * is taken when the read runs, so a refetch slides it. The previous range's
- * chart stays up while a new one loads.
+ * chart stays up while a new one loads. `perGpu` adds each GPU's own line
+ * (FleetGpuHistory.gpus); the two views are cached apart.
  */
-export function useFleetGpuHistory(range: UsageRange): UseQueryResult<FleetGpuHistory> {
+export function useFleetGpuHistory(
+  range: UsageRange,
+  opts: { perGpu?: boolean } = {}
+): UseQueryResult<FleetGpuHistory> {
+  const perGpu = opts.perGpu === true
   return useQuery({
-    queryKey: qk.fleetGpuHistory(range),
+    queryKey: qk.fleetGpuHistory(range, perGpu),
     queryFn: () => {
       const toMs = Date.now()
       return ipc.invoke('fleet:gpuHistory', {
         fromMs: toMs - rangeMs(range),
         toMs,
-        maxPoints: HISTORY_POINTS
+        maxPoints: HISTORY_POINTS,
+        ...(perGpu ? { perGpu: true } : {})
       })
     },
     refetchInterval: historyRefetchMs(range),
@@ -304,8 +317,25 @@ export function useNodes(): UseQueryResult<NodeSnapshot[]> {
   return useQuery({ queryKey: qk.nodes, queryFn: () => ipc.invoke('nodes:list') })
 }
 
-export function useJobs(): UseQueryResult<JobSummary[]> {
-  return useQuery({ queryKey: qk.jobs, queryFn: () => ipc.invoke('jobs:list') })
+/**
+ * The Jobs list, newest first. `includeHidden` adds the jobs removed from it
+ * (job:remove), under a key of its own, for a "removed jobs" view.
+ */
+export function useJobs(opts: { includeHidden?: boolean } = {}): UseQueryResult<JobSummary[]> {
+  const all = opts.includeHidden === true
+  return useQuery({
+    queryKey: all ? qk.jobsWithHidden : qk.jobs,
+    queryFn: () => ipc.invoke('jobs:list', all ? { includeHidden: true } : undefined)
+  })
+}
+
+/**
+ * The render queue as main holds it: the queued and running jobs in dispatch
+ * order, a group as one entry. The Jobs list's `queuePos`/`groupId` say the
+ * same per job; this is for a caller that wants the entries.
+ */
+export function useQueue(): UseQueryResult<QueueEntry[]> {
+  return useQuery({ queryKey: qk.queue, queryFn: () => ipc.invoke('queue:list') })
 }
 
 export function useJob(id: string): UseQueryResult<JobDetail | null> {
@@ -418,7 +448,10 @@ export function useSubmitJob(): UseMutationResult<{ jobId: string }, Error, JobS
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (submission: JobSubmission) => ipc.invoke('job:create', submission),
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs })
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.queue })
+      return qc.invalidateQueries({ queryKey: qk.jobs })
+    }
   })
 }
 
@@ -466,6 +499,144 @@ export function useResumeJob(): UseMutationResult<boolean, Error, string> {
   return useMutation({
     mutationFn: (jobId: string) => ipc.invoke('job:resume', jobId),
     onSettled: (_r, _e, jobId) => {
+      void qc.invalidateQueries({ queryKey: qk.jobs })
+      void qc.invalidateQueries({ queryKey: qk.job(jobId) })
+    }
+  })
+}
+
+/** The Jobs list as it was before an optimistic change, to put back if main refuses it. */
+interface JobsSnapshot {
+  jobs: JobSummary[] | undefined
+}
+
+/**
+ * Move a job (with its whole group) to just before `before`, or to the end
+ * with null. The list shows the new order at once (moveInQueue) and takes
+ * main's queue when it answers; a refusal puts the old order back and
+ * rejects with main's "code: message".
+ */
+export function useMoveJob(): UseMutationResult<
+  QueueEntry[],
+  Error,
+  { jobId: string; before: string | null },
+  JobsSnapshot
+> {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (v: { jobId: string; before: string | null }) => ipc.invoke('job:move', v),
+    onMutate: async ({ jobId, before }) => {
+      await qc.cancelQueries({ queryKey: qk.jobs, exact: true })
+      const jobs = qc.getQueryData<JobSummary[]>(qk.jobs)
+      if (jobs) qc.setQueryData(qk.jobs, moveInQueue(jobs, jobId, before))
+      return { jobs }
+    },
+    onError: (_e, _v, snap) => {
+      if (snap?.jobs) qc.setQueryData(qk.jobs, snap.jobs)
+    },
+    onSuccess: (queue) => {
+      qc.setQueryData(qk.queue, queue)
+      qc.setQueryData<JobSummary[]>(qk.jobs, (prev) => (prev ? withQueue(prev, queue) : prev))
+    }
+  })
+}
+
+/**
+ * Put `jobId` in `withJobId`'s group (made if it has none): they share one
+ * place and render in step. Shown at once with a stand-in group id until
+ * main answers with the real one; a refusal puts the list back.
+ */
+export function useGroupJob(): UseMutationResult<
+  { groupId: string },
+  Error,
+  { jobId: string; withJobId: string },
+  JobsSnapshot
+> {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (v: { jobId: string; withJobId: string }) => ipc.invoke('job:group', v),
+    onMutate: async ({ jobId, withJobId }) => {
+      await qc.cancelQueries({ queryKey: qk.jobs, exact: true })
+      const jobs = qc.getQueryData<JobSummary[]>(qk.jobs)
+      if (jobs) qc.setQueryData(qk.jobs, groupInQueue(jobs, jobId, withJobId))
+      return { jobs }
+    },
+    onError: (_e, _v, snap) => {
+      if (snap?.jobs) qc.setQueryData(qk.jobs, snap.jobs)
+    },
+    onSuccess: ({ groupId }, { jobId, withJobId }, snap) => {
+      // Main's group id, in place of the stand-in, from the list as it was.
+      if (snap?.jobs) qc.setQueryData(qk.jobs, groupInQueue(snap.jobs, jobId, withJobId, groupId))
+    },
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: qk.queue })
+      void qc.invalidateQueries({ queryKey: qk.jobs })
+    }
+  })
+}
+
+/** Take a job out of its group, to the place just after it. Shown at once; a refusal puts it back. */
+export function useUngroupJob(): UseMutationResult<void, Error, string, JobsSnapshot> {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (jobId: string) => ipc.invoke('job:ungroup', jobId),
+    onMutate: async (jobId) => {
+      await qc.cancelQueries({ queryKey: qk.jobs, exact: true })
+      const jobs = qc.getQueryData<JobSummary[]>(qk.jobs)
+      if (jobs) qc.setQueryData(qk.jobs, ungroupInQueue(jobs, jobId))
+      return { jobs }
+    },
+    onError: (_e, _v, snap) => {
+      if (snap?.jobs) qc.setQueryData(qk.jobs, snap.jobs)
+    },
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: qk.queue })
+      void qc.invalidateQueries({ queryKey: qk.jobs })
+    }
+  })
+}
+
+/**
+ * Cancel a job: its unfinished chunks become 'cancelled' and its renders
+ * stop. Main emits job:changed and chunk:changed; the invalidations cover
+ * one this window missed.
+ */
+export function useCancelJob(): UseMutationResult<void, Error, string> {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (jobId: string) => ipc.invoke('job:cancel', jobId),
+    onSettled: (_r, _e, jobId) => {
+      void qc.invalidateQueries({ queryKey: qk.jobs })
+      void qc.invalidateQueries({ queryKey: qk.queue })
+      void qc.invalidateQueries({ queryKey: qk.job(jobId) })
+    }
+  })
+}
+
+/**
+ * Remove a finished job from the Jobs list; its files and rows stay, and
+ * useRestoreJob lists it again. Rejects "active: …" while the job is queued
+ * or running (cancel it first). The job leaves the list here, not by
+ * job:changed alone, and its detail is dropped from the cache.
+ */
+export function useRemoveJob(): UseMutationResult<void, Error, string> {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (jobId: string) => ipc.invoke('job:remove', jobId),
+    onSuccess: (_r, jobId) => {
+      qc.setQueryData<JobSummary[]>(qk.jobs, (prev) => prev?.filter((j) => j.id !== jobId))
+      qc.removeQueries({ queryKey: qk.job(jobId), exact: true })
+      void qc.invalidateQueries({ queryKey: qk.jobsWithHidden })
+    }
+  })
+}
+
+/** List a removed job again. */
+export function useRestoreJob(): UseMutationResult<void, Error, string> {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (jobId: string) => ipc.invoke('job:restore', jobId),
+    onSuccess: (_r, jobId) => {
       void qc.invalidateQueries({ queryKey: qk.jobs })
       void qc.invalidateQueries({ queryKey: qk.job(jobId) })
     }
@@ -522,15 +693,29 @@ export function useIpcEvents(): void {
         })
       },
       'job:changed': (job) => {
-        qc.setQueryData<JobSummary[]>(qk.jobs, (prev) => {
-          if (!prev) return prev
-          const i = prev.findIndex((j) => j.id === job.id)
-          if (i < 0) return [job, ...prev]
-          const next = [...prev]
+        const prev = qc.getQueryData<JobSummary[]>(qk.jobs)?.find((j) => j.id === job.id)
+        // A removed job (hiddenAt set) leaves the list rather than being upserted.
+        qc.setQueryData<JobSummary[]>(qk.jobs, (list) => (list ? upsertJob(list, job) : list))
+        qc.setQueryData<JobSummary[]>(qk.jobsWithHidden, (list) => {
+          if (!list) return list
+          const i = list.findIndex((j) => j.id === job.id)
+          if (i < 0) return [job, ...list]
+          const next = [...list]
           next[i] = job
           return next
         })
-        qc.invalidateQueries({ queryKey: qk.job(job.id) })
+        if (job.hiddenAt != null) qc.removeQueries({ queryKey: qk.job(job.id), exact: true })
+        else qc.invalidateQueries({ queryKey: qk.job(job.id) })
+        // The queue only when the job's place in it can have moved: job:changed
+        // fires for every downloaded frame, and most change nothing there.
+        if (
+          !prev ||
+          prev.state !== job.state ||
+          prev.queuePos !== job.queuePos ||
+          prev.groupId !== job.groupId
+        ) {
+          qc.invalidateQueries({ queryKey: qk.queue })
+        }
       },
       // High-rate (one per in-flight chunk per ~5s agent poll): fold into the
       // local store, never invalidate. This used to trigger a job:get per

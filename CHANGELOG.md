@@ -175,6 +175,19 @@ stalled the app).
   window holds more frames than fit, the row shows every Nth frame and a chip
   says so ("every 12th frame · 1–5000") with a *zoom to all frames* button.
   Thumbnails of cancelled chunks are hatched grey.
+- **Progress bars that say what state a job is in.** Lime with a moving
+  stripe while it renders, solid green once complete, red for failed frames,
+  grey hatching for what a cancel stopped, amber while held, the bare track
+  while queued; each frame that arrives flashes the part it added. With room,
+  the bar marks every frame (or every chunk), and on the job page it can draw
+  each chunk where it sits in the job. The Jobs list uses it now. Motion stops
+  under *reduce motion*.
+- **Job timing, formatted** (building blocks for the Jobs and job pages):
+  "elapsed 1h 02m · 14m left · ETA 14:32" while a job renders, counting down
+  between updates, and "took 1h 02m · finished 14:32" after, with the figures
+  in mono. Renderer hooks for reordering, grouping, cancelling, removing and
+  restoring jobs (shown at once, put back if refused), and for the per-GPU
+  fleet history; a job removed from the list leaves it everywhere.
 
 ### Changed
 

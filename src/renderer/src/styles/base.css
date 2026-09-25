@@ -159,3 +159,96 @@ button:focus-visible {
   opacity: 1;
   background: color-mix(in srgb, currentColor 10%, transparent);
 }
+
+/* Progress bars (components/ProgressBar.tsx).
+   .vr-progress-live: a stripe moving through the fill of work under way.
+   .vr-progress-pulse: a flash over what just grew, restarted by remounting
+   the element (useGrowPulse), in the colour of the fill (--vr-progress-pulse).
+   .vr-progress-hatch: work a cancel stopped. Grey hatching rather than the
+   dead status fill, which is all but invisible against the surface. */
+@keyframes vr-progress-stripe {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 10px 0;
+  }
+}
+
+@keyframes vr-progress-glow {
+  0% {
+    opacity: 1;
+    background-color: color-mix(in srgb, #fff 45%, var(--vr-progress-pulse, var(--accent)));
+    box-shadow: 0 0 6px 1px var(--vr-progress-pulse, var(--accent));
+  }
+  100% {
+    opacity: 0;
+    background-color: var(--vr-progress-pulse, var(--accent));
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.vr-progress-live {
+  background-image: linear-gradient(
+    135deg,
+    rgba(0, 0, 0, 0.16) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(0, 0, 0, 0.16) 50%,
+    rgba(0, 0, 0, 0.16) 75%,
+    transparent 75%,
+    transparent
+  );
+  background-size: 10px 10px;
+  animation: vr-progress-stripe 0.9s linear infinite;
+}
+
+.vr-progress-pulse {
+  opacity: 0;
+  animation: vr-progress-glow 900ms ease-out;
+}
+
+.vr-progress-hatch {
+  background-color: var(--status-dead-fill);
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--status-dead-text) 0 1px,
+    transparent 1px 4px
+  );
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vr-progress-live,
+  .vr-progress-pulse {
+    animation: none;
+  }
+}
+
+/* Drag-and-drop feedback on a row (the Jobs queue): a line where the row
+   will land before or after the target, or a ring when dropping onto it
+   joins its group. Drawn with inset shadows so the row does not move. */
+.vr-drop-before {
+  box-shadow: inset 0 2px 0 0 var(--accent);
+}
+.vr-drop-after {
+  box-shadow: inset 0 -2px 0 0 var(--accent);
+}
+.vr-drop-group {
+  box-shadow: inset 0 0 0 2px var(--accent);
+  background: var(--accent-soft-bg);
+}
+.vr-drop-before,
+.vr-drop-after,
+.vr-drop-group {
+  transition:
+    box-shadow 80ms ease-out,
+    background 80ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vr-drop-before,
+  .vr-drop-after,
+  .vr-drop-group {
+    transition: none;
+  }
+}

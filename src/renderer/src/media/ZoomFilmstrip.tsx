@@ -17,6 +17,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { btn, mono } from '../lib/controls'
 import { useThumbWindow } from '../lib/queries'
 import { SCALE, TOKENS } from '../lib/theme'
+import { fmtStride, ordinal } from '../lib/format'
 import { domainOf, frameAt, indexOf } from './frame-domain'
 import { FrameMinimap } from './FrameMinimap'
 import { Thumb, type ThumbState } from './Thumb'
@@ -27,7 +28,6 @@ import {
   defaultView,
   fitAllView,
   layoutStrip,
-  ordinal,
   recenter,
   sampledIndices,
   worstState,
@@ -229,7 +229,7 @@ export function ZoomFilmstrip({
     )
   })
 
-  const chipText = `${layout.sampled ? `every ${ordinal(frameStride)} frame` : 'all frames'} · ${firstFrame}–${lastFrame}`
+  const chipText = `${layout.sampled ? fmtStride(frameStride) : 'all frames'} · ${firstFrame}–${lastFrame}`
   const chipTone = layout.sampled
     ? { background: TOKENS.warnSoftBg, border: TOKENS.warnSoftBorder, color: TOKENS.warnSoftText }
     : { background: TOKENS.surfaceRaised, border: TOKENS.border, color: TOKENS.textSecondary }

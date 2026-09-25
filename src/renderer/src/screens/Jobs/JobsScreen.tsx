@@ -2,29 +2,14 @@ import { useState, type CSSProperties } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
 import { SubmitJobDialog } from './SubmitJobDialog'
 import { OpenInExplorerButton } from '../../components/OpenInExplorerButton'
+import { ProgressBar } from '../../components/ProgressBar'
+import { barStateOf } from '../../components/progressSegments'
 import { btn, chip, mono, panel, tableRow } from '../../lib/controls'
 import { basename, fmtFrames, fmtMoney, fmtTimeAgo } from '../../lib/format'
 import { useNav } from '../../lib/nav'
 import { useJobs } from '../../lib/queries'
 import { SCALE, TOKENS } from '../../lib/theme'
 import type { JobSummary } from '../../../../shared/models'
-
-function ProgressBar({ done, total }: { done: number; total: number }): React.JSX.Element {
-  const pct = total > 0 ? (done / total) * 100 : 0
-  return (
-    <div style={{ height: 2, background: TOKENS.border, borderRadius: 1, width: '100%' }}>
-      <div
-        style={{
-          height: '100%',
-          width: `${pct}%`,
-          background: TOKENS.accent,
-          borderRadius: 1,
-          transition: 'width 400ms'
-        }}
-      />
-    </div>
-  )
-}
 
 const engineChipStyle: CSSProperties = { textTransform: 'uppercase', fontSize: 'var(--text-2xs)' }
 
@@ -55,7 +40,14 @@ function JobRow({ job }: { job: JobSummary }): React.JSX.Element {
           </span>
         </div>
         <div style={{ marginTop: 6 }}>
-          <ProgressBar done={job.framesDone} total={job.framesTotal} />
+          <ProgressBar
+            done={job.framesDone}
+            total={job.framesTotal}
+            cancelled={job.framesCancelled}
+            state={barStateOf(job)}
+            label={`frames of ${job.name || basename(job.blendPath)}`}
+            ticks
+          />
         </div>
       </div>
       <span style={{ width: 90, fontSize: SCALE.textSm, color: TOKENS.textSecondary }}>
