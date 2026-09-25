@@ -8,7 +8,7 @@
  * hooks in at `onReady` in Phase 3.
  */
 
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { co2Grams } from '../carbon/intensity'
 import { getDb, readAppState, writeAppState } from '../db/db'
 import { classify, type Classification } from '../errors'
@@ -22,7 +22,7 @@ import {
   type RentalContribution
 } from '../scheduler/scaling'
 import { learnedSlots } from '../scheduler/slotController'
-import { getSettings } from '../settings'
+import { getSecret, getSettings } from '../settings'
 import { ensureKeyRegistered, readPrivateKey } from '../ssh/keys'
 import { FIRST_CONNECT_BUDGET_MS, retryWithBackoff } from '../ssh/connectRetry'
 import { SshConnection } from '../ssh/sshConnection'
@@ -230,8 +230,13 @@ function rateWords(r: AccountRate): string {
  *           does not reopen renting on money that would last minutes once
  *           scale-up refills the fleet.
  *   auth    Vast refused the account itself (a 401 or 403). Released when an
- *           API key is saved, when the key is accepted again (a 401), or by
- *           the user. Kept for the session only: a restart asks Vast afresh.
+ *           API key is saved, when Vast answers a key other than the one it
+ *           refused, or by the user. Never by the refused key answering a
+ *           balance read: a key that may read the account but not rent
+ *           (scoped keys; Vast's permission errors are undocumented) would
+ *           release, rent, be refused and hold again every minute, a failed
+ *           row and two alerts each time. Kept for the session only: a
+ *           restart asks Vast afresh.
  */
 interface AccountHold {
   reason: string
@@ -241,8 +246,19 @@ interface AccountHold {
   cause: 'credit' | 'runway' | 'auth'
   /** $/hr the account billed when the hold was set (accountPerHour). */
   perHour: number
-  /** classify()'s rule, for an auth hold: what would clear it. */
+  /** classify()'s rule, for an auth hold. */
   rule?: string
+  /** For an auth hold, keyFingerprint() of the key Vast refused. In memory only. */
+  key?: string | null
+}
+
+/**
+ * A short hash of the Vast API key in use, or null with none, so an auth
+ * hold can tell a new key from the one Vast refused without keeping it.
+ */
+function keyFingerprint(): string | null {
+  const key = getSecret('vastApiKey')
+  return key ? createHash('sha256').update(key).digest('hex').slice(0, 16) : null
 }
 
 /** An account hold from app_state, or null. A value that does not parse is a hold all the same. */
@@ -1589,7 +1605,14 @@ export class NodeManager {
       return
     }
     this.setHold(
-      { reason: c.reason, balance: this.balance, cause: 'auth', perHour, rule: c.rule },
+      {
+        reason: c.reason,
+        balance: this.balance,
+        cause: 'auth',
+        perHour,
+        rule: c.rule,
+        key: keyFingerprint()
+      },
       `Vast refused the account (${c.reason}): renting is paused until the Vast.ai API key is fixed in Settings`,
       'error'
     )
@@ -1631,8 +1654,9 @@ export class NodeManager {
    *   until the runway has recovered first).
    * - Held: released once the balance has gone up, a top-up, and lasts at
    *   least RUNWAY_RELEASE_MIN at the higher of the account's rate now and
-   *   when it was held. An auth hold waits for its key, not for money; a 401
-   *   one lifts once Vast answers the key again.
+   *   when it was held. An auth hold waits for a key, not for money: it
+   *   lifts once Vast answers a key other than the one it refused (saved in
+   *   Settings before onApiKeySaved is wired, or with it).
    */
   private guardCredit(balance: number, rate: AccountRate): void {
     const perHour = rate.total
@@ -1640,8 +1664,8 @@ export class NodeManager {
     const h = this.hold
     if (h) {
       if (h.cause === 'auth') {
-        if (h.rule === 'vast-401' || h.rule === 'vast-no-key') {
-          this.releaseHold('Renting resumes: Vast accepts the API key again')
+        if (keyFingerprint() !== h.key) {
+          this.releaseHold('Renting resumes: Vast answers the new API key')
         }
         return
       }

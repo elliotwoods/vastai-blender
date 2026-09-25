@@ -275,6 +275,38 @@ describe('1.20 an account Vast refuses', () => {
     expect(app.nodeManager.accountHold()).toBeNull()
     await expect(app.nodeManager.requestNodes(1)).resolves.toHaveLength(1)
   })
+
+  // Review of 3c443cd: a 401 hold lifted at the next balance read that
+  // worked. A key that may read the account but not rent (a scoped key)
+  // then went: released, scale-up rents, 401, held, a failed row and two
+  // alerts, every minute.
+  it('a key that reads the balance but may not rent: held once, not a failed row every minute', async () => {
+    w = await setup({ settings: { maxActiveNodes: 3, eagerFleet: true } })
+    for (let i = 0; i < 8; i++) w.vast.addOffer()
+    const unauthorised = { status: 401, message: 'vast.ai PUT /asks/5001/ → 401: not permitted' }
+    w.vast.fail('createInstance', unauthorised, 20)
+    const app = await w.boot()
+    await w.submitJob(app, { frameStart: 1, frameEnd: 40, chunkSize: 2 })
+    app.scheduler.kick()
+
+    await w.advance(5 * 60_000, 5_000)
+
+    expect(w.vast.count('currentUser')).toBeGreaterThanOrEqual(5)
+    expect(w.vast.count('createInstance')).toBe(1)
+    expect(rowCount()).toBe(1)
+    expect(w.alerts('error')).toHaveLength(1)
+    expect(w.alerts('info')).toEqual([])
+    expect(app.nodeManager.accountHold()).not.toBeNull()
+
+    // A different key, saved in Settings: the next balance read Vast answers
+    // with it lifts the hold. Refused again, it holds again: one row a key.
+    w.secrets.vastApiKey = 'a-different-key'
+    await w.advance(5 * 60_000, 5_000)
+    expect(w.alerts('info')).toEqual(['Renting resumes: Vast answers the new API key'])
+    expect(w.vast.count('createInstance')).toBe(2)
+    expect(rowCount()).toBe(2)
+    expect(app.nodeManager.accountHold()).not.toBeNull()
+  })
 })
 
 describe('1.20 money readouts (Phase 0 review note on 1.1 / 1.20)', () => {
