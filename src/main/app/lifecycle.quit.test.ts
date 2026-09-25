@@ -440,6 +440,40 @@ describe('Destroy all while the fleet is still changing (plan 1.1; Phase 0 revie
     expect(w.vast.argsOf('destroyInstance')).toEqual([[instance]])
   })
 
+  it('1.1: a create still out after its 20 s: listed, and what it rents when it answers is destroyed with no Try again', async () => {
+    // 1.1 review: the row was listed but left 'requested'. A reply after the
+    // budget (a PUT can take 30 s, then 1.4's lookup a minute more) drove
+    // the instance to ready, billing behind the failure list until the user
+    // pressed Try again, if they did.
+    w = await setup()
+    const engine = await w.boot()
+    w.vast.addOffer()
+    const gate = w.vast.hold('createInstance')
+    const renting = engine.nodeManager.requestNodes(1)
+    await w.until(() => gate.reached, 'the create in flight')
+    const r = await rig(engine)
+    const retry = deferred<number>()
+    r.answers.push(DESTROY, retry.promise)
+
+    r.app.quit()
+    await w.until(() => r.dialogs.length === 2, 'the failure list')
+    expect(r.dialogs[1].detail).toContain('Vast never answered its create')
+
+    // The reply comes while the list is up, and nobody presses anything.
+    gate.release()
+    await renting
+    const [instance] = w.vast.created
+    await w.until(() => w.vast.live().length === 0, 'its instance destroyed', {
+      timeoutMs: 2 * 60_000
+    })
+    expect(w.vast.argsOf('destroyInstance')).toEqual([[instance]])
+    expect(r.app.exits).toEqual([])
+
+    retry.resolve(RETRY)
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: [instance] }])
+  })
+
   it('a scale-up batch already under way: its create in flight is destroyed, and it rents nothing more', async () => {
     // requestNodes read the caps before its first await, so each destroy
     // freed room for the batch's next rental, and it rented it.

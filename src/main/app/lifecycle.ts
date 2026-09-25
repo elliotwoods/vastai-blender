@@ -495,6 +495,17 @@ async function settleNode(
   }
   if (!n || !holdsInstance(n)) return null
   if (createOutcomeUnknown(n)) {
+    // Still out when the budget ran out, and still wanted: destroyed now, so
+    // that whatever it rents is destroyed when it answers (rentOffer, or
+    // 1.4's lookup), with no Try again. Left 'requested', a reply after the
+    // budget (a PUT may take 30 s, the lookup a minute more) drove the
+    // instance to ready and billing behind the failure list (1.1 review).
+    // One already destroying or destroyed is left to that.
+    if (createMayStillAnswer(n) && n.state === 'requested') {
+      await fleet.destroyNode(id, 0).catch(() => {})
+      n = fleet.snapshot(id)
+      if (!n || !holdsInstance(n)) return null
+    }
     return `Vast never answered its create; look for "${vastLabel(n)}" in the Vast.ai console`
   }
   // A destroy already under way (the idle scale-down, the Fleet's button) is
