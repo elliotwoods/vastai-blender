@@ -5,7 +5,7 @@
  * link to the Vast.ai instances page, the one place such an instance can be
  * checked and killed by hand, and is listed above every plain error.
  *
- * Above the screen and above RecoveryBanner, for the reason that one sits
+ * Above the screen and above HoldsBanner, for the reason that one sits
  * there: it is app-wide, and money leaking outranks paused work.
  */
 
@@ -52,7 +52,7 @@ function tone(item: AlertItem): { row: CSSProperties; meta: string; icon: string
     }
   }
   // A billing risk raised as a warning ("not rented by this profile — left
-  // running"): RecoveryBanner's colours.
+  // running"): HoldsBanner's colours for a hold.
   return {
     row: {
       background: TOKENS.warnSoftBg,

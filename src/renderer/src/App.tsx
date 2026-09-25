@@ -1,8 +1,8 @@
 import { useEffect } from 'react'
 import { AlertBanner } from './components/AlertBanner'
 import { AlertToasts } from './components/AlertToasts'
+import { HoldsBanner } from './components/HoldsBanner'
 import { PageBar } from './components/PageBar'
-import { RecoveryBanner } from './components/RecoveryBanner'
 import { useNav } from './lib/nav'
 import { isPreviewOpen, usePreview } from './lib/preview'
 import { useIpcEvents } from './lib/queries'
@@ -66,11 +66,11 @@ function App(): React.JSX.Element {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <main style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        {/* Above the screen, not inside it: the hold is app-wide, and every
-            screen would otherwise have to remember to show it. Alerts first:
-            an instance billing unmanaged outranks paused work. */}
+        {/* Above the screen, not inside it: the holds are app-wide, and
+            every screen would otherwise have to remember to show them.
+            Alerts first: an instance billing unmanaged outranks paused work. */}
         <AlertBanner />
-        <RecoveryBanner />
+        <HoldsBanner />
         <div style={{ flex: 1, minHeight: 0 }}>
           <Screen />
         </div>

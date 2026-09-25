@@ -66,30 +66,7 @@ export const qk = {
   unclaimed: ['unclaimed'] as const,
   fleetGpuHistory: (range: UsageRange) => ['fleetGpuHistory', range] as const,
   nodeMetricsHistory: (nodeId: string, range: UsageRange) =>
-    ['nodeMetricsHistory', nodeId, range] as const,
-  recoveryHold: ['recoveryHold'] as const
-}
-
-/**
- * Startup-recovered chunks whose fleet scale-up is paused, or null when none.
- *
- * Set once at boot and only ever cleared by the user, so there is nothing to
- * poll for — but it IS resolved after the window loads, hence a query rather
- * than a prop.
- */
-export function useRecoveryHold(): UseQueryResult<{ chunks: number } | null> {
-  return useQuery({
-    queryKey: qk.recoveryHold,
-    queryFn: () => ipc.invoke('scheduler:recoveryHold')
-  })
-}
-
-export function useResumeRecovery(): UseMutationResult<void, Error, void> {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: () => ipc.invoke('scheduler:resumeRecovery'),
-    onSuccess: () => qc.setQueryData(qk.recoveryHold, null)
-  })
+    ['nodeMetricsHistory', nodeId, range] as const
 }
 
 /**
