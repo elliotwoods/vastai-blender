@@ -19,6 +19,8 @@ export const HINTS = {
     'Metered spend ÷ how long the node has been up. The app meters at the quoted rate, provisioning and idle time included, so this settles at about that rate. It reads high at first, because the meter charges whole minutes: up to about a third over the rate when it first shows, at 3 minutes. It reads lower only for time the app did not meter, such as while it was closed or asleep. Estimated, not billed.',
   uptime: 'Time since vast.ai started billing this instance.',
   power: 'Current GPU power draw against the card’s limit, and energy used this session.',
+  gpuTrend:
+    'GPU utilisation over the last 30 minutes: the line is the mean across the node’s GPUs, the band runs from its least to its most busy card. A wide band under a low line is one card working while the others idle. Hover or focus it to read a moment.',
 
   fleetRate:
     'Combined $/hr of every node that may be billing: booting, working, or failed with its destroy not yet confirmed by Vast. Click for spend history.',

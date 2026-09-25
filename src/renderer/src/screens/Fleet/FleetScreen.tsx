@@ -1,6 +1,7 @@
-import { useEffect, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
 import { ConfirmButton } from '../../components/ConfirmButton'
+import { Sparkline } from '../../components/charts/Sparkline'
 import { Icon } from '../../components/Icon'
 import { InfoHint } from '../../components/Tooltip'
 import { btn, mono, panel, sectionLabel, statusDot, tableRow } from '../../lib/controls'
@@ -11,10 +12,18 @@ import { useNav } from '../../lib/nav'
 import { ipcErrorText } from '../../lib/recovery'
 import { DestroyNodeButton } from './NodeActions'
 import { NodeDetail } from './NodeDetail'
+import { FleetGpuStrip } from './FleetGpuStrip'
 import { UnclaimedPanel } from './UnclaimedPanel'
 import { MeterPair, MiniMeter } from './meters'
+import { SPARK_MS, clockFormatter, liveWindow, sparkPoints } from './usageCharts'
 import { pctOf, usageTone } from '../../lib/usage'
-import { useNodes, useRequestNode, useSettings, useUpdateSettings } from '../../lib/queries'
+import {
+  useNodeReadings,
+  useNodes,
+  useRequestNode,
+  useSettings,
+  useUpdateSettings
+} from '../../lib/queries'
 import { useNow } from '../../lib/useNow'
 import { SCALE, TOKENS, type StatusTone } from '../../lib/theme'
 import { capacityBudget, holdsInstance } from '../../../../shared/nodeState'
@@ -53,6 +62,7 @@ const COLS = {
   state: 92,
   gpu: 150,
   gpuUse: 132,
+  gpuTrend: 64,
   cpuUse: 132,
   rate: 82,
   cost: 70,
@@ -132,6 +142,7 @@ function HeaderRow(): React.JSX.Element {
       <span style={{ ...h, width: COLS.state }}>state</span>
       <span style={{ ...h, width: COLS.gpu }}>gpu</span>
       <span style={{ ...h, width: COLS.gpuUse }}>gpu % · vram %</span>
+      <HeaderCell h={h} width={COLS.gpuTrend} label="30 min" hint={HINTS.gpuTrend} />
       <span style={{ ...h, width: COLS.cpuUse }}>cpu % · ram %</span>
       <HeaderCell h={h} width={COLS.rate} label="rate" hint={HINTS.rate} />
       <HeaderCell h={h} width={COLS.cost} label="cost" hint={HINTS.spent} />
@@ -154,6 +165,36 @@ function activitySummary(node: NodeSnapshot): string {
   const jobs = new Set(work.map((w) => w.jobId))
   const slots = `${work.length}/${node.slotTarget}`
   return jobs.size === 1 ? `${slots} · ${work[0].chunkId}` : `${slots} · ${jobs.size} jobs`
+}
+
+const pct = (v: number): string => `${v.toFixed(0)}%`
+const clock = clockFormatter(SPARK_MS)
+
+/**
+ * The row's last 30 minutes of GPU use (Feature G): the mean across the
+ * node's GPUs, over the spread from its least to its most busy card. Its own
+ * component, so a sample re-renders this cell and not the whole row.
+ */
+function GpuTrend({ nodeId }: { nodeId: string }): React.JSX.Element {
+  const readings = useNodeReadings(nodeId)
+  const now = useNow(15_000)
+  const { fromMs, toMs } = liveWindow(readings, now, SPARK_MS)
+  const points = useMemo(() => sparkPoints(readings, fromMs, toMs), [readings, fromMs, toMs])
+  return (
+    <span style={{ width: COLS.gpuTrend, display: 'inline-flex', alignItems: 'center' }}>
+      <Sparkline
+        points={points}
+        fromMs={fromMs}
+        toMs={toMs}
+        yMax={100}
+        width={COLS.gpuTrend}
+        height={18}
+        label="GPU util, 30 min"
+        format={pct}
+        formatX={clock}
+      />
+    </span>
+  )
 }
 
 function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
@@ -208,6 +249,7 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
             />
           }
         />
+        <GpuTrend nodeId={node.id} />
         <MeterPair
           width={COLS.cpuUse}
           top={
@@ -463,8 +505,13 @@ export function FleetScreen(): React.JSX.Element {
           gap: SCALE.space3
         }}
       >
-        {/* Billing with no node here to show for it: above everything. */}
-        {settings && !settings.hasVastApiKey ? null : <UnclaimedPanel />}
+        {settings && !settings.hasVastApiKey ? null : (
+          <>
+            {/* Billing with no node here to show for it: above everything. */}
+            <UnclaimedPanel />
+            <FleetGpuStrip hasNodes={listed.length > 0} />
+          </>
+        )}
         {settings && !settings.hasVastApiKey ? (
           <div
             style={{

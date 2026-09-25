@@ -2,20 +2,50 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { NodeSnapshot, SettingsPublic, UnclaimedInstance } from '../../../../shared/models'
+import type { StateCreator, StoreApi, UseBoundStore } from 'zustand'
+import type {
+  FleetGpuHistory,
+  NodeSnapshot,
+  SettingsPublic,
+  UnclaimedInstance
+} from '../../../../shared/models'
 
-// The Fleet as Phase 1 wires it, rendered from a seeded query cache with
-// the IPC bridge stubbed (window.api, which a test has no window for), as
-// recoveryWiring.test.tsx does:
+// The Fleet as Phase 1 wires it, rendered from a seeded query cache and
+// metrics store with the IPC bridge stubbed (window.api, which a test has no
+// window for), as recoveryWiring.test.tsx does:
 // - 1.2: a node that may still be billing is always listed, and counted;
 // - 1.3: instances nobody here holds are listed with their rate, destroy asks;
 // - 1.20: the toolbar's balance turns amber and red by runway, not at $5;
 // - 1.5: "+ request node" at the spend cap asks before going past it;
-// - 1.18: a node waiting for an Octane sign-in offers the VNC login.
+// - 1.18: a node waiting for an Octane sign-in offers the VNC login;
+// - Feature G: the GPU strip, each row's sparkline, NodeDetail's charts.
 
+// A server render reads each zustand store's server snapshot, its initial
+// state: empty. These renders stand for the window, which reads a store as
+// it is now, the metrics seeded below. So the app's stores are made here
+// with the current state as both snapshots.
+vi.mock('zustand', async (importOriginal) => {
+  const zustand = await importOriginal<typeof import('zustand')>()
+  const { createStore } = await import('zustand/vanilla')
+  const { useSyncExternalStore } = await import('react')
+  function create<T>(init: StateCreator<T, [], []>): UseBoundStore<StoreApi<T>> {
+    const api = createStore<T>()(init)
+    function useBoundStore<U>(selector: (s: T) => U = (s) => s as unknown as U): U {
+      return useSyncExternalStore(
+        api.subscribe,
+        () => selector(api.getState()),
+        () => selector(api.getState())
+      )
+    }
+    return Object.assign(useBoundStore, api) as UseBoundStore<StoreApi<T>>
+  }
+  return { ...zustand, create }
+})
 vi.mock('../../lib/ipc', () => ({
   ipc: { invoke: vi.fn(() => new Promise(() => {})), on: vi.fn(() => () => {}) }
 }))
+// Server rendering never runs the ResizeObserver; give the charts a width.
+vi.mock('../../components/charts/useWidth', () => ({ useWidth: () => 640 }))
 const stored: Record<string, string> = {}
 vi.stubGlobal('localStorage', {
   getItem: (k: string) => stored[k] ?? null,
@@ -25,6 +55,8 @@ vi.stubGlobal('localStorage', {
 })
 
 const { qk } = await import('../../lib/queries')
+const { useMetricsStore } = await import('../../lib/metricsStore')
+type MetricsReading = import('../../lib/metricsStore').MetricsReading
 const { FleetScreen } = await import('./FleetScreen')
 const { NodeDetail } = await import('./NodeDetail')
 const { AppToolbar } = await import('../../components/AppToolbar')
@@ -86,8 +118,12 @@ const unclaimed = (patch: Partial<UnclaimedInstance>): UnclaimedInstance => ({
   ...patch
 })
 
+const seedStore = (state: Partial<ReturnType<typeof useMetricsStore.getState>>): void =>
+  useMetricsStore.setState(state)
+
 beforeEach(() => {
   for (const k of Object.keys(stored)) delete stored[k]
+  useMetricsStore.setState({ byNode: {}, seeds: {} })
 })
 
 describe('1.2: a node that may be billing is never out of sight', () => {
@@ -262,5 +298,73 @@ describe('1.18: Octane sign-in by hand', () => {
     const html = withCache(() => {}, <NodeDetail node={node({ octaneState: 'licensed' })} />)
     expect(html).not.toContain('Open VNC login')
     expect(vi.mocked(ipc.invoke).mock.calls.some(([c]) => c === 'node:openVncTunnel')).toBe(false)
+  })
+})
+
+describe('Feature G: GPU use over time', () => {
+  const now = Date.now()
+  const reading = (ts: number, utils: number[], runs: number[]): MetricsReading => ({
+    ts,
+    gpus: utils.map((util, index) => ({ index, util, vramPct: 40, runs: runs[index] })),
+    powerW: 600
+  })
+
+  it("each row has its node's 30-minute GPU sparkline beside the meter", () => {
+    seedStore({
+      byNode: {
+        'node-1-abcdef': [
+          reading(now - 60_000, [90, 10], [1, 1]),
+          reading(now - 45_000, [80, 20], [1, 1])
+        ]
+      },
+      seeds: { 'node-1-abcdef': 'done' }
+    })
+    const html = withCache((qc) => qc.setQueryData(qk.nodes, [node({})]), <FleetScreen />)
+    expect(html).toContain('aria-label="GPU util, 30 min: mean 50%, low 10%, high 90%"')
+  })
+
+  it('the fleet strip plots GPUs busy against rented, with the latest figures', () => {
+    const history: FleetGpuHistory = {
+      fromMs: now - 3_600_000,
+      toMs: now,
+      bucketMs: 30_000,
+      points: [
+        { ts: now - 90_000, gpusRented: 24, gpusBusy: 20, meanUtil: 70, idlePerHour: 1.1 },
+        { ts: now - 60_000, gpusRented: 24, gpusBusy: 17, meanUtil: 61, idlePerHour: 2.4 }
+      ]
+    }
+    const html = withCache(
+      (qc) => {
+        qc.setQueryData(qk.nodes, [node({})])
+        qc.setQueryData(qk.fleetGpuHistory('1h'), history)
+      },
+      <FleetScreen />
+    )
+    expect(html).toContain('gpu use')
+    expect(html).toContain('17 / 24')
+    expect(html).toContain('61%')
+    expect(html).toContain('$2.400/hr')
+    expect(html).toContain('rented')
+    expect(html).toContain('busy')
+  })
+
+  it("NodeDetail draws each GPU's line and shades one idle with work assigned (81fe2875)", () => {
+    seedStore({
+      byNode: {
+        'node-1-abcdef': [
+          reading(now - 60_000, [95, 2], [1, 1]),
+          reading(now - 45_000, [96, 3], [1, 1]),
+          reading(now - 30_000, [97, 1], [1, 1])
+        ]
+      },
+      seeds: { 'node-1-abcdef': 'done' }
+    })
+    const html = withCache(() => {}, <NodeDetail node={node({})} />)
+    expect(html).toContain('gpu utilisation %')
+    expect(html).toContain('GPU 0')
+    expect(html).toContain('GPU 1')
+    expect(html).toContain('idle with work assigned')
+    expect(html).toContain('vram used %')
+    expect(html).toContain('gpu power, all cards')
   })
 })

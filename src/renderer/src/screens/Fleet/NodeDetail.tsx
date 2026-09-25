@@ -1,12 +1,13 @@
 /**
  * Expanded row for a fleet node — the "what is this machine actually doing"
- * panel. Five live gauges (%GPU, %VRAM, %CPU, %RAM, temp), the money strip,
- * what it is rendering right now, its capabilities, and the console tail. A
- * node whose OctaneServer waits for a sign-in offers the VNC login first
- * (VncLogin).
+ * panel. Five live gauges (%GPU, %VRAM, %CPU, %RAM, temp), its GPU use over
+ * time (NodeUsageCharts), the money strip, what it is rendering right now,
+ * its capabilities, and the console tail. A node whose OctaneServer waits
+ * for a sign-in offers the VNC login first (VncLogin).
  *
  * Everything here comes from the NodeSnapshot the row already has, except the
- * workload panel, which fetches the node→chunk→job join it needs (NodeWorkload).
+ * workload panel, which fetches the node→chunk→job join it needs
+ * (NodeWorkload), and the charts, which read the metrics store and history.
  */
 
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
@@ -32,6 +33,7 @@ import { useNow } from '../../lib/useNow'
 import { TONE_COLOR, pctOf, usageTone, type Tone } from '../../lib/usage'
 import { Meter } from './meters'
 import { ReprovisionButton } from './NodeActions'
+import { NodeUsageCharts } from './NodeUsageCharts'
 import { NodeWorkload } from './NodeWorkload'
 import { octaneCap, octaneStateOf } from './octane'
 import { VncLogin } from './VncLogin'
@@ -419,6 +421,9 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
           tone={tempTone}
         />
       </div>
+
+      {/* -- use over time --------------------------------------------------- */}
+      <NodeUsageCharts node={node} />
 
       {/* -- money + workload ---------------------------------------------- */}
       <div
