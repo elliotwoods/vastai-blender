@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { classify, describeError, GUARD_EXIT, type AgentFailure } from './errors'
 import { RetryAbortedError } from './ssh/connectRetry'
-import { TransferAbortedError, TransferStalledError } from './ssh/pipelinedGet'
+import { LocalSinkError, TransferAbortedError, TransferStalledError } from './ssh/pipelinedGet'
 import { SftpTimeoutError } from './ssh/sftp'
 import { ExecTimeoutError, HostKeyMismatchError, SftpOpenTimeoutError } from './ssh/sshConnection'
 
@@ -323,6 +323,39 @@ describe('classify: this computer', () => {
   it("plan 1.10's LocalSinkError is local whatever it says", () => {
     const e = Object.assign(new Error('output folder unwritable'), { name: 'LocalSinkError' })
     expect(classify(e).kind).toBe('localFs')
+  })
+
+  it('knows the real LocalSinkError, whose class sets no name', () => {
+    // As pipelinedGet's asLocalSinkError and ensureRoom throw it.
+    const full = new LocalSinkError(
+      'ENOSPC',
+      "ENOSPC: no space left on device, write '/Users/me/renders/j/0001.exr.part'",
+      '/Users/me/renders/j/0001.exr.part'
+    )
+    const noRoom = new LocalSinkError(
+      'ENOSPC',
+      'not enough free space in /Users/me/renders/j: 120 MB free, 900 MB to download, and 2048 MB kept free',
+      '/Users/me/renders/j',
+      900 * 1024 ** 2
+    )
+    const gone = new LocalSinkError(
+      'ENOENT',
+      "ENOENT: no such file or directory, open '/Volumes/Render/j/0001.exr.part'",
+      '/Volumes/Render/j/0001.exr.part'
+    )
+    expect(full.name).toBe('Error')
+    for (const e of [full, noRoom, gone]) {
+      for (const via of [undefined, 'ssh', 'local'] as const) {
+        const c = classify(e, { via })
+        expect(c, c.reason).toMatchObject({ kind: 'localFs', rule: 'local-sink', retryable: false })
+      }
+    }
+    expect(classify(full).reason).toMatch(/disk full on this computer/)
+    // The free-space check's own words, and the code they leave out.
+    expect(classify(noRoom).reason).toMatch(/not enough free space.*\(ENOSPC\)/)
+    // A plain fs error is not a sink: nothing wrapped it.
+    const raw = sysErr("ENOSPC: no space left on device, write '/x'", 'ENOSPC', -28, 'write')
+    expect(classify(raw).rule).toBe('local-ENOSPC')
   })
 })
 

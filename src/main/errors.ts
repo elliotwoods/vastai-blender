@@ -216,6 +216,35 @@ function failedConnecting(e: ErrorLike, depth = 0): boolean {
   return false
 }
 
+/**
+ * pipelinedGet's LocalSinkError: the local disk would not take a file. Its
+ * class sets no name, so its shape marks it too: an fs code as a string and
+ * a needBytes field (undefined but present unless a free-space check set it),
+ * without the errno and syscall of the system error it may have wrapped.
+ */
+function isLocalSink(e: ErrorLike): boolean {
+  if (str(e.name) === 'LocalSinkError') return true
+  return (
+    typeof e.code === 'string' &&
+    /^E[A-Z0-9_]+$/.test(e.code) &&
+    'needBytes' in e &&
+    e.errno === undefined &&
+    e.syscall === undefined
+  )
+}
+
+function localFsLabel(code: string): string | null {
+  if (code === 'ENOSPC' || code === 'EDQUOT' || code === 'EFBIG') {
+    return 'disk full on this computer'
+  }
+  if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS') {
+    return 'permission denied on this computer'
+  }
+  if (code === 'ENOENT' || code === 'ENOTDIR') return 'a local file or folder is missing'
+  if (code === 'EIO') return 'the local disk failed'
+  return null
+}
+
 /** The HTTP status of a Vast reply, from VastError.status or its message ("→ 400:"). */
 function httpStatus(e: ErrorLike): number | null {
   if (typeof e.status === 'number' && e.status >= 100 && e.status < 600) return e.status
@@ -416,9 +445,10 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
   const ssh = opts.via === 'ssh' || (opts.via == null && !vast && looksLikeSsh(e))
   const code = systemCode(e)
 
-  // --- Local sink (plan 1.10 names its error LocalSinkError). ---
-  if (name === 'LocalSinkError') {
-    return result('localFs', 'local-sink', 'cannot write output on this computer', e, false)
+  // --- Local sink (plan 1.10's LocalSinkError), whatever its message says. ---
+  if (isLocalSink(e)) {
+    const label = localFsLabel(str(e.code)) ?? 'cannot write output on this computer'
+    return result('localFs', 'local-sink', label, e, false)
   }
 
   // --- The account: before anything retries or blacklists. ---
@@ -539,15 +569,7 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
 
   // --- This computer's disk. ---
   if (code && LOCAL_FS.has(code)) {
-    const label =
-      code === 'ENOSPC' || code === 'EDQUOT' || code === 'EFBIG'
-        ? 'disk full on this computer'
-        : code === 'EACCES' || code === 'EPERM' || code === 'EROFS'
-          ? 'permission denied on this computer'
-          : code === 'ENOENT' || code === 'ENOTDIR'
-            ? 'a local file or folder is missing'
-            : 'local file error'
-    return result('localFs', `local-${code}`, label, e, false)
+    return result('localFs', `local-${code}`, localFsLabel(code) ?? 'local file error', e, false)
   }
 
   // --- The node's disk, quoted back in its stderr (not a local code above). ---
