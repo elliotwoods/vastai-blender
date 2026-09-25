@@ -132,6 +132,39 @@ describe('classify: did the far end act? (plan 1.4)', () => {
   it('a create answered 200 without a contract is a refusal from Vast, not a mystery', () => {
     const c = classify(new VastError('create instance failed: no_such_ask'), { via: 'vast' })
     expect(c).toMatchObject({ kind: 'machine', outcomeUnknown: false, retryable: true })
+    // Vast's msg in place of an error, and a reply that says success: false.
+    for (const refused of [
+      'create instance failed: Instance type no longer available',
+      'create instance failed: {"success":false,"error":null,"msg":null}'
+    ]) {
+      const r = classify(new VastError(refused), { via: 'vast' })
+      expect(r, r.reason).toMatchObject({ rule: 'vast-refused', outcomeUnknown: false })
+    }
+  })
+
+  it('...but one that gives neither a contract nor a reason may have rented one', () => {
+    // vastClient falls back to the whole reply when it has no error or msg:
+    // a reply that looks like success under a renamed contract field. The
+    // machine is not blacklisted and the next offer is not tried while this
+    // one may bill under its label: plan 1.4 looks it up first.
+    for (const unknown of [
+      'create instance failed: {"success":true,"new_contract_id":4242}',
+      'create instance failed: {}',
+      'create instance failed: []',
+      'create instance failed: null',
+      'create instance failed: '
+    ]) {
+      for (const via of ['vast', undefined] as const) {
+        const c = classify(new VastError(unknown), { via })
+        expect(c, `${unknown} via ${via}`).toMatchObject({
+          kind: 'transient',
+          rule: 'vast-create-unknown',
+          outcomeUnknown: true,
+          retryable: true
+        })
+        expect(c.reason).toMatch(/create instance failed/)
+      }
+    }
   })
 
   it('an SSH command that timed out or lost its link may have run; one never sent did not', () => {

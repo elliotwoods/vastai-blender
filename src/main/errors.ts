@@ -58,8 +58,9 @@ export interface Classification {
   retryable: boolean
   /**
    * The far end may have done what was asked before the error came back: a
-   * Vast 5xx, timeout, network error or non-JSON reply, an SSH command that
-   * timed out or lost its connection, or an error nothing here recognises.
+   * Vast 5xx, timeout, network error or non-JSON reply, a create answered
+   * with neither a contract nor a reason, an SSH command that timed out or
+   * lost its connection, or an error nothing here recognises.
    * For a call that is not safe to repeat, above all a create (PUT /asks),
    * this means "find out", never "retry": the instance may exist and bill
    * under its label, so plan 1.4 looks it up by label and adopts it or
@@ -170,6 +171,29 @@ function systemCode(e: ErrorLike, depth = 0): string | null {
     if (UNREACHABLE.has(m[1]) || LOCAL_NET.has(m[1]) || DROPPED.has(m[1])) return m[1]
   }
   return null
+}
+
+/**
+ * vastClient.createInstance throws "create instance failed: …" for a 200
+ * without a contract. After the colon is Vast's `error` or `msg` when the
+ * reply had one: a refusal in Vast's own words. Otherwise it is the whole
+ * reply as JSON, and a reply that neither says no nor carries a contract (a
+ * contract field renamed, say) may have rented one, as nodeManager's
+ * createRefused already assumes of a create with no status. true = refused,
+ * false = may exist, null = not this message.
+ */
+function createReplyRefused(message: string): boolean | null {
+  const m = /^create instance failed:([\s\S]*)$/i.exec(message)
+  if (!m) return null
+  const rest = m[1].trim()
+  if (!rest) return false
+  let body: unknown
+  try {
+    body = JSON.parse(rest)
+  } catch {
+    return true
+  }
+  return isObject(body) && (body as { success?: unknown }).success === false
 }
 
 /** The HTTP status of a Vast reply, from VastError.status or its message ("→ 400:"). */
@@ -290,6 +314,7 @@ const OUTCOME_UNKNOWN = new Set([
   'vast-timeout',
   'vast-network',
   'vast-unreachable',
+  'vast-create-unknown',
   'timeout',
   'net-dropped',
   'ssh-exec-timeout',
@@ -393,10 +418,20 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
   if (status === 404 || status === 410) {
     return result('machine', 'vast-gone', 'Vast says the instance or offer is gone', e, true)
   }
-  if ((status != null && status >= 400) || (vast && /^create instance failed:/i.test(message))) {
+  const createReply = vast ? createReplyRefused(message) : null
+  if (status == null && createReply === false) {
+    return result(
+      'transient',
+      'vast-create-unknown',
+      'Vast answered the create with neither a contract nor a reason',
+      e,
+      true
+    )
+  }
+  if ((status != null && status >= 400) || createReply === true) {
     // An offer rented by someone else, or no longer on the market: another
     // offer can succeed where this one cannot. A create answered 200 with no
-    // contract says why in the same words, and is as definite a no.
+    // contract and Vast's reason (or success: false) is as definite a no.
     // An unrecognised 4xx can equally be our own request (an image, a disk
     // size or a field Vast rejects), which fails on every offer the same
     // way. So the rent path must bound these per batch (requestNodes stops
