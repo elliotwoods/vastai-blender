@@ -109,6 +109,26 @@ describe('1.21 no work, no rent (job da68b61b)', () => {
     expect(w.alerts('info').join('\n')).toContain(leftover)
   })
 
+  it('one frame left, rendering on the one live node, rents nothing', async () => {
+    w = await setup({ settings: { maxActiveNodes: 3, eagerFleet: true } })
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    w.vast.addOffer()
+    w.vast.addOffer()
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 1, chunkSize: 1 })
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => chunkRow(chunk.id).state === 'rendering', 'the frame rendering')
+
+    await w.advance(60_000)
+
+    // Buy-ahead counted one chunk in flight as work to widen the fleet for,
+    // and rented to maxActiveNodes; one frame on a live lane wants nothing.
+    expect(w.vast.count('createInstance')).toBe(1)
+    expect(chunkRow(chunk.id)).toMatchObject({ state: 'rendering', node_id: nodeId })
+    expect(app.scheduler.scaleStatus()?.status).toBe('covered')
+  })
+
   it('a chunk whose last frame lands while its node prepares is not sent', async () => {
     const { app, nodeId, machine } = await oneNode()
     const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 2, chunkSize: 2 })

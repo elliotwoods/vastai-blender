@@ -36,9 +36,10 @@ import {
   type LaneGuard,
   type LanePlan
 } from './gpuLanes'
-import { nodesToRequest } from './scaling'
+import { planScaling, type ScalingPlan } from './scaling'
 import { decide, hardCap, initialState, recordNodeSlots, type SlotState } from './slotController'
-import type { ChunkState, EngineId, NodeSnapshot } from '../../shared/models'
+import type { ChunkState, EngineId, FleetHolds, NodeSnapshot } from '../../shared/models'
+import { capacityBudget, isBooting, isDispatchable } from '../../shared/nodeState'
 
 const TICK_MS = 15_000
 const STATE_POLL_MS = 5_000
@@ -702,6 +703,8 @@ class Scheduler {
   private reservation: { nodeId: string; chunkId: string } | null = null
   /** Startup-recovered chunks awaiting confirmation before renting. See start(). */
   private recoveryHold: number | null = null
+  /** The last scale-up decision, and why (see scalePolicy). */
+  private lastScalePlan: ScalingPlan | null = null
 
   /**
    * The node's run set, CREATING it if absent. Only for the dispatch path —
@@ -739,7 +742,7 @@ class Scheduler {
    * Forget a run. The chunk's entry goes only if it is still THIS run's: once
    * forgetNode has requeued a chunk it can be re-dispatched at once, and a
    * stale run dropping by chunk id alone deleted its successor's entry. The
-   * chunk then read as not live (isLive, the scale-up's workRemaining) while
+   * chunk then read as not live (isLive, the scale-up's work in flight) while
    * it rendered, and a cancel could no longer find the run to stop it.
    */
   private dropRun(run: ChunkRun): void {
@@ -764,8 +767,8 @@ class Scheduler {
    * stall watchdog can't fire because it only runs on a non-null state. Left
    * alone, such a run polls a dead connection every 5s for the life of the
    * process, its chunk stays 'rendering' against a node that no longer exists,
-   * the job never reaches complete/partial, and `workRemaining` keeps the
-   * eager-fleet scale-up buying GPUs for work nobody is doing.
+   * the job never reaches complete/partial, and scale-up keeps counting its
+   * frames as work in hand, buying GPUs for work nobody is doing.
    */
   forgetNode(nodeId: string): void {
     this.slots.delete(nodeId)
@@ -875,6 +878,21 @@ class Scheduler {
     if (this.recoveryHold == null) return
     this.recoveryHold = null
     this.kick()
+  }
+
+  /**
+   * Every hold on scale-up that this scheduler knows of. planScaling rents
+   * nothing while any is set, and says which.
+   */
+  fleetHolds(): FleetHolds {
+    const recovery = this.recoveryHoldCount()
+    return recovery == null ? {} : { recovery }
+  }
+
+  /** The last scale-up decision and its reason (scale status), or null before the first tick. */
+  scaleStatus(): Pick<ScalingPlan, 'status' | 'reason'> | null {
+    const p = this.lastScalePlan
+    return p ? { status: p.status, reason: p.reason } : null
   }
 
   stop(): void {
@@ -1448,14 +1466,29 @@ class Scheduler {
     return { outcome: 'pending', touched }
   }
 
+  /**
+   * Frames not yet downloaded in each of these chunks' current ranges, by
+   * chunk id: what is left of the work, as planScaling counts it.
+   */
+  private framesLeftOf(chunkIds: string[]): Map<string, number> {
+    const out = new Map<string, number>()
+    if (chunkIds.length === 0) return out
+    const rows = getDb()
+      .prepare(
+        `SELECT c.id, (SELECT COUNT(*) FROM ${UNDOWNLOADED_OF_C}) AS n
+           FROM chunks c WHERE c.id IN (${chunkIds.map(() => '?').join(', ')})`
+      )
+      .all(...chunkIds) as Array<{ id: string; n: number }>
+    for (const r of rows) out.set(r.id, r.n)
+    return out
+  }
+
   /** Scale up when there's queued work; scale down long-idle nodes. */
   private scalePolicy(pending: PendingChunk[]): void {
     const settings = getSettings()
     const pendingCount = pending.length
     const nodes = nodeManager.list()
-    const active = nodes.filter((n) => !['destroyed', 'destroying', 'failed'].includes(n.state))
-    const perHour = active.reduce((a, n) => a + (n.dphTotal ?? 0), 0)
-    const usable = active.filter((n) => ['ready', 'idle', 'rendering'].includes(n.state))
+    const usable = nodes.filter(isDispatchable)
 
     // Shared and exclusive work draw on different supplies, so they need
     // separate demand tests. Shared chunks consume free SLOTS; an exclusive
@@ -1483,12 +1516,10 @@ class Scheduler {
     // them made every tick of a boot re-justify another rental for the same
     // pending chunks.
     const slotsPerGpu = normaliseSlotsPerGpu(settings.slotsPerGpu)
-    const booting = active
-      .filter((n) => ['requested', 'provisioning'].includes(n.state))
-      .map((n) => {
-        const lanes = planLanes(n.numGpus, slotsPerGpu, hardCap(null, settings.maxNodeSlots ?? 0))
-        return { lanes: lanes.lanes, sharedSlots: Math.max(2, lanes.lanes) }
-      })
+    const booting = nodes.filter(isBooting).map((n) => {
+      const lanes = planLanes(n.numGpus, slotsPerGpu, hardCap(null, settings.maxNodeSlots ?? 0))
+      return { lanes: lanes.lanes, sharedSlots: Math.max(2, lanes.lanes) }
+    })
     // What a node rented now is expected to bring. The GPU-count floor is the
     // only thing known before an offer is picked.
     const newNode = planLanes(
@@ -1497,12 +1528,35 @@ class Scheduler {
       hardCap(null, settings.maxNodeSlots ?? 0)
     )
 
-    // Buy-ahead (eagerFleet): rent to maxActiveNodes while ANY chunk is
-    // unfinished. Demand-driven scaling alone can never widen a fleet whose
-    // nodes prefetch the entire queue (pending pins at 0), which strands a
-    // long CPU-bound drain on however many nodes happened to boot first.
-    const workRemaining = pendingCount + this.runs.size
-    const toRequest = nodesToRequest({
+    // The work left, in frames not yet downloaded: pending chunks, and the
+    // chunks in flight. Counting chunks let a 1-frame leftover whose frame
+    // had already landed keep the buy-ahead fleet renting (job da68b61b).
+    const runs = [...this.runs.values()]
+    const runFrames = this.framesLeftOf(runs.map((r) => r.chunkId))
+    let remainingExclusiveFrames = 0
+    let remainingSharedFrames = 0
+    for (const c of pending) {
+      if (c.share_node === 1) remainingSharedFrames += c.frames_left
+      else remainingExclusiveFrames += c.frames_left
+    }
+    for (const r of runs) {
+      const n = runFrames.get(r.chunkId) ?? 0
+      if (r.shareNode) remainingSharedFrames += n
+      else remainingExclusiveFrames += n
+    }
+    // The rate the fleet is measured rendering these jobs at: the runs on
+    // usable nodes, from their progress polls.
+    const usableIds = new Set(usable.map((n) => n.id))
+    const running = runs.filter((r) => usableIds.has(r.nodeId))
+    const rates = running.map((r) => r.rate()).filter((v): v is number => v != null)
+
+    const plan = planScaling({
+      // Every node that may still bill takes room and money (nodeState).
+      cap: capacityBudget(nodes, settings),
+      // Startup recovery not yet confirmed — see start(). Scale-DOWN below is
+      // deliberately still live, so a held fleet cannot also be a stuck one.
+      holds: this.fleetHolds(),
+      now: Date.now(),
       pendingShared,
       pendingExclusive,
       sharedCapacity,
@@ -1510,21 +1564,29 @@ class Scheduler {
       booting,
       newNodeLanes: newNode.lanes,
       newNodeSharedSlots: Math.max(2, newNode.lanes),
-      eager: settings.eagerFleet === true,
-      workRemaining,
-      active: active.length,
-      maxActive: settings.maxActiveNodes,
-      perHour,
-      spendCap: settings.spendCapPerHour,
-      // Startup recovery not yet confirmed — see start(). Scale-DOWN below is
-      // deliberately still live, so a held fleet cannot also be a stuck one.
-      held: this.recoveryHold != null
+      usableNodes: usable.length,
+      usableLanes: usable.reduce((a, n) => a + this.lanePlanFor(n.id).lanes, 0),
+      usableSharedSlots: usable.reduce((a, n) => a + this.slotTargetFor(n.id), 0),
+      pendingFrames: pending.reduce((a, c) => a + c.frames_left, 0),
+      remainingExclusiveFrames,
+      remainingSharedFrames,
+      fleetFramesPerHour: rates.length > 0 ? rates.reduce((a, v) => a + v, 0) * 3600 : null,
+      ratedRuns: rates.length,
+      runningRuns: running.length,
+      // Buy-ahead (eagerFleet): rent while frames outnumber the fleet's lanes
+      // and slots. Demand-driven scaling alone can never widen a fleet whose
+      // nodes prefetch the entire queue (pending pins at 0), which strands a
+      // long CPU-bound drain on however many nodes happened to boot first.
+      eager: settings.eagerFleet === true
     })
+    this.lastScalePlan = plan
     // Several rentals per tick (see scaling.ts), still one batch at a time.
-    if (toRequest > 0 && !this.requestingNode) {
+    // By count for now: requestNodes still re-checks the caps itself, and
+    // does not yet take the plan's budget (plan 1.5).
+    if (plan.status === 'rent' && plan.nodes > 0 && !this.requestingNode) {
       this.requestingNode = true
       void nodeManager
-        .requestNodes(toRequest)
+        .requestNodes(plan.nodes)
         .then((ids) => {
           if (ids.length > 1) {
             emit('alert', { level: 'info', message: `scale-up: rented ${ids.length} nodes` })
@@ -1540,7 +1602,7 @@ class Scheduler {
 
     // Scale down: idle with nothing pending for idleTimeout.
     if (pendingCount === 0) {
-      for (const n of active) {
+      for (const n of usable) {
         if (n.state !== 'idle' && n.state !== 'ready') continue
         if (this.hasRuns(n.id)) continue
         // Never destroy a node we are deliberately holding empty for a
