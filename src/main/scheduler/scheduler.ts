@@ -12,6 +12,7 @@
  * (see start()).
  */
 
+import { promises as fsp } from 'fs'
 import { posix } from 'path'
 import { getDb, readAppState, writeAppState } from '../db/db'
 import { classify, describeError, type AgentFailure, type Classification } from '../errors'
@@ -25,6 +26,8 @@ import {
 } from '../jobs/jobs'
 import {
   agentAlive,
+  ConnectionLostError,
+  exitStatus,
   installBlender,
   installExtension,
   INSTALL_BLENDER_TIMEOUT_MS,
@@ -33,7 +36,8 @@ import {
 import { listAddons } from '../addons/addons'
 import { nodeManager } from '../nodes/nodeManager'
 import { getSettings } from '../settings'
-import { uploadFileVerified, writeRemoteFileAtomic } from '../ssh/sftp'
+import { sha256File, uploadFileVerified, writeRemoteFileAtomic } from '../ssh/sftp'
+import { shq } from '../ssh/shq'
 import { recordThroughput } from '../vast/offers'
 import type { SshConnection } from '../ssh/sshConnection'
 import { ChunkDownloader, localSinkHold } from '../transfer/frameDownloader'
@@ -117,6 +121,86 @@ const nodePrepLocks = new Map<string, Promise<void>>()
  * repeat runs also proved fragile under SSH channel pressure.
  */
 const installedExtensions = new Map<string, string | null>()
+
+/**
+ * The scenes each node has been seen to hold this session: nodeId → the
+ * SHA-256s of the job snapshots it has as work/scenes/<sha>.blend, checked
+ * against that hash on the node, by sendScene or by the upload's own check
+ * (plan 1.12). A job's next chunk on the node, and every job of the same
+ * scene, sends nothing and hashes nothing. Every dispatch used to hash the
+ * whole .blend on this computer and again on the node, inside the node's
+ * prep lock (#188).
+ *
+ * The file is the node's to lose, so what is known here goes with any
+ * attempt that fails on the node (requeueOrFail) and when the node is
+ * forgotten, and the next dispatch there looks again. The agent fails a
+ * chunk whose scene is missing as transient ("blend file missing"): with the
+ * entry kept, every retry on the node would skip the upload that brings the
+ * scene back.
+ */
+const scenesOnNode = new Map<string, Set<string>>()
+
+/**
+ * Deadline for sha256sum of a scene of `bytes` on a node, sftp.ts's rule: a
+ * minute, plus the file read at a deliberately slow 20 MB/s, so only a hang
+ * trips it.
+ */
+function sceneHashTimeoutMs(bytes: number): number {
+  return 60_000 + Math.ceil(bytes / 20_000)
+}
+
+/**
+ * The SHA-256 of `remote` on the node, or null when there is no such file. A
+ * check whose connection went is no answer (ConnectionLostError), never a
+ * file that is not there, which would set this computer hashing the scene
+ * to send it over a link that has gone.
+ */
+async function sceneHashOnNode(
+  ssh: SshConnection,
+  remote: string,
+  bytes: number
+): Promise<string | null> {
+  const r = await ssh.exec(`sha256sum ${shq(remote)} 2>/dev/null | cut -d' ' -f1`, {
+    timeoutMs: sceneHashTimeoutMs(bytes),
+    label: `sha256sum ${posix.basename(remote)}`
+  })
+  if (exitStatus(r.code) === null) throw new ConnectionLostError('the scene check')
+  const hash = r.stdout.trim()
+  return /^[0-9a-f]{64}$/.test(hash) ? hash : null
+}
+
+/**
+ * Put a job's scene snapshot on the node as `remote`
+ * (work/scenes/<sha>.blend), unless the node has it already: said by its
+ * hash there, so a node that has it from an earlier session, or from
+ * another job of the same scene, is sent nothing and this computer reads
+ * nothing (plan 1.12).
+ *
+ * Otherwise only a snapshot that still hashes to the job's sha goes up under
+ * that name. Every node holding <sha>.blend must render the same scene, and
+ * one the user has edited in the job's folder would send the next nodes
+ * something else under it; the job fails instead, as a scene no node can
+ * render as it stands. A snapshot that is gone (the job's folder deleted,
+ * its drive unplugged) fails at the stat, as this computer's failure,
+ * before anything is asked of the node.
+ */
+async function sendScene(
+  ssh: SshConnection,
+  scene: { sha256: string; path: string },
+  remote: string
+): Promise<'uploaded' | 'skipped'> {
+  const { size } = await fsp.stat(scene.path)
+  if ((await sceneHashOnNode(ssh, remote, size)) === scene.sha256) return 'skipped'
+  if ((await sha256File(scene.path)) !== scene.sha256) {
+    throw new JobCannotRun(
+      'scene',
+      `the job's copy of its scene (${scene.path}) has changed since the job was submitted, ` +
+        'so the frames still to render would not match those already rendered. Submit the ' +
+        'job again to render the scene as it is now'
+    )
+  }
+  return uploadFileVerified(ssh, scene.path, remote)
+}
 
 /**
  * How long the steps of one dispatch's node prep that have no deadline of
@@ -340,6 +424,9 @@ interface JobRow {
   id: string
   name: string
   blend_path: string
+  /** the snapshot's SHA-256 and path (plan 1.12); both null for a job from before them */
+  blend_sha256: string | null
+  scene_path: string | null
   engine: EngineId
   frame_step: number
   blender_version: string | null
@@ -865,7 +952,12 @@ class ChunkRun {
 
     // Steps 1-3 are serialized per node (see withNodePrep) — with multiple
     // slots two dispatches would otherwise race on userpref/extension state.
-    const remoteBlend = `${this.jobId}.blend`
+    // The scene as submitted, named by its hash, so no two versions of a
+    // scene ever share a name on a node (plan 1.12). A job from before
+    // snapshots sends its original, under the job's id, as it always did.
+    const scene =
+      job.blend_sha256 && job.scene_path ? { sha256: job.blend_sha256, path: job.scene_path } : null
+    const remoteBlend = scene ? `${scene.sha256}.blend` : `${this.jobId}.blend`
     // Each step is named with what bounds it (StepBound): its own ceiling,
     // its own stall guard, or the prep's shared budget.
     const bootstrapExprs: string[] = await withNodePrep(this.nodeId, async (step) => {
@@ -923,15 +1015,24 @@ class ChunkRun {
         }
       }
 
-      // 3. Scene upload (hash-skipped when the node already has this version),
-      // bounded by its stall guard, and by PROGRESS_STEP_CEILING_MS: a large
-      // scene can take hours, moving.
-      step('uploading the scene', 'progress')
-      const result = await uploadFileVerified(
-        this.ssh,
-        job.blend_path,
-        posix.join(REMOTE_ROOT, 'work', 'scenes', remoteBlend)
-      )
+      // 3. Scene upload: not even looked at on a node seen to hold it
+      // (scenesOnNode), hash-skipped when the node has it anyway. Bounded by
+      // its stall guard, and by PROGRESS_STEP_CEILING_MS: a large scene can
+      // take hours, moving.
+      const remotePath = posix.join(REMOTE_ROOT, 'work', 'scenes', remoteBlend)
+      let result: string
+      if (scene && scenesOnNode.get(this.nodeId)?.has(scene.sha256)) {
+        result = 'skipped, sent to this node already'
+      } else if (scene) {
+        step('uploading the scene', 'progress')
+        result = await sendScene(this.ssh, scene, remotePath)
+        const held = scenesOnNode.get(this.nodeId) ?? new Set<string>()
+        held.add(scene.sha256)
+        scenesOnNode.set(this.nodeId, held)
+      } else {
+        step('uploading the scene', 'progress')
+        result = await uploadFileVerified(this.ssh, job.blend_path, remotePath)
+      }
       emit('render:logLine', {
         nodeId: this.nodeId,
         chunkId: this.chunkId,
@@ -1847,6 +1948,8 @@ class Scheduler {
     // A node that comes back (recoverUnreachable) is judged afresh. A step
     // still running from before only sets its own entry's `running`.
     prepTimeouts.delete(nodeId)
+    // ...and asked again for the scenes it holds.
+    scenesOnNode.delete(nodeId)
     this.idleSince.delete(nodeId)
     if (this.reservation?.nodeId === nodeId) this.reservation = null
     // Sent nothing for a while. destroyNode forgets a node before it marks it
@@ -3063,6 +3166,9 @@ class Scheduler {
     f: ChunkFailure
   ): Resplit['outcome'] | null {
     this.rest(f)
+    // Whatever failed, the node may no longer hold the scenes it was seen to
+    // (scenesOnNode): its next dispatch looks again.
+    scenesOnNode.delete(f.nodeId)
     let settled: Settled
     try {
       settled = this.requeue(chunkId, f)

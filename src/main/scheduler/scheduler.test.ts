@@ -21,6 +21,11 @@ describe('scheduler dispatch', () => {
 
     const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 4 })
     const [chunk] = w.all<{ id: string }>('SELECT id FROM chunks WHERE job_id = ?', jobId)
+    // The job's copy of its scene is sent, named by its hash (plan 1.12).
+    const { blend_sha256: sha } = w.get<{ blend_sha256: string }>(
+      'SELECT blend_sha256 FROM jobs WHERE id = ?',
+      jobId
+    )!
     app.scheduler.kick()
 
     // The spec lands in the agent's inbox, whole (via the atomic tmp → rename).
@@ -28,7 +33,7 @@ describe('scheduler dispatch', () => {
     const spec = machine.agent.spec(chunk.id)!
     expect(spec).toMatchObject({
       chunkId: chunk.id,
-      blendFile: `${jobId}.blend`,
+      blendFile: `${sha}.blend`,
       blenderVersion: HARNESS_BLENDER,
       frameStart: 1,
       frameEnd: 4,
@@ -65,7 +70,7 @@ describe('scheduler dispatch', () => {
     expect(w.get('SELECT state FROM jobs WHERE id = ?', jobId)).toEqual({ state: 'complete' })
     expect(app.nodeManager.get(nodeId)?.state).toBe('idle')
     // The scene went up once, and the fleet was never widened.
-    expect(machine.files.has(`/root/vastai/work/scenes/${jobId}.blend`)).toBe(true)
+    expect(machine.files.has(`/root/vastai/work/scenes/${sha}.blend`)).toBe(true)
     expect(w.vast.count('createInstance')).toBe(1)
     expect(w.alerts('error')).toEqual([])
 

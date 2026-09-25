@@ -1,4 +1,4 @@
-import { mkdirSync, promises as fsp, writeFileSync, type StatsFs } from 'fs'
+import { mkdirSync, promises as fsp, readFileSync, writeFileSync, type StatsFs } from 'fs'
 import { join } from 'path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AddonInfo } from '../../shared/models'
@@ -112,6 +112,25 @@ const outOfMemory = {
   errorKind: 'machine',
   oom: true,
   gpu: 0
+}
+
+/**
+ * Give each node the job's scene as dispatch sends it (plan 1.12), as nodes
+ * that already hold it do. A node's first dispatch otherwise uploads it while
+ * its retries only check for it, and a test whose bound assumes two nodes
+ * failing in step would see one node retry alone while the other uploads.
+ */
+function sceneAlreadyOn(ids: string[], jobId: string): void {
+  const scene = w.get<{ blend_sha256: string; scene_path: string }>(
+    'SELECT blend_sha256, scene_path FROM jobs WHERE id = ?',
+    jobId
+  )!
+  for (const id of ids) {
+    w.machineFor(id).files.set(
+      `/root/vastai/work/scenes/${scene.blend_sha256}.blend`,
+      readFileSync(scene.scene_path)
+    )
+  }
 }
 
 /** The agent reports a failed chunk, with what the real one adds to a failure. */
@@ -695,6 +714,8 @@ describe('1.17: the job breaker, the same failure on two nodes', () => {
       }
     }
     const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 1 })
+    // In step, as the bounds below assume (sceneAlreadyOn).
+    sceneAlreadyOn(ids, jobId)
     app.scheduler.kick()
     const attention = (): string | null =>
       w.get<{ attention: string | null }>('SELECT attention FROM jobs WHERE id = ?', jobId)!
@@ -775,6 +796,9 @@ describe('1.17: the job breaker, the same failure on two nodes', () => {
       }
     }
     const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 2 })
+    // In step, as the bound below assumes: with one node still uploading, the
+    // other retries its chunk alone meanwhile.
+    sceneAlreadyOn(ids, jobId)
     app.scheduler.kick()
     const dispatched = (): number =>
       w.eventsOf('chunk:changed').filter((c) => c.jobId === jobId && c.state === 'assigned').length
