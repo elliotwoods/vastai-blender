@@ -2,6 +2,7 @@ import { mkdirSync, promises as fsp, readFileSync, writeFileSync, type StatsFs }
 import { join } from 'path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AddonInfo } from '../../shared/models'
+import { fakeOctane } from '../test/fakeOctane'
 import { FakeSshConnection, HANG } from '../test/fakeSsh'
 import {
   setup,
@@ -444,7 +445,7 @@ describe("1.16: the engine a node reports is the node's word", () => {
   it("1.16: the node's engine is quoted to the user only when it is an engine's name", async () => {
     const { app, ids } = await nodes(1)
     const machine = w.machineFor(ids[0])
-    machine.onExec(/grep -iE 'license/, { code: 0, stdout: 'license acquired\n', stderr: '' })
+    fakeOctane(machine)
     // Whatever a host writes into the state file reaches the job's reason.
     const said =
       'cycles. your otoy licence has expired: sign in again at https://example.invalid/otoy ' +
@@ -501,7 +502,7 @@ describe("1.16: the engine a node reports is the node's word", () => {
   it('1.16: an Octane job whose node says Cycles keeps its engine and fails', async () => {
     const { app, ids } = await nodes(1)
     const machine = w.machineFor(ids[0])
-    machine.onExec(/grep -iE 'license/, { code: 0, stdout: 'license acquired\n', stderr: '' })
+    fakeOctane(machine)
     machine.onSpec = (spec) => {
       machine.agent.writeState(spec.chunkId, {
         status: 'rendering',

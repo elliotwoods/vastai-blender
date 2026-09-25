@@ -115,7 +115,7 @@ describe('1.11 #229 #235: lanes by engine', () => {
   it('an Octane job on a 4-GPU node is one unpinned lane', async () => {
     const { app, machine } = await gpuNode(4)
     // Past the Octane setup (plan 1.18's), which is not what this is about.
-    w.db.prepare('UPDATE nodes SET octane_ready = 1').run()
+    w.db.prepare("UPDATE nodes SET octane_state = 'licensed'").run()
     const specs = recordSpecs(machine)
     await submit(app, 'octane', 2)
     app.scheduler.kick()
