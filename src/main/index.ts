@@ -145,7 +145,9 @@ function createWindow(): void {
     show: false,
     autoHideMenuBar: true,
     backgroundColor: '#131417',
-    ...(process.platform === 'linux' ? { icon } : {}),
+    // macOS takes its icon from the bundle's .icns; Windows and Linux windows
+    // need it set here or dev runs show Electron's.
+    ...(process.platform !== 'darwin' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false

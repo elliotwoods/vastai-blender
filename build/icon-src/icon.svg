@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#23262b"/>
+      <stop offset="1" stop-color="#0d0e10"/>
+    </linearGradient>
+    <linearGradient id="lime" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c5f26b"/>
+      <stop offset="1" stop-color="#8fd11f"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#a3e635" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#a3e635" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="body"><rect x="100" y="100" width="824" height="824" rx="185"/></clipPath>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <g clip-path="url(#body)">
+    <circle cx="512" cy="512" r="330" fill="url(#glow)" opacity="0.55"/>
+  </g>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="183.5" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+  <!-- 3x3 render tiles: 160px tiles, 40px gaps, grid origin 212 -->
+  <g>
+    <!-- pending -->
+    <rect x="612" y="212" width="160" height="160" rx="28" fill="none" stroke="#3a3e46" stroke-width="10"/>
+    <rect x="412" y="212" width="160" height="160" rx="28" fill="none" stroke="#3a3e46" stroke-width="10"/>
+    <rect x="612" y="412" width="160" height="160" rx="28" fill="none" stroke="#3a3e46" stroke-width="10"/>
+    <!-- rendering (wavefront) -->
+    <rect x="212" y="212" width="160" height="160" rx="28" fill="#a3e635" fill-opacity="0.28" stroke="#a3e635" stroke-width="10"/>
+    <rect x="412" y="412" width="160" height="160" rx="28" fill="#a3e635" fill-opacity="0.28" stroke="#a3e635" stroke-width="10"/>
+    <rect x="612" y="612" width="160" height="160" rx="28" fill="#a3e635" fill-opacity="0.28" stroke="#a3e635" stroke-width="10"/>
+    <!-- done -->
+    <rect x="212" y="412" width="160" height="160" rx="28" fill="url(#lime)"/>
+    <rect x="212" y="612" width="160" height="160" rx="28" fill="url(#lime)"/>
+    <rect x="412" y="612" width="160" height="160" rx="28" fill="url(#lime)"/>
+  </g>
+</svg>
