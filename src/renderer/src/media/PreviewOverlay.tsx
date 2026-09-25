@@ -35,6 +35,7 @@ import { Filmstrip } from './Filmstrip'
 import { domainOf, frameAt, indexOf, segmentFrameAt, segmentIndexOf } from './frame-domain'
 import { GradePanel } from './GradePanel'
 import { pickClip } from './renditions'
+import { SpeedControl } from './SpeedControl'
 import { TransportBar } from './TransportBar'
 import { useGrade } from './useGrade'
 import { useHdrCapability } from './useHdrCapability'
@@ -479,7 +480,12 @@ function Overlay({
 
       {/* -- transport + strip ------------------------------------------------ */}
       {clip ? (
-        <TransportBar controller={controller} quality={quality} keysEnabled />
+        <TransportBar
+          controller={controller}
+          quality={quality}
+          keysEnabled
+          extras={<SpeedControl controller={controller} />}
+        />
       ) : (
         <div style={{ ...panel(), padding: `6px ${SCALE.space3}` }}>
           <span style={{ fontSize: SCALE.textXs, color: TOKENS.textFaint }}>

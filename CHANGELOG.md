@@ -128,6 +128,9 @@ stalled the app).
 - **Why scale-up is (not) renting** is a line on the Fleet screen: at max
   nodes, spend cap, the tail, or what it is short of.
 - The Settings key test says which of the app's permissions the API key has.
+- **Preview playback speed.** The preview's transport bar has 0.25×, 0.5×,
+  1×, 2× and 4× buttons, and `<` / `>` step between them. The choice is
+  remembered. Compared clips stay in sync at any speed.
 
 ### Changed
 
