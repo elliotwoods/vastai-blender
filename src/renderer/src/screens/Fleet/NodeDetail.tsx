@@ -1,7 +1,9 @@
 /**
  * Expanded row for a fleet node — the "what is this machine actually doing"
  * panel. Five live gauges (%GPU, %VRAM, %CPU, %RAM, temp), the money strip,
- * what it is rendering right now, its capabilities, and the console tail.
+ * what it is rendering right now, its capabilities, and the console tail. A
+ * node whose OctaneServer waits for a sign-in offers the VNC login first
+ * (VncLogin).
  *
  * Everything here comes from the NodeSnapshot the row already has, except the
  * workload panel, which fetches the node→chunk→job join it needs (NodeWorkload).
@@ -31,6 +33,8 @@ import { TONE_COLOR, pctOf, usageTone, type Tone } from '../../lib/usage'
 import { Meter } from './meters'
 import { ReprovisionButton } from './NodeActions'
 import { NodeWorkload } from './NodeWorkload'
+import { octaneCap, octaneStateOf } from './octane'
+import { VncLogin } from './VncLogin'
 import type { NodeSnapshot } from '../../../../shared/models'
 
 const card: CSSProperties = {
@@ -358,6 +362,8 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
         </span>
       </div>
 
+      <VncLogin node={node} />
+
       {/* -- gauges -------------------------------------------------------- */}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: SCALE.space2 }}>
         <Gauge
@@ -469,10 +475,7 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
           state={node.eeveeCapable == null ? 'unknown' : node.eeveeCapable ? 'ok' : 'no'}
           label={node.eeveeCapable == null ? 'eevee unprobed' : 'eevee'}
         />
-        <Cap
-          state={node.octaneReady ? 'ok' : node.octaneNeedsManualLogin ? 'warn' : 'no'}
-          label={node.octaneNeedsManualLogin ? 'octane login needed' : 'octane'}
-        />
+        <Cap {...octaneCap(octaneStateOf(node))} />
         <span style={{ flex: 1 }} />
         <span
           style={{

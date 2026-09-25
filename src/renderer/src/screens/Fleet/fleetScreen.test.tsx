@@ -10,7 +10,8 @@ import type { NodeSnapshot, SettingsPublic, UnclaimedInstance } from '../../../.
 // - 1.2: a node that may still be billing is always listed, and counted;
 // - 1.3: instances nobody here holds are listed with their rate, destroy asks;
 // - 1.20: the toolbar's balance turns amber and red by runway, not at $5;
-// - 1.5: "+ request node" at the spend cap asks before going past it.
+// - 1.5: "+ request node" at the spend cap asks before going past it;
+// - 1.18: a node waiting for an Octane sign-in offers the VNC login.
 
 vi.mock('../../lib/ipc', () => ({
   ipc: { invoke: vi.fn(() => new Promise(() => {})), on: vi.fn(() => () => {}) }
@@ -25,6 +26,7 @@ vi.stubGlobal('localStorage', {
 
 const { qk } = await import('../../lib/queries')
 const { FleetScreen } = await import('./FleetScreen')
+const { NodeDetail } = await import('./NodeDetail')
 const { AppToolbar } = await import('../../components/AppToolbar')
 
 const settings = {
@@ -245,5 +247,20 @@ describe('1.5: a manual rental at the spend cap asks first', () => {
     const html = withCache((qc) => qc.setQueryData(qk.nodes, [node({})]), <FleetScreen />)
     expect(html).toContain('>+ request node</button>')
     expect(html).not.toContain('<span aria-live="polite">+ request node</span>')
+  })
+})
+
+describe('1.18: Octane sign-in by hand', () => {
+  it('offers the VNC login on a node waiting for a sign-in', () => {
+    const html = withCache(() => {}, <NodeDetail node={node({ octaneState: 'needsLogin' })} />)
+    expect(html).toContain('Open VNC login')
+    expect(html).toContain('octane sign-in needed')
+  })
+
+  it('offers nothing on a licensed node, and never opens a tunnel by itself', async () => {
+    const { ipc } = await import('../../lib/ipc')
+    const html = withCache(() => {}, <NodeDetail node={node({ octaneState: 'licensed' })} />)
+    expect(html).not.toContain('Open VNC login')
+    expect(vi.mocked(ipc.invoke).mock.calls.some(([c]) => c === 'node:openVncTunnel')).toBe(false)
   })
 })
