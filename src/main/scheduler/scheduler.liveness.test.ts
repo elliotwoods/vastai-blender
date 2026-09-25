@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { REMOTE_ROOT } from '../test/fakeSsh'
+import { HANG, REMOTE_ROOT } from '../test/fakeSsh'
 import {
   setup,
   type AgentSpec,
@@ -283,5 +283,56 @@ describe('1.7: a hung Blender', () => {
     expect(specs).toHaveLength(1)
     expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 0 })
     expect(w.alerts().join('\n')).not.toMatch(/no progress/)
+  })
+})
+
+describe('1.8: a node prep that hangs', () => {
+  it('releases the prep lock at its deadline: the chunks waiting on it move on, and the stuck node is let go', async () => {
+    w = await setup({ settings: { maxActiveNodes: 2, idleTimeoutMinutes: 8 } })
+    const app = await w.boot()
+    const stuckId = await w.readyNode(app, { num_gpus: 4 })
+    // Its Blender download never ends. Every dispatch to it waits on the
+    // one prep lock the first one holds.
+    w.machineFor(stuckId).onExec(/provision\.sh install-blender/, HANG)
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => assignedTo(stuckId) === 4, 'four lanes in node prep')
+    await w.advance(55 * 60_000)
+    expect(chunksOf(jobId).map((c) => c.state)).toEqual([
+      'assigned',
+      'assigned',
+      'assigned',
+      'assigned'
+    ])
+
+    // A second node joins; it renders a chunk in four minutes.
+    const otherId = await w.readyNode(app)
+    const other = w.machineFor(otherId)
+    other.onSpec = (spec) => setTimeout(() => other.agent.finish(spec.chunkId), 4 * 60_000)
+
+    // At the deadline the lock goes, and the three waiting behind it with it:
+    // all four back in the queue at once, charged to the machines.
+    await w.until(
+      () => chunksOf(jobId).every((c) => c.node_id !== stuckId || c.state !== 'assigned'),
+      'the stuck node lets go of its chunks',
+      { timeoutMs: 10 * 60_000 }
+    )
+    expect(chunksOf(jobId).map((c) => [c.retries, c.infra_retries])).toEqual([
+      [0, 1],
+      [0, 1],
+      [0, 1],
+      [0, 1]
+    ])
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /setting up the node did not finish in 60 min: installing Blender 4\.2\.3 is still running/
+    )
+
+    // Sent nothing more, it is let go of while work is still queued.
+    await w.until(() => nodeState(stuckId) === 'destroyed', 'the stuck node let go', {
+      timeoutMs: 20 * 60_000
+    })
+    expect(chunksOf(jobId).some((c) => c.state === 'pending')).toBe(true)
+    expect(assignedTo(stuckId)).toBe(4)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 60 * 60_000 })
   })
 })

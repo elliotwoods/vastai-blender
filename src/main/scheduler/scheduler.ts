@@ -111,7 +111,45 @@ const nodePrepLocks = new Map<string, Promise<void>>()
  * repeat runs also proved fragile under SSH channel pressure.
  */
 const installedExtensions = new Map<string, string | null>()
-async function withNodePrep<T>(nodeId: string, fn: () => Promise<T>): Promise<T> {
+
+/**
+ * How long one dispatch's node prep may hold the node's prep lock. Longer
+ * than any healthy step (a Blender download that needs a second mirror, a
+ * large scene upload); shorter than install-blender's own ceiling of two
+ * rounds of four mirrors at 30 min each, which is no healthy node's.
+ */
+const PREP_DEADLINE_MS = 60 * 60_000
+
+/**
+ * Node preps still running past their deadline, by node: the step, and since
+ * when. Until it ends, however it ends, the node is sent nothing (see
+ * Scheduler.nodeUnfit): its lock is free, and a second prep would run beside
+ * the stuck one, two installs writing one download, which is what the lock
+ * is for.
+ */
+const stuckPreps = new Map<string, { since: number; step: string }>()
+
+/** A node's prep ran past PREP_DEADLINE_MS, or an earlier one on the node still is. */
+class NodePrepTimeout extends Error {
+  override readonly name = 'NodePrepTimeout'
+}
+
+/**
+ * Run `fn` holding the node's prep lock, under PREP_DEADLINE_MS. `fn` names
+ * the step it is on with `step`, for the error.
+ *
+ * The lock was released only when `fn` settled, and nothing in it had a
+ * deadline of its own (a Blender download that trickles, a command on a
+ * wedged connection), so one hung step held the lock for good: every later
+ * dispatch to the node queued behind it, its chunk 'assigned' and its node
+ * billing (#82, #139). At the deadline the lock is released and the dispatch
+ * fails; the step itself cannot be cancelled from here, so it is marked
+ * stuck (stuckPreps) until it ends, and a prep that finds it so fails at once.
+ */
+async function withNodePrep<T>(
+  nodeId: string,
+  fn: (step: (what: string) => void) => Promise<T>
+): Promise<T> {
   const prev = nodePrepLocks.get(nodeId) ?? Promise.resolve()
   let release!: () => void
   const gate = new Promise<void>((r) => (release = r))
@@ -120,9 +158,39 @@ async function withNodePrep<T>(nodeId: string, fn: () => Promise<T>): Promise<T>
     prev.then(() => gate)
   )
   await prev
+  let timer: NodeJS.Timeout | undefined
   try {
-    return await fn()
+    const stuck = stuckPreps.get(nodeId)
+    if (stuck) {
+      throw new NodePrepTimeout(
+        `setting up the node is stuck: ${stuck.step} has been running for ` +
+          `${Math.round((Date.now() - stuck.since) / 60_000)} min`
+      )
+    }
+    const startedAt = Date.now()
+    let step = 'setting up the node'
+    const work = fn((what) => {
+      step = what
+    })
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const entry = { since: startedAt, step }
+        stuckPreps.set(nodeId, entry)
+        const ended = (): void => {
+          if (stuckPreps.get(nodeId) === entry) stuckPreps.delete(nodeId)
+        }
+        work.then(ended, ended)
+        reject(
+          new NodePrepTimeout(
+            `setting up the node did not finish in ${PREP_DEADLINE_MS / 60_000} min: ${step} ` +
+              'is still running, and nothing more is sent to the node until it ends'
+          )
+        )
+      }, PREP_DEADLINE_MS)
+    })
+    return await Promise.race([work, deadline])
   } finally {
+    clearTimeout(timer)
     release()
   }
 }
@@ -649,9 +717,10 @@ class ChunkRun {
     // Steps 1-3 are serialized per node (see withNodePrep) — with multiple
     // slots two dispatches would otherwise race on userpref/extension state.
     const remoteBlend = `${this.jobId}.blend`
-    const bootstrapExprs: string[] = await withNodePrep(this.nodeId, async () => {
+    const bootstrapExprs: string[] = await withNodePrep(this.nodeId, async (step) => {
       // 1. Blender version (idempotent, cheap when already installed).
       if (job.blender_version && !node.snapshot.blenderVersions.includes(job.blender_version)) {
+        step(`installing Blender ${job.blender_version}`)
         await installBlender(this.ssh, this.nodeId, job.blender_version)
       }
 
@@ -659,6 +728,7 @@ class ChunkRun {
       // OctaneBlender build on the node — see docs/OCTANE.md).
       if (job.engine === 'octane' && !node.snapshot.octaneReady) {
         const { setupOctane } = await import('../octane/octaneLicense')
+        step('setting up Octane')
         await setupOctane(this.ssh, this.nodeId)
       }
 
@@ -691,6 +761,7 @@ class ChunkRun {
           if (installedExtensions.has(key)) {
             expr = installedExtensions.get(key) ?? null
           } else {
+            step(`installing the add-on ${addon.id}`)
             expr = await installExtension(this.ssh, this.nodeId, job.blender_version, addon)
             installedExtensions.set(key, expr)
           }
@@ -699,6 +770,7 @@ class ChunkRun {
       }
 
       // 3. Scene upload (hash-skipped when the node already has this version).
+      step('uploading the scene')
       const result = await uploadFileVerified(
         this.ssh,
         job.blend_path,
@@ -1809,10 +1881,15 @@ class Scheduler {
 
   /**
    * Why the scheduler sends this node nothing whatever is queued, or null:
-   * for the fleet view and the node supervisor (plan 1.7).
+   * its agent is down, or a setup step on it is stuck past its deadline
+   * (withNodePrep). For the fleet view and the node supervisor (plan 1.7).
    */
   nodeUnfit(nodeId: string): string | null {
-    return this.agentDown.get(nodeId)?.reason ?? null
+    const down = this.agentDown.get(nodeId)
+    if (down) return down.reason
+    const stuck = stuckPreps.get(nodeId)
+    if (stuck) return `setting up the node is stuck: ${stuck.step}`
+    return null
   }
 
   /**
@@ -2382,6 +2459,12 @@ class Scheduler {
     }
     if (e instanceof AddonRegistryUnread) {
       return { c: own('localFs', 'addon-registry', e.message), stage: 'dispatch', nodeId }
+    }
+    // The node's: a step that hangs there is no more the job's than one
+    // that fails. Not node-setup, which the breaker counts across nodes:
+    // two slow mirrors are not a Blender version no mirror has.
+    if (e instanceof NodePrepTimeout) {
+      return { c: own('machine', 'node-prep-timeout', e.message), stage: 'dispatch', nodeId }
     }
     let c = classify(e, { via: 'ssh' })
     const node = nodeManager.get(nodeId)
