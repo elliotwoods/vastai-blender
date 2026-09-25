@@ -196,6 +196,17 @@ const PROBE_EVERY_MS = 15_000
 const PROBE_TIMEOUT_MS = 10_000
 
 /**
+ * A probe still out after this long gets a bare liveness check beside it
+ * (LIVENESS_COMMAND), bounded to end with the probe. The probe starts with
+ * nvidia-smi, which can take seconds on a loaded many-GPU node without
+ * persistence mode, and hangs on a card that has fallen off the bus. A probe
+ * that timed out while the node answered the check is a slow sample, not a
+ * node gone silent: it used to count as one, so such a node was taken out
+ * of the fleet every 45 s while SSH was fine.
+ */
+const PROBE_SLOW_MS = 5_000
+
+/**
  * Plan 1.7: a node whose probes have failed this many times in a row, over
  * at least UNREACHABLE_AFTER_MS, is 'unreachable': 30 to 45 s after it went
  * silent, with a probe every 15 s. A connection that drops (SshConnection's
@@ -269,15 +280,18 @@ const SUPERVISED: ReadonlySet<NodeState> = new Set<NodeState>([
 
 const HEARTBEAT = `${REMOTE_ROOT}/state/heartbeat`
 
-/**
- * The probe: GPU, CPU and RAM usage, then the agent's heartbeat age by the
- * node's own clock, read the way provision.sh reads it.
- */
+/** The agent's heartbeat age by the node's own clock, read the way provision.sh reads it. */
+const HEARTBEAT_AGE = `if [ -f ${HEARTBEAT} ]; then echo "heartbeat $(( $(date +%s) - $(date -r ${HEARTBEAT} +%s) ))"; else echo 'heartbeat none'; fi`
+
+/** The probe: GPU, CPU and RAM usage, then the agent's heartbeat age. */
 const PROBE_COMMAND =
   // `index` goes LAST so the columns everything below reads by position
   // keep their positions.
   `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,index --format=csv,noheader,nounits; echo ----; cat /proc/loadavg; nproc; echo ----; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; head -1 /proc/stat; echo ----; ` +
-  `if [ -f ${HEARTBEAT} ]; then echo "heartbeat $(( $(date +%s) - $(date -r ${HEARTBEAT} +%s) ))"; else echo 'heartbeat none'; fi`
+  HEARTBEAT_AGE
+
+/** The probe without its sample: does the node answer, and is its agent's heartbeat fresh (PROBE_SLOW_MS)? */
+const LIVENESS_COMMAND = `echo ok; ${HEARTBEAT_AGE}`
 
 /**
  * The heartbeat age a probe reported, in seconds: null when the agent never
@@ -1126,6 +1140,8 @@ export class NodeManager {
   private strikes = new Map<string, Strikes>()
   /** Nodes with a probe in flight: the next round leaves them to it. */
   private probing = new Set<string>()
+  /** Nodes whose probes time out while the node answers, since it was last logged. */
+  private slowProbes = new Set<string>()
   /** Each node's stale heartbeats seen in a row. */
   private staleBeats = new Map<string, number>()
   /**
@@ -1596,15 +1612,35 @@ export class NodeManager {
   }
 
   private async probe(node: ManagedNode, ssh: SshConnection): Promise<void> {
+    let alive: Promise<string | null> | null = null
+    const slow = setTimeout(() => {
+      alive = ssh
+        .exec(LIVENESS_COMMAND, {
+          timeoutMs: PROBE_TIMEOUT_MS - PROBE_SLOW_MS,
+          label: 'node liveness check'
+        })
+        .then(
+          (a) => (/^ok$/m.test(a.stdout) ? a.stdout : null),
+          () => null
+        )
+    }, PROBE_SLOW_MS)
     let r: ExecResult
     try {
       r = await ssh.exec(PROBE_COMMAND, { timeoutMs: PROBE_TIMEOUT_MS, label: 'node probe' })
     } catch (e) {
+      clearTimeout(slow)
       // Closed under it by a destroy or a recovery: says nothing of the node.
-      if (node.ssh === ssh) this.probeFailed(node, classify(e, { via: 'ssh' }).reason)
+      if (node.ssh !== ssh) return
+      const c = classify(e, { via: 'ssh' })
+      const answered = c.rule === 'ssh-exec-timeout' && alive ? await alive : null
+      if (node.ssh !== ssh) return
+      if (answered != null) this.probeSlow(node, answered)
+      else this.probeFailed(node, c.reason)
       return
     }
+    clearTimeout(slow)
     if (node.ssh !== ssh) return
+    this.slowProbes.delete(node.id)
     // What ssh2 hands back for a channel whose connection went: no exit
     // status (undefined; null for a signal) and no output. Only null was
     // read so, and on real ssh2 a probe the link dropped under reset the
@@ -1696,6 +1732,24 @@ export class NodeManager {
     node.takeDrops()
     this.strikes.delete(node.id)
     lastContactByNode.set(node.id, Date.now())
+  }
+
+  /**
+   * A probe timed out, and the node answered the liveness check sent beside
+   * it (PROBE_SLOW_MS): it answers, only its sample is slow. No sample this
+   * round; the heartbeat the check read is taken as the probe's would be.
+   */
+  private probeSlow(node: ManagedNode, stdout: string): void {
+    this.probeAnswered(node)
+    this.heartbeatSeen(node, heartbeatAge(stdout))
+    if (this.slowProbes.has(node.id)) return
+    this.slowProbes.add(node.id)
+    emit('render:logLine', {
+      nodeId: node.id,
+      chunkId: null,
+      line: `the usage probe (nvidia-smi) took over ${PROBE_TIMEOUT_MS / 1000}s, but the node answers: kept in the fleet, without usage samples until it is quicker`,
+      ts: Date.now()
+    })
   }
 
   /**

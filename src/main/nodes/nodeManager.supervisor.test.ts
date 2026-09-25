@@ -507,6 +507,49 @@ describe('1.7: liveness supervision', () => {
     expect(w.vast.count('destroyInstance')).toBe(0)
   })
 
+  it('1.7: a node whose usage probe is slow (nvidia-smi past 10 s) but that answers stays in the fleet', async () => {
+    // A loaded 8-GPU node without persistence mode, or a card that hangs
+    // nvidia-smi: SSH is fine, only the sample is slow. Each such probe used
+    // to count as the node gone silent, and it was out every 45 s.
+    const { app, busy, jobId, chunkId, prov } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    machine.onExec(/^nvidia-smi --query-gpu/, HANG)
+
+    await w.advance(5 * MIN, 5_000)
+    expect(states(busy)).not.toContain('unreachable')
+    expect(app.nodeManager.get(busy)?.state).toBe('rendering')
+    expect(Date.now() - app.nodeManager.get(busy)!.snapshot.lastContactAt!).toBeLessThanOrEqual(
+      15_000
+    )
+    expect(machine.ran(/^echo ok; /).length).toBeGreaterThanOrEqual(15)
+    expect(prov.get(busy)!.statusCalls).toBe(0)
+    expect(chunksOf(jobId)).toMatchObject([
+      { id: chunkId, node_id: busy, state: 'rendering', infra_retries: 0 }
+    ])
+    // Said once, not every probe.
+    const said = w
+      .eventsOf('render:logLine')
+      .filter((l) => l.nodeId === busy && /usage probe \(nvidia-smi\) took over/.test(l.line))
+    expect(said).toHaveLength(1)
+  })
+
+  it('1.7: a node that answers nothing over a connection that stays open is out within 45 s', async () => {
+    // A wedged link: every command waits for nothing, the liveness check
+    // beside a slow probe included.
+    const { app, busy } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    machine.onExec(/./, HANG)
+    const from = Date.now()
+
+    await w.until(() => app.nodeManager.get(busy)?.state === 'unreachable', 'taken out', {
+      timeoutMs: 2 * MIN
+    })
+    // Three strikes 30 s apart, each at its probe's 10 s deadline, the first
+    // probe up to 15 s away: the check beside each probe adds nothing.
+    expect(Date.now() - from).toBeLessThanOrEqual(55_000 + 500)
+    expect(app.nodeManager.get(busy)!.snapshot.lastError).toMatch(/timed out/)
+  })
+
   it('1.7: the snapshot says when the node last answered', async () => {
     const { app, busy } = await renderingOnOne()
     await w.advance(20_000)
