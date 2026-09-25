@@ -26,6 +26,7 @@ import type {
   NodeSnapshot,
   ThumbAsset
 } from '../shared/models'
+import { localPathProblem } from '../shared/settingsSanitize'
 import { applySettingsPatch, describeFieldErrors, type GateOptions } from './app/settingsGate'
 import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
 import { dismissAlerts, onAlertSurfaced, onEvent, recentAlerts } from './events'
@@ -841,6 +842,14 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   handle('jobs:list', () => (MOCK ? mockJobs() : listJobs()))
   handle('job:get', (id) => (MOCK ? mockJobDetail(id) : getJob(id)))
   handle('job:create', async (sub) => {
+    // A job's scene path is somewhere shell:showItemInFolder may reveal
+    // (revealablePlaces), so it must be a file on this computer: a UNC path
+    // there would hand the user's NTLM hash to whoever serves the share,
+    // and a render must not hang on a share that has gone away (Phase 0
+    // review, plans 1.12 and 1.14). Checked where the renderer's submission
+    // crosses into main; a headless spec is the user's own file.
+    const problem = localPathProblem(sub?.blendPath, hostPathFlavour())
+    if (problem) throw new Error(`scene file ${problem} (got ${JSON.stringify(sub?.blendPath)})`)
     const jobId = await createJob(sub)
     scheduler.kick()
     return { jobId }
