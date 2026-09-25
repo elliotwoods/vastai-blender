@@ -38,7 +38,7 @@ import type {
 import { applySettingsPatch, describeFieldErrors, type GateOptions } from './app/settingsGate'
 import { cancelJob, reprovisionNode, retryMissing } from './app/recovery'
 import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
-import { dismissAlerts, onAlertSurfaced, onEvent, recentAlerts } from './events'
+import { dismissAlerts, emit, onAlertSurfaced, onEvent, recentAlerts } from './events'
 import { hostPathFlavour } from './paths'
 import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
@@ -947,6 +947,22 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   })
 
   // -- fleet / nodes --------------------------------------------------------
+  if (MOCK) {
+    // The real fleet is empty under VR_MOCK, so nodeManager's once-a-minute
+    // fleet:cost reads $0 and the toolbar pills never show the mock nodes.
+    // Emitting faster than it keeps the mock figures on screen.
+    const tick = (): void => {
+      const live = mockNodes().filter((n) => n.state !== 'destroyed')
+      emit('fleet:cost', {
+        perHour: live.reduce((a, n) => a + (n.dphTotal ?? 0), 0),
+        sessionTotal: 18.42,
+        sessionWh: 9120,
+        sessionCo2g: mockCo2(9120),
+        balance: 142.37
+      })
+    }
+    setInterval(tick, 2000)
+  }
   handle('nodes:list', () => (MOCK ? mockNodes() : nodeManager.list()))
   handle('node:chunks', ({ nodeId, limit }) =>
     MOCK ? mockNodeChunks(nodeId) : nodeChunks(nodeId, limit)

@@ -23,7 +23,7 @@ export const HINTS = {
     'GPU utilisation over the last 30 minutes: the line is the mean across the node’s GPUs, the band runs from its least to its most busy card. A wide band under a low line is one card working while the others idle. Hover or focus it to read a moment.',
 
   fleetRate:
-    'Combined $/hr of every node that may be billing: booting, working, or failed with its destroy not yet confirmed by Vast. Click for spend history.',
+    'Combined $/hr of every node that may be billing: booting, working, or failed with its destroy not yet confirmed by Vast — and the GPU power the fleet is drawing right now (latest nvidia-smi sample per node, refreshed every 15 s). Click for spend history.',
   fleetSession:
     'Estimated total spend across every run (the cost log is never cleared), and GPU energy since the app was opened. Click for spend history.',
   balance: 'Your vast.ai credit. Click for balance history, or “+” to add funds.',

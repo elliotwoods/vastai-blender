@@ -7,6 +7,7 @@ files:
   - '!src/*'
   - '!remote/*'
   - '!fixtures/*'
+  - '!{dist,dist-*}/**'
   - '!docs/*'
   - '!scripts/*'
   - '!electron.vite.config.{js,ts,mjs,cjs}'

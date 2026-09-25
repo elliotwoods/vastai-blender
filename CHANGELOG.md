@@ -13,6 +13,13 @@ GitHub Releases with the notes from this file.
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-09-25
+
+Safety and security fixes from a full audit of the app
+([docs/AUDIT-2026-09.md](docs/AUDIT-2026-09.md)). **Upgrade from 2.2.0 or
+earlier:** a rented machine could write files anywhere on your computer, and
+several paths left instances billing unseen or finished jobs short of frames.
+
 ### Added
 
 - **Alerts reach you.** The main process raises alerts from about 25 places,
@@ -22,13 +29,15 @@ GitHub Releases with the notes from this file.
   until dismissed, billing risks first, with a link to the Vast.ai console.
   Errors and billing risks raised before the window opened, or while it was
   closed, are shown when it opens, as are info and warnings from the last
-  minute. An alert that repeats every tick is one entry. A new error raises an
-  OS notification while the window is in the background. Dismissals survive
-  closing and reopening the window.
+  minute. An alert that repeats every tick is one entry. Errors and billing
+  risks also raise an OS notification when no window is in front, even with
+  the window closed; errors are paced to one every 20 s plus a summary, billing
+  risks never. Dismissals survive closing and reopening the window.
 - **CI.** Every push and pull request runs both typechecks, eslint, vitest, the
   node agent's self-check, and `py_compile` / `bash -n` over `remote/`, which
   is uploaded verbatim to nodes and was never checked before. `npm test` now
-  runs the self-check before vitest, so it needs `python3`.
+  runs the self-check before vitest (skipped with a note where there is no
+  Python).
 - **Tests for the code that spends money.** A lifecycle harness
   (`src/main/test/harness.ts`) runs the real node manager and scheduler against
   an in-memory database built by the real migrations, a scriptable fake Vast.ai
@@ -36,30 +45,6 @@ GitHub Releases with the notes from this file.
   provisioning, dispatch, download and destroy had no tests before. To make
   that possible the event bus moved out of `ipc.ts` into `events.ts`, which
   does not import Electron.
-- **Whole-job preview clips.** A job split across a wide fleet in small chunks
-  used to preview as hundreds of clips a few frames long, each ending before
-  it could be watched. The desktop now stitches finished chunks' clips into one
-  clip per job and rendition, using `ffmpeg -c copy` with no re-encode. It
-  rebuilds about 20 s after chunks complete, and at once when the job ends.
-  Chunks not finished yet are gaps, and the clip records which job frames it
-  holds (`assets.segments`, schema v5). ffmpeg now ships with the app
-  (`ffmpeg-static`); without it, previews stay per-chunk as before.
-
-- **One render per GPU on multi-GPU nodes.** A node with N GPUs used to run one
-  Blender with every GPU enabled, so every GPU sat idle during each frame's
-  serial CPU work (scene sync, BVH build, geometry nodes). Now each GPU renders
-  its own chunk, pinned with `CUDA_VISIBLE_DEVICES`. This applies to jobs that
-  don't share nodes too: for those, one GPU is the unit of exclusivity, not the
-  whole machine. Settings → General → *Render slots per GPU*: 1 (default), 2
-  (overlaps sync with sampling on the same GPU), or off (the old behaviour).
-  `enable_gpu.py` enables only the pinned card, and only on the chosen backend,
-  since each GPU is listed once as CUDA and once as OptiX. The Fleet node panel
-  shows a bar per GPU and which GPU each slot is pinned to. A memory guard
-  drops a lane when RAM or VRAM passes 90%. `VR_JOB_SPEC` takes `slotsPerGpu`.
-- **Min GPUs per node** offer filter (`offerFilters.minNumGpus`, also in
-  Settings → Offer filters). Settings → Offer filters also gains *Min CPU
-  cores*, *Min disk* and *CPU-bound*, which could previously only be set from
-  a spec.
 
 ### Changed
 
@@ -83,22 +68,10 @@ GitHub Releases with the notes from this file.
   when the app starts: nothing checks a node's reachability during a session
   yet. 2.0.0's "realised $/hr" is the node panel's metered spend ÷ uptime, an
   estimate from the quoted rate, not a rate vast.ai billed.
-- **Faster fleet ramp.** Scale-up rents several nodes per 15 s tick (up to 8,
-  from one offer search) instead of one, still bounded by *Max active nodes*
-  and the spend cap. A 30-node fleet is now requested in about a minute rather
-  than 7.5. Demand now subtracts capacity that is still booting, so a short
-  queue no longer keeps renting while its first nodes boot.
-- Offer ranking treats measured throughput (`gpu_perf`) and learned slot counts
-  (`gpu_slots`) as **per GPU**. Both tables are keyed by GPU model, and 1-GPU
-  and 4-GPU nodes of the same model used to overwrite each other's node totals.
-  Existing rows are read as per-GPU figures, which is correct for rows learned
-  on 1-GPU nodes.
-- The preview overlay plays the whole job when the frame you open is in the job
-  clip. `[`/`]` and the filmstrip seek within it rather than reopening per
-  chunk. Frames that aren't stitched yet (a chunk still rendering) fall back to
-  the per-chunk live view.
-- The Gallery shows one tile per job when a job clip exists; **chunks** switches
-  back to the per-chunk wall.
+- The Octane settings no longer say OTOY credentials never reach a node's
+  disk: they travel in the setup command and OctaneServer's environment, where
+  the host can read them. The unlicensed-node alert no longer points to a VNC
+  sign-in the app doesn't have yet.
 
 ### Removed
 
@@ -115,6 +88,8 @@ GitHub Releases with the notes from this file.
   part of a "complete" job. Unannounced files are now adopted only after a
   clean exit, only on the chunk's frame grid, and only if this attempt wrote
   them. Before each attempt, files the manifest does not list are deleted.
+  A frame Blender reports it could not save (a full disk, say) is never
+  manifested either, even when Blender exits 0.
 - **Destroying a node while it was being rented left the instance billing,
   unseen.** A destroy before Vast.ai returned the instance id marked the node
   destroyed, and the instance then billed with nothing showing it until the
@@ -153,6 +128,7 @@ GitHub Releases with the notes from this file.
   queued forever. `createJob`, which the dialog and `VR_JOB_SPEC` both use, now
   refuses these with a message, and the dialog lists the problems as you type
   and disables *Submit*.
+  A job of more than 100,000 frames is refused too.
 - **A second launch on the same profile wrecked the first.** Its boot
   re-provisioned every live node, killing the first process's renders, reset
   every in-flight chunk to pending, and then two schedulers rented against two
@@ -160,18 +136,121 @@ GitHub Releases with the notes from this file.
   focuses the running window, and a headless one (`VR_JOB_SPEC`,
   `VR_E2E_BLEND`) exits with status 1 and submits nothing. `VR_USERDATA`
   profiles still run alongside the real one.
+- **Stereo, extension-less and stepped renders made broken previews.** The
+  preview encoder read only `0001.ext` names from an unbroken run: a stereo
+  scene's `0001_L.png`, or frames saved without an extension, failed the chunk's
+  encode after a good render, and with a frame step above 1 the clip held one
+  frame while claiming the whole count. It now reads every name Blender saves,
+  makes one clip of one view, keeps each clip frame on its Blender frame across
+  steps and gaps, and discards a clip whose decoded length disagrees.
+- **A full disk or a closed window could break a destroy.** The event system
+  ran inside the destroy and recovery paths, and anything that threw there — a
+  window already gone, or the headless stdout mirror on a full disk (seen: a
+  modal "JavaScript error in the main process" while nodes billed) — unwound
+  into them. A failing subscriber now costs a log line and nothing else.
+- **Provisioning downloads could stall for good.** The static ffmpeg and
+  NVIDIA driver downloads now give up below 100 kB/s for 60 s like the Blender
+  download (whose mirror fallback shipped in 2.2.0), and every download has a
+  30-minute ceiling per attempt.
+
+### Security
+
+- **A rented node could write files anywhere on your computer.** The app saved
+  each downloaded file at the job folder joined with the name in the node's
+  manifest, unchecked, so a name like `../../…` put a file wherever you can
+  write, a login item say. Root on the rented machine was enough, and so was a
+  startup script inside a `.blend`. Manifest entries must now look like what
+  the agent writes (`frames/NNNN.ext`, `thumbs/NNNN.jpg`,
+  `previews/<chunk>_*.mp4`) and carry a SHA-256 and a size under a cap, and
+  every path a node names goes through one `resolveInside()` check. A refused
+  frame counts as lost and re-renders, with one alert per chunk. Job-clip
+  stitching refuses paths that could slip a directive into ffmpeg's concat
+  list.
+  A frame outside the chunk's own range, and a clip named for another chunk,
+  are refused as well.
+- **The window could be steered into running programs.** Opening a file ran
+  whatever path the window asked for, and on Windows that runs an `.exe` or
+  `.bat`; frame names come from rented nodes. Links of any scheme went to the
+  operating system, and nothing stopped the window navigating away from the
+  app with the fleet controls still attached. The renderer is now sandboxed.
+  Only http(s) links leave the app, in your browser, and navigation away from
+  the app's page is blocked. A file opens only if it is a folder, image or clip
+  inside the project or a job's folder; other files there are revealed in
+  Explorer/Finder instead, and anything else is refused. The content security
+  policy also rules out plugins, `<base>` and forms.
+- **The window could reveal any path.** *Show in folder* passed whatever path
+  the window sent to the operating system; on Windows a network path makes
+  Explorer contact that server and hand it your login hash. Only files and
+  folders the app itself shows can be revealed now.
+
+## [2.2.0] — 2026-09-25
+
+First release as a standalone desktop app: a signed and notarized macOS build
+alongside the Windows installer.
+
+### Added
+
+- **App icon.** A 3×3 grid of render tiles filling along a diagonal
+  wavefront, in the UI's lime on charcoal, replacing Electron's placeholder on
+  macOS (`.icns`), Windows (`.ico`, also set on the window) and Linux. The
+  source SVG is in `build/icon-src/`.
+- **Live fleet power in the toolbar.** The `rate` pill shows the fleet's
+  current GPU draw (summed from each node's latest nvidia-smi sample) next to
+  its $/hr.
+- **Signed, notarized macOS build.** `electron-builder.yml` now notarizes Mac
+  builds; set `APPLE_KEYCHAIN_PROFILE` to a `notarytool` keychain profile.
+
+- **Whole-job preview clips.** A job split across a wide fleet in small chunks
+  used to preview as hundreds of clips a few frames long, each ending before
+  it could be watched. The desktop now stitches finished chunks' clips into one
+  clip per job and rendition, using `ffmpeg -c copy` with no re-encode. It
+  rebuilds about 20 s after chunks complete, and at once when the job ends.
+  Chunks not finished yet are gaps, and the clip records which job frames it
+  holds (`assets.segments`, schema v5). ffmpeg now ships with the app
+  (`ffmpeg-static`); without it, previews stay per-chunk as before.
+
+- **One render per GPU on multi-GPU nodes.** A node with N GPUs used to run one
+  Blender with every GPU enabled, so every GPU sat idle during each frame's
+  serial CPU work (scene sync, BVH build, geometry nodes). Now each GPU renders
+  its own chunk, pinned with `CUDA_VISIBLE_DEVICES`. This applies to jobs that
+  don't share nodes too: for those, one GPU is the unit of exclusivity, not the
+  whole machine. Settings → General → *Render slots per GPU*: 1 (default), 2
+  (overlaps sync with sampling on the same GPU), or off (the old behaviour).
+  `enable_gpu.py` enables only the pinned card, and only on the chosen backend,
+  since each GPU is listed once as CUDA and once as OptiX. The Fleet node panel
+  shows a bar per GPU and which GPU each slot is pinned to. A memory guard
+  drops a lane when RAM or VRAM passes 90%. `VR_JOB_SPEC` takes `slotsPerGpu`.
+- **Min GPUs per node** offer filter (`offerFilters.minNumGpus`, also in
+  Settings → Offer filters). Settings → Offer filters also gains *Min CPU
+  cores*, *Min disk* and *CPU-bound*, which could previously only be set from
+  a spec.
+
+### Changed
+
+- **Faster fleet ramp.** Scale-up rents several nodes per 15 s tick (up to 8,
+  from one offer search) instead of one, still bounded by *Max active nodes*
+  and the spend cap. A 30-node fleet is now requested in about a minute rather
+  than 7.5. Demand now subtracts capacity that is still booting, so a short
+  queue no longer keeps renting while its first nodes boot.
+- Offer ranking treats measured throughput (`gpu_perf`) and learned slot counts
+  (`gpu_slots`) as **per GPU**. Both tables are keyed by GPU model, and 1-GPU
+  and 4-GPU nodes of the same model used to overwrite each other's node totals.
+  Existing rows are read as per-GPU figures, which is correct for rows learned
+  on 1-GPU nodes.
+- The preview overlay plays the whole job when the frame you open is in the job
+  clip. `[`/`]` and the filmstrip seek within it rather than reopening per
+  chunk. Frames that aren't stitched yet (a chunk still rendering) fall back to
+  the per-chunk live view.
+- The Gallery shows one tile per job when a job clip exists; **chunks** switches
+  back to the per-chunk wall.
+
+### Fixed
+
 - **The launch sweep destroyed other installs' fleets.** It destroyed every
   `vastai-blender` instance this profile did not track, so a second install on
   the same account (a packaged app and a dev build, or a `VR_USERDATA`
   profile) killed the first one's live nodes at launch. It now destroys only
   instances this profile rented, and leaves any other running with a warning.
-- **Provisioning could stall for good on a slow download.** A server that
-  trickled instead of failing hung the static ffmpeg download, which blocks
-  base provisioning while the node bills, and left the background NVIDIA driver
-  download running for the node's whole life. Both now give up below 100 kB/s
-  for 60 s, and have a time limit per attempt and overall. The Blender download
-  has the same stall guard, retries every kind of error rather than only some,
-  falls back through three mirrors, and checks the archive before extracting.
 - **Healthy nodes were thrown away on boot.** vast.ai reports an instance as
   running before sshd inside it listens, and one refused connection failed and
   destroyed the node. In one 53-node run, 23 nodes were replaced this way. The
@@ -192,30 +271,6 @@ GitHub Releases with the notes from this file.
 - **Graded previews were cropped.** The grading canvas kept its intrinsic size
   (the video's native resolution) instead of filling its tile. A 1920×1080
   clip in a smaller tile therefore showed only its top-left corner.
-
-### Security
-
-- **A rented node could write files anywhere on your computer.** The app saved
-  each downloaded file at the job folder joined with the name in the node's
-  manifest, unchecked, so a name like `../../…` put a file wherever you can
-  write, a login item say. Root on the rented machine was enough, and so was a
-  startup script inside a `.blend`. Manifest entries must now look like what
-  the agent writes (`frames/NNNN.ext`, `thumbs/NNNN.jpg`,
-  `previews/<chunk>_*.mp4`) and carry a SHA-256 and a size under a cap, and
-  every path a node names goes through one `resolveInside()` check. A refused
-  frame counts as lost and re-renders, with one alert per chunk. Job-clip
-  stitching refuses paths that could slip a directive into ffmpeg's concat
-  list.
-- **The window could be steered into running programs.** Opening a file ran
-  whatever path the window asked for, and on Windows that runs an `.exe` or
-  `.bat`; frame names come from rented nodes. Links of any scheme went to the
-  operating system, and nothing stopped the window navigating away from the
-  app with the fleet controls still attached. The renderer is now sandboxed.
-  Only http(s) links leave the app, in your browser, and navigation away from
-  the app's page is blocked. A file opens only if it is a folder, image or clip
-  inside the project or a job's folder; other files there are revealed in
-  Explorer/Finder instead, and anything else is refused. The content security
-  policy also rules out plugins, `<base>` and forms.
 
 ## [2.1.0] — 2026-07-30
 
@@ -443,5 +498,8 @@ new on-node agent.
 - Energy totals are in-memory for the session; they reset when the app
   restarts. Cost totals are persisted in SQLite.
 
-[Unreleased]: https://github.com/elliotwoods/vastai-blender/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/elliotwoods/vastai-blender/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.1.0...v2.2.0
+[2.1.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/elliotwoods/vastai-blender/releases/tag/v2.0.0
