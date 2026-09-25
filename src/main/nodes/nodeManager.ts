@@ -25,7 +25,8 @@ import {
   listInstances,
   sshEndpoints,
   showInstance,
-  VastError
+  VastError,
+  vastErrorKind
 } from '../vast/vastClient'
 import type {
   GpuSample,
@@ -75,6 +76,13 @@ const DESTROY_RETRY_MS = 60_000
 const OCTANE_STOP_BUDGET_MS = 20_000
 
 /**
+ * How often a restart asks Vast again about an instance it has not answered
+ * about: from 5 s, doubling to a minute, for as long as it takes.
+ */
+const RESUME_FIRST_DELAY_MS = 5_000
+const RESUME_MAX_DELAY_MS = 60_000
+
+/**
  * The states in which the app wants a node's instance gone: it is being
  * destroyed, it failed, or it was destroyed and Vast has not confirmed that.
  */
@@ -95,6 +103,19 @@ class InstanceStillListed extends Error {
   constructor(instanceId: number, status: string | undefined) {
     super(`Vast still lists instance ${instanceId} after its destroy (${status ?? 'no status'})`)
   }
+}
+
+/**
+ * Vast did not answer: a network error, a timeout, a 5xx or a 429. That says
+ * nothing about the instance asked about, or about the machine it is on.
+ */
+function vastDown(e: unknown): boolean {
+  const kind = vastErrorKind(e)
+  return kind === 'unknown' || kind === 'transient'
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms))
 }
 
 interface NodeRow {
@@ -1127,21 +1148,42 @@ export class NodeManager {
     // its instance alone (see movedOn).
     let held: NodeState = node.state
     const deadline = Date.now() + 8 * 60_000
+    // The status poll's failure while Vast is not answering it, if the boot
+    // ends on one: not the machine's doing, so no blacklist below.
+    let vastSilent: unknown = null
     try {
       let inst: RawInstance | null = null
       for (;;) {
         if (node.movedOn(held)) return
-        inst = await showInstance(instanceId)
-        if (inst?.actual_status === 'running') {
+        try {
+          inst = await showInstance(instanceId)
+          vastSilent = null
+        } catch (e) {
+          // A Vast blip (a 5xx, a 429, a timeout, this computer's network)
+          // says nothing about the instance. It used to fail the node here,
+          // blacklist a good machine and destroy an instance whose image pull
+          // was already paid for (#39 #236). Poll on until the deadline; any
+          // other answer (a key Vast refuses) ends the boot as before.
+          if (!vastDown(e)) throw e
+          vastSilent = e
+          emit('render:logLine', {
+            nodeId: node.id,
+            chunkId: null,
+            line: `Vast.ai did not answer the status poll (${classify(e, { via: 'vast' }).reason}) — polling on`,
+            ts: Date.now()
+          })
+        }
+        if (!vastSilent && inst?.actual_status === 'running') {
           const eps = sshEndpoints(inst)
           if (eps.length > 0) break
         }
         if (Date.now() > deadline) {
+          if (vastSilent) throw vastSilent
           throw new Error(
             `instance not running after 8 min (status: ${inst?.actual_status ?? 'unknown'})`
           )
         }
-        await new Promise((r) => setTimeout(r, 10_000))
+        await sleep(10_000)
       }
 
       const startedAt = inst!.start_date ? Math.round(inst!.start_date * 1000) : Date.now()
@@ -1219,10 +1261,54 @@ export class NodeManager {
       // instance id, which the retry timer and clearFailed retry.
       if (node.movedOn(held)) return
       node.setState('failed', (e as Error).message)
-      if (machineId != null) this.blacklist.add(machineId)
+      // Vast silent for the whole boot says nothing against the machine.
+      if (machineId != null && e !== vastSilent) this.blacklist.add(machineId)
       emit('alert', { level: 'error', message: `Node failed: ${(e as Error).message}` })
       // Clean up the rented instance — never leave a failed node billing.
       await this.ensureInstanceGone(instanceId, { node })
+    }
+  }
+
+  /**
+   * resumeNode's question to Vast about a node's instance, asked until Vast
+   * answers it: the instance, or null when Vast no longer knows it (gone).
+   * Undefined if the node was destroyed meanwhile.
+   *
+   * No answer (Vast or this computer's network down, a 5xx, a key Vast
+   * refuses) says nothing about the instance: the control plane being down
+   * is not the instance being gone. It used to send the node to
+   * recoverUnreachable, which marked it 'ready' without re-provisioning when
+   * SSH worked, and 'failed', uncounted and still billing, when it did not
+   * (#33, audit A8). Now the node waits 'unreachable', counted as billing and
+   * given no work, and Vast is asked again, from 5 s backing off to a
+   * minute, for as long as it takes.
+   */
+  private async askUntilAnswered(
+    node: ManagedNode,
+    instanceId: number,
+    held: NodeState
+  ): Promise<RawInstance | null | undefined> {
+    let delay = RESUME_FIRST_DELAY_MS
+    let waiting = false
+    for (;;) {
+      try {
+        const inst = await showInstance(instanceId)
+        return node.movedOn(held) ? undefined : inst
+      } catch (e) {
+        if (node.movedOn(held)) return undefined
+        if (!waiting) {
+          waiting = true
+          const reason = classify(e, { via: 'vast' }).reason
+          node.setState(
+            'unreachable',
+            `Vast.ai did not answer about instance ${instanceId} at start-up (${reason}); asking again`
+          )
+          held = 'unreachable'
+        }
+      }
+      await sleep(delay)
+      delay = Math.min(delay * 2, RESUME_MAX_DELAY_MS)
+      if (node.movedOn(held)) return undefined
     }
   }
 
@@ -1239,8 +1325,9 @@ export class NodeManager {
     // state this step holds it in: first the one the last exit left it in.
     let held: NodeState = node.state
     try {
-      const inst = await showInstance(instanceId)
-      if (node.movedOn(held)) return
+      const inst = await this.askUntilAnswered(node, instanceId, held)
+      if (inst === undefined) return
+      held = node.state
       if (!inst) {
         // Vast no longer knows the instance: that confirms it gone.
         this.instanceGone(instanceId, 'instance missing at resume')
