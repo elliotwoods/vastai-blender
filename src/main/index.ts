@@ -20,9 +20,10 @@ import {
   type Lifecycle,
   type Prompt
 } from './app/lifecycle'
+import { startHeadlessDrivers } from './app/headless/drivers'
 import { externalUrl, isAppPage, type AppPage } from './app/windowPolicy'
 import { resolveBlenderRelease } from './blender/blendInfo'
-import { closeDb, getDb } from './db/db'
+import { closeDb } from './db/db'
 import { registerIpc } from './ipc'
 import {
   nodeManager,
@@ -388,14 +389,6 @@ async function showMessageBox(
   return r.response
 }
 
-/** Jobs a headless campaign still waits on. */
-function openJobs(): number {
-  const row = getDb()
-    .prepare("SELECT COUNT(*) AS n FROM jobs WHERE state IN ('queued', 'running')")
-    .get() as { n: number }
-  return row.n
-}
-
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.kimchiandchips.vastai-blender')
 
@@ -466,219 +459,14 @@ app.whenReady().then(() => {
   quitLifecycle = lifecycle
   createWindow()
 
-  // Headless batch driver: VR_JOB_SPEC=<path to .json> submits a whole campaign at boot.
-  // Generalises VR_E2E_BLEND (pinned to one blend, Cycles, frames 1-20, no addons) so a
-  // scripted run can set engine, frame range, addon zips and fleet size. Spec shape:
-  //   {
-  //     "blends": ["C:/.../suzanne.blend", ...]  // or "blendDir": "C:/.../blends/<cfg>"
-  //     "engine": "eevee", "frameStart": 1, "frameEnd": 200, "frameStep": 1,
-  //     "addonZips": ["C:/.../auroravision-0.2.0.zip"],
-  //     "chunkSize": null, "maxActiveNodes": 4, "spendCapPerHour": 2,
-  //     "shareNode": true,      // jobs may co-run on one node (per-blend override too)
-  //     "maxNodeSlots": 0,      // 0 = let the app judge concurrency per node
-  //     "slotsPerGpu": 1,       // renders per GPU on a node (0 = one process, all GPUs)
-  //     "offerFilters": { "minNumGpus": 4 }  // partial override of the stored filters
-  //   }
-  //
-  // Both drivers stop by the quit policy, VR_QUIT_POLICY (app/lifecycle.ts),
-  // never by a dialog. `destroy`, the default: SIGINT, SIGTERM, SIGHUP, a
-  // quit or a Windows session end destroys every node and exits, and so does
-  // the campaign being done (no job queued or running). A signal during that
-  // destroy does not cut it short: a SIGHUP never does (a closed terminal
-  // sends two), and only a second Ctrl+C or SIGTERM, 2 s or more after the
-  // first, exits without waiting. `leave`: those exit and leave the nodes as
-  // they are, and a finished campaign keeps running for the idle
-  // scale-down. The exit status is 3 when instances may be left
-  // billing, else 1 when part of the campaign was never submitted (each such
-  // part is collected in `unsubmitted`), else 0.
-  const jobSpecPath = process.env.VR_JOB_SPEC
-  if (jobSpecPath) {
-    const unsubmitted: string[] = []
-    setTimeout(() => {
-      void (async () => {
-        const { readFileSync, readdirSync } = await import('fs')
-        const { createJob, emitChunksChanged, listJobs, refreshJobState } =
-          await import('./jobs/jobs')
-        const { registerAddon } = await import('./addons/addons')
-        const { updateSettings } = await import('./settings')
-        const { getDb } = await import('./db/db')
-
-        const spec = JSON.parse(readFileSync(jobSpecPath, 'utf-8'))
-
-        const patch: Record<string, unknown> = {}
-        if (spec.maxActiveNodes) patch.maxActiveNodes = spec.maxActiveNodes
-        if (spec.spendCapPerHour) patch.spendCapPerHour = spec.spendCapPerHour
-        // Cap on the auto-judged render slots per node; 0/absent = auto.
-        // `nodeSlots` is the pre-2.1 name for the same knob.
-        const slotCap = spec.maxNodeSlots ?? spec.nodeSlots
-        if (slotCap != null) patch.maxNodeSlots = slotCap
-        // Buy-ahead fleet: rent to maxActiveNodes while any chunk is open.
-        if (spec.eagerFleet != null) patch.eagerFleet = spec.eagerFleet
-        // Render slots per GPU on multi-GPU nodes (0 = one process on all GPUs).
-        if (spec.slotsPerGpu != null) patch.slotsPerGpu = spec.slotsPerGpu
-        // Partial offer-filter overrides (e.g. {"cpuBound": true}) merge over
-        // the stored filters via updateSettings' offerFilters merge.
-        if (spec.offerFilters) patch.offerFilters = spec.offerFilters
-        if (Object.keys(patch).length) {
-          updateSettings(patch)
-          console.log(`[spec] settings ${JSON.stringify(patch)}`)
-        }
-
-        // Register each zip fresh: the registry keys on the manifest id and re-hashes the
-        // file, so re-running after an extension rebuild replaces the stale entry even
-        // when the version string is unchanged.
-        const addonIds: string[] = []
-        for (const zip of spec.addonZips ?? []) {
-          const info = registerAddon(zip)
-          addonIds.push(info.id)
-          console.log(`[spec] addon ${info.id} v${info.version} ${info.zipHash.slice(0, 12)}`)
-        }
-
-        // Blend list entries are either plain paths or objects with per-blend
-        // frame overrides: {"path": "...", "frameStart": 1, "frameEnd": 120}.
-        // Needed for mixed-length submissions (e.g. experiment scenes with
-        // different animation lengths in one campaign spec).
-        interface BlendEntry {
-          path: string
-          frameStart?: number
-          frameEnd?: number
-          frameStep?: number
-          /** may co-run with other chunks on one node; falls back to spec.shareNode */
-          shareNode?: boolean
-        }
-        let blends: BlendEntry[] = (spec.blends ?? []).map((b: string | BlendEntry): BlendEntry =>
-          typeof b === 'string' ? { path: b } : b
-        )
-        if (!blends.length && spec.blendDir) {
-          blends = readdirSync(spec.blendDir)
-            .filter((f: string) => f.toLowerCase().endsWith('.blend'))
-            .sort()
-            .map((f: string): BlendEntry => ({ path: join(spec.blendDir, f) }))
-        }
-        if (!blends.length) {
-          console.error('[spec] no blends resolved — nothing submitted')
-          unsubmitted.push(`${jobSpecPath}: no blends resolved`)
-          return
-        }
-
-        // 'partial' included: resubmitting a spec HEALS a half-done job
-        // (failed chunks revived below) instead of duplicating it.
-        const allJobs = listJobs()
-        const active = allJobs.filter((j) => ['queued', 'running', 'partial'].includes(j.state))
-        let created = 0
-        for (const blend of blends) {
-          // Satisfied: a prior job for the same blend AND the same frame
-          // range already completed — re-running the spec must not re-render
-          // finished work. (Observed: complete jobs were re-created on every
-          // respec because dedup only looked at ACTIVE jobs.)
-          const wantStart = blend.frameStart ?? spec.frameStart ?? 1
-          const wantEnd = blend.frameEnd ?? spec.frameEnd ?? 200
-          const satisfied = allJobs.find(
-            (j) =>
-              j.state === 'complete' &&
-              j.blendPath === blend.path &&
-              j.frameStart === wantStart &&
-              j.frameEnd === wantEnd
-          )
-          if (satisfied) {
-            console.log(`[spec] skip (already complete): ${blend.path}`)
-            continue
-          }
-          const existing = active.find((j) => j.blendPath === blend.path)
-          if (existing) {
-            // Revive permanently-failed chunks (retry budget exhausted, e.g.
-            // by a since-fixed dispatch bug) so the scheduler re-runs only
-            // the missing work — downloaded frames are never re-rendered
-            // because requeue narrowed the chunk ranges already.
-            const failed = getDb()
-              .prepare(`SELECT id FROM chunks WHERE job_id = ? AND state = 'failed'`)
-              .all(existing.id) as Array<{ id: string }>
-            const revived = getDb()
-              .prepare(
-                `UPDATE chunks SET state='pending', node_id=NULL, retries=0
-                 WHERE job_id = ? AND state='failed'`
-              )
-              .run(existing.id).changes
-            if (revived > 0) {
-              emitChunksChanged(failed.map((c) => c.id))
-              refreshJobState(existing.id)
-            }
-            console.log(
-              `[spec] skip (already active): ${blend.path}` +
-                (revived ? ` — revived ${revived} failed chunk(s)` : '')
-            )
-            continue
-          }
-          // One blend createJob refuses (missing file, impossible range) must
-          // not cost the rest of the campaign its submission — or skip the
-          // kick() below that starts it.
-          let jobId: string
-          try {
-            jobId = await createJob({
-              blendPath: blend.path,
-              engine: spec.engine ?? 'eevee',
-              frameStart: blend.frameStart ?? spec.frameStart ?? 1,
-              frameEnd: blend.frameEnd ?? spec.frameEnd ?? 200,
-              frameStep: blend.frameStep ?? spec.frameStep ?? 1,
-              addonIds,
-              chunkSize: spec.chunkSize ?? null,
-              shareNode: blend.shareNode ?? spec.shareNode ?? false
-            })
-          } catch (e) {
-            console.error(`[spec] skip (${(e as Error).message}): ${blend.path}`)
-            unsubmitted.push(`${blend.path}: ${(e as Error).message}`)
-            continue
-          }
-          created++
-          console.log(`[spec] job ${created}/${blends.length} ${jobId} ${blend.path}`)
-        }
-        console.log(`[spec] submitted ${created} job(s)`)
-        scheduler.kick()
-      })()
-        .catch((e) => {
-          console.error('[spec] submission failed:', e)
-          unsubmitted.push(`${jobSpecPath}: ${(e as Error)?.message ?? e}`)
-        })
-        .finally(() => lifecycle.watchCampaign(openJobs, unsubmitted))
-    }, 3000)
-  }
-
-  // Headless E2E driver: VR_E2E_BLEND=<path> submits a small Cycles job at
-  // boot; the scheduler then scales up, renders, downloads, and idles down.
-  const e2eBlend = process.env.VR_E2E_BLEND
-  if (e2eBlend) {
-    const unsubmitted: string[] = []
-    setTimeout(() => {
-      void (async () => {
-        const { createJob, listJobs } = await import('./jobs/jobs')
-        // Guard against duplicate submissions across main-process restarts.
-        const existing = listJobs().find(
-          (j) => j.blendPath === e2eBlend && ['queued', 'running'].includes(j.state)
-        )
-        if (existing) {
-          console.log(`[e2e] active job already exists: ${existing.id}`)
-          scheduler.kick()
-          return
-        }
-        const jobId = await createJob({
-          blendPath: e2eBlend,
-          engine: 'cycles',
-          frameStart: 1,
-          frameEnd: 20,
-          frameStep: 1,
-          addonIds: [],
-          chunkSize: null
-        })
-        console.log(`[e2e] job created: ${jobId}`)
-        scheduler.kick()
-      })()
-        .catch((e) => {
-          console.error('[e2e] job creation failed:', e)
-          unsubmitted.push(`${e2eBlend}: ${(e as Error)?.message ?? e}`)
-        })
-        .finally(() => lifecycle.watchCampaign(openJobs, unsubmitted))
-    }, 3000)
-  }
+  // The headless drivers (VR_JOB_SPEC, VR_E2E_BLEND) submit a few seconds
+  // after boot, and stop by the quit policy: app/headless/drivers.ts.
+  startHeadlessDrivers({
+    jobSpecPath: process.env.VR_JOB_SPEC,
+    e2eBlend: process.env.VR_E2E_BLEND,
+    lifecycle,
+    kick: () => scheduler.kick()
+  })
 
   app.on('activate', function () {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
