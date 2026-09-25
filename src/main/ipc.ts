@@ -28,6 +28,7 @@ import type {
 } from '../shared/models'
 import { localPathProblem } from '../shared/settingsSanitize'
 import { applySettingsPatch, describeFieldErrors, type GateOptions } from './app/settingsGate'
+import { reprovisionNode, retryMissing } from './app/recovery'
 import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
 import { dismissAlerts, onAlertSurfaced, onEvent, recentAlerts } from './events'
 import { hostPathFlavour } from './paths'
@@ -816,7 +817,8 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   })
   handle('fleet:clearFailed', () => nodeManager.clearFailed())
   handle('node:destroy', (id) => nodeManager.destroyNode(id))
-  handle('node:reprovision', () => {})
+  // Restart the node's agent and requeue its work (plan 1.15, app/recovery.ts).
+  handle('node:reprovision', (id) => (MOCK ? { requeued: 0 } : reprovisionNode(id)))
   handle('node:openVncTunnel', async (nodeId) => {
     const node = nodeManager.get(nodeId)
     if (!node?.ssh) throw new Error('node not connected')
@@ -860,7 +862,9 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
     // Newly shareable chunks may now fit alongside work already in flight.
     scheduler.kick()
   })
-  handle('job:retryMissing', () => {})
+  // Queue the frames not yet downloaded again (plan 1.15, app/recovery.ts).
+  // A refusal (a job failed outright) rejects, so the caller hears why.
+  handle('job:retryMissing', (id) => (MOCK ? { frames: 0, chunks: 0 } : retryMissing(id)))
 
   // -- scheduler ------------------------------------------------------------
   handle('scheduler:recoveryHold', () => {
