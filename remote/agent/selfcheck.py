@@ -1307,6 +1307,37 @@ def test_agent_runs_the_preflight():
               state.get("errorKind") == "scene" and state.get("exitCode") == nr.GUARD_EXIT
               and state.get("error") == "scene preflight failed: " + report["summary"]
               and state.get("preflight") == report and entries == [])
+    # "warn" mode: the report says ok false and raises nothing, so a later
+    # script that raised is the cause, not the scene's files.
+    for label, printed, kind, error in (
+        ("the job's expression", "Error: script failed, expr: 'import my_addon;"
+         " my_addon.register()', exiting.", "job", "a python expression of the job raised"),
+        ("the agent's Overwrite expression",
+         "Error: script failed, expr: '%s', exiting." % nr.NO_OVERWRITE_EXPR.splitlines()[0],
+         "transient", "the agent's Overwrite-off expression raised"),
+        ("preflight.py itself", "Error: script failed, file:"
+         " '/root/vastai/blender/preflight.py', exiting.", "scene", "scene preflight failed: "),
+    ):
+        with fake_node() as tmp:
+            make_chunk(tmp)
+            state, _ = run_chunk(tmp, {"default": {
+                "print": ["VR_PREFLIGHT " + json.dumps(report), printed],
+                "exit": nr.GUARD_EXIT}}, preflight="warn")
+            check(f"preflight warn: {kind} when {label} raised",
+                  state.get("errorKind") == kind
+                  and state.get("error", "").startswith(error))
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, _ = run_chunk(tmp, {"default": {
+            "print": ["VR_PREFLIGHT " + json.dumps(report),
+                      'VR_STARTUP_FAILED {"script": "startup_guard.py",'
+                      ' "error": "ValueError: no"}',
+                      "Error: script failed, file: '/root/vastai/blender/run_startup_scripts.py',"
+                      " exiting."],
+            "exit": nr.GUARD_EXIT}}, preflight="warn")
+        check("preflight warn: a startup block that raised is named, not the preflight",
+              state.get("errorKind") == "scene"
+              and "'startup_guard.py'" in state.get("error", ""))
     with fake_node() as tmp:
         make_chunk(tmp)
         state, _ = run_chunk(tmp, {"default": {

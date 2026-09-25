@@ -170,8 +170,9 @@ OOM_RE = re.compile(
 GUARD_EXIT = 32
 # Blender's own line when a -P script or a --python-expr raised under
 # --python-exit-code: "Error: script failed, file: '<path>', exiting." or
-# "Error: script failed, expr: '<code>', exiting."
-SCRIPT_FAILED_RE = re.compile(r"script failed, (file|expr): '")
+# "Error: script failed, expr: '<code>', exiting." Captured: which, and the
+# script's path or the expression (its first line, if it has several).
+SCRIPT_FAILED_RE = re.compile(r"script failed, (file|expr): '(.*?)(?:', exiting\.)?\s*$")
 # One-line reports from the scripts in remote/blender/; see each script.
 ENGINE_RE = re.compile(r"\bVR_ENGINE (\S+)")
 GPU_RE = re.compile(r"\bVR_GPU (\{.*\})")
@@ -1074,6 +1075,7 @@ def scan_line(line, state, seen, now=None):
     m = SCRIPT_FAILED_RE.search(line)
     if m:
         seen["scriptFailed"] = m.group(1)
+        seen["scriptFailedWhat"] = m.group(2)
     m = ENGINE_RE.search(line)
     if m:
         raw = m.group(1)
@@ -1113,8 +1115,16 @@ def classify_exit(code, save_failed, seen, state):
                 f"no Cycles GPU device on this node: {gpu.get('reason') or 'see log'}"
                 f" (exit {code}); not rendering on the CPU"
             )
+        # Blender names the script that raised. A failed report alone is not
+        # enough: in "warn" mode preflight.py reports ok false and raises
+        # nothing, and whatever raised later was blamed on the scene's files.
+        failed = seen.get("scriptFailed")
+        what = seen.get("scriptFailedWhat") or ""
+        script = os.path.basename(what) if failed == "file" else None
         preflight = state.get("preflight") or {}
-        if preflight.get("ok") is False:
+        if preflight.get("ok") is False and (
+            script == "preflight.py" or (failed is None and not seen.get("preflightWarn"))
+        ):
             return "scene", f"scene preflight failed: {preflight.get('summary') or 'see log'}"
         startup = seen.get("startupFailed")
         if startup:
@@ -1122,7 +1132,10 @@ def classify_exit(code, save_failed, seen, state):
                 f"startup script {startup.get('script')!r} in the .blend raised"
                 f" {startup.get('error') or 'an error'} (exit {code})"
             )
-        if seen.get("scriptFailed") == "expr":
+        if failed == "expr" and what == NO_OVERWRITE_EXPR.splitlines()[0]:
+            # The agent's own, not the job's; see NO_OVERWRITE_EXPR.
+            return "transient", f"the agent's Overwrite-off expression raised (exit {code}); see log"
+        if failed == "expr":
             # The job's own --python-expr (an extension's register call),
             # the same on every node.
             return "job", f"a python expression of the job raised (exit {code}); see log"
@@ -1295,7 +1308,7 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
     # Any one makes the render unclean, exactly like a non-zero exit.
     save_failed = []
     # What scan_line saw that only the failure's errorKind needs.
-    seen = {}
+    seen = {"preflightWarn": spec.get("preflight") == "warn"}
 
     def run_once(cmd):
         nonlocal attempt_started
