@@ -367,6 +367,50 @@ describe('1.7: liveness supervision', () => {
     expect(app.nodeManager.activeCount()).toBe(2)
   })
 
+  it('1.7: a node whose host Vast reports offline is waited for, not destroyed at the first look', async () => {
+    // The host lost its network: Vast hears nothing from it, and nor does
+    // the app, but the container renders on. It used to be destroyed at
+    // once, its render and undownloaded frames with it.
+    const { app, busy, jobId, chunkId, prov } = await renderingOnOne()
+    const instanceId = instanceOf(busy)
+    const machine = w.machineFor(busy)
+    w.vast.patchInstance(instanceId, { actual_status: 'offline' })
+    dropOff(machine)
+    await w.until(() => app.nodeManager.get(busy)?.state === 'unreachable', 'unreachable')
+
+    await w.advance(4 * MIN, 5_000)
+    expect(app.nodeManager.get(busy)?.state).toBe('unreachable')
+    expect(w.vast.count('destroyInstance')).toBe(0)
+
+    w.vast.patchInstance(instanceId, { actual_status: 'running' })
+    comeBack(machine)
+    await w.until(() => app.nodeManager.get(busy)?.state === 'rendering', 'back in service', {
+      timeoutMs: 5 * MIN
+    })
+    expect(prov.get(busy)!.restarts).toEqual([])
+    expect(chunksOf(jobId)).toMatchObject([
+      { id: chunkId, node_id: busy, state: 'rendering', infra_retries: 0 }
+    ])
+    expect(w.vast.count('destroyInstance')).toBe(0)
+  })
+
+  it('1.7: a node whose host stays offline is given up within its reconnect budget', async () => {
+    const { app, busy, jobId } = await renderingOnOne()
+    const instanceId = instanceOf(busy)
+    w.vast.patchInstance(instanceId, { actual_status: 'offline' })
+    dropOff(w.machineFor(busy))
+    await w.until(() => app.nodeManager.get(busy)?.state === 'unreachable', 'unreachable')
+    const from = Date.now()
+
+    await w.until(() => app.nodeManager.get(busy)?.state === 'destroyed', 'given up', {
+      timeoutMs: 20 * MIN,
+      stepMs: 5_000
+    })
+    expect(Date.now() - from).toBeLessThanOrEqual(11 * MIN)
+    expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
+    expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
+  })
+
   it('1.7: a node whose SSH never comes back while Vast says it runs is given up and destroyed', async () => {
     const { app, busy, jobId } = await renderingOnOne()
     dropOff(w.machineFor(busy))

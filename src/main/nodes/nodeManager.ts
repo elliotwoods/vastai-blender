@@ -306,9 +306,15 @@ function heartbeatAge(part: string | undefined): number | null | undefined {
 /**
  * What Vast says about an instance SSH no longer reaches: gone (Vast no
  * longer knows it), stopped (Vast stops an account's instances at a $0
- * balance, field incident 1d59516c; or its host went offline), up (running,
- * or coming back from a restart), or silent (no answer: Vast is down, or
- * this computer's network is).
+ * balance, field incident 1d59516c), up (running, coming back from a
+ * restart, or on a host that is offline for now), or silent (no answer:
+ * Vast is down, or this computer's network is).
+ *
+ * An 'offline' host has lost touch with Vast, and so, most likely, with
+ * everyone: its container can well be running on, renders and all, and
+ * answer again when the host's network does. It gets the reconnect rounds a
+ * running instance gets, within the same budget, rather than being
+ * destroyed, and its undownloaded frames with it, at the first look.
  */
 type InstanceFate =
   | { kind: 'gone' }
@@ -319,7 +325,7 @@ type InstanceFate =
 /** Vast is not running this instance, and will not without being asked. */
 function instanceStopped(inst: RawInstance): boolean {
   if (inst.intended_status === 'stopped' || inst.cur_state === 'stopped') return true
-  return ['exited', 'stopped', 'offline'].includes(inst.actual_status ?? '')
+  return ['exited', 'stopped'].includes(inst.actual_status ?? '')
 }
 
 /**
