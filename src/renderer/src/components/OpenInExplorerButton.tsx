@@ -1,10 +1,12 @@
 import { iconBtn } from '../lib/controls'
+import { openFolderLabel, revealLabel } from '../lib/platform'
 import { Icon } from './Icon'
 import { ipc } from '../lib/ipc'
 
 /**
- * The shared click-to-open affordance. `reveal` selects the item in Explorer;
- * `open` opens the file/folder with its default handler.
+ * The shared click-to-open affordance. `reveal` selects the item in the file
+ * manager ("Show in Finder" / "Show in Explorer"); `open` opens the file or
+ * folder with its default handler. `title` overrides the tooltip and label.
  */
 export function OpenInExplorerButton({
   path,
@@ -15,9 +17,11 @@ export function OpenInExplorerButton({
   mode?: 'reveal' | 'open'
   title?: string
 }): React.JSX.Element {
+  const label = title ?? (mode === 'reveal' ? revealLabel() : openFolderLabel())
   return (
     <button
-      title={title ?? (mode === 'reveal' ? 'Reveal in Explorer' : 'Open')}
+      title={label}
+      aria-label={label}
       style={iconBtn({ size: 'sm' })}
       onClick={(e) => {
         e.stopPropagation()

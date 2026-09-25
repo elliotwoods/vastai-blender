@@ -31,7 +31,11 @@ const api: RendererApi = {
       listener(payload)
     ipcRenderer.on(channel, wrapped)
     return () => ipcRenderer.removeListener(channel, wrapped)
-  }
+  },
+
+  // A sandboxed preload still has process.platform.
+  platform:
+    process.platform === 'darwin' || process.platform === 'win32' ? process.platform : 'linux'
 }
 
 contextBridge.exposeInMainWorld('api', api)

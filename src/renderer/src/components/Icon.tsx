@@ -207,6 +207,83 @@ const PATHS = {
       <rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.5" />
     </>
   ),
+  // -- actions --------------------------------------------------------------
+  trash: (
+    <>
+      <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
+      <path d="M5.5 6 6.5 20a1.5 1.5 0 0 0 1.5 1.4h8a1.5 1.5 0 0 0 1.5-1.4L18.5 6M10 11v6M14 11v6" />
+    </>
+  ),
+  /** drag handle: two columns of dots */
+  grip: <path d="M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01" strokeWidth={3} />,
+  link: (
+    <>
+      <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" />
+      <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
+    </>
+  ),
+  /** link, broken: the two halves pulled apart, with break ticks */
+  unlink: (
+    <>
+      <path d="m18.8 13.2 1.7-1.7a5 5 0 0 0-7-7l-1.7 1.7" />
+      <path d="m5.2 10.8-1.7 1.7a5 5 0 0 0 7 7l1.7-1.7" />
+      <path d="M8 2v3M2 8h3M16 22v-3M22 16h-3" />
+    </>
+  ),
+  /** autoscroll: arrow down onto a floor (follow the tail) */
+  autoscroll: (
+    <>
+      <path d="M12 3v12M7 10l5 5 5-5" />
+      <path d="M5 20h14" />
+    </>
+  ),
+  /** expand: two corners pulled outward */
+  expand: (
+    <>
+      <path d="M15 3h6v6M9 21H3v-6" />
+      <path d="M21 3l-7 7M3 21l7-7" />
+    </>
+  ),
+  /** gauge: speedometer dial */
+  gauge: (
+    <>
+      <path d="M3.5 17a9 9 0 1 1 17 0" />
+      <path d="m12 14 4-5" />
+      <circle cx="12" cy="14" r="1.2" />
+    </>
+  ),
+  eye: (
+    <>
+      <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z" />
+      <circle cx="12" cy="12" r="3" />
+    </>
+  ),
+  // -- transport (media/TransportBar) -------------------------------------
+  // Solid shapes (stroked too, so corners round like the line icons): at
+  // 13px an outline triangle reads as a thin wedge. One family, all filled.
+  play: <path d="M7 4.5v15l12.5-7.5z" fill="currentColor" />,
+  pause: (
+    <>
+      <rect x="6" y="4.5" width="4" height="15" rx="0.8" fill="currentColor" />
+      <rect x="14" y="4.5" width="4" height="15" rx="0.8" fill="currentColor" />
+    </>
+  ),
+  /** skip to start: bar + triangle */
+  skipStart: (
+    <>
+      <path d="M6 5v14" />
+      <path d="M19 5v14l-10-7z" fill="currentColor" />
+    </>
+  ),
+  skipEnd: (
+    <>
+      <path d="M18 5v14" />
+      <path d="M5 5v14l10-7z" fill="currentColor" />
+    </>
+  ),
+  /** rewind: two triangles */
+  rewind: <path d="M11.5 6v12L3 12zM21 6v12l-8.5-6z" fill="currentColor" />,
+  fastForward: <path d="M12.5 6v12L21 12zM3 6v12l8.5-6z" fill="currentColor" />,
   settings: (
     <>
       <circle cx="12" cy="12" r="3" />
@@ -216,6 +293,9 @@ const PATHS = {
 } as const
 
 export type IconName = keyof typeof PATHS
+
+/** Every icon name, for tests and pickers. */
+export const ICON_NAMES = Object.keys(PATHS) as IconName[]
 
 export function Icon({
   name,

@@ -21,6 +21,8 @@
  */
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { Icon } from '../components/Icon'
+import { OpenInExplorerButton } from '../components/OpenInExplorerButton'
 import { btn, iconBtn, mono, panel, sectionLabel, segmented } from '../lib/controls'
 import { basename } from '../lib/format'
 import { ipc } from '../lib/ipc'
@@ -413,21 +415,20 @@ function Overlay({
         ) : null}
         <button
           title="Grade panel"
+          aria-label="Grade panel"
           style={iconBtn({ size: 'sm', active: showGrade })}
           onClick={() => setShowGrade(!showGrade)}
         >
-          ◑
+          <Icon name="contrast" />
         </button>
-        {clip ? (
-          <button
-            style={btn({ size: 'sm' })}
-            onClick={() => void ipc.invoke('shell:showItemInFolder', clip.absPath)}
-          >
-            reveal
-          </button>
-        ) : null}
-        <button title="Close (Esc)" style={iconBtn({ size: 'sm' })} onClick={close}>
-          ✕
+        {clip ? <OpenInExplorerButton path={clip.absPath} /> : null}
+        <button
+          title="Close (Esc)"
+          aria-label="Close"
+          style={iconBtn({ size: 'sm' })}
+          onClick={close}
+        >
+          <Icon name="cross" />
         </button>
       </div>
 

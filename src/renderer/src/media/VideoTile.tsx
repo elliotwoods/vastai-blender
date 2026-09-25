@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { mono } from '../lib/controls'
+import { iconBtn, mono } from '../lib/controls'
 import { SCALE, TOKENS } from '../lib/theme'
+import { Icon } from '../components/Icon'
 import { OpenInExplorerButton } from '../components/OpenInExplorerButton'
 import type { ClipAsset } from '../../../shared/models'
 import type { ClipSyncController } from './ClipSyncController'
@@ -204,10 +205,11 @@ export function VideoTile({
         {onExpand ? (
           <button
             title="Inspect"
-            style={{ cursor: 'pointer', color: TOKENS.text, fontSize: 13 }}
+            aria-label="Inspect"
+            style={iconBtn({ size: 'sm' })}
             onClick={onExpand}
           >
-            ⤢
+            <Icon name="expand" />
           </button>
         ) : null}
       </div>

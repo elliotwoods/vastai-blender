@@ -368,4 +368,9 @@ export interface RendererApi {
     ...args: IpcInvokeMap[C]['args']
   ): Promise<IpcInvokeMap[C]['result']>
   on<C extends EventChannel>(channel: C, listener: (payload: IpcEventMap[C]) => void): () => void
+  /**
+   * The host OS, from the preload's `process.platform`, so copy can name the
+   * platform's file manager (Finder / Explorer). Anything else reads as linux.
+   */
+  readonly platform: 'darwin' | 'win32' | 'linux'
 }

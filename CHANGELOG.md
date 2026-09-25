@@ -131,6 +131,13 @@ stalled the app).
 
 ### Changed
 
+- **One icon set for the buttons.** The transport bar, preview overlay, log
+  autoscroll, tile inspect and chip remove buttons drew Unicode glyphs
+  (⏮ ⏪ ▶ ◑ ✕ ⇣ ⤢ ×) that each font rendered at a different size and weight;
+  they now use the app's SVG icons and carry `aria-label`s. The text "reveal"
+  and "open output" buttons became the folder button, whose tooltip names the
+  platform's file manager: "Show in Finder" on macOS, "Show in Explorer" on
+  Windows.
 - **The next chunk no longer waits for the last one's encode and download
   (#180).** An exclusive chunk held its GPU lane until its frames were
   downloaded, and on the node until its previews were encoded, so the GPU sat
