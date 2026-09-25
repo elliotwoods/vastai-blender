@@ -13,7 +13,22 @@ GitHub Releases with the notes from this file.
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-09-25
+
+First release as a standalone desktop app: a signed and notarized macOS build
+alongside the Windows installer.
+
 ### Added
+
+- **App icon.** A 3×3 grid of render tiles filling along a diagonal
+  wavefront, in the UI's lime on charcoal, replacing Electron's placeholder on
+  macOS (`.icns`), Windows (`.ico`, also set on the window) and Linux. The
+  source SVG is in `build/icon-src/`.
+- **Live fleet power in the toolbar.** The `rate` pill shows the fleet's
+  current GPU draw (summed from each node's latest nvidia-smi sample) next to
+  its $/hr.
+- **Signed, notarized macOS build.** `electron-builder.yml` now notarizes Mac
+  builds; set `APPLE_KEYCHAIN_PROFILE` to a `notarytool` keychain profile.
 
 - **Whole-job preview clips.** A job split across a wide fleet in small chunks
   used to preview as hundreds of clips a few frames long, each ending before
@@ -308,5 +323,7 @@ new on-node agent.
 - Energy totals are in-memory for the session; they reset when the app
   restarts. Cost totals are persisted in SQLite.
 
-[Unreleased]: https://github.com/elliotwoods/vastai-blender/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/elliotwoods/vastai-blender/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.1.0...v2.2.0
+[2.1.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/elliotwoods/vastai-blender/releases/tag/v2.0.0
