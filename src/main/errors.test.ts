@@ -815,3 +815,30 @@ describe('describeError: an agent failure with no error text', () => {
     )
   })
 })
+
+// Two of nodeManager's and provisioner's own errors, which read as
+// "unrecognised error" in the alert and the scale backoff's reason (n4).
+describe('classify: provisioning', () => {
+  it.each([
+    [
+      'provisioning past its deadline',
+      Object.assign(new Error('provisioning did not finish within 25 min'), {
+        name: 'ProvisionTimeout'
+      }),
+      'machine',
+      'node-provision-timeout'
+    ],
+    [
+      'another restart-agent still running',
+      Object.assign(new Error('another restart-agent is still running on the node'), {
+        name: 'AgentBusyError'
+      }),
+      'transient',
+      'agent-busy'
+    ]
+  ])('%s', (_what, e, kind, rule) => {
+    const c = classify(e, { via: 'ssh' })
+    expect(c).toMatchObject({ kind, rule, retryable: true })
+    expect(c.reason).not.toMatch(/unrecognised/)
+  })
+})

@@ -714,6 +714,18 @@ export function classify(e: unknown, opts: { via?: ErrorSource } = {}): Classifi
   ) {
     return result('machine', 'node-setup', 'setting up the node failed', e, true)
   }
+  // Provisioning past its deadline (nodeManager's ProvisionTimeout): a
+  // mirror too slow for it, or a step stuck on the node. The node's, and
+  // counted by the scale backoff, which is what stops the next rental
+  // failing the same way (plan 1.17).
+  if (name === 'ProvisionTimeout') {
+    return result('machine', 'node-provision-timeout', 'provisioning ran out of time', e, true)
+  }
+  // restart-agent found another one running on the node, and gave up
+  // waiting for it (provisioner's AgentBusyError): busy, not broken.
+  if (name === 'AgentBusyError') {
+    return result('transient', 'agent-busy', "the node's agent was being restarted", e, true)
+  }
   // The first connection to a new instance (nodeManager.driveToReady).
   if (/^unexpected echo result:|^echo failed\b|^instance not running after\b/i.test(message)) {
     return result('machine', 'node-not-ready', 'the node never became usable', e, true)
