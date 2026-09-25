@@ -13,6 +13,7 @@ import { extname, join } from 'path'
 import { Readable } from 'stream'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { diagWrite, guardStdio, installCrashGuard } from './app/crashGuard'
 import {
   fleetPort,
   installLifecycle,
@@ -24,6 +25,7 @@ import { startHeadlessDrivers } from './app/headless/drivers'
 import { externalUrl, isAppPage, type AppPage } from './app/windowPolicy'
 import { resolveBlenderRelease } from './blender/blendInfo'
 import { closeDb } from './db/db'
+import { emit } from './events'
 import { registerIpc } from './ipc'
 import {
   nodeManager,
@@ -36,6 +38,27 @@ import { resolveInside } from './paths'
 import { scheduler } from './scheduler/scheduler'
 import { jobClips } from './transfer/jobClip'
 import { getSettings } from './settings'
+
+// Before anything else can go wrong (plan 1.21). Field, job da68b61b: with
+// the Mac's disk full, the headless stdout mirror threw ENOSPC, and
+// Electron's modal "JavaScript error occurred in the main process" box sat
+// in front of the app while nodes billed. An uncaught exception or
+// unhandled rejection is now logged and raised as an alert, and the app
+// carries on as it did once that box was dismissed (app/crashGuard.ts).
+//
+// stdout and stderr get an 'error' listener in every run. A write to a
+// closed terminal (a headless run's SIGHUP; a person's app started from a
+// terminal that went away) or to a full disk can fail after the call has
+// returned, as an 'error' event on the stream, and one with no listener is
+// an uncaught exception, in the middle of a destroy as often as not.
+guardStdio([process.stdout, process.stderr])
+installCrashGuard({
+  proc: process,
+  alert: (message) => emit('alert', { level: 'error', message }),
+  // writeSync, as for the lines below: a crash is when a piped stderr's
+  // asynchronous write is least likely to land.
+  log: (text) => diagWrite({ write: (t: string) => writeSync(2, t) }, text)
+})
 
 // Dev aid: VR_USERDATA=<dir> runs against a throwaway profile (own settings,
 // own SQLite state, no API key) — used with VR_MOCK=1 to drive the UI for
@@ -79,17 +102,6 @@ if (!app.requestSingleInstanceLock({ scripted })) {
   if (scripted) process.exit(1)
   app.quit()
   process.exit(0)
-}
-
-// A headless run is usually started from a terminal, and SIGHUP usually
-// means that terminal went away. The destroy the quit policy then starts
-// still writes to stdout (app/lifecycle.ts, nodeManager, events.ts's
-// mirror). A write to a closed terminal fails later, as an 'error' event on
-// the stream, and one with no listener is an uncaught exception: Electron's
-// blocking error box in the middle of the destroy. There is nowhere left to
-// say it, so the listener does nothing.
-if (headless) {
-  for (const stream of [process.stdout, process.stderr]) stream.on('error', () => {})
 }
 
 // The primary instance: a second launch (above) by a person is them asking

@@ -85,6 +85,8 @@ interface Loaded {
   destroyed: string[]
   /** What index.ts wrote to stderr (fd 2). */
   stderr: string
+  /** 'stdout error', 'stderr error': listeners index.ts put on the streams (recorded, not installed). */
+  stdio: string[]
   closedDb: number
   schedulerStopped: number
   shutdowns: number
@@ -149,6 +151,7 @@ async function load(
     signals: new Map(),
     destroyed: [],
     stderr: '',
+    stdio: [],
     closedDb: 0,
     schedulerStopped: 0,
     shutdowns: 0,
@@ -277,6 +280,18 @@ async function load(
     out.signals.set(event, fn)
     return process
   }) as typeof process.on)
+  // Recorded rather than added to the test runner's own streams, unless the
+  // test has its own stand-in there already.
+  for (const [name, stream] of [
+    ['stdout', process.stdout],
+    ['stderr', process.stderr]
+  ] as const) {
+    if (vi.isMockFunction(stream.on)) continue
+    vi.spyOn(stream, 'on').mockImplementation(((event: string) => {
+      out.stdio.push(`${name} ${event}`)
+      return stream
+    }) as typeof stream.on)
+  }
 
   await import('../index')
   ready()
@@ -645,5 +660,58 @@ describe("index.ts, a headless run's settings (plan 1.14)", () => {
       slotsPerGpu: 2,
       offerFilters: { minNumGpus: 4 }
     })
+  })
+})
+
+describe('index.ts, an error nothing caught (plan 1.21)', () => {
+  // Field, job da68b61b: with the Mac's disk full, the headless stdout
+  // mirror threw ENOSPC, and Electron's modal "A JavaScript error occurred
+  // in the main process" box sat in front of the app while nodes billed.
+
+  it("a person's app: an uncaught exception is an alert and a line on stderr, not Electron's box", async () => {
+    const r = await load([node()])
+    const uncaught = r.signals.get('uncaughtException') as ((e: unknown) => void) | undefined
+    expect(uncaught).toBeTypeOf('function')
+    const { onEvent } = await import('../events')
+    const alerts: unknown[] = []
+    onEvent((e) => {
+      if (e.channel === 'alert') alerts.push(e.payload)
+    })
+
+    const e = Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' })
+    expect(() => uncaught!(e)).not.toThrow()
+
+    expect(alerts).toEqual([
+      {
+        level: 'error',
+        message: expect.stringMatching(
+          /^Vast Render hit an unexpected error and kept running: ENOSPC: no space left on device/
+        )
+      }
+    ])
+    expect(r.stderr).toContain('[vast-render] uncaught exception: ENOSPC: no space left on device')
+    expect(r.exits).toEqual([])
+  })
+
+  it('a headless run: an unhandled rejection is an alert too, and the campaign carries on', async () => {
+    const r = await load([node()], { VR_E2E_BLEND: '/scenes/e2e.blend' })
+    const rejected = r.signals.get('unhandledRejection') as ((reason: unknown) => void) | undefined
+    expect(rejected).toBeTypeOf('function')
+    const { recentAlerts } = await import('../events')
+
+    expect(() => rejected!(new Error('socket hang up'))).not.toThrow()
+
+    expect(recentAlerts().map((a) => a.message)).toEqual([
+      expect.stringContaining('kept running: socket hang up')
+    ])
+    expect(r.stderr).toContain('[vast-render] unhandled rejection: socket hang up')
+    expect(r.exits).toEqual([])
+  })
+
+  it("stdout and stderr get an 'error' listener in a person's app, not only a headless run", async () => {
+    // A person's app started from a terminal writes there too, and a write
+    // to a terminal that went away fails later, as an 'error' event.
+    const r = await load([])
+    expect(r.stdio).toEqual(expect.arrayContaining(['stdout error', 'stderr error']))
   })
 })
