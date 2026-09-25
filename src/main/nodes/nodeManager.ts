@@ -925,8 +925,8 @@ export class NodeManager {
    * - Anything else is unclaimed, listed with its rate and never destroyed
    *   here: another install's or profile's rental (a packaged app and a dev
    *   build on one account; destroying it would kill that app's live render),
-   *   or no Vast Render rental at all. Only the user destroys one
-   *   (destroyUnclaimed).
+   *   one under this install's id that no row names (ownerOf), or no Vast
+   *   Render rental at all. Only the user destroys one (destroyUnclaimed).
    *
    * Left for a later pass: an instance younger than RECONCILE_MIN_AGE_MS,
    * and one whose row's create may still answer: in flight or being looked
@@ -1037,13 +1037,11 @@ export class NodeManager {
         continue
       }
       if (young) continue
-      const owner: UnclaimedOwner = inst.label?.startsWith(LABEL_PREFIX)
-        ? 'otherVastRender'
-        : 'unlabelled'
+      const owner = this.ownerOf(inst.label)
       unclaimed.set(inst.id, this.unclaimedEntry(inst, owner, now))
-      if (owner === 'otherVastRender' && !this.foreignAlerted.has(inst.id)) {
+      if (owner !== 'unlabelled' && !this.foreignAlerted.has(inst.id)) {
         this.foreignAlerted.add(inst.id)
-        emit('alert', { level: 'warn', message: this.foreignMessage(inst) })
+        emit('alert', { level: 'warn', message: this.foreignMessage(inst, owner) })
       }
     }
     this.settleUnknownCreates(found)
@@ -1081,12 +1079,31 @@ export class NodeManager {
   }
 
   /**
-   * The one alert for a Vast Render rental of another install or profile.
-   * Its label may carry this profile's install id with no row here to name
-   * it: the id is only a claim (a settings file copied from here carries
-   * it too), and only a row says this database rented it.
+   * Whose an unclaimed instance looks to be, from its label: 'thisProfile'
+   * when it carries this install's id, though no row here names it (a lost
+   * or reset database, or a settings file copied from here); another Vast
+   * Render's when it carries another id, or none (a legacy label no row
+   * here has); 'unlabelled' for anything else on the account.
    */
-  private foreignMessage(inst: RawInstance): string {
+  private ownerOf(label: string | undefined): UnclaimedOwner {
+    if (!label?.startsWith(LABEL_PREFIX)) return 'unlabelled'
+    const install = getSettings().installId?.slice(0, 8)
+    const parts = parseRentalLabel(label)
+    return install && parts?.install === install ? 'thisProfile' : 'otherVastRender'
+  }
+
+  /**
+   * The one alert for a Vast Render rental that no row here names, left
+   * running either way. Only a row says this database rented an instance:
+   * this install's id in its label is only a claim, since a settings file
+   * copied from here carries the id too, and destroying the other copy's
+   * rental would kill its live render. The wording must not send the user
+   * off to "its own app" for an instance that has none.
+   */
+  private foreignMessage(inst: RawInstance, owner: UnclaimedOwner): string {
+    if (owner === 'thisProfile') {
+      return `instance ${inst.id} (${inst.label}) carries this install's id but no node here knows it — left running; destroy it from the Vast.ai console if it is stray`
+    }
     return `instance ${inst.id} (${inst.label}) was not rented by this profile — left running; destroy it from its own app or the Vast.ai console if it is stray`
   }
 

@@ -319,6 +319,24 @@ describe('1.3 unclaimed instances', () => {
     expect(app.nodeManager.activeCount()).toBe(0)
   })
 
+  it("one under this install's id that no row names is this profile's: listed, not destroyed, not sent to 'its own app'", async () => {
+    // A lost or reset database, or a settings file copied to another
+    // machine: the label is this install's, and nothing here rented it.
+    const label = `vastai-blender ${w.settings.installId!.slice(0, 8)}:12345678`
+    const stray = w.vast.addInstance({ label, start_date: vastTime(30 * 60_000) })
+    const app = await started()
+    await w.advance(6 * 60_000, 5_000)
+
+    expect(app.nodeManager.listUnclaimed()).toMatchObject([
+      { instanceId: stray.id, label, owner: 'thisProfile' }
+    ])
+    expect(w.vast.count('destroyInstance')).toBe(0)
+    const warned = w.alerts('warn')
+    expect(warned).toEqual([
+      `instance ${stray.id} (${label}) carries this install's id but no node here knows it — left running; destroy it from the Vast.ai console if it is stray`
+    ])
+  })
+
   it('an instance with no Vast Render label is listed, never destroyed, and not announced', async () => {
     const other = w.vast.addInstance({ start_date: vastTime(60 * 60_000) })
     const app = await started()
