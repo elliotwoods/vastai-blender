@@ -405,7 +405,9 @@ class ChunkRun {
      * assigned (Scheduler.lanePlanFor): what the node's other runs are
      * admitted beside (admission.ts exclusiveLanesFor).
      */
-    readonly lanes: LanePlan
+    readonly lanes: LanePlan,
+    /** the job's engine when it was assigned, which `lanes` was planned for */
+    readonly engine: EngineId
   ) {}
 
   /**
@@ -1702,10 +1704,27 @@ class Scheduler {
     }
   }
 
-  /** One step of the exclusive-lane memory guard (see gpuLanes.guardLanes). */
+  /**
+   * One step of the exclusive-lane memory guard (see gpuLanes.guardLanes).
+   *
+   * With the node's context, so the guard moves only between the plans
+   * planLanes makes, reads VRAM per card, waits for each step to take effect
+   * and steps back up once memory has room. Without it, the guard stepped
+   * down one lane every 90 s while the renders that caused the pressure kept
+   * running, and never back up: a 4×4090 node under a heavy scene was down to
+   * one lane pinned to card 0 in about three minutes, with three paid cards
+   * idle for the rest of its rental, while scale-up rented more nodes to make
+   * up for it (#222). The plan is the one the node's exclusive runs render:
+   * EEVEE's and Octane's is one lane, which no step can lower.
+   */
   private guardExclusiveLanes(node: NodeSnapshot, inFlight: number, now: number): void {
     const prev = this.laneGuards.get(node.id) ?? initialGuard()
-    const { guard, reason } = guardLanes(prev, node.metrics, inFlight, now)
+    const engines = new Set(
+      [...this.runsOn(node.id)].filter((r) => !r.shareNode).map((r) => r.engine)
+    )
+    const ctx = this.laneContext(node.id, engines.size === 1 ? [...engines][0] : undefined)
+    if (!ctx) return
+    const { guard, reason } = guardLanes(prev, node.metrics, inFlight, now, ctx)
     if (guard === prev) return
     this.laneGuards.set(node.id, guard)
     if (reason) emit('alert', { level: 'warn', message: `${node.gpuName ?? node.id}: ${reason}` })
@@ -1797,7 +1816,8 @@ class Scheduler {
           node.id,
           chunk.share_node === 1,
           managed.ssh,
-          this.lanePlanFor(node.id, chunk.engine)
+          this.lanePlanFor(node.id, chunk.engine),
+          chunk.engine
         )
         this.runs.set(chunk.id, run)
         this.nodeRunsMut(node.id).add(run)

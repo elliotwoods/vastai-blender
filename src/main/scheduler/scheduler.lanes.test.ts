@@ -56,6 +56,34 @@ function submit(app: App, engine: EngineId, frames: number): Promise<string> {
   return w.submitJob(app, { engine, frameStart: 1, frameEnd: frames, chunkSize: 1 })
 }
 
+/**
+ * What the node's nvidia-smi and /proc/meminfo report from now on, in
+ * pollMetrics' layout: every card at `vram` of 24 GB, `ram` of 125 GB in use.
+ * Change the returned object to change the next sample.
+ */
+function reportMemory(machine: FakeMachine, load: { vram: number; ram: number }): typeof load {
+  machine.onExec(/^nvidia-smi --query-gpu/, () => {
+    const total = 24576
+    const gpus = Array.from(
+      { length: machine.numGpus },
+      (_, i) => `95, ${Math.round(total * load.vram)}, ${total}, 65, 300.5, 450, ${i}`
+    ).join('\n')
+    const totalKb = 131072000
+    const availKb = Math.round(totalKb * (1 - load.ram))
+    return (
+      `${gpus}\n----\n4.00 3.50 3.00 2/300 12345\n32\n----\n` +
+      `MemTotal:       ${totalKb} kB\nMemAvailable:    ${availKb} kB\n` +
+      `cpu  1000 0 500 8000 100 0 0 0 0 0\n`
+    )
+  })
+  return load
+}
+
+/** The node's exclusive runs right now. */
+function inFlight(app: App, nodeId: string): number {
+  return app.scheduler.activeWorkForNode(nodeId).length
+}
+
 describe('1.11 #229 #235: lanes by engine', () => {
   it('an EEVEE job on a 4-GPU node is one unpinned lane, one chunk at a time', async () => {
     const { app, machine } = await gpuNode(4)
@@ -165,5 +193,70 @@ describe('1.11 #229 #235: lanes by engine', () => {
     await w.until(() => specs.length === 1, 'one EEVEE chunk on the node')
     await w.until(() => w.vast.count('createInstance') > 1, 'scale-up rents for the rest')
     expect(app.scheduler.scaleStatus()?.reason ?? '').not.toMatch(/covers the queue/)
+  })
+})
+
+describe('1.11 #222: the lane memory guard', () => {
+  it('every card nearly full at one lane per GPU keeps all four lanes working', async () => {
+    const { app, nodeId, machine } = await gpuNode(4)
+    // A heavy scene: 95% of every card, with one scene on each. Fewer lanes
+    // cannot lower any card's VRAM; the guard used to step down anyway, to one
+    // lane pinned to card 0, and leave three paid cards idle.
+    reportMemory(machine, { vram: 0.95, ram: 0.3 })
+    const specs = recordSpecs(machine)
+    const jobId = await submit(app, 'cycles', 8)
+    app.scheduler.kick()
+    await w.until(() => specs.length === 4, 'four lanes')
+    for (const s of specs) machine.agent.progress(s.chunkId, 0)
+    // Several settle periods under that pressure.
+    await w.advance(6 * 60_000)
+    expect(w.alerts().join('\n')).not.toMatch(/lanes capped/)
+
+    for (const s of specs.slice(0, 4)) machine.agent.finish(s.chunkId)
+    await w.until(() => specs.length === 8, 'the next four')
+    expect(specs.slice(4).map((s) => [s.lanes, s.pinGpus])).toEqual(
+      specs.slice(4).map(() => [4, true])
+    )
+    expect(inFlight(app, nodeId)).toBe(4)
+    for (const s of specs.slice(4)) machine.agent.finish(s.chunkId)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+  })
+
+  it('RAM pressure steps down to one process across every card, and it recovers once RAM has room', async () => {
+    const { app, nodeId, machine } = await gpuNode(4)
+    const load = reportMemory(machine, { vram: 0.3, ram: 0.95 })
+    const specs = recordSpecs(machine)
+    const jobId = await submit(app, 'cycles', 12)
+    app.scheduler.kick()
+    await w.until(() => specs.length === 4, 'four lanes')
+    for (const s of specs) machine.agent.progress(s.chunkId, 0)
+    await w.until(
+      () => w.alerts('warn').some((a) => /lanes capped/.test(a)),
+      'the guard steps down'
+    )
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /lanes capped at 1 \(one process across every GPU\) — RAM at 95%/
+    )
+
+    // Once the four renders that caused it are done, one process has the node.
+    for (const s of specs.slice(0, 4)) machine.agent.finish(s.chunkId)
+    await w.until(() => specs.length === 5, 'the next chunk')
+    await w.advance(20_000)
+    expect(specs).toHaveLength(5)
+    expect(specs[4]).toMatchObject({ lanes: 1, pinGpus: false })
+    machine.agent.progress(specs[4].chunkId, 0)
+
+    // RAM has room again. The guard used to stay down for the node's rental.
+    load.ram = 0.1
+    await w.until(() => w.alerts().some((a) => /lanes back up to 4/.test(a)), 'the guard recovers')
+    machine.agent.finish(specs[4].chunkId)
+    await w.until(() => specs.length === 9, 'four lanes again')
+    expect(specs.slice(5).map((s) => [s.lanes, s.pinGpus])).toEqual(
+      specs.slice(5).map(() => [4, true])
+    )
+    expect(inFlight(app, nodeId)).toBe(4)
+    machine.onSpec = (spec) => machine.agent.finish(spec.chunkId)
+    for (const s of specs.slice(5)) machine.agent.finish(s.chunkId)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
   })
 })
