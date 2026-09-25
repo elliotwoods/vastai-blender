@@ -451,11 +451,20 @@ const STATE_STALL_MS = 15 * 60_000
  */
 const HUNG_MIN_MS = 45 * 60_000
 /**
- * ...and for at least this many times the slowest gap between progress the
- * run has seen, since a heavy scene legitimately spends a long while on
- * each frame.
+ * ...and for at least this many times the longest a frame of its job has
+ * been seen to take on the same hardware (Scheduler.frameTimeFor), since a
+ * heavy scene legitimately spends a long while on each frame.
  */
 const HUNG_SLOWEST_FACTOR = 3
+/**
+ * The limit while nothing is known of the job's frames on that hardware: no
+ * run of it there has yet seen a frame saved. Judged against HUNG_MIN_MS
+ * alone, every chunk's first frame was killed once it passed 45 minutes, and
+ * again on each retry: noderunner's heartbeat was added for this user's SDF
+ * scenes, silent for 15+ minutes a frame on a whole node, and pinned to one
+ * card of an eight-GPU node the same frame takes two hours.
+ */
+const HUNG_UNKNOWN_MS = 3 * 60 * 60_000
 
 /**
  * No state file for this long after the spec was queued, and the run asks
@@ -525,6 +534,12 @@ class ChunkRun {
   /** The latest lastProgressAt this run has seen (agent epoch s), and the longest gap between two. */
   private progressAt: number | null = null
   private slowestProgressS = 0
+  /**
+   * framesDone at the last state read, and whether a frame was saved while
+   * this run watched: only then does its longest gap span a whole frame.
+   */
+  private framesSeen: number | null = null
+  private timedFrame = false
 
   /** EWMA of frames/sec while rendering; null until two progress samples land. */
   private framesPerSec: number | null = null
@@ -1066,6 +1081,9 @@ class ChunkRun {
         const state = read.state
         this.missingSince = null
         this.unreadSince = null
+        // Every state, the done one included: a one-frame chunk's frame is
+        // timed by the read that finds it done.
+        this.noteProgress(state)
         // Re-read the range every iteration rather than computing it once:
         // requeue() can narrow this chunk mid-flight, and a cached total then
         // reports progress against a range that no longer exists.
@@ -1207,21 +1225,27 @@ class ChunkRun {
           )
           return
         }
-        const hungMs = this.hungFor(state)
-        if (hungMs != null) {
+        const hung = this.hungFor(state)
+        if (hung != null) {
           // Stopped first: a hung Blender holds its GPU, and nothing else
           // will stop it (the agent has no deadline on a render).
           await this.retractSpec()
           if (this.stopped) return
           await this.downloader?.drain()
           if (this.stopped) return
+          const known =
+            hung.frameS == null
+              ? 'no frame of this job had finished on this hardware yet'
+              : `this job's frames have taken up to ${Math.max(1, Math.round(hung.frameS / 60))} ` +
+                'min on this hardware'
           this.fail(
             'render',
             own(
               'machine',
               'render-hung',
               `Blender made no progress (no frame started or saved) for ` +
-                `${Math.round(hungMs / 60_000)} min while it kept running, so it was stopped`
+                `${Math.round(hung.idleMs / 60_000)} min while it kept running, where ${known}, ` +
+                'so it was stopped'
             )
           )
           return
@@ -1232,8 +1256,35 @@ class ChunkRun {
   }
 
   /**
+   * Fold a state read into what is known of how long the job's frames take
+   * on this run's hardware: the longest gap between two progress points
+   * (lastProgressAt) the run has seen. That is a frame's time only once a
+   * frame was saved while the run watched (framesDone rose between two
+   * reads). Before that its gaps are Blender starting and loading the scene,
+   * which say nothing of how long a frame takes. From then on it is the
+   * job's to know (Scheduler.noteFrameTime), for every run of it there.
+   */
+  private noteProgress(state: AgentState): void {
+    const at = state.lastProgressAt
+    if (typeof at === 'number' && Number.isFinite(at)) {
+      if (this.progressAt != null && at > this.progressAt) {
+        this.slowestProgressS = Math.max(this.slowestProgressS, at - this.progressAt)
+      }
+      if (this.progressAt == null || at > this.progressAt) this.progressAt = at
+    }
+    if (typeof state.framesDone === 'number') {
+      if (this.framesSeen != null && state.framesDone > this.framesSeen) this.timedFrame = true
+      this.framesSeen = state.framesDone
+    }
+    if (this.timedFrame && this.slowestProgressS > 0) {
+      scheduler.noteFrameTime(this, this.slowestProgressS)
+    }
+  }
+
+  /**
    * How long a render still running has gone without progress, when that
-   * is long enough to take it as hung; null otherwise.
+   * is long enough to take it as hung, and what its job's frames are known
+   * to take there (seconds; null = nothing known yet); null otherwise.
    *
    * The agent refreshes updatedAt every 60 s while Blender lives, so a state
    * kept fresh says the process is alive, not that it is working, and a
@@ -1244,21 +1295,22 @@ class ChunkRun {
    * starts or saves. Measured against updatedAt, both on the node's clock.
    *
    * A heavy scene's frames can take a long while, so the limit is the longer
-   * of HUNG_MIN_MS and HUNG_SLOWEST_FACTOR times the slowest gap between
-   * progress this run has seen. An agent that does not report
-   * lastProgressAt is never judged.
+   * of HUNG_MIN_MS and HUNG_SLOWEST_FACTOR times the longest the job's frames
+   * have taken on this hardware, whichever run of it saw that, and
+   * HUNG_UNKNOWN_MS while nothing is known. It was this run's own slowest
+   * gap, which on a chunk's first frame is only Blender starting: every
+   * frame longer than 45 minutes was killed, on every attempt. An agent that
+   * does not report lastProgressAt is never judged.
    */
-  private hungFor(state: AgentState): number | null {
+  private hungFor(state: AgentState): { idleMs: number; frameS: number | null } | null {
     const at = state.lastProgressAt
     if (typeof at !== 'number' || !Number.isFinite(at)) return null
-    if (this.progressAt != null && at > this.progressAt) {
-      this.slowestProgressS = Math.max(this.slowestProgressS, at - this.progressAt)
-    }
-    if (this.progressAt == null || at > this.progressAt) this.progressAt = at
     if (state.status !== 'rendering' || typeof state.updatedAt !== 'number') return null
     const idleMs = (state.updatedAt - at) * 1000
-    const limitMs = Math.max(HUNG_MIN_MS, HUNG_SLOWEST_FACTOR * this.slowestProgressS * 1000)
-    return idleMs > limitMs ? idleMs : null
+    const frameS = scheduler.frameTimeFor(this)
+    const limitMs =
+      frameS == null ? HUNG_UNKNOWN_MS : Math.max(HUNG_MIN_MS, HUNG_SLOWEST_FACTOR * frameS * 1000)
+    return idleMs > limitMs ? { idleMs, frameS } : null
   }
 
   /** finish('failed') for a failure this run found itself. */
@@ -1430,6 +1482,14 @@ class Scheduler {
    * forgetNode clears the mark when a node comes back.
    */
   private agentDown = new Map<string, { since: number; reason: string }>()
+  /**
+   * The longest a frame of each job has been seen to take, in seconds, by
+   * the hardware one render of it had (frameTimeKey): what the hung-Blender
+   * watchdog judges the job's runs by (ChunkRun.hungFor). Fed by every run
+   * of the job; in memory only, so after a restart a job's first frames get
+   * HUNG_UNKNOWN_MS again.
+   */
+  private frameTimes = new Map<string, Map<string, number>>()
   /**
    * At most one node at a time may be held empty for a waiting exclusive
    * chunk. See reserveForExclusive.
@@ -1874,6 +1934,38 @@ class Scheduler {
         `so it now runs ${lanesPerGpu} per card`
     })
     nodeManager.get(run.nodeId)?.emitChanged()
+  }
+
+  /**
+   * The hardware one render of a run has, as frame times are kept by: the
+   * GPU model, and how many of its cards a render gets (a fraction when two
+   * lanes share a card), or 'shared' for work the slot controller packs.
+   * A frame's time on one card of a four-GPU node is not its time across all
+   * four, where #224 sends a job's last chunks, nor on another model: taken
+   * from the faster, the slower's first frame was judged against a quarter
+   * of what it needs.
+   */
+  private frameTimeKey(run: ChunkRun): string {
+    const snap = nodeManager.get(run.nodeId)?.snapshot
+    const gpus = Math.max(1, Math.floor(snap?.numGpus || 1))
+    const cards = run.shareNode ? 'shared' : (gpus / Math.max(1, run.lanes.lanes)).toFixed(2)
+    return `${snap?.gpuName ?? '?'}|${cards}`
+  }
+
+  /** A run of the job saw a frame take `seconds` (ChunkRun.noteProgress). */
+  noteFrameTime(run: ChunkRun, seconds: number): void {
+    let byKey = this.frameTimes.get(run.jobId)
+    if (!byKey) {
+      byKey = new Map()
+      this.frameTimes.set(run.jobId, byKey)
+    }
+    const key = this.frameTimeKey(run)
+    if (seconds > (byKey.get(key) ?? 0)) byKey.set(key, seconds)
+  }
+
+  /** The longest the run's job has been seen to take a frame on its hardware, or null. */
+  frameTimeFor(run: ChunkRun): number | null {
+    return this.frameTimes.get(run.jobId)?.get(this.frameTimeKey(run)) ?? null
   }
 
   /**
@@ -3207,6 +3299,7 @@ class Scheduler {
     }
     for (const id of settled) this.failedOn.delete(id)
     this.breaker.reset(jobId)
+    this.frameTimes.delete(jobId)
     emitChunksChanged(settled)
     emitJobCancelled(jobId)
 

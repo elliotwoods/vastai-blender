@@ -225,7 +225,17 @@ describe('1.7: a hung Blender', () => {
     return () => clearInterval(timer)
   }
 
-  it('fresh heartbeat, no frame for 45 min: stopped, and only its missing frames render again', async () => {
+  /** lastProgressAt and framesDone for frames saved at `savedMin` minutes after `start` (epoch s). */
+  function savedAt(start: number, savedMin: number[]): () => { at: number; frames: number } {
+    const saved = savedMin.map((m) => start + m * 60)
+    return () => {
+      const now = Date.now() / 1000
+      const done = saved.filter((t) => t <= now)
+      return { at: done.length ? done[done.length - 1] : start, frames: done.length }
+    }
+  }
+
+  it('frames saved at ten and twenty minutes, then none for 45: stopped, and only its missing frames render again', async () => {
     const { app, ids } = await fleet(1)
     const machine = w.machineFor(ids[0])
     const specs: AgentSpec[] = []
@@ -233,10 +243,11 @@ describe('1.7: a hung Blender', () => {
     machine.onSpec = (spec) => {
       specs.push(spec)
       if (specs.length > 1) return machine.agent.finish(spec.chunkId)
-      // Frame 1 lands, then Blender hangs on frame 2, alive.
-      machine.agent.render(spec.chunkId, [1])
-      const stuckAt = Date.now() / 1000
-      stop = heartbeat(machine, spec.chunkId, () => ({ at: stuckAt, frames: 1 }))
+      // Frames 1 and 2 land ten minutes apart, then Blender hangs on
+      // frame 3, alive.
+      setTimeout(() => machine.agent.render(spec.chunkId, [1]), 10 * 60_000)
+      setTimeout(() => machine.agent.render(spec.chunkId, [2]), 20 * 60_000)
+      stop = heartbeat(machine, spec.chunkId, savedAt(Date.now() / 1000, [10, 20]))
     }
     // The heartbeat goes once Blender is killed, as the real one does.
     machine.onExec(/pkill -f/, () => {
@@ -249,22 +260,130 @@ describe('1.7: a hung Blender', () => {
     app.scheduler.kick()
 
     await w.until(() => jobState(jobId) === 'complete', 'job complete', {
-      timeoutMs: 90 * 60_000,
+      timeoutMs: 120 * 60_000,
       stepMs: 5_000
     })
     stop()
     // The node's failure the first time: charged to the machines, and the
-    // retry leaves out the frame that had already landed.
+    // retry leaves out the frames that had already landed.
     expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
     expect(specs.map((s) => [s.frameStart, s.frameEnd])).toEqual([
       [1, 4],
-      [2, 4]
+      [3, 4]
     ])
     expect(machine.ran(new RegExp(`pkill -f '${chunk.id}'`))).not.toEqual([])
     expect(w.alerts('warn').join('\n')).toMatch(
-      /Blender made no progress \(no frame started or saved\) for 4\d min while it kept running/
+      /Blender made no progress \(no frame started or saved\) for 4\d min while it kept running, where this job's frames have taken up to 10 min on this hardware/
     )
-    expect(Date.now() - startedAt).toBeLessThan(55 * 60_000)
+    // Twenty minutes of frames and 45 without one, not three times ten.
+    expect(Date.now() - startedAt).toBeLessThan(75 * 60_000)
+  }, 20_000)
+
+  it('a first frame of fifty minutes, then frames of twenty, is not taken for a hang', async () => {
+    // The review's case: a chunk's first frame was judged against 45 min
+    // alone, since the run had timed nothing yet, and killed on every attempt.
+    const { app, ids } = await fleet(1)
+    const machine = w.machineFor(ids[0])
+    const specs: AgentSpec[] = []
+    let stop = (): void => {}
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      stop = heartbeat(machine, spec.chunkId, savedAt(Date.now() / 1000, [50, 70, 90, 110]))
+      setTimeout(() => {
+        stop()
+        machine.agent.finish(spec.chunkId)
+      }, 110 * 60_000)
+    }
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 150 * 60_000,
+      stepMs: 5_000
+    })
+    stop()
+    expect(specs).toHaveLength(1)
+    expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 0 })
+    expect(w.alerts().join('\n')).not.toMatch(/no progress/)
+  }, 20_000)
+
+  it("a Blender hung on the job's very first frame is stopped at three hours, not left for good", async () => {
+    const { app, ids } = await fleet(1)
+    const machine = w.machineFor(ids[0])
+    const specs: AgentSpec[] = []
+    let stop = (): void => {}
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      if (specs.length > 1) return machine.agent.finish(spec.chunkId)
+      // Started, and never a frame.
+      stop = heartbeat(machine, spec.chunkId, savedAt(Date.now() / 1000, []))
+    }
+    machine.onExec(/pkill -f/, () => {
+      stop()
+      return ''
+    })
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => specs.length === 1, 'dispatched')
+    await w.advance(175 * 60_000, 10_000)
+    // Nothing is known of what the job's frames take: not yet.
+    expect(specs).toHaveLength(1)
+    expect(chunksOf(jobId)[0]).toMatchObject({ state: 'rendering', infra_retries: 0 })
+
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 30 * 60_000,
+      stepMs: 5_000
+    })
+    stop()
+    expect(specs).toHaveLength(2)
+    expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /no progress \(no frame started or saved\) for 18\d min while it kept running, where no frame of this job had finished on this hardware yet/
+    )
+  }, 30_000)
+
+  it("what a frame takes on one GPU model does not judge another's first frame", async () => {
+    w = await setup({ settings: { maxActiveNodes: 2 } })
+    const app = await w.boot()
+    const fast = await w.readyNode(app, { gpu_name: 'RTX 4090' })
+    const slow = await w.readyNode(app, { gpu_name: 'RTX 3060' })
+    const specs = new Map<string, AgentSpec[]>([
+      [fast, []],
+      [slow, []]
+    ])
+    const stops: Array<() => void> = []
+    // A frame takes ten minutes on the 4090 and an hour on the 3060.
+    for (const [nodeId, minutes] of [
+      [fast, 10],
+      [slow, 60]
+    ] as const) {
+      const machine = w.machineFor(nodeId)
+      machine.onSpec = (spec) => {
+        specs.get(nodeId)!.push(spec)
+        const stop = heartbeat(machine, spec.chunkId, savedAt(Date.now() / 1000, [minutes]))
+        stops.push(stop)
+        setTimeout(
+          () => {
+            stop()
+            machine.agent.finish(spec.chunkId)
+          },
+          (minutes + 1) * 60_000
+        )
+      }
+    }
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 2, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', {
+      timeoutMs: 120 * 60_000,
+      stepMs: 5_000
+    })
+    for (const stop of stops) stop()
+    expect(specs.get(fast)).toHaveLength(1)
+    expect(specs.get(slow)).toHaveLength(1)
+    expect(chunksOf(jobId).map((c) => [c.retries, c.infra_retries])).toEqual([
+      [0, 0],
+      [0, 0]
+    ])
+    expect(w.alerts().join('\n')).not.toMatch(/no progress/)
   }, 20_000)
 
   it('frames that take twenty minutes each, and one that takes fifty, are not taken for a hang', async () => {
@@ -274,14 +393,8 @@ describe('1.7: a hung Blender', () => {
     let stop = (): void => {}
     machine.onSpec = (spec) => {
       specs.push(spec)
-      const start = Date.now() / 1000
       // Saved at 20, 40, 90 and 95 minutes.
-      const saved = [20, 40, 90, 95].map((m) => start + m * 60)
-      stop = heartbeat(machine, spec.chunkId, () => {
-        const now = Date.now() / 1000
-        const done = saved.filter((t) => t <= now)
-        return { at: done.length ? done[done.length - 1] : start, frames: done.length }
-      })
+      stop = heartbeat(machine, spec.chunkId, savedAt(Date.now() / 1000, [20, 40, 90, 95]))
       setTimeout(() => {
         stop()
         machine.agent.finish(spec.chunkId)
