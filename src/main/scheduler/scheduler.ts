@@ -3150,7 +3150,7 @@ class Scheduler {
 
     const eligible = nodeManager
       .list()
-      .filter((n) => ['ready', 'idle', 'rendering'].includes(n.state))
+      .filter(isDispatchable)
       .filter((n) => nodeManager.get(n.id)?.ssh)
       .filter((n) => !this.resting(n.id, now))
       .filter((n) => this.nodeUnfit(n.id) == null && !this.agentChecks.has(n.id))
@@ -3366,7 +3366,7 @@ class Scheduler {
     }
     let c = classify(e, { via: 'ssh' })
     const node = nodeManager.get(nodeId)
-    const usable = node != null && ['ready', 'idle', 'rendering'].includes(node.state) && !!node.ssh
+    const usable = node != null && isDispatchable(node.snapshot) && !!node.ssh
     if (!usable && c.kind === 'job') {
       c = own('machine', 'node-not-usable', `the node left the fleet mid-dispatch: ${c.reason}`)
     }
