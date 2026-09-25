@@ -81,6 +81,8 @@ export interface AgentFailure {
   error?: string | null
   errorKind?: string | null
   gpu?: number | null
+  /** The chunk log's last lines, which a failed state carries (noderunner LOG_TAIL_LINES). */
+  logTail?: readonly string[] | null
 }
 
 /** Blender's exit code when a --python script raised (noderunner.py GUARD_EXIT). */
@@ -370,9 +372,34 @@ function exitOf(f: AgentFailure): number | null {
   return m ? Number(m[1]) : null
 }
 
+/**
+ * What a failed render's log says went wrong, when the agent gave no error
+ * of its own: the last line of its logTail that reads as an error, or
+ * failing that its last line, clipped. The log is the host's to write, so
+ * only ever shown, never classified by.
+ */
+function logTailLine(tail: AgentFailure['logTail']): string | null {
+  if (!Array.isArray(tail)) return null
+  const lines = tail
+    .filter((l): l is string => typeof l === 'string')
+    // eslint-disable-next-line no-control-regex -- matching control characters is the point
+    .map((l) => l.replace(/[\u0000-\u001f\u007f]/g, ' ').trim())
+    .filter((l) => l !== '')
+  const pick =
+    [...lines]
+      .reverse()
+      .find((l) => /error|exception|traceback|killed|fail|out of memory/i.test(l)) ?? lines.at(-1)
+  if (!pick) return null
+  return pick.length > 200 ? `${pick.slice(0, 199)}…` : pick
+}
+
 function describeAgent(f: AgentFailure): string {
   const code = exitOf(f)
   let msg = str(f.error).trim()
+  // Job 1d59516c's alerts ended at "failed: ": the agent had said nothing,
+  // and the log it sent back, which did, was never read (plan 1.20).
+  const logged = msg ? null : logTailLine(f.logTail)
+  if (logged) msg = `blender's log ends: ${logged}`
   if (!msg) msg = code == null ? 'no error text from the agent' : 'blender failed'
   const tags: string[] = []
   if (code != null && !mentions(msg, String(code))) tags.push(`exit ${code}`)

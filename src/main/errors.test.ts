@@ -780,3 +780,38 @@ describe('classify: Octane (plan 1.18)', () => {
     expect(classify(e, { via: 'ssh' })).toMatchObject({ kind, rule, retryable })
   })
 })
+
+// Plan 1.20, field incident 1d59516c: alerts ended at "failed: ". When the
+// agent's failed state carries no error of its own, the chunk log's tail,
+// which the agent sends with it, says what went wrong.
+describe('describeError: an agent failure with no error text', () => {
+  it('quotes the last line of its log that reads as an error', () => {
+    const f: AgentFailure = {
+      exitCode: 1,
+      error: '',
+      logTail: [
+        'Fra:12 Mem:512M | Rendering 3 / 64 samples',
+        'Error: Cannot read file "//tex/wood.png": No such file',
+        'Fra:12 Mem:512M | Sample 4/64',
+        ''
+      ]
+    }
+    expect(describeError(f)).toBe(
+      'blender\'s log ends: Error: Cannot read file "//tex/wood.png": No such file (exit 1)'
+    )
+    // Only shown: classified by the exit code as before.
+    expect(classify(f).rule).toBe('agent-exit')
+  })
+
+  it("falls back to the log's last line, clipped, and to nothing without a log", () => {
+    const long = 'x'.repeat(500)
+    expect(describeError({ exitCode: 1, error: null, logTail: ['a', long] })).toMatch(
+      /^blender's log ends: x{199}… \(exit 1\)$/
+    )
+    expect(describeError({ exitCode: 1, error: '', logTail: [] })).toBe('blender failed (exit 1)')
+    // The agent's own words, when it has them, stay first.
+    expect(describeError({ exitCode: 1, error: 'encode failed', logTail: ['Error: x'] })).toBe(
+      'encode failed (exit 1)'
+    )
+  })
+})

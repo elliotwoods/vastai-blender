@@ -139,6 +139,13 @@ export interface AgentStateFile {
   /** epoch seconds */
   updatedAt?: number
   gpu?: number | null
+  /** What the real agent adds (scheduler's AgentState), for a test that writes it. */
+  errorKind?: string | null
+  logTail?: string[]
+  lastProgressAt?: number
+  engine?: string | null
+  oom?: boolean
+  pinFailed?: boolean
 }
 
 const ok = (stdout = ''): ExecResult => ({ code: 0, stdout, stderr: '' })

@@ -526,6 +526,29 @@ describe("1.16: the engine a node reports is the node's word", () => {
   })
 })
 
+describe('1.20: an agent failure with no error text (field incident 1d59516c)', () => {
+  it("names what blender's log says, from the failed state's logTail", async () => {
+    const { app, ids } = await nodes(1)
+    const machine = w.machineFor(ids[0])
+    let failed = false
+    machine.onSpec = (spec) => {
+      if (failed) return machine.agent.finish(spec.chunkId)
+      failed = true
+      failWith(machine, spec.chunkId, {
+        error: '',
+        exitCode: 1,
+        logTail: ['Fra:1 Mem:12M', 'Error: Cannot read file "//tex/wood.png"', 'Fra:1 Mem:12M']
+      })
+    }
+    const jobId = await w.submitJob(app)
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /chunk \S+ failed: render failed: blender's log ends: Error: Cannot read file "\/\/tex\/wood\.png" \(exit 1\)/
+    )
+  })
+})
+
 describe('1.17: the machines and the network are not the render', () => {
   it('1.17: a transient SSH error is retried after a backoff, without spending a render retry', async () => {
     const { app, ids } = await nodes(1)

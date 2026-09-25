@@ -592,7 +592,8 @@ function agentFailure(state: AgentState, nodeId: string): ChunkFailure {
     exitCode: typeof state.exitCode === 'number' ? state.exitCode : null,
     error: state.error ?? null,
     errorKind: state.errorKind ?? null,
-    gpu: typeof state.gpu === 'number' ? state.gpu : null
+    gpu: typeof state.gpu === 'number' ? state.gpu : null,
+    logTail: Array.isArray(state.logTail) ? state.logTail : null
   }
   const kind = state.errorKind
   if (kind === 'scene' || kind === 'job') {
