@@ -218,19 +218,39 @@ function answered(r: ExecResult, label: string): ExecResult {
   return r
 }
 
-/** What a failed command said: its stderr, else the script's last log line. */
+/**
+ * What a failed command said: its stderr, else the script's last log line,
+ * else its last other line but a state word. setup_octane.sh prints some
+ * refusals on plain stdout: start-vnc's "missing vnc password", which every
+ * setup meets while the exec sends no stdin, read "vnc start failed: exit 1".
+ */
 function said(r: ExecResult): string {
   const err = r.stderr.trim()
   if (err) return err.slice(0, 300)
-  const logged = r.stdout
+  const lines = r.stdout
     .split('\n')
-    .filter((l) => l.startsWith('[octane]'))
-    .at(-1)
+    .map((l) => l.trim())
+    .filter((l) => l !== '' && !/^OCTANE_[A-Z]+ /.test(l))
+  const logged = lines.filter((l) => l.startsWith('[octane]')).at(-1) ?? lines.at(-1)
   return logged ? logged.slice(0, 300) : `exit ${r.code}`
 }
 
-function newPassword(): string {
-  return randomBytes(9).toString('base64url')
+/**
+ * The node's VNC password for this session: the one already chosen, or a
+ * new one, recorded before anything is sent. After a restart a dispatch's
+ * setup and the user's Open VNC login can both reach start-vnc at once;
+ * each choosing its own left the node with whichever landed last, while the
+ * tunnel handed out the other for as long as the connection lasted.
+ * start-vnc writes the password even while VNC runs, so every caller
+ * sending this one leaves the node taking it.
+ */
+function vncPassword(nodeId: string): string {
+  let password = vncPasswords.get(nodeId)
+  if (!password) {
+    password = randomBytes(9).toString('base64url')
+    vncPasswords.set(nodeId, password)
+  }
+  return password
 }
 
 /**
@@ -348,10 +368,7 @@ export async function setupOctane(
   if (install.code !== 0) throw new Error(`octane install failed: ${said(install)}`)
 
   const scripted = getSettings().octane?.scriptedSignIn === true
-  const password = vncPasswords.get(nodeId) ?? newPassword()
-  if ((await startVnc(ssh, password)) === 'ok') {
-    vncPasswords.set(nodeId, password)
-  } else if (!scripted) {
+  if ((await startVnc(ssh, vncPassword(nodeId))) === 'notVnc' && !scripted) {
     // OctaneServer would run on that display, but nobody could sign it in.
     throw new Error(
       'vnc start failed: display :0 on this node is held by an X server that is not VNC, ' +
@@ -439,13 +456,12 @@ export async function openVncTunnel(ssh: SshConnection, nodeId: string): Promise
   // A tunnel over a connection the node has since replaced leads nowhere.
   if (existing) closeVncTunnel(nodeId)
 
-  const password = vncPasswords.get(nodeId) ?? newPassword()
+  const password = vncPassword(nodeId)
   if ((await startVnc(ssh, password)) === 'notVnc') {
     throw new Error(
       'no VNC sign-in on this node: its display :0 is held by an X server that is not VNC'
     )
   }
-  vncPasswords.set(nodeId, password)
 
   const server = createServer((socket) => {
     void ssh

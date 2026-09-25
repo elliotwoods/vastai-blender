@@ -290,6 +290,42 @@ describe('setupOctane: credentials (1.18, #40 #156)', () => {
     }
   })
 
+  it('1.18 (review): after a restart, a setup and an Open VNC login at once send the node one password, the one the tunnel hands out', async () => {
+    vi.useRealTimers()
+    const state = { now: 'licensed' as OctaneState }
+    const inner = octaneNode(state)
+    // start-vnc answers only once both have asked, as two commands in
+    // flight on the node at once would.
+    const release: Array<() => void> = []
+    const exec = (command: string, opts: Call['opts'] = {}): Promise<ExecResult> => {
+      if (!/start-vnc/.test(command)) return inner.ssh.exec(command, opts)
+      inner.calls.push({ command, opts })
+      return new Promise((resolve) => release.push(() => resolve(ok())))
+    }
+    const ssh = { ...inner.ssh, exec } as unknown as SshConnection
+    const setup = octane.setupOctane(ssh, NODE)
+    const opening = octane.openVncTunnel(ssh, NODE)
+    await vi.waitFor(() => expect(release).toHaveLength(2))
+    for (const r of release) r()
+    const [, tunnel] = await Promise.all([setup, opening])
+    try {
+      const sent = inner.calls.filter((c) => /start-vnc/.test(c.command)).map((c) => c.opts.stdin)
+      expect(sent).toEqual([`${tunnel.password}\n`, `${tunnel.password}\n`])
+    } finally {
+      octane.closeVncTunnel(NODE)
+    }
+  })
+
+  it('1.18 (review): a refusal the script prints on plain stdout is what the error says', async () => {
+    // What every setup met while the exec sent no stdin.
+    const { ssh } = node((c) =>
+      /start-vnc/.test(c) ? { code: 1, stdout: 'missing vnc password\n', stderr: '' } : ok()
+    )
+    await expect(octane.setupOctane(ssh, NODE)).rejects.toThrow(
+      /^vnc start failed: missing vnc password$/
+    )
+  })
+
   it("1.18: a node whose display is some other X server's has no VNC sign-in, and says so", async () => {
     vi.useRealTimers()
     const { ssh } = node((c) =>
