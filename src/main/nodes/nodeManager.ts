@@ -202,16 +202,33 @@ function money(v: number): string {
   return `$${v.toFixed(2)}`
 }
 
+/** What the Vast balance pays for per hour: see NodeManager.accountPerHour. */
+interface AccountRate {
+  /** this fleet's nodes that may be billing */
+  fleet: number
+  /** the other instances on the account, and how many */
+  others: number
+  otherCount: number
+  total: number
+}
+
+/** "the fleet's $6.00/hr", or, with other instances on the account billing too, each share. */
+function rateWords(r: AccountRate): string {
+  if (r.otherCount === 0) return `the fleet's ${money(r.fleet)}/hr`
+  const others = r.otherCount === 1 ? '1 other instance' : `${r.otherCount} other instances`
+  return `the account's ${money(r.total)}/hr (this fleet ${money(r.fleet)}/hr, ${others} on the account ${money(r.others)}/hr)`
+}
+
 /**
  * Why renting is on hold for the account (plan 1.20), as FleetHolds.account
  * carries it, and what releases it:
  *   credit  Vast refused a rental for lack of credit. Released once the
  *           balance has gone up (a top-up) and lasts RUNWAY_RELEASE_MIN.
- *   runway  The balance fell under RUNWAY_HOLD_MIN of the fleet's rate.
- *           Released the same way, at the higher of the fleet's rate now and
- *           then, so destroying nodes to stretch the runway does not reopen
- *           renting on money that would last minutes once scale-up refills
- *           the fleet.
+ *   runway  The balance fell under RUNWAY_HOLD_MIN of what the account
+ *           bills (accountPerHour). Released the same way, at the higher of
+ *           that rate now and then, so destroying nodes to stretch the runway
+ *           does not reopen renting on money that would last minutes once
+ *           scale-up refills the fleet.
  *   auth    Vast refused the account itself (a 401 or 403). Released when an
  *           API key is saved, when the key is accepted again (a 401), or by
  *           the user. Kept for the session only: a restart asks Vast afresh.
@@ -222,7 +239,7 @@ interface AccountHold {
   balance: number | null
   since: number
   cause: 'credit' | 'runway' | 'auth'
-  /** $/hr the fleet billed when the hold was set. */
+  /** $/hr the account billed when the hold was set (accountPerHour). */
   perHour: number
   /** classify()'s rule, for an auth hold: what would clear it. */
   rule?: string
@@ -1561,7 +1578,7 @@ export class NodeManager {
    */
   private accountRefused(c: Classification): void {
     const credit = c.rule === 'vast-credit' || c.rule === 'vast-402'
-    const perHour = this.billingPerHour()
+    const perHour = this.accountPerHour().total
     if (credit) {
       const b = this.balance
       this.setHold(
@@ -1579,9 +1596,33 @@ export class NodeManager {
   }
 
   /**
+   * What the Vast balance pays for per hour (plan 1.20): this fleet's nodes
+   * that may be billing, and every other instance on the account that the
+   * last reconcile listed as unclaimed (another install's fleet, a stray),
+   * since one balance pays for them all. On this fleet's rate alone, two
+   * apps renting on one account each read a runway that would last, and
+   * neither warned before the account hit $0. An unclaimed instance Vast
+   * has stopped ('exited', 'stopped') bills its storage only and is left
+   * out.
+   */
+  private accountPerHour(): AccountRate {
+    const fleet = this.billingPerHour()
+    let others = 0
+    let otherCount = 0
+    for (const u of this.unclaimed.values()) {
+      if (u.dphTotal == null || !(u.dphTotal > 0)) continue
+      if (u.status === 'exited' || u.status === 'stopped') continue
+      others += u.dphTotal
+      otherCount++
+    }
+    return { fleet, others, otherCount, total: fleet + others }
+  }
+
+  /**
    * The credit guard (plan 1.20), on every balance reading: the runway is
-   * the balance over what the fleet bills. Field incident 1d59516c: the
-   * balance hit $0 mid-render and nothing had said it was running low.
+   * the balance over what the account bills (accountPerHour). Field incident
+   * 1d59516c: the balance hit $0 mid-render and nothing had said it was
+   * running low.
    *
    * - Under RUNWAY_WARN_MIN: one warning, until the runway is back over
    *   RUNWAY_REARM_MIN.
@@ -1589,11 +1630,12 @@ export class NodeManager {
    *   runway crosses the line (so a hold released by hand is not set again
    *   until the runway has recovered first).
    * - Held: released once the balance has gone up, a top-up, and lasts at
-   *   least RUNWAY_RELEASE_MIN at the higher of the fleet's rate now and
+   *   least RUNWAY_RELEASE_MIN at the higher of the account's rate now and
    *   when it was held. An auth hold waits for its key, not for money; a 401
    *   one lifts once Vast answers the key again.
    */
-  private guardCredit(balance: number, perHour: number): void {
+  private guardCredit(balance: number, rate: AccountRate): void {
+    const perHour = rate.total
     const runway = runwayMinutes(balance, perHour)
     const h = this.hold
     if (h) {
@@ -1621,9 +1663,7 @@ export class NodeManager {
       if (this.runwayLow) return
       this.runwayLow = true
       const lasts =
-        perHour > 0 && balance > 0
-          ? `, about ${Math.floor(runway)} min at the fleet's ${money(perHour)}/hr`
-          : ''
+        perHour > 0 && balance > 0 ? `, about ${Math.floor(runway)} min at ${rateWords(rate)}` : ''
       this.setHold(
         {
           reason: `Vast balance ${money(balance)}${lasts}`,
@@ -1632,7 +1672,7 @@ export class NodeManager {
           perHour
         },
         `Vast balance ${money(balance)}${lasts}: renting is paused until the balance goes up. Top up in the Vast.ai console.` +
-          (perHour > 0
+          (rate.fleet > 0
             ? ' Nodes already rented are left running, and Vast stops them when the balance runs out.'
             : ''),
         perHour > 0 ? 'error' : 'warn'
@@ -1645,7 +1685,7 @@ export class NodeManager {
       this.runwayWarned = true
       emit('alert', {
         level: 'warn',
-        message: `Vast balance ${money(balance)} lasts about ${Math.floor(runway)} min at the fleet's ${money(perHour)}/hr. Renting pauses under ${RUNWAY_HOLD_MIN} min: top up in the Vast.ai console.`
+        message: `Vast balance ${money(balance)} lasts about ${Math.floor(runway)} min at ${rateWords(rate)}. Renting pauses under ${RUNWAY_HOLD_MIN} min: top up in the Vast.ai console.`
       })
     } else if (runway >= RUNWAY_REARM_MIN) {
       this.runwayWarned = false
@@ -2535,7 +2575,7 @@ export class NodeManager {
     }
     // Only a balance read just now is judged: an old one says nothing about
     // the runway left.
-    if (fresh != null) this.guardCredit(fresh, this.billingPerHour())
+    if (fresh != null) this.guardCredit(fresh, this.accountPerHour())
     emit('fleet:cost', this.fleetCost())
   }
 

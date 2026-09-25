@@ -194,6 +194,50 @@ describe('1.20 runway', () => {
     await expect(app.nodeManager.requestNodes(1)).resolves.toHaveLength(1)
   })
 
+  // Review of 3c443cd: the balance is the account's, and the main checkout
+  // and this build rent on one account. Judged on its own fleet, each app
+  // read a runway that would last, and neither warned before $0.
+  it("is judged at what the whole account bills: another install's fleet counts, a stopped instance does not", async () => {
+    w = await setup({ settings: { maxActiveNodes: 4 } })
+    const other = w.vast.addInstance({
+      label: 'vastai-blender 0bad0bad:12345678',
+      dph_total: 5,
+      start_date: (Date.now() - 60 * 60_000) / 1000
+    })
+    // Stopped: storage only, not its $3/hr.
+    w.vast.addInstance({
+      actual_status: 'exited',
+      dph_total: 3,
+      start_date: (Date.now() - 60 * 60_000) / 1000
+    })
+    const app = await started()
+    await w.readyNode(app, { dph_total: 1 })
+    w.vast.addOffer()
+
+    // $2.50: 150 minutes at this fleet's $1/hr, 25 at the account's $6/hr.
+    w.vast.user = { id: 1, credit: 2.5 }
+    await w.advance(60_000, 5_000)
+    const warned = w.alerts('warn').filter((m) => m.includes('lasts about'))
+    expect(warned).toEqual([
+      "Vast balance $2.50 lasts about 25 min at the account's $6.00/hr (this fleet $1.00/hr, 1 other instance on the account $5.00/hr). Renting pauses under 10 min: top up in the Vast.ai console."
+    ])
+
+    // $0.90: 9 minutes of the account's rate, 54 of the fleet's. Held.
+    w.vast.user = { id: 1, credit: 0.9 }
+    await w.advance(60_000, 5_000)
+    expect(app.nodeManager.accountHold()).toMatchObject({ balance: 0.9 })
+    expect(storedHold()).toMatchObject({ cause: 'runway', perHour: 6 })
+    const [held] = w.alerts('error')
+    expect(held).toContain("about 9 min at the account's $6.00/hr")
+    await expect(app.nodeManager.requestNodes(1)).resolves.toEqual([])
+
+    // The other install's fleet goes: a top-up that lasts at $6/hr releases.
+    await app.nodeManager.destroyUnclaimed(other.id)
+    w.vast.user = { id: 1, credit: 2.5 }
+    await w.advance(60_000, 5_000)
+    expect(app.nodeManager.accountHold()).toBeNull()
+  })
+
   it('released by hand, it is not set again until the runway has recovered first', async () => {
     w = await setup({ settings: { spendCapPerHour: 10 } })
     const app = await started()
