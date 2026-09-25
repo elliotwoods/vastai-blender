@@ -524,6 +524,62 @@ describe('setupOctane: the node and its state (1.18, #85)', () => {
     await expect(third).resolves.toBe('licensed')
   })
 
+  it('1.18 (review 2, A1): a node licensed before the miss, read again by the licence poll, does not end the hold', async () => {
+    // The likely A1 night: the user signed one node in, then left. Its
+    // licence, read again every 30 s, used to end the hold at the next read,
+    // and the next node was rented for another 10-minute wait, with no end.
+    const NODE_B = 'node-2-bbbbbbbb'
+    const NODE_C = 'node-3-cccccccc'
+    for (const [id, instance] of [
+      [NODE_B, 2],
+      [NODE_C, 3]
+    ] as const) {
+      h.db
+        .prepare(
+          `INSERT INTO nodes (id, instance_id, state, gpu_name) VALUES (?, ?, 'rendering', 'RTX 4090')`
+        )
+        .run(id, instance)
+    }
+    const b = { now: 'licensed' as OctaneState }
+    const nodeB = octaneNode(b)
+    await expect(octane.setupOctane(nodeB.ssh, NODE_B)).resolves.toBe('licensed')
+
+    const waited = octane
+      .setupOctane(octaneNode({ now: 'needsLogin' }).ssh, NODE)
+      .catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LOGIN_WAIT_MS + 10_000)
+    expect(await waited).toBeInstanceOf(octane.OctaneLoginNeededError)
+    const hold = octane.octaneSignInHold()
+    expect(hold).toMatchObject({ nodeId: NODE })
+
+    // The licence poll reads B, licensed as it was: nobody signed in.
+    for (let i = 0; i < 3; i++) {
+      expect(await octane.refreshOctaneState(nodeB.ssh, NODE_B)).toBe('licensed')
+      await vi.advanceTimersByTimeAsync(30_000)
+    }
+    expect(octane.octaneSignInHold()).toEqual(hold)
+    // Nor did B's setup, run again for its next chunk.
+    await expect(octane.setupOctane(nodeB.ssh, NODE_B)).resolves.toBe('licensed')
+    expect(octane.octaneSignInHold()).toEqual(hold)
+
+    // So a fresh node is not waited on for a sign-in: the licence wait only.
+    const t = Date.now()
+    const fresh = octane
+      .setupOctane(octaneNode({ now: 'none' }).ssh, NODE_C)
+      .catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LICENSE_WAIT_MS + 10_000)
+    expect(await fresh).toBeInstanceOf(octane.OctaneLoginNeededError)
+    expect(Date.now() - t).toBeLessThanOrEqual(octane.OCTANE_LICENSE_WAIT_MS + 10_000)
+    expect(octane.octaneUnfit(NODE_C)).not.toBeNull()
+
+    // B's server restarted and signed in again is a sign-in: the hold ends.
+    b.now = 'none'
+    expect(await octane.refreshOctaneState(nodeB.ssh, NODE_B)).toBe('none')
+    b.now = 'licensed'
+    expect(await octane.refreshOctaneState(nodeB.ssh, NODE_B)).toBe('licensed')
+    expect(octane.octaneSignInHold()).toBeNull()
+  })
+
   it('1.18 (review): opening the VNC login is the user acting: the hold ends, and that node may wait again', async () => {
     const a = { now: 'needsLogin' as OctaneState }
     const { ssh } = octaneNode(a)

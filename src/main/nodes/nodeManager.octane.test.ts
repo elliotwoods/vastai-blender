@@ -182,6 +182,49 @@ describe('1.18: Octane on a node, as the fleet sees it', () => {
     expect(specs).toEqual([])
   })
 
+  it('1.18 (review 2, A1): a node signed in before a sign-in is missed does not end the hold, and nothing is rented for the next wait', async () => {
+    // The likely A1 night: the user signs one node in, then leaves. The node
+    // rented next waits for a sign-in nobody makes, and is let go idle. The
+    // licence poll's reads of the first node, licensed all along, used to
+    // end the hold within 30 s, and the node rented in the second's place
+    // waited its 10 minutes too, and so on while work was pending.
+    Object.assign(w.settings, {
+      maxActiveNodes: 3,
+      spendCapPerHour: null,
+      noSpendCap: true,
+      idleTimeoutMinutes: 24 * 60,
+      dockerImageByEngine: { octane: 'otoy/octane-blender:2025.2' }
+    })
+    const app = await w.boot()
+    const lic = await import('../octane/octaneLicense')
+    const a = await w.readyNode(app)
+    fakeOctane(w.machineFor(a), { signIn: 'byHand' }).state = 'licensed'
+    await expect(lic.setupOctane(app.nodeManager.get(a)!.ssh!, a)).resolves.toBe('licensed')
+
+    const b = await w.readyNode(app)
+    fakeOctane(w.machineFor(b), { signIn: 'byHand' })
+    const missed = lic.setupOctane(app.nodeManager.get(b)!.ssh!, b).catch((e: unknown) => e)
+    await w.advance(lic.OCTANE_LICENSE_WAIT_MS + lic.OCTANE_LOGIN_WAIT_MS + 10 * SEC)
+    expect(await missed).toBeInstanceOf(lic.OctaneLoginNeededError)
+    const hold = lic.octaneSignInHold()
+    expect(hold).toMatchObject({ nodeId: b })
+
+    // B is let go; the licence poll reads A, licensed as it was, on and on.
+    await app.nodeManager.destroyNode(b)
+    const reads = w.machineFor(a).ran(/setup_octane\.sh status/).length
+    await w.advance(2 * MIN)
+    expect(w.machineFor(a).ran(/setup_octane\.sh status/).length).toBeGreaterThan(reads + 2)
+    expect(app.nodeManager.get(a)!.snapshot.octaneState).toBe('licensed')
+    expect(lic.octaneSignInHold()).toEqual(hold)
+
+    // Scale-up for Octane rents nothing in B's place, and does not search.
+    const searches = w.vast.count('searchOffers')
+    w.vast.addOffer()
+    expect(await app.nodeManager.requestNodes(1, { engine: 'octane' })).toEqual([])
+    expect(w.vast.count('searchOffers')).toBe(searches)
+    expect(w.vast.count('createInstance')).toBe(2)
+  })
+
   it('1.18: a node that never ran Octane is never asked about it', async () => {
     const app = await w.boot()
     const nodeId = await w.readyNode(app)

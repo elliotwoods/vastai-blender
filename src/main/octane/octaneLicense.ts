@@ -324,8 +324,12 @@ function writeState(nodeId: string, state: OctaneState): void {
     loginAlerted.delete(nodeId)
     unlicensedSince.delete(nodeId)
   }
-  // Someone signed in: whoever missed one before is back.
-  if (state === 'licensed') signInMissed = null
+  // Someone signed in: whoever missed one before is back. Only a node that
+  // comes to be licensed says so. One licensed all along, which the licence
+  // poll reads again every 30 s, used to end the hold within 30 s of the
+  // miss: the next Octane node was rented, and waited its 10 min for a user
+  // who was not there, and so on for as long as work was pending.
+  if (state === 'licensed' && was !== 'licensed') signInMissed = null
   if (was === state) return
   if (was === 'needsLogin' && state === 'licensed') {
     emit('alert', {
