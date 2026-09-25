@@ -8,8 +8,8 @@
  * quit or a Windows session end destroys every node and exits, and so does
  * the campaign being done (no job queued or running). A signal during that
  * destroy does not cut it short: a SIGHUP never does (a closed terminal
- * sends two), and only a second Ctrl+C or SIGTERM, 2 s or more after the
- * first, exits without waiting. `leave`: those exit and leave the nodes as
+ * sends two), and only a second Ctrl+C, or a second SIGTERM, 2 s or more
+ * after the first of its kind, exits without waiting. `leave`: those exit and leave the nodes as
  * they are, and a finished campaign keeps running for the idle
  * scale-down. The exit status is 3 when instances may be left billing,
  * else 1 when part of the campaign was never submitted (each such part is

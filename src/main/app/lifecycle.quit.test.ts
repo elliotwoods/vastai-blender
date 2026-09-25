@@ -713,6 +713,20 @@ describe('headless runs follow VR_QUIT_POLICY, never a dialog (plan 1.1)', () =>
     expect(r.stderr.join('')).toContain('SIGINT again: exiting without waiting')
   })
 
+  it('a1 review: SIGINT then SIGTERM, a supervisor escalating, is not "asked twice": the destroy carries on', async () => {
+    const { engine, instances } = await twoNodes()
+    const r = await rig(engine, { headless: 'destroy' })
+    const gate = w.vast.hold('destroyInstance')
+
+    r.signals.emit('SIGINT')
+    await w.advance(3_000)
+    r.signals.emit('SIGTERM')
+    expect(r.app.exits).toEqual([])
+    gate.release()
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+  })
+
   it('1.1: terminal closed: SIGHUP twice, 1 ms apart, still destroys every node, exit 0', async () => {
     // 1.1 review, field incident A1 again: a closed terminal sends SIGHUP
     // twice, 0.4 ms apart (the shell resends it to its jobs, then the kernel

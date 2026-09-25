@@ -64,10 +64,12 @@
  *   abandoned the destroy it had just started, with nobody left to read that
  *   the fleet was billing. One Ctrl+C can arrive twice too (the `electron`
  *   CLI forwards the SIGINT its child already had). So only a SIGINT or
- *   SIGTERM that comes SECOND_SIGNAL_MS or more after an earlier one the run
- *   acted on exits at once, with 3. A first one during a destroy the run
- *   started for another reason (the campaign done, a quit, a session end)
- *   only says how to exit now.
+ *   SIGTERM that comes SECOND_SIGNAL_MS or more after an earlier one of the
+ *   same kind the run acted on exits at once, with 3: a SIGTERM after a
+ *   SIGINT is a supervisor escalating (GitHub Actions' cancel), not a person
+ *   asking twice. A first one during a destroy the run started for another
+ *   reason (the campaign done, a quit, a session end) only says how to exit
+ *   now.
  *
  * Destroy all must rent nothing while it destroys. scheduler.stop() only
  * clears the tick timer, and a kick still ticks. Every destroy kicks
@@ -987,12 +989,15 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
 
   if (deps.headless) {
     const { policy } = deps.headless
-    // When a SIGINT or SIGTERM the run acted on arrived: the one that started
-    // the destroy, or the first during one started otherwise. Only another
-    // SECOND_SIGNAL_MS or more after it ends the destroy early (header).
+    // When a SIGINT or SIGTERM the run acted on arrived, and which: the one
+    // that started the destroy, or the first during one started otherwise.
+    // Only the same one again, SECOND_SIGNAL_MS or more after it, ends the
+    // destroy early (header).
     let armedAt: number | null = null
+    let armedBy: Signal | null = null
     const arm = (signal: Signal): void => {
       armedAt = Date.now()
+      armedBy = signal
       deps.stderr(
         `[vast-render] ${signal === 'SIGINT' ? 'Ctrl+C' : signal} again, ` +
           `${SECOND_SIGNAL_MS / 1000} s or more from now, exits without waiting for the ` +
@@ -1014,7 +1019,13 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
         say('[vast-render] SIGHUP: the terminal went away; the destroy carries on')
         return
       }
-      if (armedAt === null) return arm(signal)
+      // A signal of another kind is a supervisor escalating, not the person
+      // who pressed Ctrl+C pressing it again: GitHub Actions' cancel sends
+      // SIGINT, then SIGTERM 7.5 s later, then SIGKILL. Exiting on its
+      // SIGTERM gave up the destroy seconds before the SIGKILL would have,
+      // with DELETEs still to send (a1 review). It arms the early exit
+      // afresh instead: the same one again is asked twice.
+      if (armedAt === null || signal !== armedBy) return arm(signal)
       // The same signal, delivered twice.
       if (Date.now() - armedAt < SECOND_SIGNAL_MS) return
       // Asked twice, by someone at the terminal: out now, destroy or not.
