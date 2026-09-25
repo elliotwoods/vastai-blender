@@ -372,10 +372,23 @@ export interface CapacityBudget {
 export interface RequestNodeOptions {
   /**
    * The user confirmed a rental that takes the fleet past the spend cap.
-   * Plan 1.5 makes a manual request without it stop at the cap, as scale-up
-   * does.
+   * Without it a manual request stops at the cap, as scale-up does (plan
+   * 1.5).
    */
   overSpendCap?: boolean
+  /**
+   * No rental above this $/hr, whatever the cap leaves: the bound an
+   * over-cap confirmation names ("past the cap, at most $X/hr"). Without it
+   * an overSpendCap request is bounded by the offer filter alone.
+   */
+  maxPerHour?: number | null
+}
+
+/** Why scale-up is renting or not, as the scheduler last decided (scheduler:scaleStatus). */
+export interface ScaleStatusInfo {
+  status: 'rent' | 'held' | 'covered' | 'tail' | 'max-nodes' | 'spend-cap'
+  /** one line, for the Fleet screen */
+  reason: string
 }
 
 /** What node:reprovision did (plan 1.15). */

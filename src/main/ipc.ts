@@ -7,7 +7,14 @@
  */
 
 import { BrowserWindow, Notification, clipboard, dialog, ipcMain, shell } from 'electron'
-import { isStickyAlert, type InvokeChannel, type IpcInvokeMap, isBillingRisk } from '../shared/ipc'
+import {
+  isStickyAlert,
+  type InvokeChannel,
+  type IpcEventMap,
+  type IpcEventMapPending,
+  type IpcInvokeMap,
+  isBillingRisk
+} from '../shared/ipc'
 import type {
   AlertEvent,
   AssetIndex,
@@ -17,6 +24,7 @@ import type {
   ClipKind,
   FrameSegment,
   EngineId,
+  FleetHoldKind,
   JobDetail,
   HistoryRange,
   HistorySummary,
@@ -24,11 +32,11 @@ import type {
   JobSummary,
   NodeChunkView,
   NodeSnapshot,
+  RequestNodeOptions,
   ThumbAsset
 } from '../shared/models'
 import { localPathProblem } from '../shared/settingsSanitize'
 import { applySettingsPatch, describeFieldErrors, type GateOptions } from './app/settingsGate'
-import { jobMediaUrl } from './app/mediaProtocol'
 import { cancelJob, reprovisionNode, retryMissing } from './app/recovery'
 import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
 import { dismissAlerts, onAlertSurfaced, onEvent, recentAlerts } from './events'
@@ -37,12 +45,18 @@ import { getSettings, setSecret, updateSettings } from './settings'
 import { findOffers } from './vast/offers'
 import { testVastKey } from './vast/keyTest'
 import { nodeManager } from './nodes/nodeManager'
+import {
+  fleetGpuHistory,
+  nodeHistory,
+  onSample,
+  record as recordMetrics
+} from './nodes/metricsHistory'
 import { listAddons, registerAddon, removeAddon } from './addons/addons'
 import { createJob, getJob, listJobs, setJobShareNode } from './jobs/jobs'
 import { scheduler } from './scheduler/scheduler'
 import { co2Grams, intensityFor } from './carbon/intensity'
 import { getDb } from './db/db'
-import { toMediaUrl } from './mediaUrl'
+import { jobFileMediaUrl, toMediaUrl } from './mediaUrl'
 import { resolveRange, summary as historySummary } from './history/history'
 import { REMOTE_ROOT } from './nodes/provisioner'
 import { shq } from './ssh/shq'
@@ -141,21 +155,9 @@ function nodeChunks(nodeId: string, limit = 12): NodeChunkView[] {
     gpu: scheduler.gpuOf(r.id),
     assignedAt: r.assigned_at,
     thumbUrl: thumbByChunk.has(r.id)
-      ? jobFileUrl(r.job_id, r.output_dir, thumbByChunk.get(r.id) as string)
+      ? jobFileMediaUrl(r.job_id, r.output_dir, thumbByChunk.get(r.id) as string)
       : null
   }))
-}
-
-/**
- * The URL the renderer loads one of a job's files by: media://job/<jobId>/…
- * inside the job's own folder (plan 1.13), so it still loads after the
- * project root has moved. A URL relative to the current root pointed
- * nowhere once it had, and every earlier job's previews went blank (#9
- * #214). A file outside the job's folder, which nothing writes, keeps the
- * old form.
- */
-function jobFileUrl(jobId: string, outputDir: string, absPath: string): string {
-  return jobMediaUrl(jobId, outputDir, absPath) ?? toMediaUrl(absPath)
 }
 
 /** A job's jobs.output_dir, or null for no such job. */
@@ -179,7 +181,7 @@ function frameThumbs(jobId: string, from: number, to: number): ThumbAsset[] {
     frame: r.frame,
     chunkId: r.chunk_id,
     absPath: r.thumb_path,
-    mediaUrl: outputDir ? jobFileUrl(jobId, outputDir, r.thumb_path) : toMediaUrl(r.thumb_path)
+    mediaUrl: outputDir ? jobFileMediaUrl(jobId, outputDir, r.thumb_path) : toMediaUrl(r.thumb_path)
   }))
 }
 
@@ -692,6 +694,132 @@ function gateOptions(): GateOptions {
   return { pathFlavour: hostPathFlavour() }
 }
 
+/** Every push channel, the bus's and Phase 1's pending ones. */
+type PushMap = IpcEventMap & IpcEventMapPending
+
+/** A push to every window, for a channel the bus does not carry (IpcEventMapPending). */
+function sendPush<C extends keyof PushMap>(channel: C, payload: PushMap[C]): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    try {
+      win.webContents.send(channel, payload)
+    } catch (e) {
+      // A window going away mid-send: the rest still hear it.
+      console.warn(`[ipc] ${channel} to a window failed:`, e)
+    }
+  }
+}
+
+const HOLD_KINDS: ReadonlySet<string> = new Set<FleetHoldKind>([
+  'account',
+  'recovery',
+  'localSink',
+  'scale',
+  'octaneSignIn'
+])
+
+/**
+ * fleet:requestNode's options as main will act on them: an over-cap flag
+ * only when it is `true`, and a price bound only when it is a finite
+ * non-negative number. The renderer's argument is only as typed as the
+ * renderer (#159).
+ */
+function requestOptions(opts: RequestNodeOptions | undefined): RequestNodeOptions {
+  const max = opts?.maxPerHour
+  return {
+    overSpendCap: opts?.overSpendCap === true,
+    maxPerHour: typeof max === 'number' && Number.isFinite(max) && max >= 0 ? max : null
+  }
+}
+
+/** A history query's numbers, whatever arrived: metricsHistory clamps what is left. */
+function historyQuery(
+  q: Partial<{ fromMs: number; toMs: number; maxPoints: number }> | undefined
+): {
+  fromMs: number
+  toMs: number
+  maxPoints: number
+} {
+  const num = (v: unknown, fallback: number): number =>
+    typeof v === 'number' && Number.isFinite(v) ? v : fallback
+  const now = Date.now()
+  return {
+    fromMs: num(q?.fromMs, now - 60 * 60_000),
+    toMs: num(q?.toMs, now),
+    maxPoints: num(q?.maxPoints, 240)
+  }
+}
+
+/**
+ * VR_MOCK: six hours of GPU usage for the mock nodes, then a sample every
+ * 15 s, so the Fleet screen's usage graphs have shape for screenshots
+ * (Feature G). Deterministic: the same instant gives the same readings.
+ * node-a's two GPUs render with a dip and an idle stretch on GPU 1 while
+ * it holds a run (paid but idle), and a gap where the node was unreachable;
+ * node-b is newer and idle.
+ */
+function startMockMetrics(): void {
+  const STEP = 60_000
+  const reading = (nodeId: string, ts: number): Parameters<typeof recordMetrics>[1] => {
+    const t = ts / 60_000
+    const gpus =
+      nodeId === 'node-a'
+        ? [0, 1].map((index) => {
+            const idleStretch = index === 1 && Math.floor(t / 45) % 5 === 2
+            const util = idleStretch
+              ? 3
+              : Math.round(
+                  88 + 9 * Math.sin(t / (7 + index * 3)) - (Math.floor(t) % 29 === 0 ? 40 : 0)
+                )
+            return {
+              index,
+              util,
+              vramUsedGb: Math.round((14 + 3 * Math.sin(t / 23 + index)) * 10) / 10,
+              vramTotalGb: 24,
+              temp: 60 + Math.round(util / 8),
+              powerW: Math.round(90 + util * 3.4)
+            }
+          })
+        : [{ index: 0, util: 1, vramUsedGb: 0.4, vramTotalGb: 24, temp: 34, powerW: 21 }]
+    const util = gpus.reduce((a, g) => a + g.util, 0) / gpus.length
+    return {
+      gpuUtil: util,
+      vramUsedGb: gpus.reduce((a, g) => a + g.vramUsedGb, 0),
+      vramTotalGb: gpus.reduce((a, g) => a + g.vramTotalGb, 0),
+      gpuTemp: Math.max(...gpus.map((g) => g.temp)),
+      powerW: gpus.reduce((a, g) => a + g.powerW, 0),
+      powerLimitW: 450 * gpus.length,
+      cpuUtil: nodeId === 'node-a' ? 40 + 10 * Math.sin(t / 11) : 2,
+      cpuLoad1: 4,
+      cpuCores: 16,
+      ramUsedGb: nodeId === 'node-a' ? 21 : 3,
+      ramTotalGb: 64,
+      updatedAt: ts,
+      gpus
+    }
+  }
+  const runs = (nodeId: string): { runs: number[]; unpinned: number } =>
+    nodeId === 'node-a' ? { runs: [1, 1], unpinned: 1 } : { runs: [0], unpinned: 0 }
+  const sample = (nodeId: string, ts: number): void => {
+    // node-a unreachable for ten minutes an hour and a half ago: a gap.
+    const ago = Date.now() - ts
+    const gap = nodeId === 'node-a' && ago > 90 * 60_000 && ago < 100 * 60_000
+    recordMetrics(nodeId, gap ? null : reading(nodeId, ts), runs(nodeId), {
+      numGpus: nodeId === 'node-a' ? 2 : 1,
+      ts
+    })
+  }
+  // node-b was rented three minutes ago (mockNodes).
+  const now = Date.now()
+  for (let ts = now - 6 * 60 * 60_000; ts <= now; ts += STEP) {
+    sample('node-a', ts)
+    if (ts >= now - 3 * 60_000) sample('node-b', ts)
+  }
+  setInterval(() => {
+    sample('node-a', Date.now())
+    sample('node-b', Date.now())
+  }, 15_000)
+}
+
 export interface RegisterIpcOptions {
   /**
    * index.ts's createWindow, for a notification clicked while no window is
@@ -710,6 +838,13 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
       win.webContents.send(channel, payload)
     }
   })
+  // Phase 1's push channels (shared/ipc.ts IpcEventMapPending), straight to
+  // the windows: holds as they change, the unclaimed list as a reconcile
+  // changes it, and every metrics sample.
+  scheduler.onHoldsChanged((holds) => sendPush('fleet:holds', holds))
+  nodeManager.onUnclaimedChanged((list) => sendPush('fleet:unclaimed', list))
+  onSample((sample) => sendPush('node:metricsSample', sample))
+  if (MOCK) startMockMetrics()
   // An error or billing risk nobody is looking at: an OS notification too.
   // This runs inside emit, before the windows hear the alert, so a failure
   // here is logged and goes no further. It must never cost the user the
@@ -741,7 +876,13 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
     return settings
   })
   handle('settings:update', (patch) => applySettingsPatch(patch, settingsStore, gateOptions()))
-  handle('settings:setSecret', (key, value) => setSecret(key, value))
+  handle('settings:setSecret', (key, value) => {
+    setSecret(key, value)
+    // A new key may be another account, and a hold the old key caused says
+    // nothing about it (plan 1.20): reconcile and read the balance now
+    // rather than at the next cost tick, and lift an auth hold (plan 1.3).
+    if (key === 'vastApiKey' && !MOCK) void nodeManager.onApiKeySaved()
+  })
 
   // -- shell / dialogs (real) ----------------------------------------------
   handle('clipboard:write', (text) => {
@@ -826,13 +967,47 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
     const refused = errors.filter((e) => e.outcome === 'rejected')
     if (refused.length) throw new Error(describeFieldErrors(refused))
   })
-  handle('fleet:requestNode', async () => {
-    await nodeManager.requestNode()
+  handle('fleet:requestNode', async (opts) => {
+    if (MOCK) return
+    await nodeManager.requestNode(requestOptions(opts))
   })
+  handle('fleet:cost', () =>
+    MOCK
+      ? { perHour: 0.822, sessionTotal: 0.44, sessionWh: 612, sessionCo2g: 0, balance: 42.17 }
+      : nodeManager.fleetCost()
+  )
   handle('fleet:clearFailed', () => nodeManager.clearFailed())
+  // The Unclaimed panel (plan 1.3): instances on the account no node of this
+  // profile holds. Only one of them may be destroyed from here, and only by
+  // its id as the list shows it: nodeManager refuses anything else, the
+  // instance of a node of this profile included.
+  handle('fleet:unclaimed', () => (MOCK ? [] : nodeManager.listUnclaimed()))
+  handle('fleet:destroyUnclaimed', async (instanceId) => {
+    if (!Number.isSafeInteger(instanceId) || instanceId <= 0) {
+      return { ok: false, message: `not an instance id: ${JSON.stringify(instanceId)}` }
+    }
+    if (MOCK) return { ok: false, message: 'mock mode destroys nothing' }
+    return nodeManager.destroyUnclaimed(instanceId)
+  })
+  // Every reason the fleet is not renting, and the user releasing one.
+  handle('fleet:holds', () => (MOCK ? {} : scheduler.fleetHolds()))
+  handle('fleet:releaseHold', async (kind) => {
+    if (!HOLD_KINDS.has(kind)) throw new Error(`no such hold: ${JSON.stringify(kind)}`)
+    if (MOCK) return {}
+    return scheduler.releaseHold(kind)
+  })
+  // GPU usage over time (Feature G).
+  handle('fleet:gpuHistory', (q) => fleetGpuHistory(historyQuery(q)))
+  handle('node:metricsHistory', (q) => {
+    if (typeof q?.nodeId !== 'string') throw new Error('node:metricsHistory needs a nodeId')
+    return nodeHistory({ ...historyQuery(q), nodeId: q.nodeId })
+  })
   handle('node:destroy', (id) => nodeManager.destroyNode(id))
   // Restart the node's agent and requeue its work (plan 1.15, app/recovery.ts).
   handle('node:reprovision', (id) => (MOCK ? { requeued: 0 } : reprovisionNode(id)))
+  // Only from the user's "Open VNC login" click: a tunnel opened is taken as
+  // the user at the node's desktop, and ends a missed sign-in's hold on
+  // Octane rentals (octaneLicense.openVncTunnel).
   handle('node:openVncTunnel', async (nodeId) => {
     const node = nodeManager.get(nodeId)
     if (!node?.ssh) throw new Error('node not connected')
@@ -881,6 +1056,10 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   // Queue the frames not yet downloaded again (plan 1.15, app/recovery.ts).
   // A refusal (a job failed outright) rejects, so the caller hears why.
   handle('job:retryMissing', (id) => (MOCK ? { frames: 0, chunks: 0 } : retryMissing(id)))
+  // Release a job the retry breaker held (plan 1.17). Without it every hold
+  // ended in cancel and resubmit: a new output folder, and every frame
+  // already rendered paid for again.
+  handle('job:resume', (id) => (MOCK ? false : scheduler.resumeJob(id)))
 
   // -- scheduler ------------------------------------------------------------
   handle('scheduler:recoveryHold', () => {
@@ -889,6 +1068,7 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
     return chunks == null ? null : { chunks }
   })
   handle('scheduler:resumeRecovery', () => scheduler.resumeRecovery())
+  handle('scheduler:scaleStatus', () => (MOCK ? null : scheduler.scaleStatus()))
 
   // -- history --------------------------------------------------------------
   handle('history:summary', (range) => (MOCK ? mockHistory(range) : historySummary(range)))
@@ -929,7 +1109,9 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
         chunkId: r.chunk_id ?? '',
         label: `${r.chunk_id ?? 'job'} ${r.kind === 'previewHdr' ? 'HDR' : r.kind === 'proxy' ? 'proxy' : 'SDR'}`,
         absPath: r.abs_path,
-        mediaUrl: outputDir ? jobFileUrl(jobId, outputDir, r.abs_path) : toMediaUrl(r.abs_path),
+        mediaUrl: outputDir
+          ? jobFileMediaUrl(jobId, outputDir, r.abs_path)
+          : toMediaUrl(r.abs_path),
         fps: r.fps ?? 25,
         frames: r.frames ?? 0,
         width: r.width ?? 0,

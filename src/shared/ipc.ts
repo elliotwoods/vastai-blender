@@ -7,9 +7,9 @@
  * with no ipcMain handler is not caught: it fails at runtime.
  *
  * Phase 1 declared its channels here ahead of the code behind them, so every
- * track codes against one contract. Until each handler lands, a channel
- * marked "Phase 1" below rejects with "No handler registered". The push
- * channels it adds wait in IpcEventMapPending, for the reason given there.
+ * track codes against one contract. Every invoke channel now has a handler
+ * in main (ipc.ts). The push channels Phase 1 adds wait in
+ * IpcEventMapPending, for the reason given there; main sends them already.
  */
 
 import type {
@@ -38,6 +38,7 @@ import type {
   ReprovisionResult,
   RequestNodeOptions,
   RetryMissingResult,
+  ScaleStatusInfo,
   ThumbAsset,
   Offer,
   OfferFilters,
@@ -72,11 +73,17 @@ export interface IpcInvokeMap {
   // fleet / nodes
   'fleet:setMaxNodes': { args: [number]; result: void }
   /**
-   * Rent one node now. Plan 1.5 makes it stop at the spend cap as scale-up
-   * does, unless `overSpendCap` says the user confirmed going past it. Until
-   * then main ignores the option, and a manual request ignores the cap.
+   * Rent one node now. It stops at the spend cap as scale-up does, unless
+   * `overSpendCap` says the user confirmed going past it, and then rents
+   * nothing dearer than `maxPerHour` when the confirmation named one (plan
+   * 1.5). It rejects with the reason when nothing could be rented.
    */
   'fleet:requestNode': { args: [RequestNodeOptions?]; result: void }
+  /**
+   * The fleet totals fleet:cost pushes, as they stand now, for a window that
+   * opens between pushes (the cost timer pushes once a minute).
+   */
+  'fleet:cost': { args: []; result: FleetCost }
   'fleet:clearFailed': { args: []; result: number }
   /**
    * Phase 1 (plan 1.3). Instances on the Vast account that no node of this
@@ -107,15 +114,20 @@ export interface IpcInvokeMap {
   'fleet:gpuHistory': { args: [MetricsHistoryQuery]; result: FleetGpuHistory }
   'node:destroy': { args: [string]; result: void }
   /**
-   * Restart the node's agent and requeue what was in flight on it, without
-   * using up any retries (plan 1.15). `void` only while main's handler is
-   * still the old empty stub. The integration wave drops it along with the
-   * stub.
+   * Restart the node's agent and requeue what was in flight on it (plan
+   * 1.15). Render retries are unchanged; each requeued chunk is charged one
+   * infrastructure retry, as any chunk a node goes away under. It rejects
+   * with the reason when the node was not reprovisioned: the app is quitting
+   * (the node is left as it is), another agent restart was under way on it
+   * (the node is back in service), or it ran past its deadline (the node is
+   * destroyed).
    */
-  'node:reprovision': { args: [string]; result: ReprovisionResult | void }
+  'node:reprovision': { args: [string]; result: ReprovisionResult }
   /**
    * A local port tunnelled to the node's VNC desktop, plus its password, for
-   * signing in to Octane by hand (plan 1.18).
+   * signing in to Octane by hand (plan 1.18). Invoke it only from the user's
+   * own "Open VNC login" click: opening a tunnel is taken as the user at
+   * the desktop, and ends a missed sign-in's hold on Octane rentals.
    */
   'node:openVncTunnel': { args: [string]; result: VncTunnelInfo }
   /**
@@ -149,10 +161,18 @@ export interface IpcInvokeMap {
   /**
    * Queue again every frame of the job that has not been downloaded,
    * including frames from failed chunks (plan 1.15, "Re-render missing").
-   * `void` only while main's handler is still the old empty stub. The
-   * integration wave drops it along with the stub.
+   * Right after a cancel of the same job it first waits for the cancel to
+   * have stopped the job's renders on the nodes. Rejects with the reason
+   * for a job that cannot be revived.
    */
-  'job:retryMissing': { args: [string]; result: RetryMissingResult | void }
+  'job:retryMissing': { args: [string]; result: RetryMissingResult }
+  /**
+   * Release a job the retry breaker held (JobSummary.attention of kind
+   * 'repeatedFailure', plan 1.17): its failures are counted afresh and its
+   * chunks go out again. false = the job was not held. A job that failed
+   * outright (attention scene, engine or extension) stays failed.
+   */
+  'job:resume': { args: [string]; result: boolean }
 
   // scheduler
   /**
@@ -162,6 +182,12 @@ export interface IpcInvokeMap {
   'scheduler:recoveryHold': { args: []; result: { chunks: number } | null }
   /** Release that hold and let the fleet scale up for the recovered work. */
   'scheduler:resumeRecovery': { args: []; result: void }
+  /**
+   * Why scale-up is renting or not, as the scheduler decided at its last
+   * tick (every 15 s), or null before the first. A hold's reason is here as
+   * well as in fleet:holds.
+   */
+  'scheduler:scaleStatus': { args: []; result: ScaleStatusInfo | null }
 
   // history
   'history:summary': { args: [HistoryRange]; result: HistorySummary }
@@ -221,10 +247,13 @@ export interface IpcEventMap {
  * renderer's queries.ts) is exhaustive over it. That is on purpose: the
  * `alert` channel went unheard for the app's whole life before it was
  * exhaustive. A channel added there with no handler therefore fails
- * typecheck:web. The integration wave moves each entry below into
- * IpcEventMap in the same commit that gives it a handler (or an explicit
- * null) in queries.ts. From then on main can emit it. Until then, producers
- * and consumers are written against these payload types.
+ * typecheck:web. An entry moves into IpcEventMap in the same commit that
+ * gives it a handler (or an explicit null) in queries.ts.
+ *
+ * Main sends these already, straight to the windows rather than through the
+ * bus (ipc.ts's sendPush, typed over IpcEventMap & IpcEventMapPending, so a
+ * move needs no change there), and a renderer may subscribe to them under
+ * the same intersection.
  */
 export interface IpcEventMapPending {
   /**
