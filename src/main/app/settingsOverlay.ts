@@ -117,8 +117,8 @@ export class SettingsOverlay {
 /**
  * This process's overlay: the headless spec driver sets it, and settingsGate
  * releases from it. settings.ts's getSettings() is to return
- * `sessionOverlay.apply(saved)`; a build whose getSettings() does not yet
- * has a spec's settings not in force at all, and the spec driver says so
- * on stderr (app/headless/jobSpec.ts).
+ * `sessionOverlay.apply(saved)`. In a build whose getSettings() does not
+ * yet, a spec's settings are not in force, so the spec driver submits
+ * nothing and the run ends (app/headless/jobSpec.ts).
  */
 export const sessionOverlay = new SettingsOverlay()
