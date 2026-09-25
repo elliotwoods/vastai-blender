@@ -2231,11 +2231,15 @@ class Scheduler {
       .prepare('UPDATE jobs SET attention = ? WHERE id = ? AND attention IS NULL')
       .run(JSON.stringify(attention), jobId)
     if (r.changes === 0) return null
+    // Names the one way out this build has. resumeJob has no IPC channel or
+    // button yet ('job:resume', for the integration wave), and the text
+    // should say "resume it" once it does.
     return {
       level: 'error',
       message:
-        `job ${name} is held: ${attention.message}. None of it is sent again until you ` +
-        'resume it.'
+        `job ${name} is held: ${attention.message}. Nothing more of it is sent, and nodes ` +
+        'left idle are let go. This version cannot resume a held job yet: once the cause ' +
+        'is fixed, cancel the job and submit it again.'
     }
   }
 
