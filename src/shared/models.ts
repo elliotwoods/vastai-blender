@@ -323,6 +323,12 @@ export interface FleetHolds {
    * is when it tries again; null = when the user releases it.
    */
   scale?: { reason: string; since: number; retryAt: number | null }
+  /**
+   * A sign-in to Octane by hand that nobody made (plan 1.18). Only Octane
+   * rentals wait on it: no node is rented for Octane work until a node is
+   * signed in, the user opens a VNC login, or releases this.
+   */
+  octaneSignIn?: { reason: string; since: number; nodeId: string }
 }
 
 export type FleetHoldKind = keyof FleetHolds

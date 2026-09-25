@@ -276,7 +276,11 @@ function mins(ms: number): string {
 
 const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
 
-/** Each hold in force, its reason worded for scale status. */
+/**
+ * Each hold in force, its reason worded for scale status. Not octaneSignIn:
+ * it bounds only Octane rentals, and nodeManager's octaneRentalRoom applies
+ * it; renting for any other engine goes on.
+ */
 function holdReasons(h: FleetHolds, now: number | undefined): string[] {
   const out: string[] = []
   if (h.account) out.push(h.account.reason)

@@ -737,6 +737,24 @@ interface ReconcileRow {
   label: string | null
 }
 
+/**
+ * A rental batch's offer search came back empty, and what bounded it: the
+ * spend cap's headroom ('spendCap'), a price the caller named ('price'), or
+ * the offer filters alone ('filters'). The scheduler reads the first as the
+ * cap, not a failure: the fleet sits at its cap, and this module already
+ * leaves such a search alone for CAP_EMPTY_BACKOFF_MS.
+ */
+export class NoMatchingOffersError extends Error {
+  override readonly name = 'NoMatchingOffersError'
+
+  constructor(
+    message: string,
+    readonly bound: 'spendCap' | 'price' | 'filters'
+  ) {
+    super(message)
+  }
+}
+
 /** How far one requestNodes batch may go (plan 1.5). */
 export interface RequestNodesOptions {
   /**
@@ -2493,12 +2511,16 @@ export class NodeManager {
       const where = secureCloudOnly ? ' on datacenter (secure cloud) hosts' : ''
       if (capBound) {
         this.capEmpty = { headroom, filters, at: Date.now() }
-        throw new Error(
-          `no matching offers${where} at or under ${money(headroom)}/hr, what the spend cap of ${money(first.spendCap ?? 0)}/hr leaves`
+        throw new NoMatchingOffersError(
+          `no matching offers${where} at or under ${money(headroom)}/hr, what the spend cap of ${money(first.spendCap ?? 0)}/hr leaves`,
+          'spendCap'
         )
       }
       if (bound != null && maxDphTotal === bound) {
-        throw new Error(`no matching offers${where} at or under ${money(bound)}/hr`)
+        throw new NoMatchingOffersError(
+          `no matching offers${where} at or under ${money(bound)}/hr`,
+          'price'
+        )
       }
       if (secureCloudOnly) {
         emit('alert', {
@@ -2507,10 +2529,13 @@ export class NodeManager {
             'No matching Vast.ai offers on datacenter (secure cloud) hosts, which the Octane ' +
             'settings rent from only'
         })
-        throw new Error('no matching offers on datacenter (secure cloud) hosts')
+        throw new NoMatchingOffersError(
+          'no matching offers on datacenter (secure cloud) hosts',
+          'filters'
+        )
       }
       emit('alert', { level: 'warn', message: 'No matching Vast.ai offers found' })
-      throw new Error('no matching offers')
+      throw new NoMatchingOffersError('no matching offers', 'filters')
     }
     if (capBound) this.capEmpty = null
     const ids: string[] = []

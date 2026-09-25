@@ -34,13 +34,14 @@ import {
   REMOTE_ROOT
 } from '../nodes/provisioner'
 import { listAddons } from '../addons/addons'
-import { nodeManager } from '../nodes/nodeManager'
+import { NoMatchingOffersError, nodeManager } from '../nodes/nodeManager'
+import { octaneSignInHold, releaseOctaneSignInHold } from '../octane/octaneLicense'
 import { getSettings } from '../settings'
 import { sha256File, uploadFileVerified, writeRemoteFileAtomic } from '../ssh/sftp'
 import { shq } from '../ssh/shq'
-import { recordThroughput } from '../vast/offers'
+import { measuredFramesPerHour, recordThroughput } from '../vast/offers'
 import type { SshConnection } from '../ssh/sshConnection'
-import { ChunkDownloader, localSinkHold } from '../transfer/frameDownloader'
+import { ChunkDownloader, localSinkHold, recheckLocalSink } from '../transfer/frameDownloader'
 import { jobClips } from '../transfer/jobClip'
 import { missingRanges } from './chunker'
 import {
@@ -79,6 +80,7 @@ import type {
   AlertEvent,
   ChunkState,
   EngineId,
+  FleetHoldKind,
   FleetHolds,
   JobAttention,
   JobAttentionKind,
@@ -88,6 +90,16 @@ import { capacityBudget, isBooting, isDispatchable } from '../../shared/nodeStat
 
 const TICK_MS = 15_000
 const STATE_POLL_MS = 5_000
+/**
+ * Scale-up batches that fail in a row before scale-up backs off (plan 1.17),
+ * the first wait, doubled after each further failure, and its ceiling. A
+ * refusal every offer meets (an image, a disk size or a field Vast rejects;
+ * offers the filters no longer find) used to be retried every 15 s tick,
+ * each try a failed row and a blacklisted machine.
+ */
+const SCALE_BACKOFF_AFTER = 2
+const SCALE_BACKOFF_BASE_MS = 60_000
+const SCALE_BACKOFF_MAX_MS = 15 * 60_000
 /**
  * Failed renders a chunk may have before it fails for good: the scene or
  * Blender failing, what `chunks.retries` counts (plan 1.17). A dispatch that
@@ -489,6 +501,27 @@ interface ChunkFailure {
    * chunk of it is sent again (plan 1.16).
    */
   fatal?: JobAttentionKind
+}
+
+/**
+ * What the usable nodes would render at the rates gpu_perf has learned for
+ * their GPU models (per-GPU frames/h × the node's GPUs, summed), or null when
+ * nothing is learned for any of them: planScaling's provisionalFramesPerHour,
+ * which only its first tail rule reads, and only until a run has a rate of
+ * its own. Without it the last few frames on a live node rented another node
+ * before the node's first frame landed.
+ */
+function provisionalFramesPerHour(nodes: readonly NodeSnapshot[]): number | null {
+  let sum = 0
+  let learned = false
+  for (const n of nodes) {
+    if (!n.gpuName) continue
+    const perGpu = measuredFramesPerHour(n.gpuName)
+    if (perGpu == null || !(perGpu > 0)) continue
+    sum += perGpu * Math.max(1, n.numGpus)
+    learned = true
+  }
+  return learned ? sum : null
 }
 
 /** A failure the scheduler found itself, which it need not ask classify() about. */
@@ -1856,6 +1889,19 @@ class Scheduler {
   /** The last scale-up decision, and why (see scalePolicy). */
   private lastScalePlan: ScalingPlan | null = null
   /**
+   * Scale-up batches that failed in a row, and the backoff they set once
+   * there were SCALE_BACKOFF_AFTER of them (plan 1.17, FleetHolds.scale).
+   * A batch that rents anything clears both.
+   */
+  private scaleFailures = 0
+  private scaleHold: NonNullable<FleetHolds['scale']> | null = null
+  /** The "no spend cap is set" warning has been given for the cap as it stands. */
+  private noCapWarned = false
+  /** fleet:holds listeners, and the holds they last heard (noteHolds). */
+  private holdsListeners = new Set<(holds: FleetHolds) => void>()
+  private lastHolds = '{}'
+  private unsubscribeHolds: (() => void) | null = null
+  /**
    * Nodes resting after an attempt failed for their own or their network's
    * reason (plan 1.17; see rest()): tick() sends them nothing new until
    * `until`. Each failure in a row doubles the rest, and a chunk rendered on
@@ -2004,6 +2050,8 @@ class Scheduler {
   }
 
   start(): void {
+    // nodeManager's account hold is one of fleet:holds (noteHolds).
+    this.unsubscribeHolds ??= nodeManager.onHoldsChanged(() => this.noteHolds())
     // Restart recovery: chunks stranded in transient states (their ChunkRun
     // died with the previous process) go back to pending, unassigned, each
     // re-split around the frames already downloaded, as requeue() does but
@@ -2178,6 +2226,11 @@ class Scheduler {
    */
   fleetHolds(): FleetHolds {
     const holds: FleetHolds = {}
+    // The Vast account (plan 1.20): no credit, or a key Vast refuses.
+    // nodeManager rents nothing meanwhile either; here it gives scale status
+    // its reason instead of a batch that returns nothing.
+    const account = nodeManager.accountHold()
+    if (account) holds.account = account
     const recovery = this.recoveryHoldCount()
     if (recovery != null) holds.recovery = recovery
     // A local disk that will not take frames (plan 1.10): a node rented now
@@ -2185,7 +2238,161 @@ class Scheduler {
     // meanwhile either.
     const sink = localSinkHold()
     if (sink) holds.localSink = sink
+    // Rentals that kept failing (plan 1.17). Past its retryAt it no longer
+    // stops scale-up (planScaling), and shows until the next batch decides.
+    if (this.scaleHold) holds.scale = { ...this.scaleHold }
+    // A sign-in by hand nobody made (plan 1.18): only Octane rentals wait on
+    // it (nodeManager.octaneRentalRoom), so planScaling does not read it.
+    const signIn = octaneSignInHold()
+    if (signIn) holds.octaneSignIn = signIn
     return holds
+  }
+
+  /**
+   * Called with every hold whenever one is set or released (fleet:holds).
+   * Returns the unsubscribe function.
+   */
+  onHoldsChanged(listener: (holds: FleetHolds) => void): () => void {
+    this.holdsListeners.add(listener)
+    return () => {
+      this.holdsListeners.delete(listener)
+    }
+  }
+
+  /**
+   * Tell the listeners when the holds differ from what they last heard:
+   * after every tick (the recovery count, the local disk, a sign-in missed),
+   * and whenever nodeManager's account hold or the scale backoff changes.
+   */
+  noteHolds(): void {
+    if (this.holdsListeners.size === 0) return
+    let holds: FleetHolds
+    try {
+      holds = this.fleetHolds()
+    } catch {
+      return
+    }
+    const json = JSON.stringify(holds)
+    if (json === this.lastHolds) return
+    this.lastHolds = json
+    for (const l of [...this.holdsListeners]) {
+      try {
+        l(holds)
+      } catch {
+        // A listener's failure is its own.
+      }
+    }
+  }
+
+  /**
+   * Release one hold by hand (fleet:releaseHold), and return what is left.
+   * A hold whose cause is still there comes back at the next check: the
+   * account's at the next balance read, the local disk's at once (it is
+   * checked again here), a sign-in's when the next one is missed.
+   */
+  async releaseHold(kind: FleetHoldKind): Promise<FleetHolds> {
+    switch (kind) {
+      case 'account':
+        nodeManager.releaseAccountHold()
+        break
+      case 'recovery':
+        this.resumeRecovery()
+        break
+      case 'localSink':
+        await recheckLocalSink()
+        break
+      case 'scale':
+        this.releaseScaleHold()
+        break
+      case 'octaneSignIn':
+        releaseOctaneSignInHold()
+        break
+    }
+    this.noteHolds()
+    this.kick()
+    return this.fleetHolds()
+  }
+
+  /** The user said to try renting again now: the backoff and its count go. */
+  releaseScaleHold(): void {
+    this.scaleFailures = 0
+    if (!this.scaleHold) return
+    this.scaleHold = null
+    this.noteHolds()
+  }
+
+  /** A scale-up batch rented something: whatever was failing no longer is. */
+  private scaleSucceeded(): void {
+    this.scaleFailures = 0
+    if (this.scaleHold) {
+      this.scaleHold = null
+      emit('alert', { level: 'info', message: 'Scale-up rents again: a rental went through' })
+      this.noteHolds()
+    }
+  }
+
+  /**
+   * A scale-up batch failed. An offer search the spend cap left empty is the
+   * cap, not a failure: the plan's status says so, and nodeManager leaves
+   * that search alone for a while by itself. Anything else counts toward the
+   * backoff (plan 1.17): past SCALE_BACKOFF_AFTER failures in a row,
+   * scale-up waits, twice as long after each further one, and says why, in
+   * place of a rent attempt (a failed row, a blacklisted machine, a
+   * "scale-up failed" alert) on every 15 s tick.
+   */
+  private scaleFailed(e: unknown): void {
+    if (e instanceof NoMatchingOffersError && e.bound === 'spendCap') {
+      if (this.lastScalePlan) {
+        this.lastScalePlan = { ...this.lastScalePlan, status: 'spend-cap', reason: e.message }
+      }
+      return
+    }
+    const reason = describeError(e)
+    emit('alert', { level: 'warn', message: `scale-up failed: ${reason}` })
+    this.scaleFailures++
+    if (this.scaleFailures < SCALE_BACKOFF_AFTER) return
+    const waitMs = Math.min(
+      SCALE_BACKOFF_MAX_MS,
+      SCALE_BACKOFF_BASE_MS * 2 ** (this.scaleFailures - SCALE_BACKOFF_AFTER)
+    )
+    const now = Date.now()
+    const mins = Math.max(1, Math.round(waitMs / 60_000))
+    this.scaleHold = {
+      reason:
+        `the last ${this.scaleFailures} scale-up attempts failed (last: ${reason}); ` +
+        `trying again in ${mins} min`,
+      since: this.scaleHold?.since ?? now,
+      retryAt: now + waitMs
+    }
+    emit('alert', {
+      level: 'warn',
+      message: `Scale-up paused for ${mins} min: ${this.scaleHold.reason.replace(/; trying again.*$/, '')}`
+    })
+    this.noteHolds()
+  }
+
+  /**
+   * Warn once when the fleet rents nothing only because no spend cap is set
+   * and "no spend cap" is off: a settings.json from before that setting
+   * with its cap left blank, which meant "off" then. Reading it as no limit
+   * would spend without one; reading it as $0/hr, silently, left a queue
+   * waiting with nothing on screen to say why.
+   */
+  private warnNoCap(plan: ScalingPlan): void {
+    const noCap =
+      plan.status === 'spend-cap' && !(plan.budget.spendCap != null && plan.budget.spendCap > 0)
+    if (!noCap) {
+      if (plan.status === 'rent') this.noCapWarned = false
+      return
+    }
+    if (this.noCapWarned) return
+    this.noCapWarned = true
+    emit('alert', {
+      level: 'warn',
+      message:
+        'Work is queued, but no spend cap is set and "no spend cap" is off, so no node is ' +
+        'rented: set a cap, or tick "no spend cap", in Settings'
+    })
   }
 
   /** The last scale-up decision and its reason (scale status), or null before the first tick. */
@@ -2196,6 +2403,9 @@ class Scheduler {
 
   stop(): void {
     if (this.timer) clearInterval(this.timer)
+    this.timer = null
+    this.unsubscribeHolds?.()
+    this.unsubscribeHolds = null
   }
 
   kick(): void {
@@ -2927,6 +3137,7 @@ class Scheduler {
     }
 
     this.scalePolicy(pending, { sendable: sinkHeld ? 0 : pending.length })
+    this.noteHolds()
   }
 
   /**
@@ -3615,6 +3826,13 @@ class Scheduler {
       )
       return { lanes: lanes.lanes, sharedSlots: Math.max(2, lanes.lanes) }
     })
+    // What the rentals are for: the one engine the queue renders with, or
+    // the exclusive work's. It decides an offer's lanes, the image it is
+    // rented from, and for Octane how many may wait on a sign-in (plan 1.18).
+    const pendingEngines = new Set(pending.map((c) => c.engine))
+    const rentEngine: EngineId | null =
+      pendingEngines.size === 1 ? [...pendingEngines][0] : (laneEngine ?? null)
+
     // What a node rented now is expected to bring. The GPU-count floor is the
     // only thing known before an offer is picked.
     const newNode = planLanes(
@@ -3669,6 +3887,7 @@ class Scheduler {
       fleetFramesPerHour: rates.length > 0 ? rates.reduce((a, v) => a + v, 0) * 3600 : null,
       ratedRuns: rates.length,
       runningRuns: running.length,
+      provisionalFramesPerHour: provisionalFramesPerHour(working),
       // Buy-ahead (eagerFleet): rent while frames outnumber the fleet's lanes
       // and slots. Demand-driven scaling alone can never widen a fleet whose
       // nodes prefetch the entire queue (pending pins at 0), which strands a
@@ -3676,21 +3895,24 @@ class Scheduler {
       eager: settings.eagerFleet === true
     })
     this.lastScalePlan = plan
+    this.warnNoCap(plan)
     // Several rentals per tick (see scaling.ts), still one batch at a time.
-    // By count for now: requestNodes still re-checks the caps itself, and
-    // does not yet take the plan's budget (plan 1.5).
-    if (plan.status === 'rent' && plan.nodes > 0 && !this.requestingNode) {
+    // The batch rents against the plan's budget (plan 1.5): at most
+    // maxRentals, each offer's own lanes and slots taken off the demand as
+    // it rents, and the caps read afresh from the live fleet before each
+    // rental (withDemand). A count sized on the GPU-count filter rented
+    // whatever ranked best, 8-GPU boxes for 1-lane demand (#227 #237).
+    if (plan.status === 'rent' && plan.maxRentals > 0 && !this.requestingNode) {
       this.requestingNode = true
       void nodeManager
-        .requestNodes(plan.nodes)
+        .requestNodes(plan.maxRentals, { budget: plan.budget, engine: rentEngine })
         .then((ids) => {
+          if (ids.length > 0) this.scaleSucceeded()
           if (ids.length > 1) {
             emit('alert', { level: 'info', message: `scale-up: rented ${ids.length} nodes` })
           }
         })
-        .catch((e) =>
-          emit('alert', { level: 'warn', message: `scale-up failed: ${describeError(e)}` })
-        )
+        .catch((e) => this.scaleFailed(e))
         .finally(() => {
           this.requestingNode = false
         })
