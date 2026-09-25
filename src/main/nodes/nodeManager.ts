@@ -1954,10 +1954,14 @@ export class NodeManager {
 
   /**
    * A node SSH lost whose instance Vast has stopped or no longer knows: its
-   * chunks go back to the queue, and a stopped instance is destroyed. It
-   * still bills for its disk, and Vast will not start it again by itself.
-   * Not blacklisted: at a $0 balance Vast stops every instance of the
-   * account, whatever the machine (1d59516c).
+   * chunks go back to the queue, and the instance is destroyed. A stopped
+   * one still bills for its disk, and Vast will not start it again by
+   * itself. One Vast no longer knows is destroyed all the same, and its
+   * DELETE's 404 is what confirms it gone: showInstance answering null is
+   * not proof on its own (a 200 without an instance reads the same), and
+   * only a confirmed destroy settles a row (ensureInstanceGone). Not
+   * blacklisted: at a $0 balance Vast stops every instance of the account,
+   * whatever the machine (1d59516c).
    */
   private async lost(
     node: ManagedNode,
@@ -1976,10 +1980,6 @@ export class NodeManager {
       message: `Node ${nodeName(node.snapshot)}: ${reason}. ${fate.kind === 'gone' ? 'It is gone.' : 'Destroying it.'}`
     })
     node.closeSsh()
-    if (fate.kind === 'gone') {
-      this.instanceGone(instanceId, reason)
-      return
-    }
     node.setState('destroying', reason)
     await this.ensureInstanceGone(instanceId, { node, reason })
   }

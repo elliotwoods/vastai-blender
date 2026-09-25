@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NodeState } from '../../shared/models'
+import type { RawInstance } from '../vast/types'
 import { DEAD_HEARTBEAT_S, emulateProvision, type ProvisionLog } from '../test/fakeProvision'
 import { HANG, setup, type App, type FakeMachine, type World } from '../test/harness'
 
@@ -202,14 +203,16 @@ describe('1.7: liveness supervision', () => {
     expect(app.nodeManager.activeCount()).toBe(1)
   })
 
-  it('1.7: a node whose instance Vast no longer knows is let go, with no second DELETE', async () => {
+  it('1.7: a node whose instance Vast no longer knows is let go once its DELETE is answered 404', async () => {
     const { app, busy, jobId } = await renderingOnOne()
     const instanceId = instanceOf(busy)
     // Destroyed from the Vast console: the box is gone, and Vast says 404.
     await w.vast.destroyInstance(instanceId)
 
     await w.until(() => app.nodeManager.get(busy)?.state === 'destroyed', 'node let go')
-    expect(w.vast.count('destroyInstance')).toBe(1)
+    // The console's DELETE, then the app's, which the 404 confirms.
+    expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId], [instanceId]])
+    expect(states(busy).slice(-4)).toEqual(['rendering', 'unreachable', 'destroying', 'destroyed'])
     const row = w.get<{ destroyed_at: number | null; last_error: string }>(
       'SELECT destroyed_at, last_error FROM nodes WHERE id = ?',
       busy
@@ -450,6 +453,23 @@ describe('1.7: liveness supervision', () => {
     })
     expect(Date.now() - stoppedAt).toBeLessThanOrEqual(3 * MIN)
     expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
+  })
+
+  it('1.7: a node Vast answers about with no instance is destroyed, not written off unconfirmed', async () => {
+    // showInstance reads a 200 without an instance as "gone", the same as a
+    // 404. Taken on trust, the row was stamped destroyed while the instance
+    // billed on.
+    const { app, busy } = await renderingOnOne()
+    const instanceId = instanceOf(busy)
+    const show = w.vast.showInstance.bind(w.vast)
+    vi.spyOn(w.vast, 'showInstance')
+      .mockImplementationOnce(() => Promise.resolve(null as unknown as RawInstance))
+      .mockImplementation((id: number) => show(id))
+    dropOff(w.machineFor(busy))
+
+    await w.until(() => app.nodeManager.get(busy)?.state === 'destroyed', 'node let go')
+    expect(w.vast.argsOf('destroyInstance')).toEqual([[instanceId]])
+    expect(w.vast.live()).not.toContain(instanceId)
   })
 
   it('1.7: shutting down while a node is being recovered destroys nothing', async () => {
