@@ -584,7 +584,62 @@ describe('Windows session end (plan 1.1)', () => {
     return win
   }
 
-  it('destroys the fleet with no dialog, then exits', async () => {
+  /** Windows asks the window whether the session may end: whether it was held. */
+  function querySessionEnd(win: EventEmitter): boolean {
+    let held = false
+    win.emit('query-session-end', { reasons: ['shutdown'], preventDefault: () => (held = true) })
+    return held
+  }
+
+  it('shutting down with nodes billing: held until the fleet is destroyed, with no dialog, then exits', async () => {
+    // 1.1 review: 'session-end' alone started the destroy as Windows was
+    // about to end the process, and nothing got as far as a DELETE.
+    const { engine, instances } = await twoNodes()
+    const r = await rig(engine)
+    const win = openWindow(r)
+
+    expect(querySessionEnd(win)).toBe(true)
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+
+    expect(r.dialogs).toEqual([])
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+  })
+
+  it('every window is asked: each is held, and the fleet is destroyed once', async () => {
+    const { engine, instances } = await twoNodes()
+    const r = await rig(engine)
+    const wins = [openWindow(r), openWindow(r)]
+
+    expect(wins.map(querySessionEnd)).toEqual([true, true])
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+
+    expect(w.vast.count('destroyInstance')).toBe(2)
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+  })
+
+  it('nothing billing: the shutdown is not held, and the session end exits', async () => {
+    w = await setup()
+    const engine = await w.boot()
+    const r = await rig(engine)
+    const win = openWindow(r)
+
+    expect(querySessionEnd(win)).toBe(false)
+    expect(r.app.exits).toEqual([])
+    win.emit('session-end')
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: [] }])
+  })
+
+  it('headless, VR_QUIT_POLICY=leave: not held, and the session end leaves the nodes, exit 3', async () => {
+    const { engine, instances } = await twoNodes()
+    const r = await rig(engine, { headless: 'leave' })
+    const win = openWindow(r)
+
+    expect(querySessionEnd(win)).toBe(false)
+    win.emit('session-end')
+    expect(r.app.exits).toEqual([{ code: 3, live: instances, created: instances }])
+  })
+
+  it('a session end nobody asked about still starts the destroy', async () => {
     const { engine, instances } = await twoNodes()
     const r = await rig(engine)
     const win = openWindow(r)
@@ -605,7 +660,7 @@ describe('Windows session end (plan 1.1)', () => {
 
     r.app.quit()
     await w.advance(1_000)
-    win.emit('session-end')
+    expect(querySessionEnd(win)).toBe(true)
     await w.until(() => r.app.exits.length > 0, 'the app to exit')
     expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
 

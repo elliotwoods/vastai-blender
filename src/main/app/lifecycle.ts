@@ -19,11 +19,16 @@
  *   or downloads. The app says so as it goes to sleep (an alert and an OS
  *   notification), and on waking says roughly what the sleep cost.
  * - Windows session end (shut down, restart, log off). Nobody can answer a
- *   dialog, and Windows ends the process shortly after, so the fleet is
- *   destroyed at once, as Destroy all would.
+ *   dialog, so the fleet is destroyed as Destroy all would, and the shutdown
+ *   is held while that happens. Windows asks every window first
+ *   ('query-session-end'), and while anything bills the app says no, which
+ *   puts it on Windows' "preventing shutdown" screen until it exits. Once
+ *   'session-end' fires the process may be ended at any moment, too soon for
+ *   a DELETE that first waits on an SSH stop, a TLS handshake and a confirm,
+ *   so that event is only the fallback for a query that never came.
  * - Headless runs (VR_JOB_SPEC, VR_E2E_BLEND) never show a dialog.
  *   VR_QUIT_POLICY decides what happens on SIGINT, SIGTERM or SIGHUP, on a
- *   quit, and at the end of the campaign:
+ *   quit, on a Windows session end, and at the end of the campaign:
  *   - `destroy` (the default): destroy every node, then exit. When the
  *     campaign is done (no job queued or running), the run stops by itself.
  *   - `leave`: exit and leave the nodes as they are. The next launch on the
@@ -497,8 +502,11 @@ export interface QuitEvent {
   preventDefault(): void
 }
 
-/** A window, as far as `session-end` goes. */
+/** A window, as far as a Windows session end goes. */
 export interface SessionWindow {
+  /** Windows asks whether the session may end. preventDefault says not yet. */
+  on(event: 'query-session-end', listener: (event: QuitEvent) => void): unknown
+  /** The session is ending, and nothing can stop it. */
   on(event: 'session-end', listener: () => void): unknown
 }
 
@@ -718,8 +726,10 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
     // it is decided, and never on Electron's own schedule meanwhile.
     event.preventDefault()
     if (phase !== 'idle') {
-      // A second Cmd+Q while the dialog is up, or while destroying.
-      deps.frontWindow()
+      // A second Cmd+Q while the dialog is up, or while destroying. A
+      // headless run has no dialog to bring forward, and on Windows its
+      // window may be hidden on purpose (index.ts).
+      if (!deps.headless) deps.frontWindow()
       return
     }
     if (deps.headless) {
@@ -729,14 +739,33 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
     }
   })
 
-  // Windows: the session is ending and nothing can stop it or answer a
-  // dialog. It takes over from a quit dialog that is up: nobody will answer
-  // that now, and whatever it would have said is ignored (phase).
+  // Windows: shut down, restart or log off. Nobody will answer a dialog, so
+  // it goes as Destroy all would (or as VR_QUIT_POLICY says), and takes over
+  // from a quit dialog that is up: whatever that says later is ignored
+  // (phase). Every window is asked, so each one listens.
+  const sessionPolicy = (): QuitPolicy => deps.headless?.policy ?? 'destroy'
   deps.app.on('browser-window-created', (_event, window) => {
+    // Asked first, while the session can still be held. With anything
+    // billing, the answer is "not yet" (preventDefault), and Windows lists
+    // the app as preventing shutdown until the destroy is done and it exits.
+    // A user who presses "Shut down anyway" there, or a forced shutdown,
+    // still ends it at once. One who cancels the shutdown has the fleet
+    // destroyed and the app quit all the same: that is what was asked of it.
+    // Under `leave` there is nothing to wait for.
+    window.on('query-session-end', (event) => {
+      if (phase === 'exiting' || sessionPolicy() === 'leave') return
+      if (!fleet.list().some(holdsInstance)) return
+      event.preventDefault()
+      if (phase === 'destroying') return
+      void stopUnattended('session end', 'destroy', HEADLESS_ATTEMPTS).catch(fail('session end'))
+    })
+    // The session is ending now, and the process may be ended any moment
+    // after this returns: too soon, most likely, for the destroy it starts.
+    // Only for a session end that was never asked about, or went ahead
+    // anyway; after a held one the destroy is already under way.
     window.on('session-end', () => {
       if (phase === 'destroying' || phase === 'exiting') return
-      const policy = deps.headless?.policy ?? 'destroy'
-      void stopUnattended('session end', policy, 1).catch(fail('session end'))
+      void stopUnattended('session end', sessionPolicy(), 1).catch(fail('session end'))
     })
   })
 

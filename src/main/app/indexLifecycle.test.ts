@@ -8,15 +8,20 @@ import type { NodeSnapshot } from '../../shared/models'
 // against the real nodeManager and scheduler; this file is what fails if
 // index.ts stops installing them, or installs them wrong.
 
-/** The window createWindow makes. */
-class FakeWindow {
+/** The window createWindow makes: its listeners are real, so a test can emit on it. */
+class FakeWindow extends EventEmitter {
   static all: FakeWindow[] = []
+  /** app.on listeners, for 'browser-window-created'. */
+  static app: Map<string, Array<(...args: unknown[]) => void>> = new Map()
   shown = 0
+  hidden = 0
   focused = 0
   restored = 0
 
   constructor() {
+    super()
     FakeWindow.all.push(this)
+    for (const fn of FakeWindow.app.get('browser-window-created') ?? []) fn({}, this)
   }
 
   static getAllWindows(): FakeWindow[] {
@@ -39,11 +44,14 @@ class FakeWindow {
     this.shown++
   }
 
+  hide(): void {
+    this.hidden++
+  }
+
   focus(): void {
     this.focused++
   }
 
-  on = (): void => {}
   loadURL = (): void => {}
   loadFile = (): void => {}
 
@@ -129,6 +137,7 @@ async function load(nodes: NodeSnapshot[], env: Record<string, string> = {}): Pr
     shutdowns: 0,
     nodes
   }
+  FakeWindow.app = out.listeners
   let ready!: () => void
   const whenReady = new Promise<void>((r) => (ready = r))
   vi.doMock('electron', () => ({
@@ -244,6 +253,31 @@ async function load(nodes: NodeSnapshot[], env: Record<string, string> = {}): Pr
   return out
 }
 
+/** Windows asks a window whether the session may end: whether it was held. */
+function querySessionEnd(win: FakeWindow): boolean {
+  let held = false
+  win.emit('query-session-end', { reasons: ['shutdown'], preventDefault: () => (held = true) })
+  return held
+}
+
+/** The window's close button: whether the window went (no listener held it). */
+function closeWindow(win: FakeWindow): boolean {
+  let held = false
+  win.emit('close', { preventDefault: () => (held = true) })
+  return !held
+}
+
+/** Run `fn` as on Windows: process.platform is 'win32' meanwhile. */
+async function onWindows(fn: () => Promise<void>): Promise<void> {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+  try {
+    await fn()
+  } finally {
+    Object.defineProperty(process, 'platform', platform)
+  }
+}
+
 /** Cmd+Q: every before-quit listener, and whether one held the quit. */
 function quit(r: Loaded): boolean {
   let prevented = false
@@ -330,6 +364,25 @@ describe('index.ts installs the quit lifecycle (plan 1.1, field incident A1)', (
     const r = await load([node()])
     expect([...r.signals.keys()].filter((s) => s.startsWith('SIG'))).toEqual([])
   })
+
+  it('Windows asks whether it may shut down: held while the fleet is destroyed, then the app exits', async () => {
+    const r = await load([node()])
+    const [win] = FakeWindow.all
+
+    expect(querySessionEnd(win)).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(r.boxes).toEqual([])
+    expect(r.destroyed).toEqual(['node-1-abcdef'])
+    expect(r.exits).toEqual([0])
+  })
+
+  it("a person's window on Windows closes as it always did", async () => {
+    await onWindows(async () => {
+      await load([node()])
+      expect(closeWindow(FakeWindow.all[0])).toBe(true)
+    })
+  })
 })
 
 describe('index.ts, headless (plan 1.1)', () => {
@@ -351,6 +404,21 @@ describe('index.ts, headless (plan 1.1)', () => {
     expect(r.destroyed).toEqual([])
     expect(r.exits).toEqual([3])
     expect(r.stderr).toContain('SIGTERM: leaving 1 node billing $0.40/hr')
+  })
+
+  it('on Windows, closing the window hides it, so a shutdown still asks and is held for the destroy', async () => {
+    await onWindows(async () => {
+      const r = await load([node()], { VR_JOB_SPEC: '/campaign/spec.json' })
+      const [win] = FakeWindow.all
+
+      expect(closeWindow(win)).toBe(false)
+      expect(win.hidden).toBe(1)
+      expect(querySessionEnd(win)).toBe(true)
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(r.destroyed).toEqual(['node-1-abcdef'])
+      expect(r.exits).toEqual([0])
+    })
   })
 
   it('the campaign done (after the driver submitted it): destroys the fleet and exits 0', async () => {

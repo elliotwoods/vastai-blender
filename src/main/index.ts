@@ -241,6 +241,20 @@ function createWindow(): void {
     mainWindow.show()
   })
 
+  // A headless run on Windows keeps its window when it is closed, hidden.
+  // The run carries on without one (window-all-closed), but Windows asks
+  // windows, not processes, whether the session may end: with none, a
+  // shutdown or an overnight update's restart ended the run with its fleet
+  // billing, never asked (app/lifecycle.ts). A person's launch shows it
+  // again (second-instance). app.exit, which is how every quit ends,
+  // destroys windows without a 'close'.
+  if (headless && process.platform === 'win32') {
+    mainWindow.on('close', (event) => {
+      event.preventDefault()
+      mainWindow.hide()
+    })
+  }
+
   // Dev aid: VR_SHOT=<path.png> captures the window shortly after load —
   // used for automated visual verification during development. The delay
   // (VR_SHOT_DELAY ms) has to outlast the dev server's first paint, web font
@@ -379,7 +393,7 @@ app.whenReady().then(() => {
   // that finished under a build without job clips, or while ffmpeg failed.
   jobClips.catchUp()
   // Quit, sleep and Windows session end while nodes bill (app/lifecycle.ts).
-  // Before createWindow, so the first window gets its session-end listener.
+  // Before createWindow, so the first window gets its session-end listeners.
   // A headless run never asks: VR_QUIT_POLICY decides (see the drivers below).
   const quitPolicy = parseQuitPolicy(process.env.VR_QUIT_POLICY)
   if (headless && quitPolicy.warning) console.warn(`[vast-render] ${quitPolicy.warning}`)
@@ -429,11 +443,12 @@ app.whenReady().then(() => {
   //   }
   //
   // Both drivers stop by the quit policy, VR_QUIT_POLICY (app/lifecycle.ts),
-  // never by a dialog. `destroy`, the default: SIGINT, SIGTERM, SIGHUP or a
-  // quit destroys every node and exits, and so does the campaign being done
-  // (no job queued or running). `leave`: those exit and leave the nodes as
-  // they are, and a finished campaign keeps running for the idle scale-down.
-  // The exit status is 3 when instances may be left billing, else 0.
+  // never by a dialog. `destroy`, the default: SIGINT, SIGTERM, SIGHUP, a
+  // quit or a Windows session end destroys every node and exits, and so does
+  // the campaign being done (no job queued or running). `leave`: those exit
+  // and leave the nodes as they are, and a finished campaign keeps running
+  // for the idle scale-down. The exit status is 3 when instances may be left
+  // billing, else 0.
   const jobSpecPath = process.env.VR_JOB_SPEC
   if (jobSpecPath) {
     setTimeout(() => {
