@@ -83,6 +83,7 @@ const PATHS = {
       <path d="m4 17 6-6-6-6M12 19h8" />
     </>
   ),
+  folder: <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />,
   copy: (
     <>
       <rect x="9" y="9" width="12" height="12" rx="2" />

@@ -1,4 +1,5 @@
 import { iconBtn } from '../lib/controls'
+import { Icon } from './Icon'
 import { ipc } from '../lib/ipc'
 
 /**
@@ -23,7 +24,8 @@ export function OpenInExplorerButton({
         void ipc.invoke(mode === 'reveal' ? 'shell:showItemInFolder' : 'shell:openPath', path)
       }}
     >
-      🗀
+      {/* An SVG, not the 🗀 glyph, which the app's fonts lack: it drew as a bar. */}
+      <Icon name="folder" size={13} />
     </button>
   )
 }
