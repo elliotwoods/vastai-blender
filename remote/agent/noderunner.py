@@ -104,6 +104,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -216,6 +217,8 @@ LOG_TAIL_LINES = 40
 # Pause between run_render's end-of-render settle passes, taken only while an
 # announced frame is still not size-stable. selfcheck shortens it.
 SETTLE_PAUSE = 0.5
+# Seconds stop_blender waits after SIGTERM before it sends SIGKILL.
+BLENDER_STOP_GRACE = 10.0
 
 # Every render runs with Overwrite off (and Placeholders off, so a killed
 # Blender leaves no empty file behind): Blender then skips each frame whose
@@ -917,6 +920,32 @@ def record_failure(chunk_id, state, err, log_path, frames_done):
         print(f"[agent] could not write the failed state of {chunk_id}: {e}", flush=True)
 
 
+def signal_blender(proc, sig):
+    """Send `sig` to a Blender and everything it started. Never raises.
+
+    Blender runs in a session of its own (start_new_session), so its process
+    group is its own and nobody else's.
+    """
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, sig)
+        else:
+            proc.send_signal(sig)
+    except (OSError, ValueError):
+        pass  # already gone
+
+
+def stop_blender(proc):
+    """Stop a Blender for good: SIGTERM, then SIGKILL after BLENDER_STOP_GRACE."""
+    for sig in (signal.SIGTERM, getattr(signal, "SIGKILL", signal.SIGTERM)):
+        signal_blender(proc, sig)
+        try:
+            proc.wait(timeout=BLENDER_STOP_GRACE)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def discard_unmanifested(chunk_id, chunk_dir, recorded):
     """Delete every file in frames/ the manifest does not list.
 
@@ -1327,9 +1356,12 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
             attempt_env = dict(env)
             if preflight:
                 attempt_env["VR_PREFLIGHT"] = json.dumps(preflight_args(spec, frames, frames_dir))
+            # errors="replace": Blender prints paths as the .blend spells them,
+            # and one that is not UTF-8 raised UnicodeDecodeError out of the
+            # loop below. start_new_session: see stop_blender.
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                env=attempt_env
+                encoding="utf-8", errors="replace", env=attempt_env, start_new_session=True,
             )
 
             # State heartbeat: the loop below only rewrites the state file
@@ -1355,31 +1387,40 @@ def run_render(spec, log_path, tracker, gpu=None, state=None):
             threading.Thread(target=_heartbeat, daemon=True).start()
             last_state_write = 0.0
             stopped_for_oom = False
-            for line in proc.stdout:
-                log.write(line)
-                saved, failed = scan_line(line, state, seen)
-                if seen.get("oom"):
-                    # Out of memory: the frame in flight may still be written
-                    # and announced, black or cut short, and so may every one
-                    # after it. Trust no announcement from here on, and stop
-                    # paying for an attempt that has already failed.
-                    saved = None
-                    if proc.poll() is None and not stopped_for_oom:
-                        stopped_for_oom = True
-                        log.write("=== out of memory reported; stopping this attempt\n")
-                        proc.terminate()
-                if saved:
-                    tracker.saw_saved(saved)
-                    state["framesDone"] = len(tracker.recorded) + len(tracker.pending)
-                if failed:
-                    save_failed.append(failed)
-                now = time.time()
-                if now - last_state_write > 2:
-                    tracker.flush()
-                    state["framesDone"] = len(tracker.recorded)
-                    write_state(chunk_id, state)
-                    log.flush()
-                    last_state_write = now
+            try:
+                for line in proc.stdout:
+                    log.write(line)
+                    saved, failed = scan_line(line, state, seen)
+                    if seen.get("oom"):
+                        # Out of memory: the frame in flight may still be
+                        # written and announced, black or cut short, and so may
+                        # every one after it. Trust no announcement from here
+                        # on, and stop paying for an attempt that has already
+                        # failed.
+                        saved = None
+                        if proc.poll() is None and not stopped_for_oom:
+                            stopped_for_oom = True
+                            log.write("=== out of memory reported; stopping this attempt\n")
+                            signal_blender(proc, signal.SIGTERM)
+                    if saved:
+                        tracker.saw_saved(saved)
+                        state["framesDone"] = len(tracker.recorded) + len(tracker.pending)
+                    if failed:
+                        save_failed.append(failed)
+                    now = time.time()
+                    if now - last_state_write > 2:
+                        tracker.flush()
+                        state["framesDone"] = len(tracker.recorded)
+                        write_state(chunk_id, state)
+                        log.flush()
+                        last_state_write = now
+            except BaseException:
+                # This loop is what drains Blender's stdout. Once an error has
+                # ended it (a state or log write on a full disk), Blender blocks
+                # on the full pipe for good, holding its GPU memory on a node
+                # that bills by the hour (#81). Stop it before the error goes up.
+                stop_blender(proc)
+                raise
             code = proc.wait()
             log.write(f"=== render exit code {code}\n")
             return code
@@ -1517,35 +1558,46 @@ def run_encode(spec, state, log_path):
 
 
 def process(spec_path, gpu=None):
-    with open(spec_path) as f:
-        spec = json.load(f)
-    chunk_id = spec["chunkId"]
+    """Render one inbox spec, publish its state, and move the spec to done/ or
+    failed/. Never raises, and never leaves the spec in the inbox: the main
+    loop launches whatever is there again, every 2 s (#81)."""
+    # The app names each spec after its chunk, so even a spec that cannot be
+    # read has a state file the app is watching.
+    chunk_id = os.path.splitext(os.path.basename(spec_path))[0]
     log_path = os.path.join(LOGS, f"{chunk_id}.log")
-    chunk_dir = os.path.join(RENDERS, chunk_id)
-    os.makedirs(chunk_dir, exist_ok=True)
-
-    # Frame format follows the .blend, so EXR is usual but not guaranteed.
-    # It decides whether the linear→display conversion applies at all, and
-    # whether an HDR live clip is even meaningful.
-    worker = PreviewWorker(chunk_id, chunk_dir, spec.get("encode"))
-    tracker = FrameTracker(chunk_dir, on_frame=worker.submit)
-    if worker.may_run:
-        worker.start()
     # The chunk's one state dict: run_render fills it in, and a failure is
     # added to it (record_failure). The heartbeat thread writes this same
     # object, so a late heartbeat can never put back a state the failure
     # already replaced.
     state = {"gpu": gpu}
-    if spec.get("pinGpus") and gpu is None:
-        # See pin_plan. A pinned Cycles spec is unpinned only when the agent
-        # could not see two GPUs to pin it to.
-        if is_cycles(spec):
-            state["pinFailed"] = True
-            why = "the agent cannot see two GPUs (nvidia-smi failed, or found fewer)"
-        else:
-            why = f"{spec.get('engine')} picks its own GPU; only Cycles honours the pin"
-        log_line(chunk_id, f"not pinned to a GPU as the app asked: {why}; lanes run one at a time")
+    worker = tracker = chunk_dir = None
     try:
+        with open(spec_path) as f:
+            spec = json.load(f)
+        chunk_id = spec["chunkId"]
+        log_path = os.path.join(LOGS, f"{chunk_id}.log")
+        chunk_dir = os.path.join(RENDERS, chunk_id)
+        # Inside the try: on a full disk this raises too, and the spec must
+        # still leave the inbox.
+        os.makedirs(chunk_dir, exist_ok=True)
+
+        # Frame format follows the .blend, so EXR is usual but not guaranteed.
+        # It decides whether the linear→display conversion applies at all, and
+        # whether an HDR live clip is even meaningful.
+        worker = PreviewWorker(chunk_id, chunk_dir, spec.get("encode"))
+        tracker = FrameTracker(chunk_dir, on_frame=worker.submit)
+        if worker.may_run:
+            worker.start()
+        if spec.get("pinGpus") and gpu is None:
+            # See pin_plan. A pinned Cycles spec is unpinned only when the agent
+            # could not see two GPUs to pin it to.
+            if is_cycles(spec):
+                state["pinFailed"] = True
+                why = "the agent cannot see two GPUs (nvidia-smi failed, or found fewer)"
+            else:
+                why = f"{spec.get('engine')} picks its own GPU; only Cycles honours the pin"
+            log_line(chunk_id,
+                     f"not pinned to a GPU as the app asked: {why}; lanes run one at a time")
         run_render(spec, log_path, tracker, gpu, state)
         # Stop and join BEFORE the definitive encode: the worker reads the same
         # frames and there is no reason to have both competing for the CPU
@@ -1554,17 +1606,33 @@ def process(spec_path, gpu=None):
         run_encode(spec, state, log_path)
         state["status"] = "done"
         write_state(chunk_id, state)
-        shutil.move(spec_path, os.path.join(DONE, os.path.basename(spec_path)))
+        retire_spec(spec_path, DONE)
     except Exception as e:  # noqa: BLE001 — agent must never die on a job
-        record_failure(chunk_id, state, e, log_path, len(tracker.recorded))
+        record_failure(chunk_id, state, e, log_path, len(tracker.recorded) if tracker else 0)
         # Even when the state could not be written (a full disk): a spec left
         # in the inbox is launched again by the next scan, and fails again.
-        shutil.move(spec_path, os.path.join(FAILED, os.path.basename(spec_path)))
+        retire_spec(spec_path, FAILED)
     finally:
         # The failure path never reaches run_encode, so cleanup cannot live
         # there — a failed chunk would leave its worker and scratch behind.
-        stop_worker(worker)
-        cleanup_live_stream(chunk_dir)
+        if worker is not None:
+            stop_worker(worker)
+        if chunk_dir is not None:
+            cleanup_live_stream(chunk_dir)
+
+
+def retire_spec(spec_path, dest):
+    """Move a spec out of the inbox into `dest`, or failing that delete it.
+    Never raises; see process()."""
+    try:
+        shutil.move(spec_path, os.path.join(dest, os.path.basename(spec_path)))
+        return
+    except Exception as e:  # noqa: BLE001
+        print(f"[agent] could not move {spec_path} to {dest}: {e}", flush=True)
+    try:
+        os.remove(spec_path)
+    except OSError as e:
+        print(f"[agent] could not remove {spec_path} either: {e}", flush=True)
 
 
 def stop_worker(worker):

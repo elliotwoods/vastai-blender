@@ -245,6 +245,17 @@ if script.get("record"):
         env = {k: v for k, v in os.environ.items() if k.startswith("VR_")}
         f.write(json.dumps({"argv": argv, "env": env}) + "\n")
 attempt = script["opengl" if "--gpu-backend" in argv else "default"]
+if attempt.get("pidFile"):
+    # This process and, with "child", one it starts, as a script a .blend runs might.
+    pids = [os.getpid()]
+    if attempt.get("child"):
+        import subprocess
+        pids.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]).pid)
+    if attempt.get("ignoreTerm"):
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(attempt["pidFile"], "w") as f:
+        json.dump(pids, f)
 out = os.path.dirname(argv[argv.index("-o") + 1])
 exprs = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--python-expr"]
 # Overwrite off: unchecked in the .blend, or turned off by an expression.
@@ -264,6 +275,10 @@ def frames():
 
 for line in attempt.get("print", []):
     print(line, flush=True)
+for line in attempt.get("bytes", []):
+    # Written as Latin-1: bytes that are not UTF-8, as a path in a .blend can be.
+    sys.stdout.buffer.write(line.encode("latin-1") + b"\n")
+    sys.stdout.buffer.flush()
 if "render" in attempt:
     # The frames argv asks for, as -a or -f renders them.
     for n in frames():
@@ -313,14 +328,17 @@ def fake_node():
     "write", `announce` True prints Blender's "Saved:" line, and "error" its
     "cannot save" line, after which the fake stops writing, as Blender does;
     any further items in an entry are lines printed before it is written.
-    "sleep" seconds pass before the exit.
+    "sleep" seconds pass before the exit. "bytes" lines are printed Latin-1
+    encoded, after "print". "pidFile" gets a JSON list of the fake's pid and,
+    with "child", that of a process it starts; "ignoreTerm" makes the fake
+    ignore SIGTERM.
     Overwrite is off, skipping any frame already on disk, when `noOverwrite`
     says the .blend has it unchecked or a --python-expr sets use_overwrite.
     "record" appends each run's argv and VR_* environment to a JSON-lines file.
     """
     names = ("ROOT", "RENDERS", "STATE", "LOGS", "BLENDER_ROOT", "INBOX", "DONE", "FAILED",
              "CONTROL", "OCTANE_BLENDER", "ENCODE_SCRIPT", "size_stable", "SETTLE_PAUSE",
-             "write_state")
+             "BLENDER_STOP_GRACE", "write_state")
     saved = {k: getattr(nr, k) for k in names}
     with tempfile.TemporaryDirectory() as tmp:
         # The agent watches a frame's size for 0.5-1 s, and pauses 0.5 s between
@@ -330,6 +348,7 @@ def fake_node():
         real_stable = saved["size_stable"]
         nr.size_stable = lambda path, wait=1.0: real_stable(path, wait=0.01)
         nr.SETTLE_PAUSE = 0.01
+        nr.BLENDER_STOP_GRACE = 1.0
         nr.ROOT = tmp
         nr.RENDERS = os.path.join(tmp, "renders")
         nr.STATE = os.path.join(tmp, "state")
@@ -658,6 +677,101 @@ def test_full_disk_still_retires_the_spec():
               raised is None and "could not write the failed state of c1" in out.getvalue())
         check("full disk: the spec leaves the inbox for failed/",
               not os.path.exists(spec_path) and os.path.exists(os.path.join(nr.FAILED, "c1.json")))
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def gone_soon(pids, timeout=3.0):
+    """True once none of `pids` is alive; an orphan waits for init to reap it."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not any(alive(p) for p in pids):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_every_spec_leaves_the_inbox():
+    """#81 (review of 1.17): process() read the spec and made the chunk dir
+    before its try. On a full disk the thread died with no state written and
+    the spec in the inbox, and the main loop launched it again every 2 s."""
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        spec_path = os.path.join(nr.INBOX, "c1.json")
+        with open(spec_path, "w") as f:
+            json.dump(chunk_spec(tmp, {"default": {"render": "f"}}), f)
+        real = os.makedirs
+        chunk_dir = os.path.join(nr.RENDERS, "c1")
+
+        def full(path, *args, **kwargs):
+            if os.path.abspath(path) == chunk_dir:
+                raise OSError(28, "No space left on device")
+            return real(path, *args, **kwargs)
+
+        shutil.rmtree(chunk_dir)
+        os.makedirs = full
+        try:
+            nr.process(spec_path)
+        finally:
+            os.makedirs = real
+        with open(os.path.join(nr.STATE, "c1.json")) as f:
+            state = json.load(f)
+        check("full disk before the render: a failed state, errorKind machine",
+              state.get("status") == "failed" and state.get("errorKind") == "machine")
+        check("full disk before the render: the spec leaves the inbox",
+              not os.path.exists(spec_path) and os.path.exists(os.path.join(nr.FAILED, "c1.json")))
+    with fake_node() as tmp:
+        spec_path = os.path.join(nr.INBOX, "c2.json")
+        with open(spec_path, "w") as f:
+            f.write('{"chunkId": "c2", "blendF')
+        nr.process(spec_path)
+        with open(os.path.join(nr.STATE, "c2.json")) as f:
+            state = json.load(f)
+        check("a spec that cannot be read fails under its file's name, and leaves the inbox",
+              state.get("status") == "failed" and not os.path.exists(spec_path))
+
+
+def test_a_failed_drain_stops_blender():
+    """#81 (review of 1.17): an error out of run_once's stdout loop left Blender
+    running, blocked on a pipe nobody drained, holding its GPU memory."""
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        pid_file = os.path.join(tmp, "pids.json")
+        real = nr.write_state
+
+        def filling(chunk_id, state):
+            if state.get("lastLine") == "the disk fills here":
+                raise OSError(28, "No space left on device")
+            real(chunk_id, state)
+
+        nr.write_state = filling  # fake_node restores it
+        started = time.time()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            _state, entries = run_chunk(tmp, {"default": {
+                "pidFile": pid_file, "child": True, "ignoreTerm": True,
+                "print": ["the disk fills here"], "sleep": 30}})
+        with open(pid_file) as f:
+            pids = json.load(f)
+        check("a failed drain: Blender and what it started are stopped, SIGKILL after SIGTERM",
+              gone_soon(pids) and time.time() - started < 10)
+        check("a failed drain: the spec leaves the inbox",
+              os.path.exists(os.path.join(nr.FAILED, "c1.json")) and entries == [])
+    with fake_node() as tmp:
+        make_chunk(tmp)
+        state, entries = run_chunk(tmp, {"default": {
+            "bytes": ["Read blend: '/scenes/caf\xe9.blend'"], "render": "f"}}, grid=(1, 2, 1))
+        check("output that is not UTF-8 is read, not a failure",
+              state.get("status") == "done" and len(entries) == 2
+              and "caf\ufffd.blend" in render_log())
 
 
 def test_last_progress_at():
@@ -1726,6 +1840,8 @@ def main():
         test_eevee_retry_on_a_redispatched_chunk,
         test_failed_state_says_why,
         test_full_disk_still_retires_the_spec,
+        test_every_spec_leaves_the_inbox,
+        test_a_failed_drain_stops_blender,
         test_render_publishes_last_progress,
         test_restart_renders_only_missing_frames,
         test_explicit_frame_list,
