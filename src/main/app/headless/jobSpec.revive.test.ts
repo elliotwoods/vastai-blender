@@ -1,5 +1,5 @@
 import { writeFileSync } from 'fs'
-import { join } from 'path'
+import { join, relative } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { setup, type World } from '../../test/harness'
 
@@ -123,5 +123,39 @@ describe('runJobSpec on a campaign already submitted', () => {
     expect(app.scheduler.recoveryHoldCount()).toBeNull()
     expect(w.get('SELECT attention FROM jobs WHERE id = ?', jobId)).toEqual({ attention: null })
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining('its hold released'))
+  })
+
+  it('1.14: a scene named relative to the run is made full; a network path is not submitted', async () => {
+    const app = await w.boot({ start: false })
+    const blend = w.blend('a.blend')
+    const legacy = w.blend('legacy.blend')
+    // A job an earlier run made from a relative name keeps that name.
+    const legacyId = await w.submitJob(app, { blendPath: legacy, frameStart: 1, frameEnd: 8 })
+    w.db
+      .prepare('UPDATE jobs SET blend_path = ? WHERE id = ?')
+      .run(relative(process.cwd(), legacy), legacyId)
+    const path = join(w.dir, 'spec.json')
+    writeFileSync(
+      path,
+      JSON.stringify({
+        blends: [
+          relative(process.cwd(), blend),
+          relative(process.cwd(), legacy),
+          '\\\\fileserver\\scenes\\hero.blend'
+        ],
+        engine: 'cycles',
+        frameStart: 1,
+        frameEnd: 8
+      })
+    )
+
+    const { runJobSpec } = await import('./jobSpec')
+    const unsubmitted: string[] = []
+    await runJobSpec(path, { kick: vi.fn(), unsubmitted })
+
+    const jobs = w.all<{ blend_path: string }>('SELECT blend_path FROM jobs ORDER BY submitted_at')
+    expect(jobs.map((j) => j.blend_path)).toEqual([relative(process.cwd(), legacy), blend])
+    expect(unsubmitted).toHaveLength(1)
+    expect(unsubmitted[0]).toMatch(/fileserver.*on this computer/)
   })
 })

@@ -142,6 +142,31 @@ describe('validateSubmission', () => {
   })
 })
 
+describe('validateSubmission: the scene is a file on this computer (plan 1.14)', () => {
+  // Every job's scene is somewhere Explorer or Finder may reveal: a network
+  // path there hands the user's NTLM hash to whoever serves it (Phase 0
+  // review). Checked where every submission lands, the headless spec too.
+  it.each([
+    ['a network share', '\\\\fileserver\\scenes\\hero.blend', /on this computer/],
+    ['a network share, forward slashes', '//fileserver/scenes/hero.blend', /on this computer/],
+    ['a relative path', 'scenes/hero.blend', /full path/],
+    ["a path through '..'", '/scenes/../private/hero.blend', /'\.\.'/]
+  ])('refuses %s', (_what, blendPath, reason) => {
+    const problems = validateSubmission(sub({ blendPath }), { pathFlavour: 'posix' })
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toMatch(reason)
+  })
+
+  it("takes the host's own form of a full path", () => {
+    expect(
+      validateSubmission(sub({ blendPath: 'C:\\scenes\\a.blend' }), { pathFlavour: 'win32' })
+    ).toEqual([])
+    expect(
+      validateSubmission(sub({ blendPath: 'C:\\scenes\\a.blend' }), { pathFlavour: 'posix' })
+    ).toHaveLength(1)
+  })
+})
+
 describe('validateRenderOptions', () => {
   it('checks the options without asking which scene', () => {
     const options: RenderOptions = {

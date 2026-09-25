@@ -7,6 +7,7 @@ import { resolveJobBlenderVersion } from '../blender/blendInfo'
 import { getDb } from '../db/db'
 import { describeError } from '../errors'
 import { emit } from '../events'
+import { hostPathFlavour } from '../paths'
 import { getSettings } from '../settings'
 import { sha256File } from '../ssh/sftp'
 import { autoChunkSize, framesIn, splitFrames } from '../scheduler/chunker'
@@ -351,7 +352,7 @@ function isFile(path: string): boolean {
  * no scheduler tick, no idle scale-down, while the fleet kept billing.
  */
 export async function createJob(sub: JobSubmission): Promise<string> {
-  const problems = validateSubmission(sub)
+  const problems = validateSubmission(sub, { pathFlavour: hostPathFlavour() })
   // Only main can see the disk. With a blenderVersionOverride set nothing
   // below reads the scene, so a missing one would first surface at dispatch,
   // failing chunk after chunk on a rented node.

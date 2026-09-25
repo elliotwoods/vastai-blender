@@ -13,6 +13,7 @@
  */
 
 import type { EngineId, JobSubmission } from './models'
+import { localPathProblem, type PathFlavour } from './settingsSanitize'
 
 /**
  * Blender's highest frame number (MAXFRAME). `-e` clamps anything above it,
@@ -115,13 +116,26 @@ export function validateRenderOptions(options: RenderOptions): string[] {
  * Every problem with a submission, as messages fit to show the user; empty =
  * ok. Main adds one check of its own on top: that the scene file exists,
  * which the renderer cannot see.
+ *
+ * The scene must be a file on this computer, named by a full path
+ * (localPathProblem): every job's scene is somewhere Explorer or Finder may
+ * reveal (shell:showItemInFolder), and on Windows revealing a network path
+ * hands the user's NTLM hash to whoever serves it; a render must not hang on
+ * a share that has gone away either. Main passes its own `pathFlavour`;
+ * without one both path forms pass, good enough for a hint as the user types.
  */
-export function validateSubmission(sub: JobSubmission): string[] {
+export function validateSubmission(
+  sub: JobSubmission,
+  opts: { pathFlavour?: PathFlavour } = {}
+): string[] {
   if (typeof sub !== 'object' || sub === null) return ['job submission is missing']
   const s = sub as Unchecked<JobSubmission>
   const problems: string[] = []
   if (typeof s.blendPath !== 'string' || s.blendPath.trim() === '') {
     problems.push('no scene file chosen')
+  } else {
+    const where = localPathProblem(s.blendPath, opts.pathFlavour)
+    if (where) problems.push(`scene file ${where} (got ${JSON.stringify(s.blendPath)})`)
   }
   if (s.name != null && typeof s.name !== 'string') {
     problems.push(`job name must be text (got ${String(s.name)})`)

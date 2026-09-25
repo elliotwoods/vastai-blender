@@ -34,7 +34,7 @@
  * A value clamped to its limit is in force at the limit, said on stderr.
  */
 
-import { join } from 'path'
+import { join, resolve } from 'path'
 import type { SettingsFieldError, SettingsPublic } from '../../../shared/models'
 import { sanitizeSettingsPatch } from '../../../shared/settingsSanitize'
 import { hostPathFlavour } from '../../paths'
@@ -227,6 +227,20 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
       .sort()
       .map((f: string): BlendEntry => ({ path: join(spec.blendDir, f) }))
   }
+  // A spec may name its scenes relative to where the run was started, as it
+  // always could. A job's scene must be a full path now (validateSubmission),
+  // so each is made full from there; a network path is left as it is, for
+  // createJob to refuse. `named` keeps the spec's own spelling, which is what
+  // a job an earlier run made from a relative name has as its blendPath.
+  const named = new Map<BlendEntry, string>()
+  blends = blends.map((b) => {
+    if (typeof b.path !== 'string' || b.path === '' || /^[\\/]{2}/.test(b.path)) return b
+    const full = { ...b, path: resolve(b.path) }
+    named.set(full, b.path)
+    return full
+  })
+  const isBlend = (j: { blendPath: string }, b: BlendEntry): boolean =>
+    j.blendPath === b.path || j.blendPath === named.get(b)
   if (!blends.length) {
     console.error('[spec] no blends resolved — nothing submitted')
     deps.unsubmitted.push(`${specPath}: no blends resolved`)
@@ -248,7 +262,7 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
     const satisfied = allJobs.find(
       (j) =>
         j.state === 'complete' &&
-        j.blendPath === blend.path &&
+        isBlend(j, blend) &&
         j.frameStart === wantStart &&
         j.frameEnd === wantEnd
     )
@@ -256,7 +270,7 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
       console.log(`[spec] skip (already complete): ${blend.path}`)
       continue
     }
-    const existing = active.find((j) => j.blendPath === blend.path)
+    const existing = active.find((j) => isBlend(j, blend))
     if (existing) {
       // Revive permanently-failed chunks (retry budget exhausted, e.g.
       // by a since-fixed dispatch bug), narrowed to the frames still
