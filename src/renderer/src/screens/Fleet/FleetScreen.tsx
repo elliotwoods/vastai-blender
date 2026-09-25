@@ -13,6 +13,7 @@ import { ipcErrorText } from '../../lib/recovery'
 import { DestroyNodeButton } from './NodeActions'
 import { NodeDetail } from './NodeDetail'
 import { FleetGpuStrip } from './FleetGpuStrip'
+import { ScaleStatusLine } from './ScaleStatusLine'
 import { UnclaimedPanel } from './UnclaimedPanel'
 import { MeterPair, MiniMeter } from './meters'
 import { SPARK_MS, clockFormatter, liveWindow, sparkPoints } from './usageCharts'
@@ -509,6 +510,7 @@ export function FleetScreen(): React.JSX.Element {
           <>
             {/* Billing with no node here to show for it: above everything. */}
             <UnclaimedPanel />
+            <ScaleStatusLine />
             <FleetGpuStrip hasNodes={listed.length > 0} />
           </>
         )}

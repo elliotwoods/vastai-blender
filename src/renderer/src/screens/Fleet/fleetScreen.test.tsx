@@ -16,6 +16,7 @@ import type {
 // - 1.2: a node that may still be billing is always listed, and counted;
 // - 1.3: instances nobody here holds are listed with their rate, destroy asks;
 // - 1.20: the toolbar's balance turns amber and red by runway, not at $5;
+// - #200: why scale-up is or is not renting, in the scheduler's words;
 // - 1.5: "+ request node" at the spend cap asks before going past it;
 // - 1.18: a node waiting for an Octane sign-in offers the VNC login;
 // - Feature G: the GPU strip, each row's sparkline, NodeDetail's charts.
@@ -266,6 +267,19 @@ describe('1.20: the balance reads as a runway, not against a fixed $5', () => {
       <AppToolbar />
     )
     expect(balance(html)).toBe('var(--text)')
+  })
+})
+
+describe('why the fleet is not renting (#200)', () => {
+  it("says the scheduler's reason when the user's own limit stops it", () => {
+    const html = withCache(
+      (qc) => {
+        qc.setQueryData(qk.nodes, [node({})])
+        qc.setQueryData(qk.scaleStatus, { status: 'max-nodes', reason: 'at max nodes (4 of 4)' })
+      },
+      <FleetScreen />
+    )
+    expect(html).toContain('Not renting: at max nodes (4 of 4). Raise max nodes to rent more.')
   })
 })
 
