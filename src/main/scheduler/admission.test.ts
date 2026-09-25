@@ -1,10 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import {
   admits,
+  BREAKER_NODES,
+  breakerKey,
+  budgetFor,
+  chunkBackoffMs,
   freeExclusiveLanes,
   hasRoom,
+  JobBreaker,
   nodeCapacity,
+  nodeRestMs,
   PREFETCH,
+  RETRY_BACKOFF_BASE_MS,
+  RETRY_BACKOFF_MAX_MS,
+  NODE_REST_BASE_MS,
+  type FailureClass,
   type NodeOccupancy
 } from './admission'
 
@@ -133,5 +143,110 @@ describe('GPU lanes — exclusive chunks on a multi-GPU node', () => {
     expect(freeExclusiveLanes(lanes4({ inFlight: 1, hasExclusive: true }))).toBe(3)
     expect(freeExclusiveLanes(lanes4({ inFlight: 1, hasExclusive: false }))).toBe(0)
     expect(freeExclusiveLanes(occ())).toBe(1)
+  })
+})
+
+describe('retry policy (plan 1.17)', () => {
+  const f = (kind: FailureClass['kind'], rule: string): FailureClass => ({ kind, rule })
+
+  describe('budgetFor: whose fault decides what an attempt costs', () => {
+    it('charges the render only for the render', () => {
+      expect(budgetFor(f('job', 'agent-exit'))).toBe('render')
+      expect(budgetFor(f('job', 'unclassified'))).toBe('render')
+    })
+
+    it('1d59516c: a node Vast stopped, or the network, is charged to the machines', () => {
+      expect(budgetFor(f('machine', 'ssh-unreachable'))).toBe('infra')
+      expect(budgetFor(f('machine', 'node-gone'))).toBe('infra')
+      expect(budgetFor(f('transient', 'ssh-channels'))).toBe('infra')
+      expect(budgetFor(f('account', 'vast-credit'))).toBe('infra')
+      expect(budgetFor(f('localFs', 'local-ENOENT'))).toBe('infra')
+    })
+
+    it('charges nothing for frames this computer would not take', () => {
+      expect(budgetFor(f('localFs', 'local-sink'))).toBe('none')
+    })
+  })
+
+  describe('chunkBackoffMs: only a transient failure waits', () => {
+    it('doubles from the base with each infrastructure retry, up to the cap', () => {
+      const t = f('transient', 'ssh-channels')
+      expect(chunkBackoffMs(t, 1)).toBe(RETRY_BACKOFF_BASE_MS)
+      expect(chunkBackoffMs(t, 2)).toBe(2 * RETRY_BACKOFF_BASE_MS)
+      expect(chunkBackoffMs(t, 3)).toBe(4 * RETRY_BACKOFF_BASE_MS)
+      expect(chunkBackoffMs(t, 50)).toBe(RETRY_BACKOFF_MAX_MS)
+    })
+
+    it("sends a machine's failure elsewhere at once, and a render failure again at once", () => {
+      expect(chunkBackoffMs(f('machine', 'ssh-unreachable'), 1)).toBe(0)
+      expect(chunkBackoffMs(f('job', 'agent-exit'), 1)).toBe(0)
+      expect(chunkBackoffMs(f('localFs', 'local-sink'), 1)).toBe(0)
+    })
+  })
+
+  it('nodeRestMs doubles with each failure in a row, up to the cap', () => {
+    expect(nodeRestMs(1)).toBe(NODE_REST_BASE_MS)
+    expect(nodeRestMs(2)).toBe(2 * NODE_REST_BASE_MS)
+    expect(nodeRestMs(100)).toBe(RETRY_BACKOFF_MAX_MS)
+  })
+
+  describe("breakerKey: which failures may be the job's", () => {
+    it("counts the render's failures and a node setup that fails", () => {
+      expect(breakerKey(f('job', 'agent-exit'))).toBe('job')
+      expect(breakerKey(f('job', 'unclassified'))).toBe('job')
+      expect(breakerKey(f('machine', 'node-setup'))).toBe('node-setup')
+      expect(breakerKey(f('localFs', 'local-ENOENT'))).toBe('localFs')
+    })
+
+    it("1d59516c: never a node that is gone or refuses, or the network, or the disk's hold", () => {
+      expect(breakerKey(f('machine', 'ssh-unreachable'))).toBeNull()
+      expect(breakerKey(f('machine', 'node-gone'))).toBeNull()
+      expect(breakerKey(f('machine', 'agent-gpu'))).toBeNull()
+      expect(breakerKey(f('transient', 'ssh-channels'))).toBeNull()
+      expect(breakerKey(f('localFs', 'local-sink'))).toBeNull()
+    })
+
+    it('not a setup step whose connection went before it exited', () => {
+      const setup = (reason: string): FailureClass => ({ ...f('machine', 'node-setup'), reason })
+      expect(
+        breakerKey(setup('setting up the node failed: install blender 4.2.3 failed (exit 1)'))
+      ).toBe('node-setup')
+      expect(
+        breakerKey(setup('setting up the node failed: install blender 4.2.3 failed (exit null)'))
+      ).toBeNull()
+    })
+  })
+
+  describe('JobBreaker', () => {
+    it(`trips on the node that makes it ${BREAKER_NODES}, once`, () => {
+      const b = new JobBreaker()
+      expect(b.record('job', 'job', 'node-a')).toBe(false)
+      // The same node again says nothing more about the job.
+      expect(b.record('job', 'job', 'node-a')).toBe(false)
+      expect(b.record('job', 'job', 'node-b')).toBe(true)
+      expect(b.record('job', 'job', 'node-c')).toBe(false)
+      expect(b.nodesFor('job', 'job').sort()).toEqual(['node-a', 'node-b', 'node-c'])
+    })
+
+    it('counts each failure, and each job, apart', () => {
+      const b = new JobBreaker()
+      expect(b.record('job-1', 'job', 'node-a')).toBe(false)
+      expect(b.record('job-1', 'node-setup', 'node-b')).toBe(false)
+      expect(b.record('job-2', 'job', 'node-b')).toBe(false)
+    })
+
+    it('starts again once the job renders a chunk', () => {
+      const b = new JobBreaker()
+      b.record('job', 'job', 'node-a')
+      b.reset('job')
+      expect(b.record('job', 'job', 'node-b')).toBe(false)
+      expect(b.record('job', 'job', 'node-a')).toBe(true)
+    })
+
+    it("takes this computer's failures as the job's on the second, on any node", () => {
+      const b = new JobBreaker()
+      expect(b.record('job', 'localFs', 'node-a')).toBe(false)
+      expect(b.record('job', 'localFs', 'node-a')).toBe(true)
+    })
   })
 })
