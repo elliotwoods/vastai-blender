@@ -757,7 +757,7 @@ function historyQuery(
  * node-b is newer and idle.
  */
 function startMockMetrics(): void {
-  const STEP = 60_000
+  const STEP = 15_000 // the real probe cadence: a coarser backfill leaves every other 30 s bucket empty
   const reading = (nodeId: string, ts: number): Parameters<typeof recordMetrics>[1] => {
     const t = ts / 60_000
     const gpus =
