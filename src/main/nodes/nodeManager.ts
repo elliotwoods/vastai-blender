@@ -62,7 +62,16 @@ import {
   type NodeCostFacts
 } from '../../shared/nodeState'
 import type { RawInstance } from '../vast/types'
-import { AGENT_STALE_S, agentStatus, provisionDeps, REMOTE_ROOT, restartAgent } from './provisioner'
+import {
+  AGENT_STALE_S,
+  AgentBusyError,
+  agentStatus,
+  ConnectionLostError,
+  provisionDeps,
+  REMOTE_ROOT,
+  restartAgent,
+  type AgentRestart
+} from './provisioner'
 
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
 
@@ -206,6 +215,15 @@ const RECONNECT_PAUSE_MS = 5_000
 const ANSWER_TIMEOUT_MS = 15_000
 
 /**
+ * Once SSH answers again, the agent check gets at least RECONNECT_SLICE_MS
+ * of the budget, however late in it the node came back: a link that drops
+ * under the check right after a reconnect costs another round, not the node.
+ * At most this many times in one recovery, since a link that drops under
+ * every check leaves a node billing with no work done.
+ */
+const ANSWERED_GRACE_MAX = 3
+
+/**
  * A heartbeat older than AGENT_STALE_S (provision.sh's, six missed beats)
  * means a dead agent. The probe must see it AGENT_STALE_PROBES times in a
  * row, and restart-agent checks again under its lock, since a false "dead"
@@ -282,6 +300,30 @@ type InstanceFate =
 function instanceStopped(inst: RawInstance): boolean {
   if (inst.intended_status === 'stopped' || inst.cur_state === 'stopped') return true
   return ['exited', 'stopped', 'offline'].includes(inst.actual_status ?? '')
+}
+
+/**
+ * The link to the node failed under a command, rather than the node
+ * answering it: the connection went under it (ConnectionLostError, or a step
+ * that ended with no exit status, "failed (exit null)"), it timed out, the
+ * node could not be reached, or anything else classify() calls transient
+ * over SSH. That is no verdict on the node or its agent. A laptop's Wi-Fi
+ * flapping just after it wakes does exactly this, and a node brought back
+ * from one drop used to be destroyed, renders and all, for the next.
+ */
+function linkFailed(e: unknown): boolean {
+  if (e instanceof ProvisionTimeout) return false
+  if (e instanceof ConnectionLostError) return true
+  if (e instanceof Error && /\(exit null\)/.test(e.message)) return true
+  const c = classify(e, { via: 'ssh' })
+  return c.kind === 'transient' || c.rule === 'ssh-lost' || c.rule === 'ssh-unreachable'
+}
+
+/** One line for why a recovery step failed. */
+function failureReason(e: unknown): string {
+  // Not one classify() knows yet: it would read "unrecognised error".
+  if (e instanceof AgentBusyError) return e.message
+  return classify(e, { via: 'ssh' }).reason
 }
 
 /** How reviveAgent left the agent of a node that answers again. */
@@ -1693,8 +1735,15 @@ export class NodeManager {
   /**
    * A node SSH answers whose agent looks dead: out of the fleet
    * ('provisioning', sent nothing) while reviveAgent looks at the agent and
-   * restarts it if it is, then back. Given up on if that fails or passes
-   * PROVISION_DEADLINE_MS.
+   * restarts it if it is, then back. Given up on if the agent cannot be
+   * brought back, or that passes PROVISION_DEADLINE_MS.
+   *
+   * A check that tells nothing about the agent is not that: the link going
+   * under it, or another restart-agent holding the node. The node is then
+   * taken for one that stopped answering, out of the fleet ('unreachable'),
+   * and recover() brings it back or lets it go, in reconnect rounds with
+   * Vast asked after each, and never destroys it while Vast is silent too.
+   * One such blip used to destroy the node.
    */
   private async restoreAgent(node: ManagedNode, why: string): Promise<void> {
     const ssh = node.ssh
@@ -1713,11 +1762,15 @@ export class NodeManager {
         this.backInService(node, revival, why)
       } catch (e) {
         if (node.movedOn(held) || this.shutDown) return
-        await this.giveUp(
-          node,
-          `${why}, and the agent could not be brought back: ${classify(e, { via: 'ssh' }).reason}`,
-          { connected: true }
-        )
+        const reason = failureReason(e)
+        if (linkFailed(e) || e instanceof AgentBusyError) {
+          node.setState('unreachable', `${why}, and checking the agent failed: ${reason}`)
+          await this.recover(node, { askVast: true, why: reason })
+          return
+        }
+        await this.giveUp(node, `${why}, and the agent could not be brought back: ${reason}`, {
+          connected: true
+        })
       }
     } finally {
       this.recovering.delete(node.id)
@@ -1744,7 +1797,9 @@ export class NodeManager {
    *
    * The node's runs are forgotten exactly when the agent was restarted,
    * since that killed their renders (restartAgent); never on a check made
-   * beforehand, which can go stale in between.
+   * beforehand, which can go stale in between. A restart-agent that ended
+   * without a verdict (the link went, it timed out, another one held the
+   * node) may have restarted it, and counts as one.
    */
   private async reviveAgent(node: ManagedNode, ssh: SshConnection): Promise<AgentRevival> {
     if (!this.provisioned.has(node.id)) return this.reprovision(node, ssh)
@@ -1767,7 +1822,13 @@ export class NodeManager {
       }
       if (!status.depsCurrent) await provisionDeps(ssh, node.id)
     }
-    const r = await restartAgent(ssh, node.id, { force: !status.restartNeeded })
+    let r: AgentRestart
+    try {
+      r = await restartAgent(ssh, node.id, { force: !status.restartNeeded })
+    } catch (e) {
+      forgetNodeProvider?.(node.id)
+      throw e
+    }
     if (!r.restarted) return { kind: 'kept', renders: status.blenderProcs }
     forgetNodeProvider?.(node.id)
     if (status.restartNeeded) this.agentRestarts.set(node.id, [...recent, Date.now()])
@@ -3069,9 +3130,10 @@ export class NodeManager {
 
   /**
    * Bring an 'unreachable' node back, or let it go (plan 1.7). From
-   * resumeNode, for a node SSH did not reach at start-up, and from the
-   * supervisor (nodeSilent), with `askVast` since Vast has not been asked.
-   * One at a time per node.
+   * resumeNode, for a node SSH did not reach at start-up, from the
+   * supervisor (nodeSilent), and from restoreAgent when its check lost the
+   * link, the last two with `askVast` since Vast has not been asked. One at
+   * a time per node.
    *
    * - Vast has stopped the instance or no longer knows it: let go (lost).
    * - Otherwise the node's own connection reconnects with backoff, for up to
@@ -3079,11 +3141,17 @@ export class NodeManager {
    *   back on other ports. Once SSH answers, the agent is checked and, if it
    *   is dead, restarted, before the node takes work again (reviveAgent). It
    *   used to go 'ready' on a bare reconnect.
-   * - SSH does not come back: Vast is asked again. Stopped or gone: let go.
-   *   Running: given up on and destroyed. No answer: this computer's network
-   *   may be what is down, not the node, so the node stays 'unreachable',
-   *   counted as billing and sent nothing, and both are tried again. A
-   *   laptop offline for ten minutes used to come back to a fleet destroyed.
+   * - A round that fails, SSH not answering or the link going again under
+   *   the agent check (linkFailed), or another restart-agent holding the
+   *   node: Vast is asked again. Stopped or gone: let go. Running: another
+   *   round, until the budget is spent, and then given up on and destroyed.
+   *   No answer: this computer's network may be what is down, not the node,
+   *   so the node stays 'unreachable', counted as billing and sent nothing,
+   *   and both are tried again. A laptop offline for ten minutes used to come
+   *   back to a fleet destroyed, and one whose link dropped once more under
+   *   the agent check to a node destroyed.
+   * - The agent check's own verdict (the agent cannot be restarted, or
+   *   bringing it back ran past PROVISION_DEADLINE_MS): given up on.
    *
    * The chunks the node had are not given back until one of those settles
    * it (see nodeSilent).
@@ -3105,7 +3173,8 @@ export class NodeManager {
     node: ManagedNode,
     opts: { askVast?: boolean; why?: string }
   ): Promise<void> {
-    // 'unreachable', set by resumeNode or nodeSilent just now. See movedOn.
+    // 'unreachable', set by resumeNode, nodeSilent or restoreAgent just now.
+    // See movedOn.
     const held = node.state
     const instanceId = node.facts.instanceId
     let why = opts.why ?? node.snapshot.lastError ?? 'no answer over SSH'
@@ -3118,13 +3187,17 @@ export class NodeManager {
       }
       if (fate.kind === 'up') node.retargetTo(sshEndpoints(fate.inst))
     }
-    let ssh: SshConnection
-    // SSH gets RECONNECT_BUDGET_MS to answer again, counted afresh when Vast
-    // lists the instance on other ports or does not answer either.
+    // SSH gets RECONNECT_BUDGET_MS to answer again and the agent to be
+    // brought back, counted afresh when Vast lists the instance on other
+    // ports or does not answer either.
     let deadline = Date.now() + RECONNECT_BUDGET_MS
+    let graces = 0
     for (;;) {
+      // SSH answered this round: what fails after that failed under the
+      // agent check.
+      let answered = false
       try {
-        ssh = node.ssh ?? (await node.connectSsh())
+        const ssh = node.ssh ?? (await node.connectSsh())
         // Closed by destroyNode mid-connect, as in resumeNode: end the session
         // the connect opened anyway.
         if (node.movedOn(held)) {
@@ -3147,22 +3220,45 @@ export class NodeManager {
         if (node.movedOn(held)) return
         if (!r.stdout.includes('ok'))
           throw new Error(`no answer after reconnecting (exit ${r.code})`)
-        break
+        answered = true
+        lastContactByNode.set(node.id, Date.now())
+        node.takeDrops()
+        if (graces < ANSWERED_GRACE_MAX && deadline < Date.now() + RECONNECT_SLICE_MS) {
+          graces++
+          deadline = Date.now() + RECONNECT_SLICE_MS
+        }
+        const revival = await withDeadline(
+          this.reviveAgent(node, ssh),
+          PROVISION_DEADLINE_MS,
+          'bringing the agent back'
+        )
+        if (node.movedOn(held)) return
+        this.backInService(node, revival, why)
+        return
       } catch (e) {
         // Destroyed meanwhile: destroyNode closed the connection the
         // reconnect was retrying on, which is what ended it. The destroy is
         // not this node failing, and destroying the instance again here
         // would only join destroyNode's.
         if (node.movedOn(held) || this.shutDown) return
-        why = classify(e, { via: 'ssh' }).reason
+        why = failureReason(e)
+        const busy = e instanceof AgentBusyError
+        const unrevived = `SSH answers again, but the agent could not be brought back: ${why}`
+        // The agent's own answer, not the link's: it cannot be brought back.
+        if (answered && !busy && !linkFailed(e)) {
+          await this.giveUp(node, unrevived, { connected: true })
+          return
+        }
         // Another machine answers at the endpoint (waiting will not change
-        // that), or Vast running the instance while SSH stays down: given up
-        // on. Nothing else destroys a node that fails this way, since
-        // scale-down takes only idle nodes. Its connection is the one that
-        // just died, so it is closed first: an Octane stop over it would only
-        // wait out its budget before the destroy.
+        // that), or Vast running the instance while the rounds keep failing:
+        // given up on. Nothing else destroys a node that fails this way,
+        // since scale-down takes only idle nodes. A connection that just
+        // died is closed first: an Octane stop over it would only wait out
+        // its budget before the destroy.
         const abandon = (): Promise<void> =>
-          this.giveUp(node, `SSH did not come back: ${why}`, { connected: false })
+          this.giveUp(node, answered ? unrevived : `SSH did not come back: ${why}`, {
+            connected: busy
+          })
         if (e instanceof HostKeyMismatchError || instanceId == null) return abandon()
         const fate = await this.askVast(instanceId)
         if (node.movedOn(held) || this.shutDown) return
@@ -3190,24 +3286,6 @@ export class NodeManager {
         }
         return abandon()
       }
-    }
-    lastContactByNode.set(node.id, Date.now())
-    node.takeDrops()
-    try {
-      const revival = await withDeadline(
-        this.reviveAgent(node, ssh),
-        PROVISION_DEADLINE_MS,
-        'bringing the agent back'
-      )
-      if (node.movedOn(held)) return
-      this.backInService(node, revival, why)
-    } catch (e) {
-      if (node.movedOn(held) || this.shutDown) return
-      await this.giveUp(
-        node,
-        `SSH answers again, but the agent could not be brought back: ${classify(e, { via: 'ssh' }).reason}`,
-        { connected: true }
-      )
     }
   }
 

@@ -477,3 +477,171 @@ describe('1.7: liveness supervision', () => {
     expect(app.nodeManager.get(busy)!.snapshot.lastError).toMatch(/^no answer over SSH for \d+s: /)
   })
 })
+
+/**
+ * The link goes again, for `downMs`, the moment the node is asked `what`:
+ * a laptop's Wi-Fi flapping just after it wakes. Once.
+ */
+function dropUnder(machine: FakeMachine, what: RegExp, downMs: number): void {
+  machine.onExec(
+    what,
+    (_c, _m, mc) => {
+      mc.kill()
+      setTimeout(() => comeBack(mc), downMs)
+      return HANG
+    },
+    1
+  )
+}
+
+describe('1.7: a link that drops under the agent check costs a round, not the node', () => {
+  it('1.7: a node back from the network whose link drops again under agent-status keeps its render', async () => {
+    const { app, busy, jobId, chunkId, prov } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    dropOff(machine)
+    await w.until(() => app.nodeManager.get(busy)?.state === 'unreachable', 'unreachable')
+    await w.advance(30_000)
+    dropUnder(machine, /provision\.sh agent-status$/, 20_000)
+    comeBack(machine)
+
+    await w.until(() => app.nodeManager.get(busy)?.state === 'rendering', 'back in service', {
+      timeoutMs: 8 * MIN
+    })
+    // Asked again once it answered again, and kept: nothing restarted, the
+    // render and its chunk never left the node, nothing destroyed.
+    expect(machine.ran(/provision\.sh agent-status$/)).toHaveLength(2)
+    expect(prov.get(busy)!.statusCalls).toBe(1)
+    expect(prov.get(busy)!.restarts).toEqual([])
+    expect(prov.get(busy)!.killed).toEqual([])
+    expect(chunksOf(jobId)).toMatchObject([
+      { id: chunkId, node_id: busy, state: 'rendering', retries: 0, infra_retries: 0 }
+    ])
+    expect(w.vast.count('destroyInstance')).toBe(0)
+    expect(w.alerts('warn')).toEqual([])
+  })
+
+  it('1.7: a node back late in its reconnect budget survives a drop under the agent check', async () => {
+    const { app, busy } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    const instanceId = instanceOf(busy)
+    dropOff(machine)
+    await w.until(() => app.nodeManager.get(busy)?.state === 'unreachable', 'unreachable')
+    await w.advance(9 * MIN + 30_000, 5_000)
+    expect(app.nodeManager.get(busy)?.state).toBe('unreachable')
+    // Back just before the budget runs out, and gone again for a minute
+    // under the agent check, which ends past it.
+    dropUnder(machine, /provision\.sh agent-status$/, MIN)
+    comeBack(machine)
+
+    // Its chunk went back after ten silent minutes (the scheduler's own
+    // bound), so the node comes back to no work: 'ready', not destroyed.
+    await w.until(() => app.nodeManager.get(busy)?.state === 'ready', 'back in service', {
+      timeoutMs: 8 * MIN
+    })
+    expect(machine.ran(/provision\.sh agent-status$/)).toHaveLength(2)
+    expect(w.vast.count('destroyInstance')).toBe(0)
+    expect(w.vast.live()).toContain(instanceId)
+  })
+
+  it('1.7: a node back with its agent dead whose link drops under restart-agent is restarted on the next round', async () => {
+    const { app, busy, idle, jobId, chunkId, prov } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    await app.nodeManager.destroyNode(idle)
+    dropOff(machine)
+    await w.until(() => app.nodeManager.get(busy)?.state === 'unreachable', 'unreachable')
+    machine.agent.alive = false
+    dropUnder(machine, /provision\.sh restart-agent$/, 20_000)
+    comeBack(machine)
+    finishWhenAlive(machine)
+
+    await w.until(() => app.nodeManager.get(busy)?.state === 'ready', 'back in service', {
+      timeoutMs: 8 * MIN
+    })
+    expect(machine.ran(/provision\.sh restart-agent$/)).toHaveLength(2)
+    expect(prov.get(busy)!.restarts).toEqual([
+      { force: false, restarted: true, reason: `heartbeat stale (${DEAD_HEARTBEAT_S}s)` }
+    ])
+    expect(w.vast.count('destroyInstance')).toBe(1) // the idle node's
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 20 * MIN })
+    expect(chunksOf(jobId)).toMatchObject([
+      { id: chunkId, node_id: busy, retries: 0, infra_retries: 1 }
+    ])
+    expect(w.vast.live()).toEqual([instanceOf(busy)])
+  })
+
+  it('1.7: a dead agent whose check loses the link is restarted once the node answers again', async () => {
+    const { app, busy, idle, jobId, chunkId, prov } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    await app.nodeManager.destroyNode(idle)
+    finishWhenAlive(machine)
+    dropUnder(machine, /provision\.sh agent-status$/, 5_000)
+    machine.agent.alive = false
+
+    await w.until(() => prov.get(busy)!.restarts.length > 0, 'agent restarted', {
+      timeoutMs: 5 * MIN
+    })
+    expect(prov.get(busy)!.restarts).toEqual([
+      { force: false, restarted: true, reason: `heartbeat stale (${DEAD_HEARTBEAT_S}s)` }
+    ])
+    await w.until(() => app.nodeManager.get(busy)?.state === 'ready', 'back in service')
+    expect(states(busy).slice(-4)).toEqual(['rendering', 'provisioning', 'unreachable', 'ready'])
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 20 * MIN })
+    expect(chunksOf(jobId)).toMatchObject([
+      { id: chunkId, node_id: busy, retries: 0, infra_retries: 1 }
+    ])
+    expect(w.vast.count('destroyInstance')).toBe(1) // the idle node's
+    expect(w.alerts('warn').join('\n')).not.toMatch(/Destroying it/)
+  })
+
+  it('1.7: another restart-agent holding the node is waited out, not taken for a broken node', async () => {
+    const { app, busy, idle, jobId, prov } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    await app.nodeManager.destroyNode(idle)
+    finishWhenAlive(machine)
+    // provision.sh's answer when another restart-agent held its lock for 90 s.
+    machine.onExec(
+      /provision\.sh restart-agent$/,
+      {
+        code: 1,
+        stdout: '[provision] another restart-agent still running after 90s — nothing done\n'
+      },
+      2
+    )
+    machine.agent.alive = false
+
+    await w.until(() => prov.get(busy)!.restarts.length > 0, 'agent restarted', {
+      timeoutMs: 8 * MIN
+    })
+    await w.until(() => app.nodeManager.get(busy)?.state === 'ready', 'back in service')
+    expect(machine.ran(/provision\.sh restart-agent$/)).toHaveLength(3)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete', { timeoutMs: 20 * MIN })
+    expect(w.vast.count('destroyInstance')).toBe(1) // the idle node's
+    expect(w.alerts('warn').join('\n')).not.toMatch(/Destroying it/)
+  })
+
+  it('1.7: a link that drops under every agent check is given up on, bounded', async () => {
+    const { app, busy, jobId } = await renderingOnOne()
+    const machine = w.machineFor(busy)
+    dropOff(machine)
+    await w.until(() => app.nodeManager.get(busy)?.state === 'unreachable', 'unreachable')
+    machine.onExec(/provision\.sh agent-status$/, (_c, _m, mc) => {
+      mc.kill()
+      setTimeout(() => comeBack(mc), 5_000)
+      return HANG
+    })
+    comeBack(machine)
+    const backAt = Date.now()
+
+    await w.until(() => app.nodeManager.get(busy)?.state === 'destroyed', 'given up', {
+      timeoutMs: 30 * MIN,
+      stepMs: 5_000
+    })
+    // The ten-minute budget, and at most three two-minute graces for the
+    // agent check after a late reconnect.
+    expect(Date.now() - backAt).toBeLessThanOrEqual(20 * MIN)
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /SSH answers again, but the agent could not be brought back: .*connection closed under provision\.sh agent-status.*Destroying it\./
+    )
+    expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
+  })
+})
