@@ -27,6 +27,14 @@
  *   'session-end' fires the process may be ended at any moment, too soon for
  *   a DELETE that first waits on an SSH stop, a TLS handshake and a confirm,
  *   so that event is only the fallback for a query that never came.
+ * - Windows console closing (SIGHUP there). Windows ends the process about
+ *   5 to 10 s later, whatever it is doing (Node's docs). Nobody can answer
+ *   a dialog in that time, so it goes as a session end does.
+ * - Either way, once the process may be ended at any moment ('session-end',
+ *   the console closing), the destroys still waiting their DESTROY_STAGGER_MS
+ *   turn start sooner (`hurry`): each once the one before it has settled.
+ *   Staggered, only the first 2 to 4 DELETEs went out before Windows ended
+ *   the process (1.1 review). destroyFleet says why not all at once.
  * - Headless runs (VR_JOB_SPEC, VR_E2E_BLEND) never show a dialog.
  *   VR_QUIT_POLICY decides what happens on SIGINT, SIGTERM or SIGHUP, on a
  *   quit, on a Windows session end, and at the end of the campaign:
@@ -106,7 +114,8 @@ export const OCTANE_STOP_MS = 20_000
  * 429 says "threshold=3.0"), and vastClient retries a 429 inside the call,
  * backing off, for up to 30 s. Six DELETEs sent at once got through one by
  * one down that backoff, and the last were still refused when their budget
- * ran out, reported as maybe billing.
+ * ran out, reported as maybe billing. Not once the process may be ended at
+ * any moment (DestroyOptions.hurry).
  */
 export const DESTROY_STAGGER_MS = 3_000
 
@@ -428,6 +437,12 @@ export interface DestroyOptions {
   maxRounds?: number
   /** Gap between the start of one node's destroy and the next. Default DESTROY_STAGGER_MS. */
   staggerMs?: number
+  /**
+   * Aborted when the process may be ended at any moment: a destroy waiting
+   * its turn starts once the one before it has settled (see destroyFleet),
+   * and the next pass without its pause.
+   */
+  hurry?: AbortSignal
 }
 
 function defaultBudget(n: NodeSnapshot): number {
@@ -437,6 +452,36 @@ function defaultBudget(n: NodeSnapshot): number {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+/**
+ * `ms`, or less once `hurry` is aborted: no longer than until `previous` has
+ * settled, or not at all when there is none.
+ */
+function pause(
+  ms: number,
+  hurry: AbortSignal | undefined,
+  previous?: Promise<unknown>
+): Promise<void> {
+  if (!hurry) return sleep(ms)
+  return new Promise((resolve) => {
+    let settled = previous === undefined
+    const done = (): void => {
+      clearTimeout(timer)
+      hurry.removeEventListener('abort', onHurry)
+      resolve()
+    }
+    const onHurry = (): void => {
+      if (settled && hurry.aborted) done()
+    }
+    const timer = setTimeout(done, ms)
+    hurry.addEventListener('abort', onHurry)
+    void previous?.then(
+      () => ((settled = true), onHurry()),
+      () => ((settled = true), onHurry())
+    )
+    if (hurry.aborted) onHurry()
+  })
 }
 
 /** Whether `p` settled within `ms`. A destroy that loses the race carries on regardless. */
@@ -529,6 +574,14 @@ async function settleNode(
  * its own budget from its own start. Returns what is still billing, with the
  * reason where a destroy was tried.
  *
+ * Once `hurry` is aborted, the next destroy starts as soon as the last one
+ * has settled, or its 3 s are up, whichever is first. Not all at once:
+ * under the per-endpoint limit Vast documents, DELETEs sent together are
+ * refused but one, and vastClient retries the rest 2, 6 and 14 s later, so
+ * all-at-once got 2 of 6 through in 10 s where one every 3 s gets 4
+ * (lifecycle.quit.test.ts, against vastRateLimit). Should the limit turn
+ * out to be per instance, each goes the moment the one before it is done.
+ *
  * The answer is only as fresh as the last await. A caller that exits on an
  * empty answer must look at the fleet again in the same synchronous run as
  * the exit, as installLifecycle does.
@@ -549,15 +602,14 @@ export async function destroyFleet(
       .sort((a, b) => (b.dphTotal ?? 0) - (a.dphTotal ?? 0))
     if (fresh.length === 0) break
     for (const n of fresh) reasons.set(n.id, null)
-    const results = await Promise.allSettled(
-      fresh.map(async (n, i) => {
-        if (i > 0) await sleep(i * staggerMs)
-        return settleNode(fleet, n.id, budget(n), pollMs)
-      })
-    )
-    results.forEach((r, i) => {
-      reasons.set(fresh[i].id, r.status === 'fulfilled' ? r.value : String(r.reason))
-    })
+    const settling: Array<Promise<string | null>> = []
+    for (const n of fresh) {
+      const previous = settling.at(-1)
+      if (previous) await pause(staggerMs, opts.hurry, previous)
+      settling.push(settleNode(fleet, n.id, budget(n), pollMs).catch((e: unknown) => String(e)))
+    }
+    const results = await Promise.all(settling)
+    results.forEach((reason, i) => reasons.set(fresh[i].id, reason))
   }
   return failuresOf(fleet.list(), reasons)
 }
@@ -629,6 +681,8 @@ export interface LifecycleDeps<W = unknown> {
   signals: { on(signal: Signal, listener: () => void): unknown }
   /** A line for a script's stderr, written before the process exits. */
   stderr(text: string): void
+  /** process.platform, by default. On 'win32' a SIGHUP is the console closing. */
+  platform?: NodeJS.Platform
   /** Test knobs for destroyFleet. */
   destroy?: DestroyOptions
 }
@@ -665,6 +719,11 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
   // just before it changed.
   const destroying = (): boolean => phase === 'destroying'
   let asleep: Asleep | null = null
+  // Aborted once the process may be ended at any moment (see the header).
+  const hurry = new AbortController()
+  const destroyOptions: DestroyOptions = { ...deps.destroy, hurry: hurry.signal }
+  const consoleClosing = (signal: Signal): boolean =>
+    signal === 'SIGHUP' && (deps.platform ?? process.platform) === 'win32'
 
   const contained = (what: string, fn: () => void): void => {
     try {
@@ -712,7 +771,7 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
       })
     }
     for (;;) {
-      const tried = await destroyFleet(fleet, deps.destroy)
+      const tried = await destroyFleet(fleet, destroyOptions)
       if (phase !== 'destroying') return
       // In the same synchronous run as the exit: see destroyFleet.
       const still = fleet.list().filter(holdsInstance)
@@ -766,7 +825,7 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
     say(`[vast-render] ${why}: destroying ${plural(billing.nodes.length, 'node')} before exiting`)
     fleet.stopScheduling()
     for (let attempt = 1; ; attempt++) {
-      const tried = await destroyFleet(fleet, deps.destroy)
+      const tried = await destroyFleet(fleet, destroyOptions)
       if (phase !== 'destroying') return
       // In the same synchronous run as the exit: see destroyFleet.
       if (!fleet.list().some(holdsInstance)) return finish(code)
@@ -781,7 +840,7 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
         )
         return finish(EXIT_BILLING_LEFT)
       }
-      await sleep(HEADLESS_RETRY_PAUSE_MS)
+      await pause(HEADLESS_RETRY_PAUSE_MS, hurry.signal)
       if (phase !== 'destroying') return
     }
   }
@@ -856,6 +915,7 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
     // Only for a session end that was never asked about, or went ahead
     // anyway; after a held one the destroy is already under way.
     window.on('session-end', () => {
+      hurry.abort()
       if (phase === 'destroying' || phase === 'exiting') return
       void stopUnattended('session end', sessionPolicy(), 1).catch(fail('session end'))
     })
@@ -897,6 +957,7 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
     }
     const onSignal = (signal: Signal) => (): void => {
       if (phase === 'exiting') return
+      if (consoleClosing(signal)) hurry.abort()
       if (phase === 'idle') {
         // Synchronous up to its first await: 'destroying' once it returns
         // unless there was nothing to wait for and it has exited.
@@ -937,6 +998,16 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
     // while Destroy all runs, change nothing.
     for (const signal of SIGNALS) {
       deps.signals.on(signal, () => {
+        if (phase === 'exiting') return
+        if (consoleClosing(signal)) {
+          // Windows ends the process 5 to 10 s from now: no time for the
+          // dialog to be answered. As a session end: the fleet destroyed,
+          // taking over from a dialog that is up, every DELETE at once.
+          hurry.abort()
+          if (phase === 'destroying') return
+          void stopUnattended('the console window closed', sessionPolicy(), 1).catch(fail(signal))
+          return
+        }
         if (phase !== 'idle') return
         say(`[lifecycle] ${signal}: quitting`)
         void askAndQuit().catch(fail(signal))

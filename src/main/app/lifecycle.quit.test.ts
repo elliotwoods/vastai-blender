@@ -73,7 +73,7 @@ interface Rig {
  */
 async function rig(
   engine: App,
-  opts: { headless?: QuitPolicy; hooks?: boolean } = {}
+  opts: { headless?: QuitPolicy; hooks?: boolean; platform?: NodeJS.Platform } = {}
 ): Promise<Rig> {
   const { fleetPort, installLifecycle } = await import('./lifecycle')
   // Every destroy loads octaneLicense lazily (ensureInstanceGone's Octane
@@ -116,7 +116,9 @@ async function rig(
     closeDb: () => r.closedDb++,
     headless: opts.headless ? { policy: opts.headless } : null,
     signals: r.signals,
-    stderr: (text) => r.stderr.push(text)
+    stderr: (text) => r.stderr.push(text),
+    // Not this machine's: a SIGHUP means a console closing only on Windows.
+    platform: opts.platform ?? 'darwin'
   })
   return r
 }
@@ -128,6 +130,17 @@ function instanceOf(nodeId: string): number {
 
 function nodeState(nodeId: string): string | undefined {
   return w.get<{ state: string }>('SELECT state FROM nodes WHERE id = ?', nodeId)?.state
+}
+
+/** `count` nodes up and billing, $0.40/hr each. */
+async function fleetOf(
+  count: number
+): Promise<{ engine: App; ids: string[]; instances: number[] }> {
+  w = await setup({ settings: { maxActiveNodes: count, spendCapPerHour: 10 } })
+  const engine = await w.boot()
+  const ids: string[] = []
+  for (let i = 0; i < count; i++) ids.push(await w.readyNode(engine))
+  return { engine, ids, instances: ids.map(instanceOf) }
 }
 
 /** Two nodes up and billing, $0.40/hr each. */
@@ -886,6 +899,81 @@ describe('Windows session end (plan 1.1)', () => {
     answer.resolve(LEAVE)
     await w.advance(1_000)
     expect(r.app.exits).toHaveLength(1)
+  })
+
+  it('1.1: a session end nobody asked about: each destroy starts once the one before it is done, not 3 s apart', async () => {
+    // 'session-end': the process may be ended at any moment.
+    const { engine, instances } = await fleetOf(6)
+    const r = await rig(engine)
+    const win = openWindow(r)
+
+    win.emit('session-end')
+    await w.advance(2_000, 100)
+
+    expect(w.vast.count('destroyInstance')).toBe(6)
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+  })
+})
+
+describe('Windows: the console closing (SIGHUP) ends the process 5 to 10 s later (plan 1.1)', () => {
+  it("1.1: a headless run's console closed: each destroy starts once the one before it is done, not 3 s apart", async () => {
+    // 1.1 review: Windows ends the process about 5 to 10 s after the
+    // console closes, and one DELETE every 3 s sent only the first 2 to 4.
+    const { engine, instances } = await fleetOf(6)
+    const r = await rig(engine, { headless: 'destroy', platform: 'win32' })
+
+    r.signals.emit('SIGHUP')
+    await w.advance(2_000, 100)
+
+    expect(w.vast.count('destroyInstance')).toBe(6)
+    await w.until(() => r.app.exits.length > 0, 'the run to exit')
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+  })
+
+  it("under Vast's 3 s DELETE limit: no fewer through in 10 s than one every 3 s", async () => {
+    // Why not every DELETE at once: Vast takes one and refuses the rest,
+    // and vastClient retries those 2, 6 and 14 s later. All at once got 2
+    // of these 6 through in 10 s.
+    const { engine } = await fleetOf(6)
+    const client = await import('../vast/vastClient')
+    rateLimitDestroys(w.vast, client, (m, status) => new client.VastError(m, status))
+    const r = await rig(engine, { headless: 'destroy', platform: 'win32' })
+
+    r.signals.emit('SIGHUP')
+    await w.advance(10_000, 100)
+
+    expect(w.vast.count('destroyInstance')).toBeGreaterThanOrEqual(4)
+  })
+
+  it("a person's app: no dialog can be answered in time, so it goes as a session end, taking over the one that is up", async () => {
+    const { engine, instances } = await fleetOf(3)
+    const r = await rig(engine, { platform: 'win32' })
+    const answer = deferred<number>()
+    r.answers.push(answer.promise)
+    r.app.quit()
+    await w.advance(1_000)
+
+    r.signals.emit('SIGHUP')
+    await w.advance(2_000, 100)
+
+    expect(w.vast.count('destroyInstance')).toBe(3)
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+    expect(r.dialogs).toHaveLength(1)
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+    answer.resolve(LEAVE)
+    await w.advance(1_000)
+    expect(r.app.exits).toHaveLength(1)
+  })
+
+  it('elsewhere a SIGHUP is a terminal, and the 3 s turns stand', async () => {
+    const { engine } = await fleetOf(3)
+    const r = await rig(engine, { headless: 'destroy', platform: 'linux' })
+
+    r.signals.emit('SIGHUP')
+    await w.advance(2_000, 100)
+
+    expect(w.vast.count('destroyInstance')).toBe(1)
   })
 })
 
