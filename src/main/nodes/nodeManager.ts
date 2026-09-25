@@ -48,6 +48,7 @@ import type {
   NodeSnapshot,
   NodeState,
   NodeWorkRef,
+  OctaneState,
   Offer,
   RequestNodeOptions,
   SettingsPublic,
@@ -75,6 +76,13 @@ import {
   type AgentRestart
 } from './provisioner'
 import { prune as pruneMetrics, record as recordMetrics, runsPerGpu } from './metricsHistory'
+import {
+  asOctaneState,
+  forgetOctaneNode,
+  onOctaneState,
+  refreshOctaneState,
+  stopOctaneServer
+} from '../octane/octaneLicense'
 
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
 
@@ -195,6 +203,12 @@ function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T>
  */
 const PROBE_EVERY_MS = 15_000
 const PROBE_TIMEOUT_MS = 10_000
+
+/**
+ * Plan 1.18: how often the licence poll reads the Octane state of a node in
+ * the fleet that has run Octane (pollOctane).
+ */
+const OCTANE_POLL_MS = 30_000
 
 /**
  * A probe still out after this long gets a bare liveness check beside it
@@ -919,8 +933,11 @@ function rowToSnapshot(r: NodeRow): NodeSnapshot {
     slotsInUse: slots.inUse,
     slotTarget: slots.target,
     eeveeCapable: r.eevee_capable === null ? null : r.eevee_capable === 1,
-    octaneReady: r.octane_ready === 1,
-    octaneNeedsManualLogin: false,
+    // octane_state alone (plan 1.18): octane_ready was set by the log check
+    // #85 found read failures as licences, and an older build may still.
+    octaneReady: r.octane_state === 'licensed',
+    octaneNeedsManualLogin: r.octane_state === 'needsLogin',
+    octaneState: asOctaneState(r.octane_state),
     blenderVersions: JSON.parse(r.blender_versions) as string[],
     lastError: r.last_error,
     metrics: metricsByNode.get(r.id) ?? null,
@@ -961,6 +978,11 @@ class ManagedNode {
   /** What the billing predicates read (shared/nodeState.ts), without a whole snapshot. */
   get facts(): NodeCostFacts {
     return rowFacts(this.row)
+  }
+
+  /** Where Octane is on this node (plan 1.18): nodes.octane_state. */
+  get octaneState(): OctaneState {
+    return asOctaneState(this.row.octane_state)
   }
 
   /**
@@ -1179,6 +1201,10 @@ export class NodeManager {
   private strikes = new Map<string, Strikes>()
   /** Nodes with a probe in flight: the next round leaves them to it. */
   private probing = new Set<string>()
+  /** Nodes whose Octane state is being read now, and when each was last read (plan 1.18). */
+  private octaneReading = new Set<string>()
+  private octaneReadAt = new Map<string, number>()
+  private octaneUnsubscribe: (() => void) | null = null
   /** Nodes whose probes time out while the node answers, since it was last logged. */
   private slowProbes = new Set<string>()
   /** Each node's stale heartbeats seen in a row. */
@@ -1207,6 +1233,9 @@ export class NodeManager {
 
   init(): void {
     this.hold = loadAccountHold()
+    // A node's Octane state changes outside this module (the scheduler's
+    // setupOctane, the licence poll): its snapshot goes out with it.
+    this.octaneUnsubscribe = onOctaneState((id) => this.nodes.get(id)?.emitChanged())
     const rows = getDb().prepare('SELECT * FROM nodes').all() as NodeRow[]
     for (const r of rows) {
       const facts = rowFacts(r)
@@ -1630,6 +1659,7 @@ export class NodeManager {
     if (this.costTimer) clearInterval(this.costTimer)
     if (this.metricsTimer) clearInterval(this.metricsTimer)
     if (this.destroyTimer) clearInterval(this.destroyTimer)
+    this.octaneUnsubscribe?.()
     for (const n of this.nodes.values()) n.retire()
   }
 
@@ -1655,6 +1685,27 @@ export class NodeManager {
       if (this.probing.has(node.id)) continue
       this.probing.add(node.id)
       void this.probe(node, ssh).finally(() => this.probing.delete(node.id))
+    }
+    this.pollOctane()
+  }
+
+  /**
+   * The licence poll (plan 1.18): every OCTANE_POLL_MS, read the Octane
+   * state of each node in the fleet that has run Octane. A sign-in by hand
+   * over VNC moves a node from needsLogin to licensed here, and Octane
+   * chunks can go to it; nothing else would notice, since the sign-in
+   * happens on the node. A server that died reads as none, so the next
+   * Octane chunk sets it up again instead of rendering unlicensed.
+   */
+  private pollOctane(now = Date.now()): void {
+    for (const node of this.nodes.values()) {
+      const ssh = node.ssh
+      if (!ssh || !SUPERVISED.has(node.state) || this.octaneReading.has(node.id)) continue
+      if (now - (this.octaneReadAt.get(node.id) ?? 0) < OCTANE_POLL_MS) continue
+      if (node.octaneState === 'none') continue
+      this.octaneReading.add(node.id)
+      this.octaneReadAt.set(node.id, now)
+      void refreshOctaneState(ssh, node.id).finally(() => this.octaneReading.delete(node.id))
     }
   }
 
@@ -2937,8 +2988,7 @@ export class NodeManager {
   private async stopOctane(node: ManagedNode): Promise<void> {
     const ssh = node.ssh
     if (!ssh || !node.sshEverAnswered) return
-    const { closeVncTunnel, stopOctaneServer } = await import('../octane/octaneLicense')
-    closeVncTunnel(node.id)
+    forgetOctaneNode(node.id)
     await stopOctaneServer(ssh, { timeoutMs: OCTANE_STOP_BUDGET_MS, onlyIfStarted: true })
   }
 
