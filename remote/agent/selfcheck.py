@@ -868,11 +868,51 @@ def marker(printed, tag):
 NS = types.SimpleNamespace
 
 
-def scene_bpy(tmp, **data):
+class ID(types.SimpleNamespace):
+    """A stand-in datablock. Hashed and compared by identity, as bpy compares
+    two handles on one ID by its pointer. `uses` lists the datablocks it
+    refers to, which is what the stand-in bpy.data.user_map() inverts."""
+
+    __hash__ = object.__hash__
+
+    def __eq__(self, other):
+        return self is other
+
+
+def datablock(id_type, name, uses=(), **kw):
+    fields = dict(id_type=id_type, name=name, uses=list(uses), users=1, use_fake_user=False,
+                  library=None, is_missing=False, packed_file=None)
+    fields.update(kw)
+    return ID(**fields)
+
+
+def obj(name, uses=(), type="MESH", modifiers=(), **kw):
+    """An object that renders unless hide_render says otherwise."""
+    fields = dict(type=type, hide_render=False, modifiers=list(modifiers), users_collection=[])
+    fields.update(kw)
+    return datablock("OBJECT", name, uses, **fields)
+
+
+def collection(name, *objects, **kw):
+    coll = datablock("COLLECTION", name, objects, objects=list(objects), hide_render=False, **kw)
+    for o in objects:
+        o.users_collection.append(coll)
+    return coll
+
+
+def drawn(*ids, name="Cube", **kw):
+    """A mesh that renders (unless `kw` hides it), with a material that uses `ids`."""
+    return obj(name, [datablock("MATERIAL", name + " material", ids)], **kw)
+
+
+def scene_bpy(tmp, scene_objects=(), **data):
     """A stand-in bpy holding one scene, saved as <tmp>/job.blend as on a node.
 
-    `data` fills bpy.data collections (images=[...], libraries=[...], ...);
-    the scene is bpy.context.scene, its render bpy.context.scene.render.
+    `scene_objects` are the scene's objects (and bpy.data.objects, unless
+    `data` says otherwise); `data` fills bpy.data collections (images=[...],
+    libraries=[...], ...); the scene is bpy.context.scene, its render
+    bpy.context.scene.render. bpy.data.user_map() inverts the `uses` of every
+    datablock it can reach from those, as Blender's does its ID pointers.
     """
     blend = os.path.join(tmp, "job.blend")
 
@@ -882,11 +922,35 @@ def scene_bpy(tmp, **data):
             return os.path.join(base, path[2:])
         return path
 
-    render = NS(engine="CYCLES", is_movie_format=False,
+    render = NS(engine="CYCLES", is_movie_format=False, use_compositing=True,
                 image_settings=NS(file_format="OPEN_EXR"))
-    scene = NS(name="Scene", render=render, frame_start=1, objects=[], rigidbody_world=None)
+    scene = datablock("SCENE", "Scene", render=render, frame_start=1,
+                      objects=list(scene_objects), rigidbody_world=None, world=None,
+                      use_nodes=False, node_tree=None)
+    data.setdefault("objects", list(scene_objects))
     bpy = types.ModuleType("bpy")
-    bpy.data = NS(filepath=blend, **data)
+
+    def user_map():
+        todo = [scene, scene.world, getattr(scene, "compositing_node_group", None)]
+        todo += list(scene.objects)
+        for value in data.values():
+            try:
+                todo += list(value)
+            except Exception:  # noqa: BLE001 — a collection a case broke on purpose
+                pass
+        found = {}
+        while todo:
+            idb = todo.pop()
+            if isinstance(idb, ID) and idb not in found:
+                found[idb] = set()
+                todo += idb.uses
+        for idb in list(found):
+            for dep in idb.uses:
+                if isinstance(dep, ID):
+                    found[dep].add(idb)
+        return found
+
+    bpy.data = NS(filepath=blend, user_map=user_map, **data)
     bpy.context = NS(scene=scene)
     bpy.path = NS(abspath=abspath)
     bpy.utils = NS(blend_paths=lambda **kw: [])
@@ -895,10 +959,9 @@ def scene_bpy(tmp, **data):
 
 
 def image(name, path, users=1, **kw):
-    fields = dict(name=name, filepath=path, users=users, use_fake_user=False, source="FILE",
-                  type="IMAGE", packed_file=None, library=None, tiles=[])
+    fields = dict(filepath=path, users=users, source="FILE", type="IMAGE", tiles=[])
     fields.update(kw)
-    return NS(**fields)
+    return datablock("IMAGE", name, **fields)
 
 
 def cache(**kw):
@@ -909,16 +972,16 @@ def cache(**kw):
 
 
 def cloth(name="Flag", pc=None, **kw):
-    fields = dict(name=name, hide_render=False, library=None,
-                  modifiers=[NS(type="CLOTH", show_render=True, point_cache=pc or cache())])
-    fields.update(kw)
-    return NS(**fields)
+    return obj(name, modifiers=[NS(type="CLOTH", show_render=True, point_cache=pc or cache())],
+               **kw)
 
 
-def layer(name, children=(), exclude=False, hide_render=False):
-    """A view layer's LayerCollection over a collection called `name`."""
-    return NS(collection=NS(name=name, hide_render=hide_render), exclude=exclude,
-              children=list(children))
+def layer(coll, children=(), exclude=False, hide_render=False):
+    """A view layer's LayerCollection over `coll`, a collection or its name."""
+    if isinstance(coll, str):
+        coll = collection(coll)
+    coll.hide_render = hide_render
+    return NS(collection=coll, exclude=exclude, children=list(children))
 
 
 def preflight(tmp, bpy, **args):
@@ -940,35 +1003,39 @@ def test_preflight_files():
         clean = [
             image("packed", "//gone/a.png", packed_file=NS(size=1)),
             image("on disk", "//tex/ok.png"),
-            image("fake user only", "//gone/b.png", users=1, use_fake_user=True),
             image("generated", "", source="GENERATED"),
             image("render result", "", type="RENDER_RESULT"),
         ]
-        err, report = preflight(tmp, scene_bpy(tmp, images=clean))
+        fake = image("fake user only", "//gone/b.png", users=1, use_fake_user=True)
+        err, report = preflight(tmp, scene_bpy(tmp, [drawn(*clean)], images=clean + [fake]))
         check("preflight: packed, present and unused files pass",
-              err is None and report is not None and report["ok"] is True)
+              err is None and report is not None and report["ok"] is True
+              and report["warnings"] == [])
 
-        err, report = preflight(tmp, scene_bpy(tmp, images=clean + [
-            image("wood", "//tex/wood.png"),
-            image("udim", "//tex/udim.<UDIM>.png", source="TILED",
-                  tiles=[NS(number=1001), NS(number=1002)]),
-        ]))
+        wood = image("wood", "//tex/wood.png")
+        udim = image("udim", "//tex/udim.<UDIM>.png", source="TILED",
+                     tiles=[NS(number=1001), NS(number=1002)])
+        err, report = preflight(tmp, scene_bpy(tmp, [drawn(*clean, wood, udim)],
+                                               images=clean + [wood, udim]))
         check("preflight: a missing texture refuses the render before a frame",
               isinstance(err, RuntimeError) and str(err).startswith("scene preflight failed: ")
               and report is not None and report["ok"] is False)
         check("preflight: every missing file is named, each UDIM tile on its own",
-              [(m["name"], m["path"]) for m in report["missing"]]
-              == [("wood", "//tex/wood.png"), ("udim", "//tex/udim.1002.png")]
-              and "image 'wood' (//tex/wood.png)" in report["summary"])
+              [(m["name"], m["path"], m["packable"]) for m in report["missing"]]
+              == [("wood", "//tex/wood.png", True), ("udim", "//tex/udim.1002.png", True)]
+              and "not packed into the .blend and not on the node: image 'wood' (//tex/wood.png)"
+              in report["summary"])
 
-        lib = NS(name="chars.blend", filepath="//libs/chars.blend", packed_file=None, library=None)
-        other = NS(name="props.blend", filepath="//tex/ok.png", packed_file=None, library=None)
-        objects = [NS(name="Hero", is_missing=True, users=2, use_fake_user=False, library=lib),
-                   NS(name="Chair", is_missing=True, users=1, use_fake_user=False, library=other)]
-        err, report = preflight(tmp, scene_bpy(tmp, libraries=[lib, other], objects=objects))
+        lib = datablock("LIBRARY", "chars.blend", filepath="//libs/chars.blend")
+        other = datablock("LIBRARY", "props.blend", filepath="//tex/ok.png")
+        hero = obj("Hero", is_missing=True, users=2, library=lib)
+        chair = obj("Chair", is_missing=True, library=other)
+        err, report = preflight(tmp, scene_bpy(tmp, [hero, chair], libraries=[lib, other]))
         check("preflight: a missing library, and data missing from one that is there",
               err is not None and [(m["kind"], m["name"]) for m in report["missing"]]
-              == [("library", "chars.blend"), ("linked data", "Chair")])
+              == [("library", "chars.blend"), ("linked data", "Chair")]
+              and "linked data missing from its library: linked data 'Chair'"
+              in report["summary"])
 
         bpy = scene_bpy(tmp)
         bpy.context.scene.render.is_movie_format = True
@@ -977,8 +1044,7 @@ def test_preflight_files():
         check("preflight: a movie output is refused (#249)",
               err is not None and "movie (FFMPEG)" in report["summary"])
 
-        err, report = preflight(tmp, scene_bpy(tmp, images=[image("wood", "//tex/wood.png")]),
-                                mode="warn")
+        err, report = preflight(tmp, scene_bpy(tmp, [drawn(wood)], images=[wood]), mode="warn")
         check("preflight: warn mode reports without refusing",
               err is None and report["ok"] is False)
 
@@ -996,16 +1062,53 @@ def test_preflight_files():
               and not any("####" in w for w in report["warnings"]))
 
 
+def broken_user_map():
+    raise RuntimeError("user_map broke")
+
+
 def test_preflight_simulations():
     """1.16 / #247: an unbaked simulation steps only frame by frame from its
     start. Every chunk but the first, and a chunk that skips frames already on
     disk, starts it cold and renders it wrong."""
     with tempfile.TemporaryDirectory() as tmp:
         def scene(*objects, **scene_kw):
-            bpy = scene_bpy(tmp)
-            bpy.context.scene.objects = list(objects)
+            bpy = scene_bpy(tmp, objects)
             for k, v in scene_kw.items():
                 setattr(bpy.context.scene, k, v)
+            return bpy
+
+        def layered(objects, *children):
+            """A scene whose view layer holds `children` under its own collection."""
+            return scene(*objects, view_layers=[NS(use=True, layer_collection=layer(
+                "Scene Collection", children))])
+
+        def in_collections(home):
+            """A cloth in `home` of Set and WIP, whose WIP is disabled for renders."""
+            flag = cloth()
+            wip = collection("WIP", *([flag] if home == "WIP" else []))
+            set_ = collection("Set", *([flag] if home == "Set" else []))
+            return layered([flag], layer(set_), layer(wip, hide_render=True))
+
+        def excluded(instanced):
+            flag = cloth()
+            wip = collection("WIP", flag)
+            empties = [obj("Flags", [wip], type="EMPTY", instance_collection=wip)] if instanced else []
+            return layered([flag] + empties, layer(collection("Set", *empties)),
+                           layer(wip, exclude=True))
+
+        def surface_deform():
+            proxy = cloth("Proxy", hide_render=True)
+            shirt = obj("Shirt", [proxy], modifiers=[
+                NS(type="SURFACE_DEFORM", show_render=True, target=proxy)])
+            return scene(shirt, proxy)
+
+        def instanced_from_outside():
+            props = collection("Props", cloth())
+            return scene(obj("Props", [props], type="EMPTY", instance_collection=props))
+
+        def untraced():
+            bpy = scene(cloth(hide_render=True))
+            bpy.data.user_map = broken_user_map
             return bpy
 
         cases = [
@@ -1023,30 +1126,29 @@ def test_preflight_simulations():
              {"jobChunks": 3}, True),
             ("baked to disk, one chunk", scene(cloth(pc=cache(is_baked=True, use_disk_cache=True))),
              {"jobChunks": 1}, False),
-            ("hidden from the render", scene(cloth(hide_render=True)), {"jobChunks": 3}, True),
-            ("in a collection disabled for renders", scene(
-                cloth(users_collection=[NS(name="WIP")]),
-                view_layers=[NS(use=True, layer_collection=layer("Scene Collection", [
-                    layer("Set"), layer("WIP", hide_render=True)]))]),
+            ("hidden, and nothing that renders uses it", scene(cloth(hide_render=True)),
              {"jobChunks": 3}, True),
-            ("in a collection the view layer excludes", scene(
-                cloth(users_collection=[NS(name="WIP")]),
-                view_layers=[NS(use=True, layer_collection=layer("Scene Collection", [
-                    layer("WIP", exclude=True)]))]),
-             {"jobChunks": 3}, True),
-            ("in a collection that renders", scene(
-                cloth(users_collection=[NS(name="Set")]),
-                view_layers=[NS(use=True, layer_collection=layer("Scene Collection", [
-                    layer("Set"), layer("WIP", hide_render=True)]))]),
+            # Review of 1.16: what renders pulls in what it depends on, hidden
+            # or excluded, and that simulation starts cold all the same.
+            ("hidden, but a mesh that renders follows it through Surface Deform",
+             surface_deform(), {"jobChunks": 3}, False),
+            ("in a collection disabled for renders", in_collections("WIP"), {"jobChunks": 3}, True),
+            ("in a collection the view layer excludes", excluded(False), {"jobChunks": 3}, True),
+            ("in an excluded collection an empty that renders instances", excluded(True),
              {"jobChunks": 3}, False),
-            ("hair without dynamics", scene(NS(name="Fur", hide_render=False, modifiers=[
+            ("in a collection outside the scene that an empty instances",
+             instanced_from_outside(), {"jobChunks": 3}, False),
+            ("hidden, when bpy cannot say what the render uses", untraced(),
+             {"jobChunks": 3}, False),
+            ("in a collection that renders", in_collections("Set"), {"jobChunks": 3}, False),
+            ("hair without dynamics", scene(obj("Fur", modifiers=[
                 NS(type="PARTICLE_SYSTEM", show_render=True, particle_system=NS(
                     settings=NS(type="HAIR", physics_type="NEWTON"), use_hair_dynamics=False,
                     point_cache=cache()))])), {"jobChunks": 3}, True),
             ("rigid body world", scene(rigidbody_world=NS(
                 enabled=True, collection=NS(objects=[1]), point_cache=cache())),
              {"jobChunks": 3}, False),
-            ("fluid bake on disk", scene(NS(name="Pool", hide_render=False, modifiers=[
+            ("fluid bake on disk", scene(obj("Pool", modifiers=[
                 NS(type="FLUID", show_render=True, fluid_type="DOMAIN", domain_settings=NS(
                     cache_type="ALL", has_cache_baked_any=True, cache_frame_start=1,
                     cache_directory="//cache_fluid"))])), {"jobChunks": 1}, False),
@@ -1055,6 +1157,103 @@ def test_preflight_simulations():
             err, report = preflight(tmp, bpy, **args)
             check(f"preflight sim: {label} -> {'renders' if ok else 'refused'}",
                   report is not None and report["ok"] is ok and (err is None) is ok)
+
+
+def test_preflight_reads_only_what_renders():
+    """Review of 1.16: a file counted as needed because anything used it, so a
+    scene that renders right was refused, non-retryably, over a file nothing it
+    draws reads: a reference image, a camera's background, a brush's texture,
+    the footage a camera solve was tracked from, a hidden object's cache."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def refused(label, bpy, ok=False, **args):
+            err, report = preflight(tmp, bpy, **args)
+            passed = report is not None and report["ok"] is ok and (err is None) is ok
+            if ok:
+                # Not silent either: the artist may still want the file.
+                passed = passed and any("nothing the render draws uses it" in w
+                                        for w in report["warnings"])
+            check(f"preflight reads: {label} -> {'renders' if ok else 'refused'}", passed)
+            return report
+
+        ref = image("reference", "//gone/ref.png")
+        refused("an empty's reference image", scene_bpy(
+            tmp, [obj("Ref", [ref], type="EMPTY", data=ref)], images=[ref]), ok=True)
+        bg = image("background", "//gone/bg.png")
+        camera = obj("Camera", [datablock("CAMERA", "Camera", [bg])], type="CAMERA")
+        refused("a camera's background image", scene_bpy(tmp, [camera], images=[bg]), ok=True)
+        stroke = image("stroke", "//gone/stroke.png")
+        brush = datablock("BRUSH", "Draw", [datablock("TEXTURE", "Stroke", [stroke])])
+        refused("a brush's texture", scene_bpy(tmp, images=[stroke], brushes=[brush]), ok=True)
+        wood = image("wood", "//gone/wood.png")
+        refused("a hidden object's material", scene_bpy(
+            tmp, [drawn(wood, name="Crate", hide_render=True)], images=[wood]), ok=True)
+        refused("a displace texture on a mesh that renders", scene_bpy(
+            tmp, [obj("Ground", [datablock("TEXTURE", "Noise", [wood])])], images=[wood]))
+
+        # A camera solve reads the tracking data saved in the .blend, not the
+        # footage, and a movie clip cannot be packed at all.
+        plate = datablock("MOVIECLIP", "Plate", filepath="//footage/plate.mov", users=2)
+        solved = obj("Camera", [datablock("CAMERA", "Camera", [plate]), plate], type="CAMERA")
+        bpy = scene_bpy(tmp, [solved], movieclips=[plate])
+        bpy.context.scene.active_clip = plate
+        bpy.context.scene.uses.append(plate)
+        refused("a camera solve's footage", bpy, ok=True)
+
+        def composited(on):
+            bpy = scene_bpy(tmp, [drawn()], movieclips=[plate])
+            bpy.context.scene.use_nodes = True
+            bpy.context.scene.node_tree = NS(nodes=[
+                NS(bl_idname="CompositorNodeRLayers", scene=bpy.context.scene),
+                NS(bl_idname="CompositorNodeMovieClip", clip=plate)])
+            bpy.context.scene.render.use_compositing = on
+            return bpy
+
+        report = refused("footage the compositor reads", composited(True))
+        check("preflight reads: a clip it cannot pack is not called unpacked",
+              report is not None and [m["packable"] for m in report["missing"]] == [False]
+              and "a .blend cannot pack them: movie clip 'Plate'" in report["summary"]
+              and "not packed into" not in report["summary"])
+        refused("footage in a compositor that is off", composited(False), ok=True)
+        bpy = scene_bpy(tmp, [drawn()], movieclips=[plate])
+        bpy.context.scene.compositing_node_group = datablock(
+            "NODETREE", "Compositor", [plate], nodes=[NS(bl_idname="CompositorNodeMovieClip",
+                                                          clip=plate)])
+        refused("footage the 5.0 compositor's node group reads", bpy)
+
+        abc = datablock("CACHEFILE", "sim.abc", filepath="//cache/sim.abc")
+        refused("an Alembic cache only a hidden object reads", scene_bpy(
+            tmp, [obj("Sim", [abc], hide_render=True)], cache_files=[abc]), ok=True)
+        refused("an Alembic cache a rendered object reads", scene_bpy(
+            tmp, [obj("Sim", [abc])], cache_files=[abc]))
+
+        # Sculpting links Blender's own brush assets; nothing rendered is
+        # linked from them, and their path is the artist's Blender install.
+        essentials = datablock("LIBRARY", "essentials_brushes-mesh_sculpt.blend",
+                               filepath="/Applications/Blender.app/brushes/essentials.blend")
+        linked = datablock("BRUSH", "Clay Strips", library=essentials)
+        refused("a library only brushes are linked from", scene_bpy(
+            tmp, [drawn()], libraries=[essentials], brushes=[linked]), ok=True)
+        chars = datablock("LIBRARY", "chars.blend", filepath="//libs/chars.blend")
+        rig = collection("Hero", library=chars, is_missing=True)
+        refused("a missing library a rendered empty instances a collection from", scene_bpy(
+            tmp, [obj("Hero", [rig], type="EMPTY", instance_collection=rig)],
+            libraries=[chars], collections=[rig]))
+        hero = obj("Hero", library=chars, is_missing=True)
+        refused("a missing library a rendered override is rebuilt from", scene_bpy(
+            tmp, [obj("Hero override", override_library=NS(reference=hero))],
+            libraries=[chars]))
+        placed = collection("Set", library=chars, is_missing=True)
+        bpy = scene_bpy(tmp, [], libraries=[chars], collections=[placed])
+        bpy.context.scene.view_layers = [NS(use=True, layer_collection=layer(
+            "Scene Collection", [layer(placed)]))]
+        refused("a missing library whose collection sits in the view layer", bpy)
+
+        bpy = scene_bpy(tmp, [drawn(wood, name="Crate", hide_render=True)], images=[wood])
+        bpy.data.user_map = broken_user_map
+        err, report = preflight(tmp, bpy)
+        check("preflight reads: without a trace, every file with a user counts, and it says so",
+              err is not None and [m["name"] for m in report["missing"]] == ["wood"]
+              and any("could not trace what the render uses" in w for w in report["warnings"]))
 
 
 def test_startup_script_marker():
@@ -1473,6 +1672,7 @@ def main():
         test_last_progress_at,
         test_preflight_files,
         test_preflight_simulations,
+        test_preflight_reads_only_what_renders,
         test_startup_script_marker,
         test_enable_gpu,
     ):

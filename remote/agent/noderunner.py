@@ -89,7 +89,8 @@ added, so an older app reads a newer agent's state):
                               or another engine's id in lower case. The
                               spec's engine is only the app's label for it,
     "preflight": {...}|null   preflight.py's report once Blender ran it:
-                              {ok, summary, missing, problems, warnings} }
+                              {ok, summary, missing: [{kind, name, path,
+                              packable}], problems, warnings} }
   A failed state keeps every field it had and adds:
     "error": str              one readable line,
     "errorKind": "scene"|"job"|"machine"|"transient"   see ERROR_KINDS,

@@ -8,9 +8,7 @@ unbaked simulation starts cold in every chunk but the first. Each renders the
 whole job wrong, and every chunk completes, downloads and is billed across the
 fleet (#246 #247 #249 #252).
 
-Checks, over what the scene can use (datablocks with real users; a fake user
-alone does not count, and objects that do not render, hidden or in a
-collection disabled for renders or excluded from the view layer, are skipped):
+Checks, over what the render evaluates and reads (see trace):
   * files it refers to by path and did not pack: images (every UDIM tile),
     movie clips, volumes, Alembic/USD caches, fonts, mesh-cache modifiers and
     linked libraries, and any linked datablock Blender could not find
@@ -23,17 +21,23 @@ collection disabled for renders or excluded from the view layer, are skipped):
     the chunking: disk caches are not uploaded, and a baked cache whose files
     are missing is not simulated either;
   * a movie output format: chunks render one image per frame.
-bpy.utils.blend_paths() also lists paths the checks above do not know about;
-those are warnings only, since it cannot say whether anything uses them. So
-are sounds (renders run with -noaudio) and geometry-nodes simulation zones,
-whose bake state Python cannot read.
+A missing file nothing the render reads from is only a warning: a reference
+image on an empty, a camera's background, a brush's texture, the footage a
+camera solve was tracked from, a cache only a hidden object uses. So is every
+path bpy.utils.blend_paths() knows and the checks above do not, since it
+cannot say whether anything uses it; and so are sounds (renders run with
+-noaudio) and geometry-nodes simulation zones, whose bake state Python cannot
+read.
 
 Output: exactly one line,
-    VR_PREFLIGHT {"ok": bool, "summary": str, "missing": [...],
+    VR_PREFLIGHT {"ok": bool, "summary": str,
+                  "missing": [{"kind", "name", "path", "packable"}],
                   "problems": [str], "warnings": [str]}
 and then, when ok is false, a raise: under --python-exit-code Blender exits
 GUARD_EXIT before rendering, and the agent fails the chunk with errorKind
-"scene" and the summary as its error.
+"scene" and the summary as its error. A missing entry's "packable" is false
+for what a .blend cannot hold (movie clips, caches) and for linked data a
+library lacks: packing is no fix for those.
 
 Input: VR_PREFLIGHT in the environment, JSON set by the agent:
     {"jobChunks": int|null, "first": int|null, "last": int|null,
@@ -79,7 +83,7 @@ def load_args():
 
 ARGS = load_args()
 scene = bpy.context.scene
-missing = []  # {"kind", "name", "path"}: fatal
+missing = []  # {"kind", "name", "path", "packable"}: fatal
 problems = []  # fatal
 warnings = []
 checked = set()  # every normalised path a typed check looked at
@@ -114,17 +118,13 @@ def abspath(path, idb=None):
     return os.path.normpath(path)
 
 
-def need_file(kind, idb, path):
-    """Record `path`, which datablock `idb` renders from, if it is not on this node."""
-    full = abspath(path, idb)
-    checked.add(full)
-    if not os.path.exists(full):
-        missing.append({"kind": kind, "name": getattr(idb, "name", "?"), "path": path})
+def id_type(idb):
+    return getattr(idb, "id_type", "") or ""
 
 
 def rendering_collections():
-    """Names of the collections that render in some view layer, or None when
-    bpy cannot say (then every collection counts).
+    """The collections that render in some view layer, or None when bpy
+    cannot say (then every collection counts).
 
     A collection renders unless it, or one above it, is disabled for renders
     or excluded from the layer: where artists park work in progress, an
@@ -133,58 +133,208 @@ def rendering_collections():
     layers = [vl for vl in getattr(scene, "view_layers", None) or () if getattr(vl, "use", True)]
     if not layers:
         return None
-    names = set()
+    found = set()
 
     def walk(layer_collection, hidden):
         coll = layer_collection.collection
         hidden = hidden or layer_collection.exclude or getattr(coll, "hide_render", False)
         if not hidden:
-            names.add(coll.name)
+            found.add(coll)
         for child in layer_collection.children:
             walk(child, hidden)
 
     for layer in layers:
         walk(layer.layer_collection, False)
-    return names
+    return found
 
 
-def rendered_objects():
-    try:
-        rendering = rendering_collections()
-    except Exception:  # noqa: BLE001 — then every collection counts
-        rendering = None
+def direct_objects(rendering):
+    """The scene's objects that render in their own right: not hidden from the
+    render, and in a collection in `rendering` (any, when that is None)."""
     for obj in getattr(scene, "objects", None) or ():
         if getattr(obj, "hide_render", False):
             continue
         if rendering is not None and not any(
-            c.name in rendering for c in getattr(obj, "users_collection", None) or ()
+            c in rendering for c in getattr(obj, "users_collection", None) or ()
         ):
             continue
         yield obj
 
 
+def compositor_inputs():
+    """What the compositor reads while it runs: its tree, and the images, movie
+    clips, masks and node groups its nodes hold."""
+    if not getattr(scene.render, "use_compositing", True):
+        return []
+    # 5.0 made the compositor's tree a datablock of its own; before, it is the
+    # scene's embedded node_tree, used while use_nodes is on.
+    tree = getattr(scene, "compositing_node_group", None)
+    if tree is None and getattr(scene, "use_nodes", False):
+        tree = getattr(scene, "node_tree", None)
+    if tree is None:
+        return []
+    found = [tree] if id_type(tree) else []
+    for node in getattr(tree, "nodes", None) or ():
+        for attr in ("image", "clip", "mask", "node_tree"):
+            ref = getattr(node, attr, None)
+            if ref is not None and id_type(ref):
+                found.append(ref)
+    return found
+
+
+def not_drawn_from(idb):
+    """Datablock types `idb` uses that no render draws: a camera's background
+    images and clips are the viewport's; an object's movie clip is the tracking
+    data of its Camera Solver or Follow Track constraint, which the .blend
+    holds; an empty's image is a viewport reference."""
+    kind = id_type(idb)
+    if kind == "CAMERA":
+        return ("IMAGE", "MOVIECLIP")
+    if kind == "OBJECT":
+        return ("IMAGE", "MOVIECLIP") if getattr(idb, "type", "") == "EMPTY" else ("MOVIECLIP",)
+    return ()
+
+
+def trace():
+    """Every datablock this render evaluates or reads from, or None when bpy
+    cannot say.
+
+    Blender's render evaluates the objects that render and whatever they
+    depend on. An object hidden from the render, or in an excluded collection,
+    is evaluated all the same when something that renders uses it: the cloth
+    proxy a visible mesh follows through Surface Deform, a collection an empty
+    instances, the image a material samples. Counting it by where it sits
+    missed those, and counting every datablock with a user refused scenes that
+    render right, over a reference image or a camera solve's footage.
+
+    So: from the objects that render, the world and the compositor's inputs,
+    follow bpy.data.user_map() downwards (A uses B), through everything but a
+    scene (which uses all of it) and the uses not_drawn_from names.
+    """
+    user_map = getattr(bpy.data, "user_map", None)
+    if not callable(user_map):
+        return None
+    uses = {}
+    for idb, users in user_map().items():
+        for user in users:
+            uses.setdefault(user, []).append(idb)
+    todo = list(direct_objects(RENDERING))
+    world = getattr(scene, "world", None)
+    if world is not None:
+        todo.append(world)
+    todo += compositor_inputs()
+    reached = set()
+    while todo:
+        idb = todo.pop()
+        if idb in reached:
+            continue
+        reached.add(idb)
+        if id_type(idb) == "SCENE":
+            continue
+        skip = not_drawn_from(idb)
+        deps = list(uses.get(idb, ()))
+        # A library override is rebuilt from the linked datablock it overrides.
+        reference = getattr(getattr(idb, "override_library", None), "reference", None)
+        if reference is not None:
+            deps.append(reference)
+        for dep in deps:
+            if dep not in reached and id_type(dep) not in skip:
+                todo.append(dep)
+    return reached
+
+
+try:
+    RENDERING = rendering_collections()
+except Exception as e:  # noqa: BLE001 — then every collection counts
+    RENDERING = None
+    warnings.append(f"preflight could not read the view layers: {type(e).__name__}: {e}")
+try:
+    REACHED = trace()
+    if REACHED is None:
+        warnings.append("this Blender has no bpy.data.user_map: every object in the scene, and"
+                        " every file with a user, counts as rendered")
+except Exception as e:  # noqa: BLE001 — then everything counts, as refusing is the safe side
+    REACHED = None
+    warnings.append(f"preflight could not trace what the render uses ({type(e).__name__}: {e}):"
+                    " every object in the scene, and every file with a user, counts as rendered")
+
+
+def used(idb):
+    """Does the render evaluate or read `idb`? Without a trace, anything with
+    a real user does (a fake user alone never counts)."""
+    if REACHED is None:
+        return real_users(idb)
+    return idb in REACHED or (RENDERING is not None and idb in RENDERING)
+
+
+def rendered_objects():
+    """The objects the render evaluates, the scene's own first. Without a
+    trace, every object in the scene, hidden or not."""
+    objects = list(getattr(scene, "objects", None) or ())
+    if REACHED is None:
+        return objects
+    found = [obj for obj in objects if obj in REACHED]
+    in_scene = set(found)
+    others = [idb for idb in REACHED if id_type(idb) == "OBJECT" and idb not in in_scene]
+    return found + sorted(others, key=lambda obj: getattr(obj, "name", ""))
+
+
+def need_file(kind, idb, path, packable=True, needed=None):
+    """Record `path`, which datablock `idb` refers to, if it is not on this node:
+    fatal when the render reads it (`needed`, by default used(idb)), else a
+    warning."""
+    full = abspath(path, idb)
+    checked.add(full)
+    if os.path.exists(full):
+        return
+    name = getattr(idb, "name", "?")
+    if used(idb) if needed is None else needed:
+        missing.append({"kind": kind, "name": name, "path": path, "packable": packable})
+    else:
+        warnings.append(f"{kind} '{name}' is not on the node ({path}), but nothing the render"
+                        " draws uses it")
+
+
+absent_libraries = set()  # filepaths of the libraries not on this node
+
+
 def check_libraries():
+    """A library the render links data from. One nothing it draws comes from,
+    such as the brush assets a sculpting session linked, is only a warning."""
+    libraries = None
+    if REACHED is not None:
+        libraries = {getattr(idb, "library", None) for idb in REACHED | (RENDERING or set())}
     for lib in getattr(bpy.data, "libraries", None) or ():
         path = getattr(lib, "filepath", "") or ""
         if path and not packed(lib):
-            need_file("library", lib, path)
+            if not os.path.exists(abspath(path, lib)):
+                absent_libraries.add(path)
+            need_file("library", lib, path,
+                      needed=True if libraries is None else lib in libraries)
 
 
 def check_missing_ids():
     """Linked datablocks Blender replaced with an empty placeholder."""
-    reported = {m["path"] for m in missing if m["kind"] == "library"}
     by_library = {}
+    unused = []
     for attr in ID_COLLECTIONS:
         for idb in getattr(bpy.data, attr, None) or ():
-            if getattr(idb, "is_missing", False) and real_users(idb):
-                path = getattr(getattr(idb, "library", None), "filepath", "") or "?"
+            if not getattr(idb, "is_missing", False) or not real_users(idb):
+                continue
+            path = getattr(getattr(idb, "library", None), "filepath", "") or "?"
+            if path in absent_libraries:
+                continue  # the library itself is missing, and already says so
+            if used(idb):
                 by_library.setdefault(path, []).append(getattr(idb, "name", "?"))
+            else:
+                unused.append(f"{getattr(idb, 'name', '?')} ({path})")
     for path, names in by_library.items():
-        if path in reported:
-            continue  # the library itself is missing, and already says so
         more = f" and {len(names) - 3} more" if len(names) > 3 else ""
         missing.append({"kind": "linked data", "name": ", ".join(names[:3]) + more,
-                        "path": path})
+                        "path": path, "packable": False})
+    if unused:
+        warnings.append("linked data missing from its library, but nothing the render draws"
+                        " uses it: " + ", ".join(unused[:5]))
 
 
 def check_images():
@@ -220,7 +370,7 @@ def check_other_files():
                 continue
             path = getattr(idb, "filepath", "") or ""
             if path and path != "<builtin>":
-                need_file(kind, idb, path)
+                need_file(kind, idb, path, packable=can_pack)
 
 
 def check_mesh_caches():
@@ -229,7 +379,7 @@ def check_mesh_caches():
             if getattr(mod, "type", "") == "MESH_CACHE" and getattr(mod, "show_render", True):
                 path = getattr(mod, "filepath", "") or ""
                 if path:
-                    need_file("mesh cache", obj, path)
+                    need_file("mesh cache", obj, path, packable=False)
 
 
 def check_sounds():
@@ -409,12 +559,23 @@ def check_blend_paths():
 
 
 def summarise():
+    def listed(entries):
+        shown = ", ".join(f"{m['kind']} '{m['name']}' ({m['path']})" for m in entries[:4])
+        return shown + (f" and {len(entries) - 4} more" if len(entries) > 4 else "")
+
     parts = []
-    if missing:
-        shown = ", ".join(f"{m['kind']} '{m['name']}' ({m['path']})" for m in missing[:4])
-        more = f" and {len(missing) - 4} more" if len(missing) > 4 else ""
-        parts.append(f"{len(missing)} file(s) not packed into the .blend and not on the node: "
-                     f"{shown}{more}")
+    linked = [m for m in missing if m["kind"] == "linked data"]
+    packable = [m for m in missing if m["packable"]]
+    # Movie clips and caches: a .blend cannot hold them, so packing is no fix.
+    other = [m for m in missing if not m["packable"] and m not in linked]
+    if packable:
+        parts.append(f"{len(packable)} file(s) not packed into the .blend and not on the node: "
+                     f"{listed(packable)}")
+    if other:
+        parts.append(f"{len(other)} file(s) the render reads are not on the node, and a .blend"
+                     f" cannot pack them: {listed(other)}")
+    if linked:
+        parts.append(f"linked data missing from its library: {listed(linked)}")
     parts += problems[:3]
     if len(problems) > 3:
         parts.append(f"{len(problems) - 3} more problem(s)")
