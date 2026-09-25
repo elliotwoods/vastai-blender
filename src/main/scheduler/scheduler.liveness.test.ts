@@ -427,6 +427,37 @@ describe('1.8: a spec write with no answer', () => {
     expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
     expect(w.alerts('warn').join('\n')).toMatch(/SFTP write \S+\.tmp\.json: no answer for 30s/)
   })
+
+  it('a rename the node applied with its answer lost is withdrawn before the chunk goes back', async () => {
+    const { app, ids } = await fleet(1)
+    const machine = w.machineFor(ids[0])
+    // The node moves the spec into place and its answer never comes (a
+    // channel reset under it, #245): the spec is live while the dispatch
+    // fails, and an agent would render it with nobody polling it.
+    machine.onSftp(
+      'rename',
+      (from, m) => {
+        if (!from.endsWith('.tmp.json')) return undefined
+        m.files.set(from.replace(/\.tmp\.json$/, '.json'), m.files.get(from)!)
+        m.files.delete(from)
+        return HANG
+      },
+      1
+    )
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(
+      () => w.alerts('warn').some((a) => a.startsWith(`dispatch ${chunk.id} failed`)),
+      'the dispatch failed'
+    )
+    expect(machine.agent.inbox()).not.toContain(chunk.id)
+    expect(machine.ran(new RegExp(`pkill -f '${chunk.id}'`))).toHaveLength(1)
+
+    machine.agent.autoFinish()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
+  })
 })
 
 describe('1.8: a node prep that hangs', () => {

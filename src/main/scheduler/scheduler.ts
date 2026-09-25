@@ -940,9 +940,20 @@ class ChunkRun {
     // requests and was never answered, so the dispatch hung with its chunk
     // 'assigned' and its lane taken (#244, #245).
     const inbox = posix.join(REMOTE_ROOT, 'jobs', 'inbox')
-    await writeRemoteFileAtomic(this.ssh, `${inbox}/${this.chunkId}.json`, JSON.stringify(spec), {
-      tmpPath: `${inbox}/${this.chunkId}.tmp.json`
-    })
+    try {
+      await writeRemoteFileAtomic(this.ssh, `${inbox}/${this.chunkId}.json`, JSON.stringify(spec), {
+        tmpPath: `${inbox}/${this.chunkId}.tmp.json`
+      })
+    } catch (e) {
+      // The rename may have landed with its answer lost (a channel reset
+      // under it, #245, or its deadline), and the agent then renders a spec
+      // nobody polls or downloads, while the chunk goes back to the queue
+      // and is rendered again: paid twice, on a lane counted as free.
+      // Withdrawn first, as a cancel is (bounded, and harmless when the
+      // spec never landed).
+      await this.retractSpec()
+      throw e
+    }
     // The spec is now live: from here the agent may pick it up at any moment, so
     // a cancel that landed during the write has to be retracted rather than just
     // returned from.
