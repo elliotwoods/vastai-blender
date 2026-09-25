@@ -1,7 +1,8 @@
 import { writeFileSync } from 'fs'
 import { join, relative } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { setup, type World } from '../../test/harness'
+import { setup, type App, type World } from '../../test/harness'
+import type { HeadlessResume } from './jobSpec'
 
 // A resubmitted VR_JOB_SPEC campaign heals a half-done job instead of
 // duplicating it, through the same revive as "Re-render missing" (plan
@@ -17,6 +18,14 @@ afterEach(async () => {
   vi.restoreAllMocks()
   await w.dispose()
 })
+
+/** The resume index.ts hands the drivers. */
+function resumeAsIndexDoes(app: App): HeadlessResume {
+  return {
+    recovery: (jobIds) => app.scheduler.resumeRecoveryFor(jobIds),
+    job: (jobId) => app.scheduler.resumeJob(jobId, { octaneSignIn: false })
+  }
+}
 
 function specFor(blend: string): string {
   const path = join(w.dir, 'spec.json')
@@ -114,15 +123,64 @@ describe('runJobSpec on a campaign already submitted', () => {
     await runJobSpec(specFor(blend), {
       kick: vi.fn(),
       unsubmitted: [],
-      resume: {
-        recovery: () => app.scheduler.resumeRecovery(),
-        job: (id) => app.scheduler.resumeJob(id)
-      }
+      resume: resumeAsIndexDoes(app)
     })
 
     expect(app.scheduler.recoveryHoldCount()).toBeNull()
     expect(w.get('SELECT attention FROM jobs WHERE id = ?', jobId)).toEqual({ attention: null })
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining('its hold released'))
+  })
+
+  it('integration review: a campaign lifts the recovery hold for its own jobs only: other unfinished work is neither sent nor rented for, nor waited on', async () => {
+    // resumeRecovery lifted it for every unfinished job on the profile, so
+    // each headless re-run rented again for older work nobody had confirmed.
+    w.settings.maxActiveNodes = 4
+    w.settings.spendCapPerHour = 10
+    const app = await w.boot({ start: false })
+    const earlier = await w.submitJob(app, {
+      blendPath: w.blend('earlier.blend'),
+      frameStart: 1,
+      frameEnd: 4
+    })
+    app.nodeManager.init()
+    app.scheduler.start()
+    const held = app.scheduler.recoveryHoldCount()
+    expect(held).not.toBeNull()
+    for (let i = 0; i < 4; i++) w.vast.addOffer()
+
+    const { runJobSpec } = await import('./jobSpec')
+    const campaign: string[] = []
+    await runJobSpec(specFor(w.blend('campaign.blend')), {
+      kick: () => app.scheduler.kick(),
+      unsubmitted: [],
+      campaign,
+      resume: resumeAsIndexDoes(app)
+    })
+    const [{ id: submitted }] = w.all<{ id: string }>('SELECT id FROM jobs WHERE id != ?', earlier)
+
+    const campaignDone = (): boolean => {
+      for (const id of w.vast.created) {
+        const machine = w.vast.machine(id)
+        if (!machine.onSpec) machine.agent.autoFinish()
+      }
+      return (
+        w.get<{ state: string }>('SELECT state FROM jobs WHERE id = ?', submitted)?.state ===
+        'complete'
+      )
+    }
+    await w.until(campaignDone, 'the campaign rendered', { timeoutMs: 20 * 60_000, stepMs: 5_000 })
+    await w.advance(2 * 60_000, 5_000)
+
+    // The earlier job is still held, and none of it went out.
+    expect(app.scheduler.recoveryHoldCount()).toBe(held)
+    expect(
+      w.eventsOf('chunk:changed').filter((c) => c.jobId === earlier && c.state === 'assigned')
+    ).toEqual([])
+    // The run waits on its own job only: done, with the earlier one open.
+    expect(campaign).toEqual([submitted])
+    const { openJobs } = await import('./drivers')
+    expect(openJobs(campaign)).toBe(0)
+    expect(openJobs()).toBe(1)
   })
 
   it('1.14: a scene named relative to the run is made full; a network path is not submitted', async () => {

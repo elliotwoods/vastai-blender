@@ -1916,6 +1916,12 @@ class Scheduler {
    * user. Mirrors app_state's 'recovery_hold'. See start().
    */
   private recoveryHold: RecoveryHoldRecord | null = null
+  /**
+   * Whether the recovery hold holds only its own jobs, not all scale-up:
+   * set once a headless campaign lifted it for the jobs it names
+   * (resumeRecoveryFor). Session only.
+   */
+  private recoveryPerJob = false
   /** The last scale-up decision, and why (see scalePolicy). */
   private lastScalePlan: ScalingPlan | null = null
   /**
@@ -2279,10 +2285,51 @@ class Scheduler {
     this.kick()
   }
 
+  /**
+   * Lift the recovery hold for these jobs only: a headless campaign's say-so
+   * (app/headless), which covers the jobs it names or submits and not the
+   * other unfinished work on the profile. resumeRecovery lifted it for all
+   * of that, so every headless re-run rented again for older work nobody had
+   * confirmed (integration review).
+   *
+   * From then on the hold is per job, as a breaker's is: the jobs left in it
+   * are neither sent out nor rented for (pendingChunks), and the rest of the
+   * queue, the campaign's, rents as usual. It no longer stops scale-up as a
+   * whole (planHolds). Left with no job, it is released as resumeRecovery
+   * releases it. In memory only: the next launch holds its unfinished work
+   * again, until a campaign names it again or the user resumes.
+   */
+  resumeRecoveryFor(jobIds: readonly string[]): void {
+    const hold = this.recoveryHold
+    if (!hold) return
+    const named = new Set(jobIds)
+    const left = hold.jobIds.filter((id) => !named.has(id))
+    if (left.length === 0) {
+      this.resumeRecovery()
+      return
+    }
+    this.recoveryHold = { ...hold, jobIds: left }
+    this.recoveryPerJob = true
+    this.noteHolds()
+    this.kick()
+  }
+
   /** Drop the hold here and in app_state, so no later launch revives it. */
   private releaseRecoveryHold(): void {
     this.recoveryHold = null
+    this.recoveryPerJob = false
     writeAppState(getDb(), 'recovery_hold', null)
+  }
+
+  /**
+   * The holds scale-up plans under: every hold (fleetHolds), except a
+   * recovery hold a campaign narrowed to other jobs, which holds those jobs'
+   * chunks back from the queue instead (resumeRecoveryFor).
+   */
+  private planHolds(): FleetHolds {
+    const holds = this.fleetHolds()
+    if (this.recoveryPerJob) delete holds.recovery
+    return holds
   }
 
   /**
@@ -2872,7 +2919,10 @@ class Scheduler {
           ORDER BY j.submitted_at, c.frame_start`
       )
       .all() as PendingChunk[]
-    return rows.filter((c) => c.frames_left > 0)
+    // Work a campaign did not name, left in a narrowed recovery hold.
+    const withheld =
+      this.recoveryPerJob && this.recoveryHold ? new Set(this.recoveryHold.jobIds) : null
+    return rows.filter((c) => c.frames_left > 0 && !withheld?.has(c.job_id))
   }
 
   /**
@@ -3848,14 +3898,17 @@ class Scheduler {
    * fixed, and the job revived or submitted again. True if a hold was
    * released.
    */
-  resumeJob(jobId: string): boolean {
+  resumeJob(jobId: string, opts: { octaneSignIn?: boolean } = {}): boolean {
     // Resuming an Octane job is the user acting on a missed sign-in: each
-    // node may be waited on for a sign-in once more.
+    // node may be waited on for a sign-in once more. Not a headless
+    // campaign's resume (`octaneSignIn: false`): nobody is at a desktop to
+    // sign in, and each wait re-armed rented a node and billed it through
+    // ten minutes of waiting on nobody (the A1 shape).
     const engine = (
       getDb().prepare('SELECT engine FROM jobs WHERE id = ?').get(jobId) as
         { engine: EngineId } | undefined
     )?.engine
-    if (engine === 'octane') releaseOctaneSignInHold()
+    if (engine === 'octane' && opts.octaneSignIn !== false) releaseOctaneSignInHold()
     const r = getDb()
       .prepare(
         `UPDATE jobs SET attention = NULL
@@ -4098,7 +4151,7 @@ class Scheduler {
       cap: capacityBudget(nodes, settings),
       // Startup recovery not yet confirmed — see start(). Scale-DOWN below is
       // deliberately still live, so a held fleet cannot also be a stuck one.
-      holds: this.fleetHolds(),
+      holds: this.planHolds(),
       now: Date.now(),
       pendingShared,
       pendingExclusive,

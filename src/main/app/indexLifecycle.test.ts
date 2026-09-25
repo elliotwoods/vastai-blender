@@ -97,6 +97,10 @@ interface Loaded {
   accrued: number[]
   /** nodeManager.reconcile calls. */
   reconciles: number
+  /** scheduler.resumeRecoveryFor calls, by the jobs each named. */
+  resumedFor: string[][]
+  /** scheduler.resumeJob calls. */
+  resumedJobs: Array<{ jobId: string; octaneSignIn?: boolean }>
 }
 
 function node(patch: Partial<NodeSnapshot> = {}): NodeSnapshot {
@@ -146,6 +150,8 @@ async function load(
     settings?: SettingsPublic
     /** jobs.output_dir by job id, for the media:// handler's lookup. */
     jobDirs?: Record<string, string>
+    /** What jobs.listJobs hands the drivers: jobs an earlier run left. */
+    jobs?: Array<{ id: string; blendPath: string; state: string }>
   } = {}
 ): Promise<Loaded> {
   for (const k of ['VR_JOB_SPEC', 'VR_E2E_BLEND', 'VR_SHOT', 'VR_USERDATA', 'VR_QUIT_POLICY']) {
@@ -174,7 +180,9 @@ async function load(
     nodes,
     protocols: new Map(),
     accrued: [],
-    reconciles: 0
+    reconciles: 0,
+    resumedFor: [],
+    resumedJobs: []
   }
   FakeWindow.app = out.listeners
   let ready!: () => void
@@ -286,7 +294,14 @@ async function load(
       stop: () => {
         out.schedulerStopped++
       },
-      kick: () => {}
+      kick: () => {},
+      resumeRecoveryFor: (jobIds: readonly string[]) => {
+        out.resumedFor.push([...jobIds])
+      },
+      resumeJob: (jobId: string, o: { octaneSignIn?: boolean } = {}) => {
+        out.resumedJobs.push({ jobId, ...o })
+        return false
+      }
     }
   }))
   vi.doMock('../transfer/jobClip', () => ({ jobClips: { catchUp: () => {} } }))
@@ -325,7 +340,7 @@ async function load(
     })
   }))
   vi.doMock('../jobs/jobs', () => ({
-    listJobs: () => [],
+    listJobs: () => opts.jobs ?? [],
     createJob: opts.createJob ?? (async () => 'job-1'),
     emitChunksChanged: () => {},
     refreshJobState: () => {}
@@ -643,12 +658,28 @@ describe('index.ts, headless (plan 1.1)', () => {
     expect(r.stderr).toContain(`  ${spec}: ENOENT`)
   })
 
+  it("integration review: an E2E job an earlier run left open is resumed as the run's own, never its Octane sign-in", async () => {
+    const r = await load(
+      [node()],
+      { VR_E2E_BLEND: '/scenes/e2e.blend' },
+      {
+        jobs: [{ id: 'job-7', blendPath: '/scenes/e2e.blend', state: 'running' }]
+      }
+    )
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    expect(r.resumedJobs).toEqual([{ jobId: 'job-7', octaneSignIn: false }])
+    expect(r.resumedFor).toEqual([['job-7']])
+  })
+
   it('the campaign done (after the driver submitted it): destroys the fleet and exits 0', async () => {
     const r = await load([node()], { VR_E2E_BLEND: '/scenes/e2e.blend' })
     // The driver submits 3 s after boot; the campaign counts as done after
     // two checks 30 s apart with no job open.
     await vi.advanceTimersByTimeAsync(3_000)
     expect(r.exits).toEqual([])
+    // The recovery hold is lifted for the job it submitted, and only that.
+    expect(r.resumedFor).toEqual([['job-1']])
     await vi.advanceTimersByTimeAsync(61_000)
 
     expect(r.destroyed).toEqual(['node-1-abcdef'])

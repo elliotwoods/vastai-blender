@@ -62,6 +62,27 @@ describe('Octane in the scheduler (plan 1.18)', () => {
     expect(attentionOf(jobId)).toBeNull()
   })
 
+  it("integration review: a headless campaign's resume lifts the job's hold, never the sign-in's", async () => {
+    // resumeJob released the sign-in hold for any Octane job, and a headless
+    // re-run naming one did so with nobody at a desktop: every Octane rental
+    // waited out its ten minutes for a sign-in again (the A1 shape).
+    w = await setup({ settings: { maxActiveNodes: 1, idleTimeoutMinutes: 120 } })
+    const app = await w.boot()
+    const nodeId = await w.readyNode(app)
+    fakeOctane(w.machineFor(nodeId), { signIn: 'byHand' })
+    const jobId = await w.submitJob(app, { engine: 'octane' })
+    app.scheduler.kick()
+    await w.until(() => attentionOf(jobId) != null, 'the job held for a sign-in', {
+      timeoutMs: 20 * MIN,
+      stepMs: 5_000
+    })
+    expect(app.scheduler.fleetHolds().octaneSignIn).toBeDefined()
+
+    expect(app.scheduler.resumeJob(jobId, { octaneSignIn: false })).toBe(true)
+    expect(attentionOf(jobId)).toBeNull()
+    expect(app.scheduler.fleetHolds().octaneSignIn).toBeDefined()
+  })
+
   it('1.18: an Octane chunk is not sent to a node scale-up rented for another engine, and does not keep it alive', async () => {
     w = await setup({ settings: { maxActiveNodes: 1, idleTimeoutMinutes: 5 } })
     const app = await w.boot()

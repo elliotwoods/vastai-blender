@@ -502,10 +502,11 @@ app.whenReady().then(() => {
     e2eBlend: process.env.VR_E2E_BLEND,
     lifecycle,
     kick: () => scheduler.kick(),
-    // A campaign submitted is the say-so a headless run has no button for.
+    // A campaign submitted is the say-so a headless run has no button for,
+    // for its own jobs only; and nobody is there to sign in to Octane.
     resume: {
-      recovery: () => scheduler.resumeRecovery(),
-      job: (jobId) => scheduler.resumeJob(jobId)
+      recovery: (jobIds) => scheduler.resumeRecoveryFor(jobIds),
+      job: (jobId) => scheduler.resumeJob(jobId, { octaneSignIn: false })
     }
   })
 

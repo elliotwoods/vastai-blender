@@ -51,12 +51,27 @@ export interface JobSpecDeps {
   /**
    * The scheduler's holds a campaign submitted is the user's say-so to lift
    * (index.ts passes the scheduler's): the recovery hold on a launch with
-   * unfinished work (plan 1.9), and a breaker's hold on a job the campaign
-   * names again (plan 1.17). A headless run has nobody to click Resume, so
-   * without these a re-run on a profile with unfinished jobs rented nothing
-   * new, and a held job waited for good.
+   * unfinished work (plan 1.9), for the campaign's own jobs only, and a
+   * breaker's hold on a job the campaign names again (plan 1.17). A headless
+   * run has nobody to click Resume, so without these a re-run on a profile
+   * with unfinished jobs rented nothing new, and a held job waited for good.
+   * Other unfinished work on the profile stays held: the campaign did not
+   * name it (integration review).
    */
-  resume?: { recovery(): void; job(jobId: string): boolean }
+  resume?: HeadlessResume
+  /**
+   * Filled with the campaign's jobs, each blend's: the one submitted, or the
+   * open one it names again. What a headless run waits on (drivers.ts).
+   */
+  campaign?: string[]
+}
+
+/** What a headless campaign may lift (JobSpecDeps.resume). */
+export interface HeadlessResume {
+  /** The recovery hold, for these jobs only (scheduler.resumeRecoveryFor). */
+  recovery(jobIds: readonly string[]): void
+  /** A breaker's hold on this job, never a missed Octane sign-in's (scheduler.resumeJob). */
+  job(jobId: string): boolean
 }
 
 /**
@@ -186,6 +201,7 @@ function describeOutcome(e: SettingsFieldError): string {
  * blend does not cost the rest of the campaign.
  */
 export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<void> {
+  const campaign = deps.campaign ?? []
   const { readFileSync, readdirSync } = await import('fs')
   const { createJob, listJobs } = await import('../../jobs/jobs')
   const { reviveFailedChunks } = await import('../../jobs/revive')
@@ -272,6 +288,7 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
     }
     const existing = active.find((j) => isBlend(j, blend))
     if (existing) {
+      campaign.push(existing.id)
       // Revive permanently-failed chunks (retry budget exhausted, e.g.
       // by a since-fixed dispatch bug), narrowed to the frames still
       // missing, so the scheduler re-runs only the missing work
@@ -316,9 +333,10 @@ export async function runJobSpec(specPath: string, deps: JobSpecDeps): Promise<v
       continue
     }
     created++
+    campaign.push(jobId)
     console.log(`[spec] job ${created}/${blends.length} ${jobId} ${blend.path}`)
   }
   console.log(`[spec] submitted ${created} job(s)`)
-  deps.resume?.recovery()
+  deps.resume?.recovery(campaign)
   deps.kick()
 }
