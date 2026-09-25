@@ -745,6 +745,14 @@ export class NodeManager {
   private foreignAlerted = new Set<number>()
   /** Why each unconfirmed destroy failed, by instance, until it is confirmed. */
   private destroyErrors = new Map<number, string>()
+  /**
+   * When Vast confirmed each instance gone (epoch ms), kept for
+   * RECONCILE_MIN_AGE_MS. A reconcile whose list came before such a destroy
+   * finished, or from a Vast still listing it for a moment after, must not
+   * list it as unclaimed again: the user's destroyUnclaimed, which said ok,
+   * would read as undone until the next pass.
+   */
+  private goneAt = new Map<number, number>()
   private lastOrphanLine = ''
   private unclaimedListeners = new Set<(list: UnclaimedInstance[]) => void>()
   /** The account hold (plan 1.20), or null while renting is free. */
@@ -938,6 +946,9 @@ export class NodeManager {
   private async reconcileOrphans(): Promise<boolean> {
     const started = Date.now()
     this.nextReconcileAt = started + RECONCILE_EVERY_MS
+    for (const [id, at] of this.goneAt) {
+      if (at < started - RECONCILE_MIN_AGE_MS) this.goneAt.delete(id)
+    }
     // Before the list is asked for, as well as after. An instance held when
     // Vast answers is left alone even if its row is confirmed gone meanwhile:
     // the list predates that destroy.
@@ -985,6 +996,7 @@ export class NodeManager {
         tracked++
         continue
       }
+      if (this.goneAt.has(inst.id)) continue
       // Being destroyed now (the retry timer, or the user's destroy of an
       // unclaimed one): that destroy settles it. Listed as it was meanwhile.
       if (this.goneChecks.has(inst.id)) {
@@ -1045,6 +1057,9 @@ export class NodeManager {
       }
     }
     this.settleUnknownCreates(found)
+    // Confirmed gone while this pass awaited Vast (an orphan's destroy): an
+    // entry copied above while its destroy was in flight is stale now.
+    for (const id of [...unclaimed.keys()]) if (this.goneAt.has(id)) unclaimed.delete(id)
     const before = JSON.stringify(this.listUnclaimed())
     this.unclaimed = unclaimed
     if (JSON.stringify(this.listUnclaimed()) !== before) this.unclaimedChanged()
@@ -2040,6 +2055,7 @@ export class NodeManager {
     for (const n of this.holders(instanceId)) {
       n.update({ state: 'destroyed', destroyed_at: now, last_error: lastError })
     }
+    this.goneAt.set(instanceId, now)
     this.destroyErrors.delete(instanceId)
     if (this.unconfirmedAlerted.delete(instanceId)) {
       emit('alert', {

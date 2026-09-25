@@ -374,6 +374,38 @@ describe('1.3 unclaimed instances', () => {
     expect(heard).toEqual([[]])
   })
 
+  it('an unclaimed instance the user destroyed while a reconcile was listing it is not listed again', async () => {
+    const foreign = w.vast.addInstance({
+      label: 'vastai-blender 0bad0bad:12345678',
+      start_date: vastTime(30 * 60_000)
+    })
+    const app = await started()
+    const heard: UnclaimedInstance[][] = []
+    app.nodeManager.onUnclaimedChanged((list) => heard.push(list))
+    // An orphan of this profile, which the next pass stops to destroy.
+    const id = await lookupGaveUp(app)
+    const orphan = w.vast.addInstance({ label: labelOf(id), start_date: vastTime(10 * 60_000) })
+
+    // The user's destroy is at Vast when a pass lists the account...
+    const userDestroy = w.vast.hold('destroyInstance')
+    const destroying = app.nodeManager.destroyUnclaimed(foreign.id)
+    await w.until(() => userDestroy.reached, "the user's destroy at Vast")
+    const orphanDestroy = w.vast.hold('destroyInstance')
+    const pass = app.nodeManager.reconcile()
+    await w.until(() => orphanDestroy.reached, 'the pass destroying the orphan')
+    // ...and is confirmed while the pass waits on the orphan's.
+    userDestroy.release()
+    await expect(destroying).resolves.toMatchObject({ ok: true })
+    expect(app.nodeManager.listUnclaimed()).toEqual([])
+    orphanDestroy.release()
+    await pass
+
+    expect(w.vast.argsOf('destroyInstance')).toEqual([[foreign.id], [orphan.id]])
+    expect(w.vast.live()).toEqual([])
+    expect(app.nodeManager.listUnclaimed()).toEqual([])
+    expect(heard.at(-1)).toEqual([])
+  })
+
   it('an unclaimed instance whose destroy Vast refuses stays listed, with the reason', async () => {
     const foreign = w.vast.addInstance({
       label: 'vastai-blender 0bad0bad:12345678',
