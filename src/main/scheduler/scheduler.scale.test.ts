@@ -109,6 +109,43 @@ describe('scale-up against the plan', () => {
     expect(app.nodeManager.list().filter((n) => n.state === 'ready')).toHaveLength(1)
   })
 
+  it('integration review: past a backoff for failed boots, one node is rented as a probe, not a batch', async () => {
+    // The first tick past the backoff rented a whole batch, maxRentals
+    // nodes, each billed through its boot before it failed the same way.
+    w = await setup({ settings: { maxActiveNodes: 4, spendCapPerHour: 10 } })
+    for (let i = 0; i < 60; i++) w.vast.addOffer()
+    const app = await w.boot()
+    app.nodeManager.onReady = async () => {
+      throw new Error('install blender 5.1.0 failed (exit 1)')
+    }
+    await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => app.scheduler.fleetHolds().scale != null, 'backing off', {
+      timeoutMs: 10 * 60_000,
+      stepMs: 1_000
+    })
+    await w.advance(5_000, 1_000)
+    const batch = w.vast.count('createInstance')
+    expect(batch).toBe(4)
+
+    // Past the backoff: one rental, and nothing more while it boots.
+    await w.until(() => w.vast.count('createInstance') > batch, 'the next rental', {
+      timeoutMs: 30 * 60_000,
+      stepMs: 5_000
+    })
+    await w.advance(30_000, 1_000)
+    expect(w.vast.count('createInstance')).toBe(batch + 1)
+
+    // Provisioning works again: once a probe is ready, the rest are rented.
+    app.nodeManager.onReady = null
+    await w.until(
+      () =>
+        app.nodeManager.list().filter((n) => ['ready', 'rendering'].includes(n.state)).length === 4,
+      'the fleet rented',
+      { timeoutMs: 60 * 60_000, stepMs: 5_000 }
+    )
+  })
+
   it('1.17: the user releasing the backoff lets the next tick rent at once', async () => {
     w = await setup({ settings: { maxActiveNodes: 2, spendCapPerHour: 10 } })
     w.vast.addOffer()

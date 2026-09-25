@@ -1931,6 +1931,14 @@ class Scheduler {
    */
   private scaleFailures = 0
   private scaleHold: NonNullable<FleetHolds['scale']> | null = null
+  /**
+   * Rentals kept failing to boot, so scale-up rents one node at a time, and
+   * none while one is booting, until a rented node reaches ready. Past a
+   * backoff for failed boots, the next batch was a whole one: up to
+   * maxRentals nodes, each billed through its boot before it failed the
+   * same way (integration review).
+   */
+  private scaleProbe = false
   /** The "no spend cap is set" warning has been given for the cap as it stands. */
   private noCapWarned = false
   /** fleet:holds listeners, and the holds they last heard (noteHolds). */
@@ -2099,7 +2107,9 @@ class Scheduler {
     this.unsubscribeBoots ??= nodeManager.onBootEnded((_id, failure) =>
       failure == null
         ? this.scaleSucceeded()
-        : this.countScaleFailure(`a rented node never became ready: ${failure}`)
+        : this.countScaleFailure(`a rented node never became ready: ${failure}`, {
+            boot: true
+          })
     )
     // A node signed in to Octane: jobs held for a sign-in go out again.
     this.unsubscribeOctane ??= onOctaneState((_id, state) => {
@@ -2443,6 +2453,7 @@ class Scheduler {
    */
   private scaleSucceeded(): void {
     this.scaleFailures = 0
+    this.scaleProbe = false
     if (this.scaleHold) {
       this.scaleHold = null
       emit('alert', { level: 'info', message: 'Scale-up rents again: a rented node is ready' })
@@ -2474,11 +2485,13 @@ class Scheduler {
   /**
    * One more scale-up that came to nothing: a batch that failed, or a node
    * it rented that never became ready (nodeManager.onBootEnded, whose own
-   * alert has said why). Past SCALE_BACKOFF_AFTER in a row, scale-up waits.
+   * alert has said why). Past SCALE_BACKOFF_AFTER in a row, scale-up waits,
+   * and where boots failed it then rents one node at a time (scaleProbe).
    */
-  private countScaleFailure(reason: string): void {
+  private countScaleFailure(reason: string, opts: { boot?: boolean } = {}): void {
     this.scaleFailures++
     if (this.scaleFailures < SCALE_BACKOFF_AFTER) return
+    if (opts.boot) this.scaleProbe = true
     const waitMs = Math.min(
       SCALE_BACKOFF_MAX_MS,
       SCALE_BACKOFF_BASE_MS * 2 ** (this.scaleFailures - SCALE_BACKOFF_AFTER)
@@ -4184,10 +4197,27 @@ class Scheduler {
     // it rents, and the caps read afresh from the live fleet before each
     // rental (withDemand). A count sized on the GPU-count filter rented
     // whatever ranked best, 8-GPU boxes for 1-lane demand (#227 #237).
-    if (plan.status === 'rent' && plan.maxRentals > 0 && !this.requestingNode) {
+    //
+    // After boots that kept failing, one rental at a time, and none while
+    // one is on its way (scaleProbe): the next node says whether renting
+    // works again, for the price of one boot rather than a batch of them.
+    let rentals = plan.maxRentals
+    if (plan.status === 'rent' && this.scaleProbe) {
+      rentals = booting.length > 0 ? 0 : Math.min(1, rentals)
+      if (rentals === 0) {
+        this.lastScalePlan = {
+          ...plan,
+          status: 'held',
+          reason:
+            'rentals kept failing to boot: one node at a time until one is ready, ' +
+            'and one is booting now'
+        }
+      }
+    }
+    if (plan.status === 'rent' && rentals > 0 && !this.requestingNode) {
       this.requestingNode = true
       void nodeManager
-        .requestNodes(plan.maxRentals, { budget: plan.budget, engine: rentEngine })
+        .requestNodes(rentals, { budget: plan.budget, engine: rentEngine })
         .then((ids) => {
           if (ids.length > 1) {
             emit('alert', { level: 'info', message: `scale-up: rented ${ids.length} nodes` })
