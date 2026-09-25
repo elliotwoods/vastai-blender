@@ -369,7 +369,8 @@ describe('the downloader, given a manifest line that escapes the job folder', ()
     expect(existsSync(join(w.dir, 'escaped'))).toBe(false)
     // Frame 3 counted as lost, so the chunk went back through requeue and
     // only frame 3 re-rendered: complete means every frame, from inside the
-    // job folder.
+    // job folder. A frame the node listed and could not be fetched is the
+    // node's failure, not the render's (1.17): charged to the machines.
     const frames = w.all<{ frame: number; state: string; local_path: string }>(
       'SELECT frame, state, local_path FROM frames WHERE job_id = ? ORDER BY frame',
       jobId
@@ -381,7 +382,10 @@ describe('the downloader, given a manifest line that escapes the job folder', ()
       [4, 'downloaded']
     ])
     for (const f of frames) expect(f.local_path.startsWith(jobDir + sep)).toBe(true)
-    expect(w.get('SELECT retries FROM chunks WHERE job_id = ?', jobId)).toEqual({ retries: 1 })
+    expect(w.get('SELECT retries, infra_retries FROM chunks WHERE job_id = ?', jobId)).toEqual({
+      retries: 0,
+      infra_retries: 1
+    })
     // Polled every 5 s, and read again by the retry, yet reported once.
     const refusals = w.alerts('error').filter((m) => m.includes('refused'))
     expect(refusals).toHaveLength(1)

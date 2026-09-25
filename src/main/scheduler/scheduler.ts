@@ -14,8 +14,15 @@
 
 import { posix } from 'path'
 import { getDb, readAppState, writeAppState } from '../db/db'
+import { classify, describeError, type AgentFailure, type Classification } from '../errors'
 import { emit } from '../events'
-import { emitChunkChanged, emitChunksChanged, refreshJobState } from '../jobs/jobs'
+import {
+  emitChunkChanged,
+  emitChunksChanged,
+  emitJobChanged,
+  noteChunkError,
+  refreshJobState
+} from '../jobs/jobs'
 import { installBlender, installExtension, REMOTE_ROOT } from '../nodes/provisioner'
 import { getAddon } from '../addons/addons'
 import { nodeManager } from '../nodes/nodeManager'
@@ -23,10 +30,22 @@ import { getSettings } from '../settings'
 import { sftpRename, sftpWriteFile, uploadFileVerified } from '../ssh/sftp'
 import { recordThroughput } from '../vast/offers'
 import type { SshConnection } from '../ssh/sshConnection'
-import { ChunkDownloader } from '../transfer/frameDownloader'
+import { ChunkDownloader, localSinkHold } from '../transfer/frameDownloader'
 import { jobClips } from '../transfer/jobClip'
 import { missingRanges } from './chunker'
-import { admits, freeExclusiveLanes, hasRoom, type NodeOccupancy } from './admission'
+import {
+  admits,
+  breakerKey,
+  budgetFor,
+  chunkBackoffMs,
+  freeExclusiveLanes,
+  hasRoom,
+  JobBreaker,
+  NODE_REST_BASE_MS,
+  nodeRestMs,
+  type NodeOccupancy,
+  type RetryBudget
+} from './admission'
 import {
   effectiveLanes,
   guardLanes,
@@ -38,15 +57,34 @@ import {
 } from './gpuLanes'
 import { planScaling, type ScalingPlan } from './scaling'
 import { decide, hardCap, initialState, recordNodeSlots, type SlotState } from './slotController'
-import type { ChunkState, EngineId, FleetHolds, NodeSnapshot } from '../../shared/models'
+import type {
+  AlertEvent,
+  ChunkState,
+  EngineId,
+  FleetHolds,
+  JobAttention,
+  JobAttentionKind,
+  NodeSnapshot
+} from '../../shared/models'
 import { capacityBudget, isBooting, isDispatchable } from '../../shared/nodeState'
 
 const TICK_MS = 15_000
 const STATE_POLL_MS = 5_000
-// 4: with many concurrent runs per node, transient SSH channel contention can
-// fail a dispatch attempt — the retry budget must absorb a few of those on
-// top of genuine render failures.
+/**
+ * Failed renders a chunk may have before it fails for good: the scene or
+ * Blender failing, what `chunks.retries` counts (plan 1.17). A dispatch that
+ * lost its SSH channel, a node that died or stalled, a download that failed
+ * are the machines' failures and never charged here: they used to be, and
+ * job 1d59516c's 16 chunks spent all four on two instances Vast had stopped.
+ */
 const MAX_RETRIES = 4
+/**
+ * Failed attempts a chunk may have for the machines' and the network's
+ * reasons (`chunks.infra_retries`): larger, because none of them says the
+ * render is wrong, but still a bound, because each one can cost a paid
+ * render (a node that dies mid-chunk, a transfer that never lands).
+ */
+const MAX_INFRA_RETRIES = 8
 
 /**
  * Per-node preparation mutex. With nodeSlots > 1 several ChunkRuns dispatch
@@ -90,6 +128,11 @@ interface ChunkRow {
   node_id: string | null
   frames_done: number
   retries: number
+  infra_retries: number
+  /** epoch ms before which it is not dispatched (a transient failure's backoff) */
+  not_before: number | null
+  /** the last failed attempt's ErrorClass */
+  error_kind: string | null
 }
 
 /** A pending chunk joined to the few job columns assignment needs. */
@@ -124,6 +167,14 @@ interface Resplit {
   touched: string[]
 }
 
+/** What settling a failed attempt did, for announcing once it has committed. */
+interface Settled {
+  /** null = nothing written (a cancelled job's chunk) */
+  r: Resplit | null
+  /** what to tell the user: why it failed and what happens next */
+  alerts: AlertEvent[]
+}
+
 /** The startup recovery hold as app_state keeps it (key 'recovery_hold'). */
 interface RecoveryHoldRecord {
   /** the jobs that had unfinished work when the hold was set */
@@ -134,6 +185,7 @@ interface RecoveryHoldRecord {
 
 interface JobRow {
   id: string
+  name: string
   blend_path: string
   engine: EngineId
   frame_step: number
@@ -141,8 +193,11 @@ interface JobRow {
   addon_ids: string
   state: string
   share_node: number
+  /** JSON JobAttention: why the job waits on the user; null = it does not */
+  attention: string | null
 }
 
+/** noderunner.py's state/<chunkId>.json; see its header. Fields are only ever added. */
 interface AgentState {
   status: 'rendering' | 'encoding' | 'done' | 'failed'
   currentFrame: number | null
@@ -154,6 +209,114 @@ interface AgentState {
   updatedAt?: number
   /** GPU index the agent pinned this chunk's Blender to; absent/null = unpinned */
   gpu?: number | null
+  /** why a failed state failed: scene | job | machine | transient (noderunner ERROR_KINDS) */
+  errorKind?: string | null
+  /** the chunk log's last lines, on a failed state */
+  logTail?: string[]
+  /** epoch seconds of the last real progress (a frame saved or started) */
+  lastProgressAt?: number
+  /** the engine the scene really renders with, once Blender loaded it */
+  engine?: string | null
+  /** Blender reported running out of GPU memory */
+  oom?: boolean
+  /** the app asked for a pinned render and the agent could not pin it */
+  pinFailed?: boolean
+  /** preflight.py's report (plan 1.16) */
+  preflight?: {
+    ok: boolean
+    summary?: string
+    missing?: Array<{ kind: string; name: string; path: string; packable?: boolean }>
+    problems?: string[]
+    warnings?: string[]
+  } | null
+}
+
+/** Where in an attempt a chunk failed. */
+type FailureStage = 'dispatch' | 'render' | 'download' | 'node'
+
+/** A failed attempt, as the retry policy (plan 1.17) weighs it. */
+interface ChunkFailure {
+  /** whose fault, and why in words that always carry the error's code */
+  c: Classification
+  stage: FailureStage
+  /** the node it failed on */
+  nodeId: string
+  /**
+   * No node can render the job as it stands: the agent said errorKind scene
+   * (the preflight, a scene guard) or job (an engine no node has, the job's
+   * own expression raising), or the job needs an extension the registry no
+   * longer has. The job fails at once with this as its attention, and no
+   * chunk of it is sent again (plan 1.16).
+   */
+  fatal?: JobAttentionKind
+}
+
+/** A failure the scheduler found itself, which it need not ask classify() about. */
+function own(kind: Classification['kind'], rule: string, reason: string): Classification {
+  return { kind, rule, reason, retryable: kind !== 'localFs', outcomeUnknown: false }
+}
+
+/** Thrown in dispatch for a job no node can run as it stands. */
+class JobCannotRun extends Error {
+  override readonly name = 'JobCannotRun'
+
+  constructor(
+    readonly kind: JobAttentionKind,
+    message: string
+  ) {
+    super(message)
+  }
+}
+
+/**
+ * What a failed agent state means for the retry policy. classify() reads
+ * errorKind 'scene' and the exit code; the agent's errorKind 'job' and
+ * 'machine' are read here too, because a job no node can run is not a crash
+ * that may pass, and a node that ran out of GPU memory or lacks a GPU is the
+ * machine's failure whatever Blender's exit code says (an out-of-memory stop
+ * is the agent's own SIGTERM).
+ */
+function agentFailure(state: AgentState, nodeId: string): ChunkFailure {
+  const f: AgentFailure = {
+    exitCode: typeof state.exitCode === 'number' ? state.exitCode : null,
+    error: state.error ?? null,
+    errorKind: state.errorKind ?? null,
+    gpu: typeof state.gpu === 'number' ? state.gpu : null
+  }
+  const kind = state.errorKind
+  if (kind === 'scene' || kind === 'job') {
+    // The agent's own words: they name what failed ("scene preflight failed:
+    // 2 file(s) not packed..."), and describeError adds the exit code.
+    const message = describeError(f)
+    const c =
+      kind === 'scene'
+        ? { ...classify(f), reason: message }
+        : own('job', 'agent-job', `the job asks for what no node has: ${message}`)
+    return {
+      c: { ...c, retryable: false },
+      stage: 'render',
+      nodeId,
+      fatal: attentionKind(kind, message)
+    }
+  }
+  const c = classify(f)
+  if (kind === 'machine' && c.kind !== 'machine') {
+    const label = state.oom ? 'out of GPU memory on this node' : 'this node cannot render it'
+    return {
+      c: own('machine', state.oom ? 'agent-oom' : 'agent-machine', `${label}: ${describeError(f)}`),
+      stage: 'render',
+      nodeId
+    }
+  }
+  return { c, stage: 'render', nodeId }
+}
+
+/** The attention a job gets for the agent's errorKind scene or job. */
+function attentionKind(errorKind: 'scene' | 'job', message: string): JobAttentionKind {
+  if (errorKind === 'scene') return 'scene'
+  if (/octane/i.test(message)) return 'engine'
+  if (/python expression|extension|add-?on/i.test(message)) return 'extension'
+  return 'scene'
 }
 
 /**
@@ -284,7 +447,9 @@ class ChunkRun {
     const lanes = scheduler.lanePlanFor(this.nodeId)
 
     this.setChunk({ state: 'assigned', node_id: this.nodeId, assigned_at: Date.now() })
-    node.setState('rendering')
+    // State only: setState would also wipe the node's last error, which is how
+    // a node that kept refusing dispatches showed nothing wrong between them.
+    node.update({ state: 'rendering' })
     refreshJobState(this.jobId)
 
     // Steps 1-3 are serialized per node (see withNodePrep) — with multiple
@@ -309,11 +474,13 @@ class ChunkRun {
       for (const addonId of JSON.parse(job.addon_ids) as string[]) {
         const addon = getAddon(addonId)
         if (!addon) {
-          emit('alert', {
-            level: 'warn',
-            message: `addon ${addonId} missing from registry — skipped`
-          })
-          continue
+          // Rendering on without it was skipping it: unless the scene guards
+          // against that itself, every frame renders wrong and the job
+          // completes (#197). No node has it, so the job stops here.
+          throw new JobCannotRun(
+            'extension',
+            `the job needs the add-on ${addonId}, which is no longer in the add-on registry`
+          )
         }
         if (job.blender_version) {
           const key = `${this.nodeId}:${job.blender_version}:${addon.id}:${addon.zipHash}`
@@ -428,6 +595,8 @@ class ChunkRun {
     }
     this.setChunk({ state: 'rendering' })
     refreshJobState(this.jobId)
+    // The node took the spec: an error a failed dispatch wrote on it is stale.
+    scheduler.dispatchLanded(this.nodeId)
 
     // 5. Live downloads + log tail + state poll.
     this.downloader = new ChunkDownloader({
@@ -523,32 +692,69 @@ class ChunkRun {
           if (this.stopped) return
           // Failing sends the chunk through requeue(), which re-splits around
           // the frames that DID land — so only the missing ones re-render,
-          // rather than the chunk quietly completing with a hole in it.
+          // rather than the chunk quietly completing with a hole in it. The
+          // render itself succeeded in the first three cases, so none of them
+          // costs it a render retry.
           if (drained && !drained.manifestRead) {
             // What the agent listed since the last good poll was never even
             // seen, so there is no "lost" list to trust.
-            this.finish('failed', "could not read the node's manifest for the final download pass")
+            this.fail(
+              'download',
+              own(
+                'transient',
+                'manifest-unread',
+                "could not read the node's manifest for the final download pass"
+              )
+            )
             return
           }
           const lost = drained?.lost ?? []
           if (lost.length > 0) {
             // The render succeeded but frames did not reach us, and this was
             // the last download pass.
-            this.finish(
-              'failed',
-              `${lost.length} frame(s) could not be downloaded: ${lost.slice(0, 3).join(', ')}`
+            this.fail(
+              'download',
+              own(
+                'transient',
+                'frames-lost',
+                `${lost.length} frame(s) could not be downloaded: ${lost.slice(0, 3).join(', ')}`
+              )
+            )
+            return
+          }
+          // Frames the node has and this computer's disk would not take
+          // (plan 1.10): no fault of the render or the node, so nothing is
+          // charged. Sent again only once the disk takes files, since tick()
+          // dispatches nothing while localSinkHold() is set; charging a retry
+          // here re-rendered them after each 20-minute hold, and failed the
+          // chunk after four.
+          const held = drained?.localSinkBlocked ?? []
+          if (held.length > 0) {
+            const sink = localSinkHold()
+            this.fail(
+              'download',
+              own(
+                'localFs',
+                'local-sink',
+                `${held.length} frame(s) held back by the local disk: ` +
+                  (sink?.reason ?? 'it would not take them')
+              )
             )
             return
           }
           // Complete means downloaded, and the frames table is what says so —
           // not the agent's 'done', and not the downloader, which only knows
           // what the manifest listed. A frame Blender never wrote, or never
-          // manifested, is in neither.
+          // manifested, is in neither: the render's failure, charged to it.
           const missing = this.undownloadedFrames()
           if (missing.length > 0) {
-            this.finish(
-              'failed',
-              `${missing.length} frame(s) never arrived: ${missing.slice(0, 3).join(', ')}`
+            this.fail(
+              'render',
+              own(
+                'job',
+                'frames-missing',
+                `${missing.length} frame(s) never arrived: ${missing.slice(0, 3).join(', ')}`
+              )
             )
             return
           }
@@ -558,7 +764,7 @@ class ChunkRun {
         if (state.status === 'failed') {
           await this.downloader?.drain()
           if (this.stopped) return
-          this.finish('failed', state.error ?? `exit ${state.exitCode}`)
+          this.finish('failed', agentFailure(state, this.nodeId))
           return
         }
         if (
@@ -568,9 +774,15 @@ class ChunkRun {
         ) {
           await this.downloader?.drain()
           if (this.stopped) return
-          this.finish(
-            'failed',
-            `render stalled — no agent state update for ${Math.round(STATE_STALL_MS / 60000)} min`
+          // The node's failure, not the render's: its Blender or agent died
+          // or hung without saying so.
+          this.fail(
+            'render',
+            own(
+              'machine',
+              'agent-stalled',
+              `render stalled — no agent state update for ${Math.round(STATE_STALL_MS / 60000)} min`
+            )
           )
           return
         }
@@ -579,7 +791,17 @@ class ChunkRun {
     }
   }
 
-  private finish(state: 'complete' | 'failed', error?: string): void {
+  /** finish('failed') for a failure this run found itself. */
+  private fail(stage: FailureStage, c: Classification): void {
+    this.finish('failed', { c, stage, nodeId: this.nodeId })
+  }
+
+  /**
+   * Settle the attempt. A failure is announced, and charged to whichever
+   * budget it belongs to, by the scheduler's requeue (plan 1.17), which
+   * knows what happens next.
+   */
+  private finish(state: 'complete' | 'failed', failure?: ChunkFailure): void {
     this.cleanup()
     // cancelJob settled every chunk of a cancelled job in one go, and nothing
     // may write over that. A run it aborted never gets here (see the stopped
@@ -591,9 +813,6 @@ class ChunkRun {
       return
     }
     this.setChunk({ state })
-    if (error) {
-      emit('alert', { level: 'warn', message: `chunk ${this.chunkId} failed: ${error}` })
-    }
     if (state === 'complete') {
       // Feed the machine-selection strategy with measured throughput.
       const elapsedH = (Date.now() - this.dispatchedAt) / 3_600_000
@@ -613,8 +832,10 @@ class ChunkRun {
         // 4-GPU node and a 1-GPU node of one model teach the same figure.
         recordThroughput(gpuName, (frames / elapsedH) * this.meanConcurrency(), snap?.numGpus ?? 1)
       }
+      scheduler.onChunkFinished(this, { rendered: true })
+      return
     }
-    scheduler.onChunkFinished(this)
+    scheduler.onChunkFinished(this, { failure })
   }
 
   /**
@@ -716,6 +937,24 @@ class Scheduler {
   private recoveryHold: RecoveryHoldRecord | null = null
   /** The last scale-up decision, and why (see scalePolicy). */
   private lastScalePlan: ScalingPlan | null = null
+  /**
+   * Nodes resting after an attempt failed for their own or their network's
+   * reason (plan 1.17; see rest()): tick() sends them nothing new until
+   * `until`. Each failure in a row doubles the rest, and a chunk rendered on
+   * the node forgets them. `lastError` is what the rest wrote on the node, so
+   * clearing it later clears that and nothing another writer put there.
+   */
+  private rests = new Map<
+    string,
+    { until: number; failures: number; lastError: string; stage: FailureStage }
+  >()
+  /**
+   * Nodes each chunk failed on for a machine's or the network's reason. It
+   * is sent to one of them again only when no other node could take it.
+   */
+  private failedOn = new Map<string, Set<string>>()
+  /** The same failure on two nodes holds its job for the user (plan 1.17). */
+  private breaker = new JobBreaker()
 
   /**
    * The node's run set, CREATING it if absent. Only for the dispatch path —
@@ -785,6 +1024,17 @@ class Scheduler {
     this.slots.delete(nodeId)
     this.laneGuards.delete(nodeId)
     if (this.reservation?.nodeId === nodeId) this.reservation = null
+    // Sent nothing for a while. destroyNode forgets a node before it marks it
+    // destroying, and the kick below ran a tick in between: the node still
+    // read as usable and empty, and the chunks just requeued went straight
+    // back to it. A node that comes back (recoverUnreachable) takes work again
+    // once this has passed.
+    this.rests.set(nodeId, {
+      until: Date.now() + NODE_REST_BASE_MS,
+      failures: 0,
+      lastError: '',
+      stage: 'node'
+    })
 
     const orphaned = [...this.runsOn(nodeId)]
     this.byNode.delete(nodeId)
@@ -793,15 +1043,23 @@ class Scheduler {
       run.abort()
       this.dropRun(run)
       this.dropPreviewSubscription(run.chunkId, nodeId)
-      // Treated exactly like a failed chunk: re-split around whatever frames
-      // did land so only missing work re-renders, and burn a retry so a node
-      // that dies repeatedly still gives up eventually. Never a throw from
-      // here: destroyNode calls this before it destroys the instance.
-      this.requeueOrFail(run.chunkId, run.jobId)
+      // Treated like a failed chunk: re-split around whatever frames did land
+      // so only missing work re-renders. The node's failure, not the
+      // render's (plan 1.17): it is charged an infrastructure retry, so a
+      // chunk that loses node after node still gives up eventually, and its
+      // render retries are untouched. Never a throw from here: destroyNode
+      // calls this before it destroys the instance.
+      this.requeueOrFail(run.chunkId, run.jobId, {
+        c: own('machine', 'node-gone', 'the node went away mid-render'),
+        stage: 'node',
+        nodeId
+      })
     }
     emit('alert', {
       level: 'warn',
-      message: `${orphaned.length} chunk(s) requeued — node went away mid-render`
+      message:
+        `${orphaned.length} chunk(s) requeued — node went away mid-render ` +
+        `(render retries unchanged)`
     })
     this.kick()
   }
@@ -832,7 +1090,7 @@ class Scheduler {
     const completed = new Set<string>()
     for (const c of stranded) {
       try {
-        const r = this.resplitAroundDownloaded(c.id, { burnRetry: false })
+        const r = this.resplitAroundDownloaded(c.id, { charge: 'none' })
         touched.push(...r.touched)
         if (r.outcome === 'complete') completed.add(c.job_id)
       } catch (e) {
@@ -844,7 +1102,7 @@ class Scheduler {
           level: 'warn',
           message:
             `chunk ${c.id} could not be narrowed to its missing frames after the restart, ` +
-            `so all of it renders again: ${(e as Error).message}`
+            `so all of it renders again: ${describeError(e)}`
         })
       }
     }
@@ -980,8 +1238,15 @@ class Scheduler {
    * nothing while any is set, and says which.
    */
   fleetHolds(): FleetHolds {
+    const holds: FleetHolds = {}
     const recovery = this.recoveryHoldCount()
-    return recovery == null ? {} : { recovery }
+    if (recovery != null) holds.recovery = recovery
+    // A local disk that will not take frames (plan 1.10): a node rented now
+    // would render frames with nowhere to land. tick() dispatches nothing
+    // meanwhile either.
+    const sink = localSinkHold()
+    if (sink) holds.localSink = sink
+    return holds
   }
 
   /** The last scale-up decision and its reason (scale status), or null before the first tick. */
@@ -1051,7 +1316,10 @@ class Scheduler {
    * instead of one per (node, candidate) pair.
    *
    * A chunk whose every frame is already downloaded is never offered:
-   * settleDownloadedPending completes it first.
+   * settleDownloadedPending completes it first. Nor is one whose job waits on
+   * the user (jobs.attention, plan 1.17's breaker): it is neither sent out
+   * nor rented for. A chunk waiting out a backoff (not_before) is offered,
+   * since it is still work the fleet has to do; tick() holds it back.
    */
   private pendingChunks(): PendingChunk[] {
     const rows = getDb()
@@ -1060,6 +1328,7 @@ class Scheduler {
                 (SELECT COUNT(*) FROM ${UNDOWNLOADED_OF_C}) AS frames_left
            FROM chunks c JOIN jobs j ON j.id = c.job_id
           WHERE c.state = 'pending' AND j.state IN ('queued', 'running')
+            AND j.attention IS NULL
           ORDER BY j.submitted_at, c.frame_start`
       )
       .all() as PendingChunk[]
@@ -1292,24 +1561,32 @@ class Scheduler {
   async tick(): Promise<void> {
     this.settleDownloadedPending()
     const pending = this.pendingChunks()
+    const now = Date.now()
+    // Chunks that may go out now: none while the local disk refuses frames
+    // (plan 1.10; they would render with nowhere to land), and none still
+    // waiting out a transient failure's backoff (plan 1.17).
+    const ready = localSinkHold()
+      ? []
+      : pending.filter((c) => c.not_before == null || c.not_before <= now)
 
     const eligible = nodeManager
       .list()
       .filter((n) => ['ready', 'idle', 'rendering'].includes(n.state))
       .filter((n) => nodeManager.get(n.id)?.ssh)
+      .filter((n) => !this.resting(n.id, now))
 
     this.runSlotController(eligible)
-    this.reserveForExclusive(pending, eligible)
+    this.reserveForExclusive(ready, eligible)
 
     // Assign ROUND-ROBIN across nodes with room ('rendering' nodes included —
     // a node below its slot target can take more). One chunk per node per
     // pass, so early-ready nodes don't swallow the whole queue into their
     // prefetch while later nodes sit idle.
     let assignedInPass = true
-    while (pending.length > 0 && assignedInPass) {
+    while (ready.length > 0 && assignedInPass) {
       assignedInPass = false
       for (const node of eligible) {
-        if (pending.length === 0) break
+        if (ready.length === 0) break
         const occ = this.occupancy(node.id)
         if (!hasRoom(occ)) continue
         const managed = nodeManager.get(node.id)
@@ -1319,9 +1596,12 @@ class Scheduler {
         // version is already installed. Admission comes first: an exclusive
         // chunk needs an empty node, so on a busy node only shared work is
         // eligible however good its version affinity.
-        const idx = this.pickChunk(pending, occ, node)
+        const idx = this.pickChunk(ready, occ, node, eligible)
         if (idx < 0) continue
-        const chunk = pending.splice(idx, 1)[0]
+        const chunk = ready.splice(idx, 1)[0]
+        // What scale-up counts as pending is what is left unassigned.
+        const at = pending.indexOf(chunk)
+        if (at >= 0) pending.splice(at, 1)
         assignedInPass = true
         if (this.reservation?.chunkId === chunk.id) this.reservation = null
 
@@ -1335,11 +1615,12 @@ class Scheduler {
         this.runs.set(chunk.id, run)
         this.nodeRunsMut(node.id).add(run)
         void run.dispatch().catch((e) => {
-          const message = (e as Error).message
+          const message = describeError(e)
           const letGo = (): void => {
             this.dropRun(run)
             const n = nodeManager.get(node.id)
-            if (n && !this.hasRuns(node.id) && n.state === 'rendering') n.setState('idle')
+            // State only, keeping the node's last error (see dispatch).
+            if (n && !this.hasRuns(node.id) && n.state === 'rendering') n.update({ state: 'idle' })
           }
           // A stopped run's failure is not the chunk's, so it is never
           // requeued. forgetNode or cancelJob has already settled the chunk,
@@ -1373,8 +1654,7 @@ class Scheduler {
             letGo()
             return
           }
-          emit('alert', { level: 'error', message: `dispatch ${chunk.id} failed: ${message}` })
-          this.requeueOrFail(chunk.id, chunk.job_id)
+          this.requeueOrFail(chunk.id, chunk.job_id, this.dispatchFailure(e, node.id))
           letGo()
         })
       }
@@ -1387,76 +1667,232 @@ class Scheduler {
    * Index of the best pending chunk for this node, or -1 if it may take none.
    * Queue order (oldest job first) breaks ties, so an admissible chunk is only
    * passed over for one that saves a Blender install.
+   *
+   * A chunk goes back to a node it failed on for a machine's or the
+   * network's reason only when no other node this tick could take it: the
+   * failure may be the node's, and another node settles that.
    */
-  private pickChunk(pending: PendingChunk[], occ: NodeOccupancy, node: NodeSnapshot): number {
+  private pickChunk(
+    pending: PendingChunk[],
+    occ: NodeOccupancy,
+    node: NodeSnapshot,
+    eligible: NodeSnapshot[]
+  ): number {
     let fallback = -1
     for (let i = 0; i < pending.length; i++) {
       const c = pending[i]
       if (!admits(occ, { id: c.id, sharesNode: c.share_node === 1 })) continue
+      const avoid = this.failedOn.get(c.id)
+      if (avoid?.has(node.id) && eligible.some((n) => !avoid.has(n.id))) continue
       if (!c.blender_version || node.blenderVersions.includes(c.blender_version)) return i
       if (fallback < 0) fallback = i
     }
     return fallback
   }
 
-  /** Called by a run when its chunk reaches complete/failed. */
-  onChunkFinished(run: ChunkRun): void {
+  /** Is this node resting after a failed dispatch? */
+  private resting(nodeId: string, now = Date.now()): boolean {
+    const rest = this.rests.get(nodeId)
+    return rest != null && rest.until > now
+  }
+
+  /**
+   * The rest a node is on after failed dispatches, for the fleet view and
+   * the liveness check (plan 1.7): until when, after how many failures in a
+   * row, and the last one's reason. Null = it is sent work as usual.
+   */
+  nodeRest(nodeId: string): { until: number; failures: number; reason: string } | null {
+    const rest = this.rests.get(nodeId)
+    if (!rest || rest.until <= Date.now()) return null
+    return { until: rest.until, failures: rest.failures, reason: rest.lastError }
+  }
+
+  /**
+   * A spec reached the node, so dispatching to it works again: the error a
+   * failed dispatch wrote on it goes (unless another has been written since),
+   * and the fleet view shows what it is doing instead. Its failures in a row
+   * are forgotten only once it renders a chunk (rendered()).
+   */
+  dispatchLanded(nodeId: string): void {
+    const rest = this.rests.get(nodeId)
+    if (rest?.stage === 'dispatch') this.clearRestError(nodeId, rest.lastError)
+  }
+
+  /**
+   * What a dispatch that threw means for the retry policy. A failure on a
+   * node that is no longer a usable one (unreachable, failed, gone) is the
+   * node's whatever the error says: nothing about the job was tried.
+   */
+  private dispatchFailure(e: unknown, nodeId: string): ChunkFailure {
+    if (e instanceof JobCannotRun) {
+      return {
+        c: own('job', 'job-cannot-run', e.message),
+        stage: 'dispatch',
+        nodeId,
+        fatal: e.kind
+      }
+    }
+    let c = classify(e, { via: 'ssh' })
+    const node = nodeManager.get(nodeId)
+    const usable = node != null && ['ready', 'idle', 'rendering'].includes(node.state) && !!node.ssh
+    if (!usable && c.kind === 'job') {
+      c = own('machine', 'node-not-usable', `the node left the fleet mid-dispatch: ${c.reason}`)
+    }
+    return { c, stage: 'dispatch', nodeId }
+  }
+
+  /**
+   * Called by a run when its chunk reaches complete/failed: `failure` says
+   * why a failed one failed; `rendered` that a complete one rendered (not
+   * that it had nothing left to send).
+   */
+  onChunkFinished(
+    run: ChunkRun,
+    outcome: { failure?: ChunkFailure; rendered?: boolean } = {}
+  ): void {
     this.dropRun(run)
     // A finished chunk can never produce another live frame, so the flag is
     // dead weight on the node from here on.
     this.dropPreviewSubscription(run.chunkId, run.nodeId)
     const chunk = getDb().prepare('SELECT * FROM chunks WHERE id = ?').get(run.chunkId) as ChunkRow
-    if (chunk.state === 'failed') this.requeueOrFail(run.chunkId, run.jobId)
+    if (chunk.state === 'failed') {
+      this.requeueOrFail(
+        run.chunkId,
+        run.jobId,
+        outcome.failure ?? {
+          c: own('job', 'unclassified', 'the attempt failed and gave no reason'),
+          stage: 'render',
+          nodeId: run.nodeId
+        }
+      )
+    } else if (chunk.state === 'complete') {
+      this.failedOn.delete(run.chunkId)
+      if (outcome.rendered) this.rendered(run)
+    }
     refreshJobState(run.jobId)
     // After refreshJobState, so a job that just finished is built promptly.
     // A failed chunk schedules too: it may have ended the job as 'partial'.
     jobClips.schedule(run.jobId)
     const node = nodeManager.get(run.nodeId)
     // Only fall back to idle when the node has no other in-flight chunks.
-    if (node && node.state === 'rendering' && !this.hasRuns(run.nodeId)) node.setState('idle')
+    // State only, keeping the node's last error (see dispatch).
+    if (node && node.state === 'rendering' && !this.hasRuns(run.nodeId)) {
+      node.update({ state: 'idle' })
+    }
     this.kick()
   }
 
   /**
-   * requeue(), for callers that must carry on whatever happens in it. forgetNode
-   * runs inside destroyNode BEFORE the instance is destroyed, and the dispatch
-   * catch and onChunkFinished have a run to let go of and a node to idle after
-   * it. A throw from requeue (missingRanges refuses a range or step it cannot
-   * walk) skipped all of that, and an instance kept billing. So a chunk
-   * requeue cannot handle is failed, loudly, and the caller goes on.
+   * A chunk rendered: its job renders, so whatever failed it before was not
+   * the job's (the breaker counts afresh), and its node renders, so any rest
+   * it was on is over and its failures in a row are forgotten.
+   */
+  private rendered(run: ChunkRun): void {
+    this.breaker.reset(run.jobId)
+    const rest = this.rests.get(run.nodeId)
+    if (!rest) return
+    this.rests.delete(run.nodeId)
+    this.clearRestError(run.nodeId, rest.lastError)
+  }
+
+  /** Clear the error a rest wrote on a node, unless another has been written since. */
+  private clearRestError(nodeId: string, written: string): void {
+    const node = nodeManager.get(nodeId)
+    if (node && node.snapshot.lastError === written) node.update({ last_error: null })
+  }
+
+  /**
+   * Rest a node that failed an attempt for its own or its network's reason
+   * (plan 1.17): nothing new is sent to it until the rest is over, and its
+   * last error says why, so the fleet view shows what is wrong with it.
+   *
+   * Job 1d59516c: Vast stopped two of three nodes when the balance ran out.
+   * The app still read them as idle, and each refused every dispatch in
+   * milliseconds, so they took the next chunk, and the next, as fast as
+   * the queue came back to them, while the one working node waited for
+   * work. The rest doubles with each failure in a row and ends when the
+   * node renders a chunk. Failures while it rests (runs dispatched before
+   * it began) are one spell and extend nothing. Out of GPU memory is not
+   * the node's to rest for: that is how many renders share a GPU (plan
+   * 1.11). Never throws.
+   */
+  private rest(f: ChunkFailure): void {
+    const restable =
+      !f.fatal &&
+      ((f.stage === 'dispatch' && budgetFor(f.c) === 'infra' && f.c.kind !== 'localFs') ||
+        (f.stage === 'render' && f.c.kind === 'machine' && f.c.rule !== 'agent-oom'))
+    if (!restable) return
+    try {
+      const now = Date.now()
+      const prev = this.rests.get(f.nodeId)
+      if (prev && prev.until > now) return
+      const failures = (prev?.failures ?? 0) + 1
+      const lastError = `${f.stage} failed: ${f.c.reason}`
+      this.rests.set(f.nodeId, {
+        until: now + nodeRestMs(failures),
+        failures,
+        lastError,
+        stage: f.stage
+      })
+      nodeManager.get(f.nodeId)?.update({ last_error: lastError })
+    } catch (e) {
+      console.warn(`[scheduler] could not rest node ${f.nodeId}: ${describeError(e)}`)
+    }
+  }
+
+  /**
+   * Settle a failed attempt (plan 1.17): what it costs, and whether and when
+   * the chunk runs again. For callers that must carry on whatever happens in
+   * it. forgetNode runs inside destroyNode BEFORE the instance is destroyed,
+   * and the dispatch catch and onChunkFinished have a run to let go of and a
+   * node to idle after it. A throw from requeue (missingRanges refuses a
+   * range or step it cannot walk) skipped all of that, and an instance kept
+   * billing. So a chunk requeue cannot handle is failed, loudly, and the
+   * caller goes on.
    *
    * Only the requeue itself can fail the chunk. Announcing it (the chunk
-   * events, refreshJobState) used to sit in the same try, so a throw there,
-   * after the requeue had committed, marked a chunk failed that was already
-   * back in the queue: a job gone 'partial' for a failed write of its state.
+   * events, refreshJobState, the alerts) used to sit in the same try, so a
+   * throw there, after the requeue had committed, marked a chunk failed that
+   * was already back in the queue: a job gone 'partial' for a failed write
+   * of its state.
    */
-  private requeueOrFail(chunkId: string, jobId: string): void {
-    let r: Resplit | null
+  private requeueOrFail(chunkId: string, jobId: string, f: ChunkFailure): void {
+    this.rest(f)
+    let settled: Settled
     try {
-      r = this.requeue(chunkId)
+      settled = this.requeue(chunkId, f)
     } catch (e) {
       emit('alert', {
         level: 'error',
-        message: `chunk ${chunkId} could not be requeued, so it is marked failed: ${(e as Error).message}`
+        message:
+          `chunk ${chunkId} could not be requeued, so it is marked failed: ${describeError(e)} ` +
+          `(its attempt had failed: ${f.c.reason})`
       })
       try {
         getDb().prepare("UPDATE chunks SET state = 'failed' WHERE id = ?").run(chunkId)
         emitChunkChanged(chunkId)
         refreshJobState(jobId)
       } catch (e2) {
-        console.warn(`[scheduler] could not fail chunk ${chunkId}: ${(e2 as Error).message}`)
+        console.warn(`[scheduler] could not fail chunk ${chunkId}: ${describeError(e2)}`)
       }
       return
     }
-    this.announceRequeue(jobId, r)
+    this.announceRequeue(jobId, settled)
   }
 
   /**
-   * Tell the UI about a requeue that has committed: its chunks, the job's
-   * state, and a job clip for a chunk it completed. Never throws: whatever
-   * fails here, the requeue stands.
+   * Tell the user and the UI about a requeue that has committed: why the
+   * attempt failed and what happens next, its chunks, the job's state, and a
+   * job clip for a chunk it completed. Never throws: whatever fails here,
+   * the requeue stands.
    */
-  private announceRequeue(jobId: string, r: Resplit | null): void {
+  private announceRequeue(jobId: string, s: Settled): void {
+    try {
+      for (const alert of s.alerts) emit('alert', alert)
+    } catch (e) {
+      console.warn(`[scheduler] could not raise the requeue's alert: ${describeError(e)}`)
+    }
+    const r = s.r
     try {
       // These ids can include rows that did not exist a moment ago, so
       // anything caching a node's chunk list has to re-read.
@@ -1466,29 +1902,211 @@ class Scheduler {
     } catch (e) {
       console.warn(
         `[scheduler] requeued ${r?.touched.join(', ') ?? 'a chunk'} of job ${jobId}, ` +
-          `but announcing it failed: ${(e as Error).message}`
+          `but announcing it failed: ${describeError(e)}`
       )
     }
   }
 
   /**
    * Requeue a failed chunk: re-split around already-downloaded frames so only
-   * missing work re-renders, charging a retry; give up after MAX_RETRIES.
-   * Writes rows only, and returns what it did for announceRequeue; null for a
-   * cancelled job, which it leaves alone. Throws on a range or step
-   * missingRanges refuses: call it through requeueOrFail.
+   * missing work re-renders, charging the attempt to the budget its failure
+   * belongs to (admission.ts budgetFor), and give up once that budget is
+   * spent. A transient failure waits out a backoff (chunks.not_before)
+   * first; a failure the agent says no node can get past fails the job at
+   * once (failJob); the same failure on two nodes holds the job for the user
+   * (the breaker).
+   *
+   * Writes rows only, and returns what it did and what to tell the user, for
+   * announceRequeue. Leaves a cancelled job's chunks alone. Throws on a range
+   * or step missingRanges refuses: call it through requeueOrFail.
    */
-  private requeue(chunkId: string): Resplit | null {
+  private requeue(chunkId: string, f: ChunkFailure): Settled {
     const db = getDb()
     const chunk = db.prepare('SELECT * FROM chunks WHERE id = ?').get(chunkId) as ChunkRow
-    const job = db.prepare('SELECT state FROM jobs WHERE id = ?').get(chunk.job_id) as Pick<
-      JobRow,
-      'state'
-    >
+    const job = db
+      .prepare('SELECT name, state, attention FROM jobs WHERE id = ?')
+      .get(chunk.job_id) as Pick<JobRow, 'name' | 'state' | 'attention'>
     // A cancelled job's chunks stay as cancelJob left them. Requeueing one put
     // it back to 'pending' — work nobody wants, which then read as unfinished.
-    if (job.state === 'cancelled') return null
-    return this.resplitAroundDownloaded(chunkId, { burnRetry: true })
+    if (job.state === 'cancelled') return { r: null, alerts: [] }
+    db.prepare('UPDATE chunks SET error_kind = ? WHERE id = ?').run(f.c.kind, chunkId)
+    noteChunkError(chunkId, f.c.reason)
+    // The job has already failed (failJob): its chunks still in flight when
+    // it did settle here, failed and quietly. The job said why once.
+    if (job.state === 'failed') {
+      db.prepare("UPDATE chunks SET state = 'failed' WHERE id = ? AND state != 'complete'").run(
+        chunkId
+      )
+      return { r: { outcome: 'failed', touched: [chunkId] }, alerts: [] }
+    }
+    if (f.fatal) return this.failJob(chunk, job.name, f)
+
+    const alerts: AlertEvent[] = []
+    const budget = budgetFor(f.c)
+    const key = breakerKey(f.c)
+    if (key && job.attention == null && this.breaker.record(chunk.job_id, key, f.nodeId)) {
+      const hold = this.holdJob(chunk.job_id, job.name, key, f)
+      if (hold) alerts.push(hold)
+    }
+    const infraRetries = chunk.infra_retries + (budget === 'infra' ? 1 : 0)
+    const waitMs = chunkBackoffMs(f.c, infraRetries)
+    const r = this.resplitAroundDownloaded(chunkId, {
+      charge: budget,
+      notBefore: waitMs > 0 ? Date.now() + waitMs : null
+    })
+    // A node that failed it for its own reasons is the last it goes back to;
+    // the chunks it was split into inherit that.
+    if (r.outcome !== 'pending') {
+      this.failedOn.delete(chunkId)
+    } else if (budget === 'infra' && f.stage !== 'download') {
+      const avoid = this.failedOn.get(chunkId) ?? new Set<string>()
+      avoid.add(f.nodeId)
+      for (const id of r.touched) this.failedOn.set(id, avoid)
+    }
+    const alert = this.failureAlert(chunk, f, budget, r, waitMs)
+    if (alert) alerts.unshift(alert)
+    return { r, alerts }
+  }
+
+  /**
+   * What the user is told about a failed attempt: the reason, with its code
+   * (describeError; job 1d59516c's alerts ended at "failed: "), and what
+   * happens next. A chunk lost with its node says nothing of its own:
+   * forgetNode's alert covers them all.
+   */
+  private failureAlert(
+    before: ChunkRow,
+    f: ChunkFailure,
+    budget: RetryBudget,
+    r: Resplit,
+    waitMs: number
+  ): AlertEvent | null {
+    if (f.stage === 'node') return null
+    const what = `${f.stage === 'dispatch' ? 'dispatch' : 'chunk'} ${before.id} failed`
+    if (r.outcome === 'complete') {
+      return {
+        level: 'warn',
+        message: `${what}: ${f.c.reason} — every frame had already arrived, so it is complete`
+      }
+    }
+    if (r.outcome === 'failed') {
+      const spent =
+        budget === 'render'
+          ? `its ${MAX_RETRIES} render retries are spent`
+          : `it failed ${MAX_INFRA_RETRIES} more times for the machines or the network`
+      return { level: 'error', message: `${what} for good, ${spent}: ${f.c.reason}` }
+    }
+    let next: string
+    if (budget === 'render') {
+      next = `requeued, render retry ${before.retries + 1}/${MAX_RETRIES}`
+    } else if (budget === 'infra') {
+      next =
+        `requeued without charging the render (attempt ${before.infra_retries + 1}/` +
+        `${MAX_INFRA_RETRIES} for the machines and network` +
+        (waitMs > 0 ? `, again in ${Math.round(waitMs / 1000)} s)` : ')')
+    } else {
+      next = 'requeued, nothing charged'
+    }
+    return { level: 'warn', message: `${what}: ${f.c.reason} — ${next}` }
+  }
+
+  /**
+   * Fail a job no node can render as it stands (plan 1.16): the scene failed
+   * its preflight or a guard, the engine is missing, an extension it needs is
+   * gone. Retrying only pays for the same failure again, on every node: the
+   * job fails at once, with the reason as its attention, and no chunk of it
+   * is sent again. Chunks still in flight finish on their own; their frames
+   * are kept, and a failure among them settles quietly (requeue).
+   * refreshJobState keeps a failed job failed.
+   */
+  private failJob(chunk: ChunkRow, name: string, f: ChunkFailure): Settled {
+    const db = getDb()
+    const attention: JobAttention = { kind: f.fatal!, message: f.c.reason, since: Date.now() }
+    const touched = db.transaction((): string[] => {
+      db.prepare("UPDATE jobs SET state = 'failed', attention = ? WHERE id = ?").run(
+        JSON.stringify(attention),
+        chunk.job_id
+      )
+      const open = db
+        .prepare(
+          `SELECT id FROM chunks WHERE job_id = ? AND (state = 'pending' OR id = ?)
+             AND state != 'complete'`
+        )
+        .all(chunk.job_id, chunk.id) as Array<{ id: string }>
+      const fail = db.prepare("UPDATE chunks SET state = 'failed' WHERE id = ?")
+      for (const c of open) fail.run(c.id)
+      return open.map((c) => c.id)
+    })()
+    for (const id of touched) this.failedOn.delete(id)
+    this.breaker.reset(chunk.job_id)
+    return {
+      r: { outcome: 'failed', touched },
+      alerts: [
+        {
+          level: 'error',
+          message:
+            `job ${name} failed: no node can render it as it stands, so nothing more of it ` +
+            `is sent: ${f.c.reason}`
+        }
+      ]
+    }
+  }
+
+  /**
+   * The breaker (plan 1.17): the same failure on two nodes is taken as the
+   * job's, not the machines'. Its chunks are held (jobs.attention; see
+   * pendingChunks), with one alert, until the user resumes it (resumeJob).
+   * Chunks in flight finish, or fail and wait with the rest.
+   */
+  private holdJob(jobId: string, name: string, key: string, f: ChunkFailure): AlertEvent | null {
+    const nodes = this.breaker.nodesFor(jobId, key)
+    const where =
+      key === 'localFs'
+        ? 'twice, on this computer'
+        : `on ${nodes.length} nodes (${nodes.map((id) => this.nodeName(id)).join(', ')})`
+    const attention: JobAttention = {
+      kind: 'repeatedFailure',
+      message: `the same failure ${where}: ${f.c.reason}`,
+      since: Date.now(),
+      errorClass: f.c.kind
+    }
+    const r = getDb()
+      .prepare('UPDATE jobs SET attention = ? WHERE id = ? AND attention IS NULL')
+      .run(JSON.stringify(attention), jobId)
+    if (r.changes === 0) return null
+    return {
+      level: 'error',
+      message:
+        `job ${name} is held: ${attention.message}. None of it is sent again until you ` +
+        'resume it.'
+    }
+  }
+
+  /** A node as the user knows it: its GPU, and which one. */
+  private nodeName(nodeId: string): string {
+    const gpu = nodeManager.get(nodeId)?.snapshot.gpuName
+    return gpu ? `${gpu} ${nodeId.slice(0, 8)}` : nodeId.slice(0, 8)
+  }
+
+  /**
+   * Release a job the breaker held (jobs.attention) once the user has looked
+   * at it: its failures are counted afresh and its chunks go out again. A
+   * job that failed outright (failJob) stays failed: its scene has to be
+   * fixed, and the job revived or submitted again. True if a hold was
+   * released.
+   */
+  resumeJob(jobId: string): boolean {
+    const r = getDb()
+      .prepare(
+        `UPDATE jobs SET attention = NULL
+          WHERE id = ? AND state IN ('queued', 'running') AND attention IS NOT NULL`
+      )
+      .run(jobId)
+    if (r.changes === 0) return false
+    this.breaker.reset(jobId)
+    emitJobChanged(jobId)
+    this.kick()
+    return true
   }
 
   /**
@@ -1498,16 +2116,21 @@ class Scheduler {
    * frame missing is complete instead, whatever its retries: nothing is
    * left to render, so it must neither be sent again nor fail the job.
    *
-   * `burnRetry` charges the chunk a retry, as requeue() does for a failed
-   * render, and a chunk that has none left is failed. restart recovery
-   * (start()) re-splits without one: the chunk did not fail, the process
-   * that was driving it went away.
+   * `charge` is the budget the failed attempt costs (plan 1.17): 'render'
+   * adds to retries and 'infra' to infra_retries, and a chunk with none of
+   * that budget left is failed. 'none' charges nothing: restart recovery
+   * (start()), where the chunk did not fail, the process that was driving it
+   * went away. The new chunks inherit both counts, the backoff and the
+   * error's class.
    *
    * Downloaded frames are read by job and range, as UNDOWNLOADED_OF_C says
    * why. Writes rows only, in one transaction; the caller announces the
    * result (announceRequeue). Throws on a range or step missingRanges refuses.
    */
-  private resplitAroundDownloaded(chunkId: string, opts: { burnRetry: boolean }): Resplit {
+  private resplitAroundDownloaded(
+    chunkId: string,
+    opts: { charge: RetryBudget; notBefore?: number | null }
+  ): Resplit {
     const db = getDb()
     const chunk = db.prepare('SELECT * FROM chunks WHERE id = ?').get(chunkId) as ChunkRow
     const job = db.prepare('SELECT frame_step FROM jobs WHERE id = ?').get(chunk.job_id) as Pick<
@@ -1533,25 +2156,41 @@ class Scheduler {
       db.prepare("UPDATE chunks SET state = 'complete' WHERE id = ?").run(chunkId)
       return { outcome: 'complete', touched: [chunkId] }
     }
-    if (opts.burnRetry && chunk.retries >= MAX_RETRIES) {
+    const spent =
+      (opts.charge === 'render' && chunk.retries >= MAX_RETRIES) ||
+      (opts.charge === 'infra' && chunk.infra_retries >= MAX_INFRA_RETRIES)
+    if (spent) {
       db.prepare("UPDATE chunks SET state = 'failed' WHERE id = ?").run(chunkId)
       return { outcome: 'failed', touched: [chunkId] }
     }
-    const retries = chunk.retries + (opts.burnRetry ? 1 : 0)
+    const retries = chunk.retries + (opts.charge === 'render' ? 1 : 0)
+    const infraRetries = chunk.infra_retries + (opts.charge === 'infra' ? 1 : 0)
+    const notBefore = opts.notBefore ?? null
     const touched: string[] = [chunkId]
     db.transaction(() => {
       // Narrow the original chunk to the first missing range, add new chunks
       // for the rest, and re-point frame rows.
       const first = ranges[0]
       db.prepare(
-        `UPDATE chunks SET state='pending', node_id=NULL, frames_done=?, retries=?, frame_start=?, frame_end=?, assigned_at=NULL WHERE id = ?`
-      ).run(0, retries, first.start, first.end, chunkId)
+        `UPDATE chunks SET state='pending', node_id=NULL, frames_done=?, retries=?, infra_retries=?,
+                not_before=?, frame_start=?, frame_end=?, assigned_at=NULL WHERE id = ?`
+      ).run(0, retries, infraRetries, notBefore, first.start, first.end, chunkId)
       for (const range of ranges.slice(1)) {
         const newId = `${chunk.job_id.slice(0, 8)}-${range.start}-${range.end}-r${retries}`
         db.prepare(
-          `INSERT INTO chunks (id, job_id, frame_start, frame_end, state, frames_done, retries)
-           VALUES (?, ?, ?, ?, 'pending', 0, ?)`
-        ).run(newId, chunk.job_id, range.start, range.end, retries)
+          `INSERT INTO chunks (id, job_id, frame_start, frame_end, state, frames_done, retries,
+                              infra_retries, not_before, error_kind)
+           VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)`
+        ).run(
+          newId,
+          chunk.job_id,
+          range.start,
+          range.end,
+          retries,
+          infraRetries,
+          notBefore,
+          chunk.error_kind
+        )
         db.prepare(
           `UPDATE frames SET chunk_id = ? WHERE job_id = ? AND frame BETWEEN ? AND ? AND state != 'downloaded'`
         ).run(newId, chunk.job_id, range.start, range.end)
@@ -1688,7 +2327,7 @@ class Scheduler {
           }
         })
         .catch((e) =>
-          emit('alert', { level: 'warn', message: `scale-up failed: ${(e as Error).message}` })
+          emit('alert', { level: 'warn', message: `scale-up failed: ${describeError(e)}` })
         )
         .finally(() => {
           this.requestingNode = false
@@ -1746,6 +2385,8 @@ class Scheduler {
       run.abort()
       this.dropRun(run)
     }
+    for (const id of settled) this.failedOn.delete(id)
+    this.breaker.reset(jobId)
     emitChunksChanged(settled)
     emitJobCancelled(jobId)
 
@@ -1760,7 +2401,7 @@ class Scheduler {
           .catch(() => {})
       }
       if (node && node.state === 'rendering' && !this.hasRuns(run.nodeId)) {
-        node.setState('idle')
+        node.update({ state: 'idle' })
       }
     }
   }

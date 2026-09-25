@@ -1,0 +1,526 @@
+import { promises as fsp, type StatsFs } from 'fs'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { FakeSshConnection } from '../test/fakeSsh'
+import {
+  setup,
+  type AgentSpec,
+  type AgentStateFile,
+  type App,
+  type FakeMachine,
+  type World
+} from '../test/harness'
+
+// The retry policy (plans 1.16, 1.17, 1.20), end to end on the lifecycle
+// harness: a failed attempt is charged to whoever failed it. The machines'
+// and the network's failures never spend a render retry, a scene no node can
+// render fails its job once, and the same failure on two nodes holds the job
+// for the user instead of spending the fleet on it.
+
+let w: World
+afterEach(async () => {
+  await w.dispose()
+  vi.restoreAllMocks()
+})
+
+interface ChunkRow {
+  id: string
+  state: string
+  node_id: string | null
+  retries: number
+  infra_retries: number
+  not_before: number | null
+  error_kind: string | null
+  frame_start: number
+  frame_end: number
+}
+
+function chunksOf(jobId: string): ChunkRow[] {
+  return w.all<ChunkRow>('SELECT * FROM chunks WHERE job_id = ? ORDER BY frame_start', jobId)
+}
+
+function chunkRow(id: string): ChunkRow {
+  return w.get<ChunkRow>('SELECT * FROM chunks WHERE id = ?', id)!
+}
+
+function jobState(jobId: string): string | undefined {
+  return w.get<{ state: string }>('SELECT state FROM jobs WHERE id = ?', jobId)?.state
+}
+
+function settled(jobId: string): boolean {
+  return ['complete', 'partial', 'failed'].includes(jobState(jobId) ?? '')
+}
+
+function downloaded(jobId: string): number[] {
+  return w
+    .all<{ frame: number }>(
+      "SELECT frame FROM frames WHERE job_id = ? AND state = 'downloaded' ORDER BY frame",
+      jobId
+    )
+    .map((f) => f.frame)
+}
+
+/** Chunks dispatched to a node: every 'assigned' the renderer heard with its id. */
+function assignedTo(nodeId: string): number {
+  return w.eventsOf('chunk:changed').filter((c) => c.state === 'assigned' && c.nodeId === nodeId)
+    .length
+}
+
+function nodeError(nodeId: string): string | null {
+  return w.get<{ last_error: string | null }>('SELECT last_error FROM nodes WHERE id = ?', nodeId)!
+    .last_error
+}
+
+async function nodes(n: number): Promise<{ app: App; ids: string[] }> {
+  w = await setup({ settings: { maxActiveNodes: n } })
+  const app = await w.boot()
+  const ids: string[] = []
+  for (let i = 0; i < n; i++) ids.push(await w.readyNode(app))
+  return { app, ids }
+}
+
+/** The agent reports a failed chunk, with what the real one adds to a failure. */
+function failWith(machine: FakeMachine, chunkId: string, state: Record<string, unknown>): void {
+  machine.agent.fail(chunkId, String(state.error ?? ''), (state.exitCode as number) ?? 1)
+  machine.agent.writeState(chunkId, {
+    status: 'failed',
+    framesDone: 0,
+    logTail: ['Blender 4.2.3', 'Read blend: /root/vastai/work/scenes/x.blend'],
+    ...state
+  } as Partial<AgentStateFile>)
+}
+
+describe('field incident 1d59516c: two of three nodes stopped by Vast at a $0 balance', () => {
+  /**
+   * What a stopped instance looks like from here. Vast stops it; the app
+   * still has the node idle; every SSH connect is refused. Node refuses a
+   * host with several addresses as an AggregateError with an empty message
+   * and the code on it, which is how every alert of the incident read
+   * "dispatch … failed: " with nothing after the colon.
+   */
+  function stopAtZeroBalance(nodeId: string): void {
+    const instanceId = w.get<{ instance_id: number }>(
+      'SELECT instance_id FROM nodes WHERE id = ?',
+      nodeId
+    )!.instance_id
+    const machine = w.machineFor(nodeId)
+    w.vast.patchInstance(instanceId, { actual_status: 'stopped', cur_state: 'stopped' })
+    machine.kill()
+    stopped.add(machine)
+  }
+
+  const stopped = new Set<FakeMachine>()
+
+  function refusedLikeNode(host: string, port: number): Error {
+    const part = (address: string): Error =>
+      Object.assign(new Error(`connect ECONNREFUSED ${address}:${port}`), {
+        code: 'ECONNREFUSED',
+        errno: -61,
+        syscall: 'connect',
+        address,
+        port
+      })
+    return Object.assign(new AggregateError([part(host), part('::1')], ''), {
+      code: 'ECONNREFUSED'
+    })
+  }
+
+  it('1.20 1d59516c: dispatches to the stopped nodes spend no render retry, every alert says why, and the healthy node renders the job', async () => {
+    const { app, ids } = await nodes(3)
+    stopped.clear()
+    const acquire = FakeSshConnection.prototype.acquire
+    vi.spyOn(FakeSshConnection.prototype, 'acquire').mockImplementation(async function (
+      this: FakeSshConnection
+    ) {
+      const machine = w.network.find(this.host, this.port)
+      if (machine && stopped.has(machine)) throw refusedLikeNode(this.host, this.port)
+      return acquire.call(this)
+    })
+    // The healthy node is last, so the stopped ones are offered work first.
+    const [deadA, deadB, healthy] = ids
+    w.machineFor(healthy).agent.autoFinish()
+    stopAtZeroBalance(deadA)
+    stopAtZeroBalance(deadB)
+
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 16, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => settled(jobId), 'job settled', { timeoutMs: 60 * 60_000 })
+
+    // Every chunk moved to the node that works, and every frame arrived.
+    expect(jobState(jobId)).toBe('complete')
+    expect(downloaded(jobId)).toEqual(Array.from({ length: 16 }, (_, i) => i + 1))
+    const chunks = chunksOf(jobId)
+    // Not one render retry spent on a node that could not be reached; the
+    // machines' failures are counted apart.
+    expect(chunks.map((c) => c.retries)).toEqual(chunks.map(() => 0))
+    expect(chunks.reduce((n, c) => n + c.infra_retries, 0)).toBeGreaterThanOrEqual(2)
+    expect(chunks.filter((c) => c.infra_retries > 0).map((c) => c.error_kind)).toEqual(
+      chunks.filter((c) => c.infra_retries > 0).map(() => 'machine')
+    )
+    // Each stopped node was tried, then rested, not fed chunk after chunk.
+    for (const dead of [deadA, deadB]) {
+      expect(assignedTo(dead)).toBeGreaterThanOrEqual(1)
+      expect(assignedTo(dead)).toBeLessThanOrEqual(4)
+    }
+    // No reason is empty, and each names what happened.
+    const alerts = w.alerts()
+    expect(alerts.filter((a) => /:\s*$/.test(a) || /: —/.test(a))).toEqual([])
+    const dispatchFailed = alerts.filter((a) => a.startsWith('dispatch '))
+    expect(dispatchFailed.length).toBeGreaterThanOrEqual(2)
+    for (const a of dispatchFailed) {
+      expect(a).toMatch(/node unreachable over SSH: .*ECONNREFUSED/)
+      expect(a).toContain('without charging the render')
+    }
+    // The stopped nodes say why they get no work; the healthy one says nothing.
+    expect(nodeError(deadA)).toMatch(/ECONNREFUSED/)
+    expect(nodeError(deadB)).toMatch(/ECONNREFUSED/)
+    expect(nodeError(healthy)).toBeNull()
+    // Not the job's fault: nothing held it.
+    expect(w.get('SELECT attention FROM jobs WHERE id = ?', jobId)).toEqual({ attention: null })
+  })
+})
+
+describe('1.16: a job no node can render fails once, with the reason', () => {
+  const summary =
+    "1 file(s) not packed into the .blend and not on the node: image 'wood' (//tex/wood.png)"
+  const cases = [
+    {
+      name: 'a scene the preflight refuses',
+      attention: 'scene',
+      said: 'not packed',
+      state: {
+        error: `scene preflight failed: ${summary}`,
+        exitCode: 32,
+        errorKind: 'scene',
+        preflight: {
+          ok: false,
+          summary,
+          missing: [{ kind: 'image', name: 'wood', path: '//tex/wood.png', packable: true }],
+          problems: [],
+          warnings: []
+        }
+      }
+    },
+    {
+      name: 'an Octane job on nodes without OctaneBlender',
+      attention: 'engine',
+      said: 'OctaneBlender is not installed',
+      state: {
+        error:
+          'Octane job, but OctaneBlender is not installed on this node ' +
+          '(/usr/local/OctaneBlender/blender); stock Blender would render it with another engine',
+        exitCode: null,
+        errorKind: 'job'
+      }
+    }
+  ]
+
+  for (const c of cases) {
+    it(`1.16: ${c.name} fails the job once, with the reason, and nothing more of it is sent`, async () => {
+      const { app, ids } = await nodes(2)
+      const specs: AgentSpec[] = []
+      for (const id of ids) {
+        const machine = w.machineFor(id)
+        machine.onSpec = (spec) => {
+          specs.push(spec)
+          failWith(machine, spec.chunkId, c.state)
+        }
+      }
+      const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 1 })
+      app.scheduler.kick()
+      await w.until(() => jobState(jobId) === 'failed', 'job failed')
+      // Ticks enough to have retried every chunk several times over.
+      await w.advance(5 * 60_000)
+
+      // Failed, and it stays failed while the chunk still in flight settles.
+      expect(jobState(jobId)).toBe('failed')
+      const job = await w.invoke('job:get', jobId)
+      expect(job?.attention).toMatchObject({
+        kind: c.attention,
+        message: expect.stringContaining(c.said)
+      })
+      // One attempt per node, then nothing: no chunk was sent again.
+      expect(specs).toHaveLength(2)
+      expect(chunksOf(jobId).map((r) => [r.state, r.retries])).toEqual(
+        chunksOf(jobId).map(() => ['failed', 0])
+      )
+      // Said once, as the job's failure, not once per chunk.
+      expect(w.alerts('error').filter((a) => a.includes(c.said))).toHaveLength(1)
+      expect(w.alerts().filter((a) => /^chunk .* failed/.test(a))).toEqual([])
+      // Nothing rented for it either.
+      expect(w.vast.count('createInstance')).toBe(2)
+    })
+  }
+
+  it('A12: an add-on gone from the registry fails the job; it never renders without it', async () => {
+    const { app, ids } = await nodes(1)
+    const specs: AgentSpec[] = []
+    w.machineFor(ids[0]).onSpec = (spec) => void specs.push(spec)
+    const jobId = await w.submitJob(app, { addonIds: ['gone-from-the-registry'] })
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'failed', 'job failed')
+    await w.advance(60_000)
+
+    expect(specs).toEqual([])
+    const job = await w.invoke('job:get', jobId)
+    expect(job?.attention).toMatchObject({
+      kind: 'extension',
+      message: expect.stringContaining('gone-from-the-registry')
+    })
+    expect(chunksOf(jobId)[0]).toMatchObject({ state: 'failed', retries: 0 })
+    expect(w.alerts().filter((a) => a.includes('skipped'))).toEqual([])
+  })
+})
+
+describe('1.17: the machines and the network are not the render', () => {
+  it('1.17: a transient SSH error is retried after a backoff, without spending a render retry', async () => {
+    const { app, ids } = await nodes(1)
+    const [nodeId] = ids
+    const machine = w.machineFor(nodeId)
+    machine.agent.autoFinish()
+    // The node's sshd has no channel to spare for the first scene-hash check.
+    machine.onExec(
+      /^sha256sum /,
+      () => Promise.reject(new Error('(SSH) Channel open failure: open failed')),
+      1
+    )
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => chunkRow(chunk.id).infra_retries === 1, 'first attempt failed')
+    const failedAt = Date.now()
+
+    // Back in the queue, charged to the network, and waiting out a backoff.
+    expect(chunkRow(chunk.id)).toMatchObject({
+      state: 'pending',
+      retries: 0,
+      infra_retries: 1,
+      error_kind: 'transient'
+    })
+    expect(chunkRow(chunk.id).not_before).toBeGreaterThanOrEqual(failedAt + 14_000)
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /dispatch .* failed: SSH channel limit on the node: \(SSH\) Channel open failure.*again in 15 s/
+    )
+    // Not sent again at once: a tick comes and goes inside the backoff.
+    await w.advance(14_000)
+    expect(assignedTo(nodeId)).toBe(1)
+
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(assignedTo(nodeId)).toBe(2)
+    expect(chunkRow(chunk.id)).toMatchObject({ state: 'complete', retries: 0, infra_retries: 1 })
+    expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
+    // The node rendered again, so the error its failed dispatch wrote is gone.
+    expect(nodeError(nodeId)).toBeNull()
+  })
+
+  it('1.17: a render stopped out of GPU memory is the machine, not the render', async () => {
+    const { app, ids } = await nodes(1)
+    const machine = w.machineFor(ids[0])
+    machine.onSpec = (spec) => {
+      machine.onSpec = (retry) => machine.agent.finish(retry.chunkId)
+      failWith(machine, spec.chunkId, {
+        error: 'out of GPU memory on GPU 0 (exit -15): CUDA error: Out of memory in cuMemAlloc',
+        exitCode: -15,
+        errorKind: 'machine',
+        oom: true,
+        gpu: 0
+      })
+    }
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(chunkRow(chunk.id)).toMatchObject({
+      retries: 0,
+      infra_retries: 1,
+      error_kind: 'machine'
+    })
+  })
+
+  it('1.17: a node that goes away mid-render costs its chunks no render retry', async () => {
+    const { app, ids } = await nodes(2)
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => chunkRow(chunk.id).state === 'rendering', 'chunk rendering')
+    const first = chunkRow(chunk.id).node_id!
+    const second = ids.find((id) => id !== first)!
+    w.machineFor(second).agent.autoFinish()
+
+    // destroyNode lets the scheduler forget the node before it marks it
+    // destroying: the requeue must not hand the chunk straight back to it.
+    void app.nodeManager.destroyNode(first)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(assignedTo(first)).toBe(1)
+    expect(assignedTo(second)).toBe(1)
+    expect(chunkRow(chunk.id)).toMatchObject({
+      retries: 0,
+      infra_retries: 1,
+      error_kind: 'machine'
+    })
+    expect(w.alerts('warn').join('\n')).toContain('render retries unchanged')
+  })
+})
+
+describe('1.17: the job breaker, the same failure on two nodes', () => {
+  it('1.17: the same render failure on two nodes holds the job with one alert, until it is resumed', async () => {
+    const { app, ids } = await nodes(2)
+    let crashing = true
+    const specs: AgentSpec[] = []
+    for (const id of ids) {
+      const machine = w.machineFor(id)
+      machine.onSpec = (spec) => {
+        specs.push(spec)
+        if (crashing) machine.agent.fail(spec.chunkId, 'blender exited -11', -11)
+        else machine.agent.finish(spec.chunkId)
+      }
+    }
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 1 })
+    app.scheduler.kick()
+    const attention = (): string | null =>
+      w.get<{ attention: string | null }>('SELECT attention FROM jobs WHERE id = ?', jobId)!
+        .attention
+    const dispatched = (): number =>
+      w.eventsOf('chunk:changed').filter((c) => c.jobId === jobId && c.state === 'assigned').length
+    await w.until(() => attention() !== null, 'job held')
+    const sent = dispatched()
+    await w.advance(5 * 60_000)
+
+    // Held: nothing more of it is sent (a dispatch already under way when it
+    // tripped runs its course), and the fleet is not widened for it.
+    expect(dispatched()).toBe(sent)
+    expect(specs.length).toBeLessThanOrEqual(sent)
+    expect(w.vast.count('createInstance')).toBe(2)
+    expect(['queued', 'running']).toContain(jobState(jobId))
+    const job = await w.invoke('job:get', jobId)
+    expect(job?.attention).toMatchObject({
+      kind: 'repeatedFailure',
+      errorClass: 'job',
+      message: expect.stringMatching(/on 2 nodes .*blender exited -11/)
+    })
+    expect(w.alerts('error').filter((a) => a.includes('is held'))).toHaveLength(1)
+    // A crash is the render's failure: each attempt before the hold cost a
+    // render retry, and it held after a handful, not after every chunk had
+    // spent all of its (4 chunks x 5 attempts).
+    const chunks = chunksOf(jobId)
+    expect(chunks.reduce((n, c) => n + c.retries, 0)).toBe(sent)
+    expect(chunks.reduce((n, c) => n + c.infra_retries, 0)).toBe(0)
+    expect(sent).toBeLessThanOrEqual(4)
+
+    // The user fixes whatever it was, and resumes.
+    crashing = false
+    expect(app.scheduler.resumeJob(jobId)).toBe(true)
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
+    expect(attention()).toBeNull()
+  })
+
+  it('1.17: a Blender install that fails on two nodes holds the job, and costs no render retry', async () => {
+    const { app, ids } = await nodes(2)
+    for (const id of ids) {
+      w.machineFor(id).onExec(/provision\.sh install-blender/, {
+        code: 1,
+        stdout: '',
+        stderr: 'no mirror has Blender 4.2.3'
+      })
+    }
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(
+      () =>
+        w.get<{ attention: string | null }>('SELECT attention FROM jobs WHERE id = ?', jobId)!
+          .attention !== null,
+      'job held'
+    )
+    const job = await w.invoke('job:get', jobId)
+    expect(job?.attention).toMatchObject({
+      kind: 'repeatedFailure',
+      errorClass: 'machine',
+      message: expect.stringContaining('install blender 4.2.3 failed (exit 1)')
+    })
+    expect(chunksOf(jobId).map((c) => c.retries)).toEqual([0, 0, 0, 0])
+  })
+
+  it('1.17: a crash now and then, between chunks that render, never holds the job', async () => {
+    const { app, ids } = await nodes(2)
+    let n = 0
+    for (const id of ids) {
+      const machine = w.machineFor(id)
+      machine.onSpec = (spec) => {
+        // Every third attempt crashes, on whichever node it lands.
+        if (++n % 3 === 0) machine.agent.fail(spec.chunkId, 'blender exited -11', -11)
+        else machine.agent.finish(spec.chunkId)
+      }
+    }
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 12, chunkSize: 1 })
+    app.scheduler.kick()
+    await w.until(() => settled(jobId), 'job settled')
+    expect(jobState(jobId)).toBe('complete')
+    expect(w.get('SELECT attention FROM jobs WHERE id = ?', jobId)).toEqual({ attention: null })
+  })
+})
+
+describe('1.10 / 1.17: frames the local disk will not take', () => {
+  /**
+   * Every file opened while `full` refuses writes, as a full disk does, and
+   * statfs reports room, so only a write that lands shows it has recovered
+   * (as frameDownloader.test.ts's fullDisk).
+   */
+  function fullDisk(): { full: boolean } {
+    const disk = { full: true }
+    const open = fsp.open.bind(fsp)
+    vi.spyOn(fsp, 'open').mockImplementation(async (...args: Parameters<typeof fsp.open>) => {
+      const fh = await open(...args)
+      if (disk.full) {
+        fh.write = (() =>
+          Promise.reject(
+            Object.assign(new Error('ENOSPC: no space left on device, write'), {
+              code: 'ENOSPC',
+              syscall: 'write'
+            })
+          )) as typeof fh.write
+      }
+      return fh
+    })
+    vi.spyOn(fsp, 'statfs').mockResolvedValue({
+      bavail: 100 * 1024 ** 2,
+      bsize: 1024
+    } as unknown as StatsFs)
+    return disk
+  }
+
+  it('1.10 B6 / 1.17: a chunk whose frames the disk held back is charged nothing, and waits for the disk before it is sent again', async () => {
+    const { app, ids } = await nodes(1)
+    const [nodeId] = ids
+    w.machineFor(nodeId).agent.autoFinish()
+    const disk = fullDisk()
+    const { SINK_HOLD_MS } = await import('../transfer/frameDownloader')
+    const jobId = await w.submitJob(app)
+    const [chunk] = chunksOf(jobId)
+    app.scheduler.kick()
+
+    // The final pass holds the node for the disk, then lets it go with the
+    // frames reported held back, not lost.
+    await w.until(() => chunkRow(chunk.id).state === 'pending', 'chunk back in the queue', {
+      timeoutMs: SINK_HOLD_MS + 10 * 60_000
+    })
+    expect(chunkRow(chunk.id)).toMatchObject({
+      retries: 0,
+      infra_retries: 0,
+      error_kind: 'localFs'
+    })
+    expect(w.alerts('warn').join('\n')).toMatch(/held back by the local disk.*nothing charged/)
+    expect(app.scheduler.fleetHolds().localSink?.reason).toMatch(/ENOSPC/)
+
+    // Nothing is rendered again while the disk still refuses: it would only
+    // be held back again, on a paid node.
+    await w.advance(10 * 60_000)
+    expect(assignedTo(nodeId)).toBe(1)
+
+    disk.full = false
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(assignedTo(nodeId)).toBe(2)
+    expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
+    expect(chunkRow(chunk.id)).toMatchObject({ retries: 0, infra_retries: 0 })
+    expect(app.scheduler.fleetHolds().localSink).toBeUndefined()
+  })
+})

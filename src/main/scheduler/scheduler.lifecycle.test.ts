@@ -17,6 +17,7 @@ interface ChunkRow {
   state: string
   node_id: string | null
   retries: number
+  infra_retries: number
   frame_start: number
   frame_end: number
 }
@@ -139,10 +140,17 @@ describe('stale runs', () => {
     // Past the next scheduler tick, which would pick up a requeued chunk.
     await w.advance(20_000)
 
-    // Exactly one live dispatch: the successor, still owning its chunk.
+    // Exactly one live dispatch: the successor, still owning its chunk, and
+    // charged once, for the node that went (1.17: to the machines, never to
+    // the render).
     const withSpec = machines.filter((m) => m.agent.spec(chunk.id) !== null)
     expect(withSpec).toEqual([w.machineFor(second)])
-    expect(chunkRow(chunk.id)).toMatchObject({ state: 'rendering', node_id: second, retries: 1 })
+    expect(chunkRow(chunk.id)).toMatchObject({
+      state: 'rendering',
+      node_id: second,
+      retries: 0,
+      infra_retries: 1
+    })
     expect(app.scheduler.isLive(chunk.id)).toBe(true)
     expect(chunkStates(chunk.id).filter((s) => s === 'assigned')).toHaveLength(2)
     expect(w.alerts('error').filter((a) => a.includes('dispatch'))).toEqual([])
@@ -150,7 +158,7 @@ describe('stale runs', () => {
     w.machineFor(second).agent.finish(chunk.id)
     await w.until(() => jobState(jobId) === 'complete', 'job complete')
     expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
-    expect(chunkRow(chunk.id).retries).toBe(1)
+    expect(chunkRow(chunk.id)).toMatchObject({ retries: 0, infra_retries: 1 })
   })
 
   it('cancelling a job announces it, and a run caught mid-drain does not resurrect its chunk', async () => {
@@ -222,7 +230,12 @@ describe('stale runs', () => {
     gate.reject(new Error('(SSH) Channel open failure'))
     await w.advance(20_000)
 
-    expect(chunkRow(chunk.id)).toMatchObject({ state: 'rendering', node_id: second, retries: 1 })
+    expect(chunkRow(chunk.id)).toMatchObject({
+      state: 'rendering',
+      node_id: second,
+      retries: 0,
+      infra_retries: 1
+    })
     expect(app.scheduler.isLive(chunk.id)).toBe(true)
     expect(chunkStates(chunk.id).filter((s) => s === 'assigned')).toHaveLength(2)
     expect(w.machineFor(second).agent.inbox()).toEqual([chunk.id])
@@ -230,7 +243,7 @@ describe('stale runs', () => {
     w.machineFor(second).agent.finish(chunk.id)
     await w.until(() => jobState(jobId) === 'complete', 'job complete')
     expect(downloaded(jobId)).toEqual([1, 2, 3, 4])
-    expect(chunkRow(chunk.id).retries).toBe(1)
+    expect(chunkRow(chunk.id)).toMatchObject({ retries: 0, infra_retries: 1 })
   })
 })
 
@@ -283,7 +296,7 @@ describe('bookkeeping that throws', () => {
     })
     app.scheduler.kick()
     await w.until(
-      () => w.alerts('error').some((a) => a.includes(`dispatch ${chunk.id} failed`)),
+      () => w.alerts('error').some((a) => a.includes(`chunk ${chunk.id} could not be requeued`)),
       'dispatch failed'
     )
     await w.advance(1_000)
@@ -291,7 +304,10 @@ describe('bookkeeping that throws', () => {
     expect(app.scheduler.isLive(chunk.id)).toBe(false)
     expect(app.nodeManager.get(nodeId)?.state).toBe('idle')
     expect(chunkRow(chunk.id).state).toBe('failed')
-    expect(w.alerts('error').join('\n')).toMatch(/could not be requeued/)
+    // The alert says why the dispatch failed as well as why the requeue did.
+    expect(w.alerts('error').join('\n')).toMatch(
+      /could not be requeued.*install blender \S+ failed \(exit 1\)/
+    )
   })
 
   it('a requeue stands when announcing it throws (1.9 review)', async () => {
@@ -366,14 +382,19 @@ describe('completion means downloaded', () => {
     )
     machine.agent.finish(chunk.id, { frames: [3, 4] })
     await w.until(
-      () => chunkRow(chunk.id).state === 'complete' || chunkRow(chunk.id).retries > 0,
+      () => chunkRow(chunk.id).state === 'complete' || chunkRow(chunk.id).infra_retries > 0,
       'chunk settled after its final pass'
     )
 
-    // Not complete: 3 and 4 were never fetched. Requeued (and at once
-    // re-dispatched), narrowed to just them.
+    // Not complete: 3 and 4 were never fetched. Requeued, narrowed to just
+    // them, and charged to the network, not the render, which succeeded.
     expect(chunkRow(chunk.id).state).not.toBe('complete')
-    expect(chunkRow(chunk.id)).toMatchObject({ retries: 1, frame_start: 3, frame_end: 4 })
+    expect(chunkRow(chunk.id)).toMatchObject({
+      retries: 0,
+      infra_retries: 1,
+      frame_start: 3,
+      frame_end: 4
+    })
     expect(chunkStates(chunk.id)).toContain('failed')
     expect(downloaded(jobId)).toEqual([1, 2])
     expect(jobState(jobId)).not.toBe('complete')
