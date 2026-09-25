@@ -120,6 +120,57 @@ const RESUME_FIRST_DELAY_MS = 5_000
 const RESUME_MAX_DELAY_MS = 60_000
 
 /**
+ * Plan 1.8: how long onReady (the remote tree, the deps, the agent, the
+ * default Blender, the EEVEE probe) may take before the node is failed and
+ * destroyed. It had no deadline, and one stalled download left a node
+ * 'provisioning', billing, for good (#37 #82).
+ *
+ * A node that meets the offer filters' bandwidth (100 Mbps by default) gets
+ * through onReady in a few minutes: a 130 MB ffmpeg and a 400 MB Blender are
+ * seconds of download each, and restart-agent's worst case, waiting out
+ * another one on the node, is under 3 min. provision.sh's download ceilings
+ * are sized for a link trickling just above curl's stall guard (100 kB/s),
+ * where a slow download still finishes: 30 min an attempt, so about an hour
+ * for ffmpeg before its apt fallback, and 30 min a Blender mirror. Such a
+ * node would take longer than this deadline, and the app does not wait for
+ * it: at 25 min it is destroyed like any other failed provision, and the
+ * next rental goes to another machine. So inside onReady this deadline, not
+ * the script's ceilings or provisioner.ts's per-step timeouts, is the one
+ * that ends a slow node.
+ */
+const PROVISION_DEADLINE_MS = 25 * 60_000
+
+/**
+ * Plan 1.8: provisioning that ran past PROVISION_DEADLINE_MS. The work
+ * itself is not stopped here: its caller destroys the node, which closes the
+ * connection the work runs on.
+ */
+class ProvisionTimeout extends Error {
+  override readonly name = 'ProvisionTimeout'
+
+  constructor(what: string, ms: number) {
+    super(`${what} did not finish within ${Math.round(ms / 60_000)} min`)
+  }
+}
+
+/** `work`, or a ProvisionTimeout once `ms` has passed without it. */
+function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new ProvisionTimeout(what, ms)), ms)
+    work.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (e: unknown) => {
+        clearTimeout(timer)
+        reject(e)
+      }
+    )
+  })
+}
+
+/**
  * Plan 1.3: how often the account's instances are checked against this
  * profile's rows, from the cost timer. The check used to run once, at start-
  * up, so an orphan made mid-session (a create Vast carried out after its
@@ -210,6 +261,11 @@ function runwayMinutes(balance: number, perHour: number): number {
 
 function money(v: number): string {
   return `$${v.toFixed(2)}`
+}
+
+/** A node as alerts name it: its GPU and the start of its id. */
+function nodeName(s: Pick<NodeSnapshot, 'id' | 'gpuName'>): string {
+  return s.gpuName ? `${s.gpuName} ${s.id.slice(0, 8)}` : s.id.slice(0, 8)
 }
 
 /** What the Vast balance pays for per hour: see NodeManager.accountPerHour. */
@@ -2363,7 +2419,14 @@ export class NodeManager {
       node.setState('provisioning')
       held = 'provisioning'
       if (this.onReady && node.ssh) {
-        await this.onReady({ id: node.id, ssh: node.ssh })
+        // Past the deadline the node fails like any other provision, below:
+        // blacklisted, alerted and destroyed, which closes the connection
+        // the stalled step is waiting on.
+        await withDeadline(
+          this.onReady({ id: node.id, ssh: node.ssh }),
+          PROVISION_DEADLINE_MS,
+          'provisioning'
+        )
       }
       // Provisioning takes minutes, plenty of time to be destroyed in; a
       // node that was must not end 'ready', where the scheduler would use it.
@@ -2483,7 +2546,11 @@ export class NodeManager {
       if (node.movedOn(held)) return
       if (!r.stdout.includes('ok')) throw new Error('echo failed')
       if (this.onReady && node.ssh) {
-        await this.onReady({ id: node.id, ssh: node.ssh })
+        await withDeadline(
+          this.onReady({ id: node.id, ssh: node.ssh }),
+          PROVISION_DEADLINE_MS,
+          'provisioning'
+        )
       }
       // Destroyed while provisioning: not 'ready', where the scheduler would
       // dispatch to it and scale-down would destroy it a second time.
@@ -2495,9 +2562,36 @@ export class NodeManager {
       // 'unreachable' over the destroy's state, and no recovery that would
       // end 'failed' and destroy the instance again.
       if (node.movedOn(held)) return
+      // SSH answered, and provisioning stalled on it: waiting for the node to
+      // answer again would not help, and it bills meanwhile (plan 1.8).
+      if (e instanceof ProvisionTimeout) {
+        await this.giveUp(node, e.message, { connected: true })
+        return
+      }
       node.setState('unreachable', (e as Error).message)
       void this.recoverUnreachable(node)
     }
+  }
+
+  /**
+   * Give up on a node: fail it, give its chunks back to the queue, say so,
+   * and destroy its instance. For a node whose connection is dead
+   * (`connected: false`) the connection is closed first, so the destroy does
+   * not wait out an Octane stop over it.
+   */
+  private async giveUp(
+    node: ManagedNode,
+    reason: string,
+    opts: { connected: boolean }
+  ): Promise<void> {
+    node.setState('failed', reason)
+    // A node lost mid-render never reaches destroyNode, so the scheduler
+    // would otherwise keep polling it for chunks it can no longer finish.
+    forgetNodeProvider?.(node.id)
+    const s = node.snapshot
+    emit('alert', { level: 'warn', message: `Node ${nodeName(s)}: ${reason}. Destroying it.` })
+    if (!opts.connected) node.closeSsh()
+    if (s.instanceId != null) await this.ensureInstanceGone(s.instanceId, { node })
   }
 
   private async recoverUnreachable(node: ManagedNode): Promise<void> {
