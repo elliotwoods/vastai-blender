@@ -1,5 +1,6 @@
-import { useState, type CSSProperties } from 'react'
+import { useEffect, useState, type CSSProperties } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
+import { ConfirmButton } from '../../components/ConfirmButton'
 import { Icon } from '../../components/Icon'
 import { InfoHint } from '../../components/Tooltip'
 import { btn, mono, panel, sectionLabel, statusDot, tableRow } from '../../lib/controls'
@@ -7,16 +8,17 @@ import { fmtDuration, fmtEnergy, fmtMoney, fmtRate, fmtWatts } from '../../lib/f
 import { HINTS } from '../../lib/hints'
 import { ipc } from '../../lib/ipc'
 import { useNav } from '../../lib/nav'
+import { ipcErrorText } from '../../lib/recovery'
 import { DestroyNodeButton } from './NodeActions'
 import { NodeDetail } from './NodeDetail'
 import { UnclaimedPanel } from './UnclaimedPanel'
 import { MeterPair, MiniMeter } from './meters'
 import { pctOf, usageTone } from '../../lib/usage'
-import { useNodes, useSettings, useUpdateSettings } from '../../lib/queries'
+import { useNodes, useRequestNode, useSettings, useUpdateSettings } from '../../lib/queries'
 import { useNow } from '../../lib/useNow'
 import { SCALE, TOKENS, type StatusTone } from '../../lib/theme'
-import { holdsInstance } from '../../../../shared/nodeState'
-import type { NodeSnapshot, NodeState } from '../../../../shared/models'
+import { capacityBudget, holdsInstance } from '../../../../shared/nodeState'
+import type { NodeSnapshot, NodeState, SettingsPublic } from '../../../../shared/models'
 
 const STATE_TONE: Record<NodeState, StatusTone> = {
   requested: 'queued',
@@ -287,6 +289,89 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
   )
 }
 
+/**
+ * "+ request node": one rental now, by hand. At the spend cap (or with no
+ * cap set) main refuses it unless the user says to go past the cap (plan
+ * 1.5), so the button asks first there, naming the cap. It stays disabled
+ * while a request is out, so a double-click rents one node, not two (#94),
+ * and main's refusal is shown beside it rather than dropped.
+ */
+function RequestNodeButton({
+  nodes,
+  settings
+}: {
+  nodes: readonly NodeSnapshot[]
+  settings: SettingsPublic | undefined
+}): React.JSX.Element {
+  const req = useRequestNode()
+  const { error, reset } = req
+  // A refusal stays up long enough to read, not for the rest of the session.
+  useEffect(() => {
+    if (!error) return
+    const t = window.setTimeout(reset, 20_000)
+    return () => window.clearTimeout(t)
+  }, [error, reset])
+
+  const budget = settings ? capacityBudget(nodes, settings) : null
+  const message = error ? ipcErrorText(error) : null
+  // The renderer's view of the cap can trail main's by a push; main's own
+  // refusal says the same, so either one turns the button into the question.
+  const overCap =
+    (budget?.headroomPerHour != null && budget.headroomPerHour <= 0) ||
+    (message != null && /spend cap/i.test(message))
+  const noCap = settings?.spendCapPerHour == null
+  const request = (overSpendCap: boolean): Promise<unknown> =>
+    // The refusal is shown from the mutation's error; nothing to rethrow.
+    req.mutateAsync(overSpendCap ? { overSpendCap: true } : undefined).catch(() => undefined)
+
+  return (
+    <>
+      {message ? (
+        <span
+          role="status"
+          title={message}
+          style={{
+            maxWidth: 320,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            fontSize: SCALE.textXs,
+            color: TOKENS.danger
+          }}
+        >
+          {message}
+        </span>
+      ) : null}
+      {overCap ? (
+        <ConfirmButton
+          label="+ request node"
+          variant="default"
+          confirmLabel={
+            noCap
+              ? 'no spend cap set: rent anyway?'
+              : `past the ${fmtRate(budget?.spendCap ?? settings?.spendCapPerHour ?? 0)} cap?`
+          }
+          title={
+            noCap
+              ? 'No spend cap is set, so scale-up rents nothing. Click twice to rent one node anyway.'
+              : `The fleet bills ${fmtRate(budget?.perHour ?? 0)} of its ${fmtRate(budget?.spendCap ?? 0)} spend cap. ` +
+                'A node rented now takes it past the cap: click twice to rent one anyway.'
+          }
+          onConfirm={() => request(true)}
+        />
+      ) : (
+        <button
+          style={btn({ size: 'sm', disabled: req.isPending })}
+          disabled={req.isPending}
+          onClick={() => void request(false)}
+        >
+          {req.isPending ? 'requesting…' : '+ request node'}
+        </button>
+      )}
+    </>
+  )
+}
+
 // Renderer-only view preference, like the grade in media/useGrade.ts.
 const LS_SHOW_FAILED = 'vr:fleet:showFailed'
 
@@ -364,12 +449,7 @@ export function FleetScreen(): React.JSX.Element {
             >
               {clearing ? 'clearing…' : 'clear failed'}
             </button>
-            <button
-              style={btn({ size: 'sm' })}
-              onClick={() => void ipc.invoke('fleet:requestNode')}
-            >
-              + request node
-            </button>
+            <RequestNodeButton nodes={nodes ?? []} settings={settings} />
           </span>
         }
       />

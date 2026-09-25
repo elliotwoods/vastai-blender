@@ -9,7 +9,8 @@ import type { NodeSnapshot, SettingsPublic, UnclaimedInstance } from '../../../.
 // recoveryWiring.test.tsx does:
 // - 1.2: a node that may still be billing is always listed, and counted;
 // - 1.3: instances nobody here holds are listed with their rate, destroy asks;
-// - 1.20: the toolbar's balance turns amber and red by runway, not at $5.
+// - 1.20: the toolbar's balance turns amber and red by runway, not at $5;
+// - 1.5: "+ request node" at the spend cap asks before going past it.
 
 vi.mock('../../lib/ipc', () => ({
   ipc: { invoke: vi.fn(() => new Promise(() => {})), on: vi.fn(() => () => {}) }
@@ -227,5 +228,22 @@ describe('1.20: the balance reads as a runway, not against a fixed $5', () => {
       <AppToolbar />
     )
     expect(balance(html)).toBe('var(--text)')
+  })
+})
+
+describe('1.5: a manual rental at the spend cap asks first', () => {
+  it('asks, naming the cap, once the fleet bills all of it', () => {
+    const html = withCache(
+      (qc) => qc.setQueryData(qk.nodes, [node({ dphTotal: 10 })]),
+      <FleetScreen />
+    )
+    expect(html).toContain('<span aria-live="polite">+ request node</span>')
+    expect(html).toContain('bills $10.000/hr of its $10.000/hr spend cap')
+  })
+
+  it('rents at one click under the cap', () => {
+    const html = withCache((qc) => qc.setQueryData(qk.nodes, [node({})]), <FleetScreen />)
+    expect(html).toContain('>+ request node</button>')
+    expect(html).not.toContain('<span aria-live="polite">+ request node</span>')
   })
 })
