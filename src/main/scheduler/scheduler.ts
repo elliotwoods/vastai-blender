@@ -1777,11 +1777,26 @@ class Scheduler {
       const c = pending[i]
       if (!admits(occ, { id: c.id, sharesNode: c.share_node === 1 })) continue
       const avoid = this.failedOn.get(c.id)?.nodes
-      if (avoid?.has(node.id) && eligible.some((n) => !avoid.has(n.id))) continue
+      if (avoid?.has(node.id) && this.anotherTakes(c, avoid, eligible)) continue
       if (!c.blender_version || node.blenderVersions.includes(c.blender_version)) return i
       if (fallback < 0) fallback = i
     }
     return fallback
+  }
+
+  /**
+   * Could a node the chunk has not failed on take it now: one with room that
+   * admits it? Any other node at all was the old test, so at the tail a node
+   * the chunk failed on sat idle and billing while the chunk waited for a
+   * busy one, and one reserved for it stayed reserved and empty.
+   */
+  private anotherTakes(
+    c: PendingChunk,
+    avoid: ReadonlySet<string>,
+    eligible: NodeSnapshot[]
+  ): boolean {
+    const cand = { id: c.id, sharesNode: c.share_node === 1 }
+    return eligible.some((n) => !avoid.has(n.id) && admits(this.occupancy(n.id), cand))
   }
 
   /** Is this node resting after a failed dispatch? */

@@ -487,6 +487,46 @@ describe('1.17: the machines and the network are not the render', () => {
   })
 })
 
+describe('1.17: where a chunk the machines failed goes, and what it is told', () => {
+  it('1.17: a chunk goes back to the node it failed on when the only other node is busy', async () => {
+    const { app, ids } = await nodes(2)
+    const attempts = new Map<string, number>()
+    let releaseLong: (() => void) | null = null
+    for (const id of ids) {
+      const machine = w.machineFor(id)
+      machine.onSpec = (spec) => {
+        const n = (attempts.get(spec.chunkId) ?? 0) + 1
+        attempts.set(spec.chunkId, n)
+        if (spec.frameStart !== 1) {
+          // The other chunk holds its node until the test lets it finish.
+          releaseLong = () => machine.agent.finish(spec.chunkId)
+        } else if (n === 1) {
+          failWith(machine, spec.chunkId, outOfMemory)
+        } else {
+          machine.agent.finish(spec.chunkId)
+        }
+      }
+    }
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 2 })
+    const [first] = chunksOf(jobId)
+    app.scheduler.kick()
+    await w.until(() => chunkRow(first.id).infra_retries === 1, 'first attempt failed')
+    const failedOn = w
+      .eventsOf('chunk:changed')
+      .find((c) => c.chunkId === first.id && c.state === 'assigned')!.nodeId!
+
+    // The node it failed on is idle, the other is busy and has no room: it
+    // is sent back rather than left waiting while an idle node bills.
+    await w.until(() => chunkRow(first.id).state === 'complete', 'failed chunk rendered', {
+      timeoutMs: 5 * 60_000
+    })
+    expect(assignedTo(failedOn)).toBe(2)
+    expect(releaseLong).not.toBeNull()
+    releaseLong!()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+  })
+})
+
 describe('1.17: the job breaker, the same failure on two nodes', () => {
   it('1.17: the same render failure on two nodes holds the job with one alert, until it is resumed', async () => {
     const { app, ids } = await nodes(2)
