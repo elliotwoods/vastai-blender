@@ -425,6 +425,25 @@ describe('index.ts, headless (plan 1.1)', () => {
     })
   })
 
+  it('a closed terminal (EPIPE on stdout or stderr) is not an uncaught exception mid-destroy', async () => {
+    const listening: string[] = []
+    for (const [name, stream] of [
+      ['stdout', process.stdout],
+      ['stderr', process.stderr]
+    ] as const) {
+      vi.spyOn(stream, 'on').mockImplementation(((event: string, fn: (e: Error) => void) => {
+        listening.push(`${name} ${event}`)
+        // Nowhere to say it: the listener must not throw either.
+        if (event === 'error') fn(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+        return stream
+      }) as typeof stream.on)
+    }
+    const r = await load([node()], { VR_E2E_BLEND: '/scenes/e2e.blend' })
+
+    expect(listening).toEqual(expect.arrayContaining(['stdout error', 'stderr error']))
+    expect(r.signals.has('SIGHUP')).toBe(true)
+  })
+
   it('the campaign done (after the driver submitted it): destroys the fleet and exits 0', async () => {
     const r = await load([node()], { VR_E2E_BLEND: '/scenes/e2e.blend' })
     // The driver submits 3 s after boot; the campaign counts as done after

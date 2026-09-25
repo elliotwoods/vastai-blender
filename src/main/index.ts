@@ -74,6 +74,17 @@ if (!app.requestSingleInstanceLock({ scripted })) {
   process.exit(0)
 }
 
+// A headless run is usually started from a terminal, and SIGHUP usually
+// means that terminal went away. The destroy the quit policy then starts
+// still writes to stdout (app/lifecycle.ts, nodeManager, events.ts's
+// mirror). A write to a closed terminal fails later, as an 'error' event on
+// the stream, and one with no listener is an uncaught exception: Electron's
+// blocking error box in the middle of the destroy. There is nowhere left to
+// say it, so the listener does nothing.
+if (headless) {
+  for (const stream of [process.stdout, process.stderr]) stream.on('error', () => {})
+}
+
 // The primary instance: a second launch (above) by a person is them asking
 // for the app, so show them the one that is running. A scripted one is not:
 // a campaign resubmitted, or a capture, on a box rendering headless must not
