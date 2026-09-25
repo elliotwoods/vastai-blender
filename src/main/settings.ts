@@ -10,6 +10,7 @@ import { app, safeStorage } from 'electron'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import type { OfferFilters, SecretKey, SettingsPublic } from '../shared/models'
+import { sessionOverlay } from './app/settingsOverlay'
 
 interface SettingsFile {
   public: SettingsPublic
@@ -139,8 +140,17 @@ function persist(): void {
   renameSync(tmp, file)
 }
 
+/**
+ * The settings in force: what is saved, with this session's overlay laid
+ * over it (plan 1.14). A headless spec run puts its fleet size, cap and
+ * filters in the overlay rather than in settings.json, so every reader sees
+ * them for the run and nothing of them is ever saved: persist() writes only
+ * the cache, never this. Without the overlay here the spec driver finds its
+ * settings not in force and refuses the campaign (app/headless/jobSpec.ts).
+ */
 export function getSettings(): SettingsPublic {
-  return { ...load().public, offerFilters: { ...load().public.offerFilters } }
+  const saved = load().public
+  return sessionOverlay.apply({ ...saved, offerFilters: { ...saved.offerFilters } })
 }
 
 export function updateSettings(patch: Partial<SettingsPublic>): SettingsPublic {

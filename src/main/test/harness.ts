@@ -657,27 +657,32 @@ function registerMocks(scope: Scope): void {
     closeDb: () => {}
   }))
 
-  vi.doMock('../settings', () => ({
-    getSettings: () => copySettings(world().settings),
-    // As settings.ts: the derived has* flags are stripped from the patch, and
-    // a partial offerFilters merges over the current filters.
-    updateSettings: (patch: Partial<SettingsPublic>) => {
-      const s = world().settings
-      const rest = { ...patch }
-      delete rest.hasVastApiKey
-      delete rest.hasOtoyCredentials
-      delete rest.offerFilters
-      Object.assign(s, rest)
-      if (patch.offerFilters) Object.assign(s.offerFilters, patch.offerFilters)
-      return copySettings(s)
-    },
-    getSecret: (key: SecretKey) => world().secrets[key] ?? null,
-    setSecret: (key: SecretKey, value: string) => {
-      const w = world()
-      w.secrets[key] = value
-      deriveFlags(w)
+  vi.doMock('../settings', async () => {
+    // As settings.ts: a headless spec's session overlay is laid over what is
+    // saved (plan 1.14), and never saved with it.
+    const { sessionOverlay } = await import('../app/settingsOverlay')
+    return {
+      getSettings: () => sessionOverlay.apply(copySettings(world().settings)),
+      // As settings.ts: the derived has* flags are stripped from the patch, and
+      // a partial offerFilters merges over the current filters.
+      updateSettings: (patch: Partial<SettingsPublic>) => {
+        const s = world().settings
+        const rest = { ...patch }
+        delete rest.hasVastApiKey
+        delete rest.hasOtoyCredentials
+        delete rest.offerFilters
+        Object.assign(s, rest)
+        if (patch.offerFilters) Object.assign(s.offerFilters, patch.offerFilters)
+        return sessionOverlay.apply(copySettings(s))
+      },
+      getSecret: (key: SecretKey) => world().secrets[key] ?? null,
+      setSecret: (key: SecretKey, value: string) => {
+        const w = world()
+        w.secrets[key] = value
+        deriveFlags(w)
+      }
     }
-  }))
+  })
 
   vi.doMock('../vast/vastClient', async (importOriginal) => {
     const real = await importOriginal<typeof import('../vast/vastClient')>()

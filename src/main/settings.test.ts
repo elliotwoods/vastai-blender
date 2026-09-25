@@ -143,3 +143,37 @@ describe('1.3 install id', () => {
     expect(existsSync(join(paths.userData, 'settings.json'))).toBe(false)
   })
 })
+
+// Plan 1.14: a headless spec run's settings are a session overlay, in force
+// for every reader through getSettings() and never saved. Before this,
+// getSettings() read settings.json alone, so the spec driver found its own
+// settings not in force and refused every campaign that set any (a2 review).
+describe('1.14 session overlay', () => {
+  it("getSettings lays the overlay over what is saved, and a save writes only the user's own", async () => {
+    writeFileSync(
+      join(paths.userData, 'settings.json'),
+      JSON.stringify({
+        public: { maxActiveNodes: 2, spendCapPerHour: 3, offerFilters: { minGpuRamGb: 12 } },
+        secrets: {}
+      })
+    )
+    const settings = await launch()
+    const { sessionOverlay } = await import('./app/settingsOverlay')
+    sessionOverlay.set({ maxActiveNodes: 30, offerFilters: { minDiskGb: 80 } })
+    try {
+      const s = settings.getSettings()
+      expect(s.maxActiveNodes).toBe(30)
+      expect(s.spendCapPerHour).toBe(3)
+      // Filters merge one by one: the saved 12 GB stays beside the spec's disk.
+      expect(s.offerFilters).toMatchObject({ minGpuRamGb: 12, minDiskGb: 80 })
+
+      const after = settings.updateSettings({ idleTimeoutMinutes: 9 })
+      expect(after.maxActiveNodes).toBe(30)
+      expect(onDisk().public).toMatchObject({ maxActiveNodes: 2, idleTimeoutMinutes: 9 })
+      expect((onDisk().public.offerFilters as Record<string, unknown>).minDiskGb).not.toBe(80)
+    } finally {
+      sessionOverlay.clear()
+    }
+    expect(settings.getSettings().maxActiveNodes).toBe(2)
+  })
+})
