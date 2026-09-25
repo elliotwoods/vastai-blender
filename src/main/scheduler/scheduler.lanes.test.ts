@@ -260,3 +260,64 @@ describe('1.11 #222: the lane memory guard', () => {
     await w.until(() => jobState(jobId) === 'complete', 'job complete')
   })
 })
+
+describe('1.11 #224: a chunk with cards to spare goes out across every card', () => {
+  it("a job's last chunk on an empty 4-GPU node renders on every card, and holds the node", async () => {
+    const { app, nodeId, machine } = await gpuNode(4)
+    const specs = recordSpecs(machine)
+    const lone = await w.submitJob(app, { frameStart: 1, frameEnd: 4, chunkSize: 4 })
+    app.scheduler.kick()
+    await w.until(() => specs.length === 1, 'the chunk dispatched')
+    // Pinned, it rendered on one card at single-GPU speed while three idled.
+    expect(specs[0]).toMatchObject({ lanes: 1, pinGpus: false })
+
+    // Nothing is sent beside it: it has every card, and the agent would start
+    // a pinned spec next to it.
+    const next = await submit(app, 'cycles', 4)
+    app.scheduler.kick()
+    await w.advance(20_000)
+    expect(specs).toHaveLength(1)
+    expect(inFlight(app, nodeId)).toBe(1)
+
+    // Once it is done, four chunks fill the four lanes, pinned again.
+    machine.agent.finish(specs[0].chunkId)
+    await w.until(() => specs.length === 5, 'four lanes for the next job')
+    expect(specs.slice(1).map((s) => [s.lanes, s.pinGpus])).toEqual(
+      specs.slice(1).map(() => [4, true])
+    )
+    for (const s of specs.slice(1)) machine.agent.finish(s.chunkId)
+    await w.until(
+      () => jobState(lone) === 'complete' && jobState(next) === 'complete',
+      'both jobs complete'
+    )
+  })
+
+  it('decides per chunk: six chunks on two empty 4-GPU nodes, one across a node and four in lanes', async () => {
+    // By default auto-chunking sizes a job at about 3 chunks per node, so two
+    // 4-GPU nodes got 3 pinned lanes each, a card idle on each for the whole
+    // job and every chunk at single-GPU speed.
+    w = await setup({ settings: { maxActiveNodes: 2 } })
+    const app = await w.boot()
+    const ids = [await w.readyNode(app, { num_gpus: 4 }), await w.readyNode(app, { num_gpus: 4 })]
+    const specs = ids.map((id) => recordSpecs(w.machineFor(id)))
+    const jobId = await submit(app, 'cycles', 6)
+    app.scheduler.kick()
+    await w.until(() => specs[0].length + specs[1].length === 5, 'five dispatched')
+    await w.advance(20_000)
+    const plans = specs.map((s) => s.map((x) => [x.lanes, x.pinGpus]))
+    // Eight free lanes for six chunks: the first takes a whole node. On the
+    // other, four chunks for four lanes: pinned. The sixth waits for a lane.
+    expect(plans.map((p) => p.length).sort()).toEqual([1, 4])
+    const [whole, laned] = plans[0].length === 1 ? plans : [plans[1], plans[0]]
+    expect(whole).toEqual([[1, false]])
+    expect(laned).toEqual(laned.map(() => [4, true]))
+    expect(chunksOf(jobId).filter((c) => c.state === 'pending')).toHaveLength(1)
+
+    for (const id of ids)
+      w.machineFor(id).onSpec = (spec) => w.machineFor(id).agent.finish(spec.chunkId)
+    for (const [i, id] of ids.entries()) {
+      for (const s of specs[i]) w.machineFor(id).agent.finish(s.chunkId)
+    }
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+  })
+})

@@ -51,6 +51,7 @@ import {
   type RetryBudget
 } from './admission'
 import {
+  dispatchLanePlan,
   guardedLanePlan,
   guardLanes,
   initialGuard,
@@ -1480,6 +1481,53 @@ class Scheduler {
   }
 
   /**
+   * The lanes an exclusive chunk is sent to this node with: the node's plan
+   * for its engine, unless the free lanes the queue can reach outnumber the
+   * exclusive chunks waiting for them, when a chunk that finds its node
+   * empty goes out as one unpinned process on every card
+   * (gpuLanes.dispatchLanePlan).
+   *
+   * Pinning used to be decided per node, never per chunk, so whenever a job
+   * had fewer chunks left than the fleet had lanes (small jobs, and the end
+   * of every job) the last chunks rendered one card each while the other
+   * cards idled and billed, where one process used to use them all (#224):
+   * on 93cbad4's own figures a lone tail chunk took about three times as
+   * long. The unpinned chunk then holds its node (exclusiveLanesFor).
+   *
+   * `pending` is what is still unassigned this tick, without this chunk.
+   * Only chunks that render in pinned lanes count as waiting for lanes: an
+   * EEVEE or Octane chunk takes a whole node, never a lane.
+   */
+  private exclusiveDispatchPlan(
+    nodeId: string,
+    chunk: PendingChunk,
+    pending: PendingChunk[],
+    eligible: NodeSnapshot[]
+  ): LanePlan {
+    const plan = this.lanePlanFor(nodeId, chunk.engine)
+    if (!plan.pin) return plan
+    const pins = new Map<EngineId, boolean>()
+    const inLanes = (engine: EngineId): boolean => {
+      let p = pins.get(engine)
+      if (p === undefined) {
+        p = this.lanePlanFor(nodeId, engine).pin
+        pins.set(engine, p)
+      }
+      return p
+    }
+    const waiting = pending.filter((c) => c.share_node !== 1 && inLanes(c.engine)).length
+    return dispatchLanePlan({
+      plan,
+      nodeInFlight: this.runsOn(nodeId).size,
+      freeLanes: eligible.reduce(
+        (a, n) => a + freeExclusiveLanes(this.occupancy(n.id, chunk.engine)),
+        0
+      ),
+      pendingExclusive: waiting + 1
+    })
+  }
+
+  /**
    * The slot count the UI shows for a node: its GPU lanes while it runs
    * exclusive work (or sits empty), otherwise the shared-work target. A
    * node running an unpinned exclusive chunk (EEVEE, Octane, or a Cycles
@@ -1816,7 +1864,9 @@ class Scheduler {
           node.id,
           chunk.share_node === 1,
           managed.ssh,
-          this.lanePlanFor(node.id, chunk.engine),
+          chunk.share_node === 1
+            ? this.lanePlanFor(node.id, chunk.engine)
+            : this.exclusiveDispatchPlan(node.id, chunk, pending, eligible),
           chunk.engine
         )
         this.runs.set(chunk.id, run)
