@@ -683,6 +683,64 @@ class InstanceStillListed extends Error {
   }
 }
 
+/** What a caller of ensureInstanceGone asks of it. */
+interface GoneCheckOptions {
+  node?: ManagedNode
+  budgetMs?: number
+  quiet?: boolean
+  reason?: string
+  /** The most the Octane stop may take: see destroyUntilGone. 0 skips it. */
+  octaneStopMs?: number
+}
+
+/** An ensureInstanceGone in flight, for the callers that join it. */
+interface GoneCheck {
+  done: Promise<boolean>
+  /** When its Octane stop must end by: a later caller may bring it forward. */
+  stopBy: StopDeadline
+  /** Whether it keeps a failure to itself (the retry timer's). */
+  quiet: boolean
+}
+
+/**
+ * The most a destroy's OctaneServer stop may take for this caller:
+ * `octaneStopMs` as given, OCTANE_STOP_BUDGET_MS for a caller with a budget
+ * of its own, or undefined for stopOctane's default.
+ */
+function octaneStopBound(opts: GoneCheckOptions): number | undefined {
+  return opts.octaneStopMs ?? (opts.budgetMs != null ? OCTANE_STOP_BUDGET_MS : undefined)
+}
+
+/**
+ * The moment an Octane stop is given up on, which only ever comes sooner:
+ * `reached` resolves then. Nothing is set until a caller joining the destroy
+ * asks for a bound (joinGoneCheck); the stop's own timeout covers the rest.
+ */
+class StopDeadline {
+  readonly reached: Promise<void>
+  private resolve!: () => void
+  private at = Number.POSITIVE_INFINITY
+  private timer: ReturnType<typeof setTimeout> | null = null
+
+  constructor() {
+    this.reached = new Promise<void>((r) => (this.resolve = r))
+  }
+
+  /** End the stop within `ms` from now, unless it is due sooner already. */
+  within(ms: number): void {
+    const at = Date.now() + Math.max(0, ms)
+    if (at >= this.at) return
+    this.at = at
+    this.clear()
+    this.timer = setTimeout(() => this.resolve(), Math.max(0, ms))
+  }
+
+  clear(): void {
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = null
+  }
+}
+
 /**
  * Vast did not answer: a network error, a timeout, a 5xx or a 429. That says
  * nothing about the instance asked about, or about the machine it is on.
@@ -1244,9 +1302,10 @@ export class NodeManager {
   /**
    * ensureInstanceGone calls in flight, by instance id. A second caller for
    * the same instance (the retry timer, clearFailed, the destroy button
-   * pressed again) waits on the first instead of sending its own DELETE.
+   * pressed again, a quit's destroy-all) waits on the first instead of
+   * sending its own DELETE; see joinGoneCheck for what it may change.
    */
-  private goneChecks = new Map<number, Promise<boolean>>()
+  private goneChecks = new Map<number, GoneCheck>()
   /** Instances whose unconfirmed destroy has been alerted this session. */
   private unconfirmedAlerted = new Set<number>()
   private retryingDestroys = false
@@ -3164,33 +3223,65 @@ export class NodeManager {
    */
   ensureInstanceGone(
     instanceId: number,
-    opts: {
-      node?: ManagedNode
-      budgetMs?: number
-      quiet?: boolean
-      reason?: string
-      /** The most the Octane stop may take: see destroyUntilGone. 0 skips it. */
-      octaneStopMs?: number
-    } = {}
+    opts: GoneCheckOptions & { /** Internal: joinGoneCheck's own check. */ joined?: true } = {}
   ): Promise<boolean> {
     const running = this.goneChecks.get(instanceId)
-    if (running) return running
-    const check = this.destroyUntilGone(instanceId, opts).finally(() =>
-      this.goneChecks.delete(instanceId)
-    )
+    if (running) return this.joinGoneCheck(instanceId, running, opts)
+    const stopBy = new StopDeadline()
+    const check: GoneCheck = {
+      done: this.destroyUntilGone(instanceId, opts, stopBy).finally(() => {
+        stopBy.clear()
+        if (this.goneChecks.get(instanceId) === check) this.goneChecks.delete(instanceId)
+      }),
+      stopBy,
+      quiet: opts.quiet === true
+    }
     this.goneChecks.set(instanceId, check)
-    return check
+    return check.done
+  }
+
+  /**
+   * A second caller for an instance already being destroyed. It sends no
+   * DELETE of its own while that check runs, but the check is held to its
+   * bounds too (integration review):
+   *
+   * - Its Octane stop ends no later than this caller allows. A quit that
+   *   joined the Fleet button's destroy of a licensed node gone quiet waited
+   *   out that destroy's 35 s stop, which came out of the quit's own 40 s:
+   *   the DELETE's retries were still pending when it gave up, and 'Quit
+   *   anyway' left the instance live. A hurried quit's 0 ends it now.
+   * - If the check gives up while this caller's budget has time left, or it
+   *   was a quiet one (the retry timer's single attempt) and this caller
+   *   would be told, this caller gets one check of its own with what is
+   *   left: the destroy button pressed during the timer's round was one
+   *   attempt and no word, whatever became of it (n1 review).
+   */
+  private async joinGoneCheck(
+    instanceId: number,
+    running: GoneCheck,
+    opts: GoneCheckOptions & { joined?: true }
+  ): Promise<boolean> {
+    const stopMs = octaneStopBound(opts)
+    if (stopMs !== undefined) running.stopBy.within(stopMs)
+    const deadline = Date.now() + (opts.budgetMs ?? DESTROY_BUDGET_MS)
+    if (await running.done) return true
+    if (opts.joined) return false
+    const left = deadline - Date.now()
+    const unheard = running.quiet && opts.quiet !== true
+    if (left <= 0 && !unheard) return false
+    return this.ensureInstanceGone(instanceId, {
+      ...opts,
+      budgetMs: Math.max(0, left),
+      // The check it joined said so already, unless it was quiet.
+      quiet: opts.quiet === true || !running.quiet,
+      joined: true
+    })
   }
 
   private async destroyUntilGone(
     instanceId: number,
-    opts: {
-      node?: ManagedNode
-      budgetMs?: number
-      quiet?: boolean
-      reason?: string
-      octaneStopMs?: number
-    }
+    opts: GoneCheckOptions,
+    stopBy: StopDeadline
   ): Promise<boolean> {
     const { node } = opts
     if (node) {
@@ -3203,10 +3294,13 @@ export class NodeManager {
       // out of the DELETE's window, so a licensed node gone quiet, and two
       // 502s, left the quit reporting it billing, and 'Quit anyway' left it
       // live (n5 review). 0 skips the stop: the process may be ended any
-      // moment, and the instance matters more than the seat.
-      const stopMs =
-        opts.octaneStopMs ?? (opts.budgetMs != null ? OCTANE_STOP_BUDGET_MS : undefined)
-      if (stopMs !== 0) await this.stopOctane(node, stopMs).catch(() => {})
+      // moment, and the instance matters more than the seat. A caller that
+      // joins this check later may end the stop sooner (joinGoneCheck);
+      // closing the connection below ends the script's exec.
+      const stopMs = octaneStopBound(opts)
+      if (stopMs !== 0) {
+        await Promise.race([this.stopOctane(node, stopMs).catch(() => {}), stopBy.reached])
+      }
       node.closeSsh()
     }
     let last: unknown = null

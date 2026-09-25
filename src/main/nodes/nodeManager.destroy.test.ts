@@ -283,6 +283,31 @@ describe('1.2 ensureInstanceGone: a destroy is done when Vast confirms it', () =
     await expect(app.nodeManager.requestNodes(1)).resolves.toHaveLength(1)
   })
 
+  it("n1 review: the destroy button pressed during the retry timer's quiet attempt gets an attempt of its own", async () => {
+    // It joined the timer's single, quiet attempt: when that failed, the
+    // user's press had sent nothing, and said nothing either.
+    const app = await bootNodes()
+    app.nodeManager.init()
+    const id = await w.readyNode(app)
+    const [instanceId] = w.vast.created
+    const refused = { status: 403, message: 'access denied' }
+    w.vast.fail('destroyInstance', refused)
+    await app.nodeManager.destroyNode(id)
+    expect(row(id).state).toBe('failed')
+    expect(w.alerts('error')).toHaveLength(1)
+
+    // The retry timer's round: one attempt, quiet, held in flight.
+    const del = w.vast.hold('destroyInstance')
+    await w.until(() => del.reached, "the timer's DELETE in flight", { stepMs: 1_000 })
+    const pressed = watch(app.nodeManager.destroyNode(id))
+    del.fail(refused)
+    await w.until(() => pressed.done, 'the press answered')
+
+    expect(w.vast.count('destroyInstance')).toBe(3)
+    expect(row(id).state).toBe('destroyed')
+    expect(w.vast.live()).not.toContain(instanceId)
+  })
+
   it('OctaneServer is stopped before the DELETE, and a stop that hangs holds it up 20 s at most (1.18)', async () => {
     const app = await bootNodes()
     app.nodeManager.init()

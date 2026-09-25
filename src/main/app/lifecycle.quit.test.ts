@@ -366,12 +366,59 @@ describe('Destroy all that cannot confirm a destroy (plan 1.1)', () => {
 
 describe('Destroy all with an Octane node gone quiet (plans 1.1, 1.18)', () => {
   /** One node, licensed for Octane, whose OctaneServer stop never answers. */
-  async function quietOctaneNode(): Promise<{ engine: App; instances: number[] }> {
+  async function quietOctaneNode(): Promise<{ engine: App; id: string; instances: number[] }> {
     const { engine, ids, instances } = await fleetOf(1)
     w.db.prepare("UPDATE nodes SET octane_state = 'licensed' WHERE id = ?").run(ids[0])
     w.machineFor(ids[0]).onExec(/stop-server/, HANG)
-    return { engine, instances }
+    return { engine, id: ids[0], instances }
   }
+
+  /**
+   * The Fleet's destroy button on it, the moment before the quit: its stop
+   * under way. Wrapped, since an async function would adopt the promise.
+   */
+  async function destroyUnderWay(engine: App, id: string): Promise<{ done: Promise<void> }> {
+    const machine = w.machineFor(id)
+    const done = engine.nodeManager.destroyNode(id)
+    await w.until(() => machine.ran(/stop-server/).length > 0, 'the Octane stop under way')
+    return { done }
+  }
+
+  it("integration review: a quit that joins the Fleet's destroy of a licensed node holds its stop to the quit's 20 s: three 502s, and it is still destroyed", async () => {
+    // The destroy already under way had no budget: 35 s for the stop, and
+    // the quit that joined it waited that out of its own 40 s. The DELETE's
+    // retries were still pending when the quit gave up, and 'Quit anyway'
+    // left the instance live.
+    const { engine, id, instances } = await quietOctaneNode()
+    const r = await rig(engine)
+    const destroying = await destroyUnderWay(engine, id)
+    r.answers.push(DESTROY, QUIT_ANYWAY)
+    w.vast.fail('destroyInstance', { status: 502, message: 'bad gateway' }, 3)
+
+    r.app.quit()
+    await w.until(() => r.app.exits.length > 0, 'the app to exit', { timeoutMs: 120_000 })
+
+    expect(r.dialogs).toHaveLength(1)
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+    await destroying.done
+    expect(w.vast.count('destroyInstance')).toBe(4)
+  })
+
+  it("integration review: a session end that joins the Fleet's destroy sends its DELETE without waiting on the stop", async () => {
+    const { engine, id, instances } = await quietOctaneNode()
+    const r = await rig(engine)
+    const win = new EventEmitter()
+    r.app.emit('browser-window-created', {}, win)
+    const destroying = await destroyUnderWay(engine, id)
+
+    win.emit('session-end')
+    await w.advance(3_000, 100)
+
+    expect(w.vast.count('destroyInstance')).toBe(1)
+    await w.until(() => r.app.exits.length > 0, 'the app to exit')
+    expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
+    await destroying.done
+  })
 
   it("n5 review: a licensed node's stop does not eat the DELETE's window: two 502s, and it is still destroyed", async () => {
     // A server known to have run gets 35 s to stop, and the stop came out
