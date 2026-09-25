@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { HANG, REMOTE_ROOT } from '../test/fakeSsh'
 import {
   setup,
@@ -489,6 +489,54 @@ describe('1.7: a hung Blender', () => {
     )
     expect(w.alerts().join('\n')).not.toMatch(/no progress/)
   }, 60_000)
+
+  it('this computer asleep for three hours while frames landed: a hang after it is still stopped at 45 min', async () => {
+    // Review round 2: the gap between the last read before a sleep and the
+    // first after it was taken for one frame's time, eighteen frames' worth,
+    // and every later run of the job on that hardware got three times that:
+    // nine hours before a hung Blender was stopped.
+    const { app, ids } = await fleet(1)
+    const machine = w.machineFor(ids[0])
+    const specs: AgentSpec[] = []
+    let progress: Progress = () => ({ at: 0, frames: 0 })
+    let stop = (): void => {}
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      if (specs.length > 1) return machine.agent.finish(spec.chunkId)
+      // A frame every ten minutes, 22 of them; then Blender hangs, alive.
+      const saves = Array.from({ length: 22 }, (_, i) => (i + 1) * 10)
+      progress = savedAt(Date.now() / 1000, saves)
+      stop = heartbeat(machine, spec.chunkId, progress)
+    }
+    machine.onExec(/pkill -f/, () => {
+      stop()
+      return ''
+    })
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 30, chunkSize: 30 })
+    app.scheduler.kick()
+    await w.until(() => specs.length === 1, 'dispatched')
+    const dispatchedAt = Date.now()
+    // Two frames seen saved, ten minutes apart.
+    await w.advance(25 * 60_000, 5_000)
+    // Asleep for three hours: this computer's timers stand still, while the
+    // node renders on and its agent keeps its state fresh.
+    vi.setSystemTime(Date.now() + 3 * 60 * 60_000)
+    beat(machine, specs[0].chunkId, progress)
+
+    await w.until(() => specs.length === 2, 'the hung render stopped and sent again', {
+      timeoutMs: 3 * 60 * 60_000,
+      stepMs: 5_000
+    })
+    stop()
+    // The last frame was saved at 220 min: stopped 45 min on, not 9 h.
+    const minutes = (Date.now() - dispatchedAt) / 60_000
+    expect(minutes).toBeGreaterThan(265)
+    expect(minutes).toBeLessThan(272)
+    expect(chunksOf(jobId)[0]).toMatchObject({ retries: 0, infra_retries: 1 })
+    expect(w.alerts('warn').join('\n')).toMatch(
+      /no progress \(no frame started or saved\) for 4\d min while it kept running, where this job's frames have taken up to 10 min on this hardware/
+    )
+  }, 30_000)
 })
 
 describe('1.8: a spec write with no answer', () => {

@@ -524,6 +524,15 @@ const HUNG_SLOWEST_FACTOR = 3
 const HUNG_UNKNOWN_MS = 3 * 60 * 60_000
 
 /**
+ * Two state reads further apart than this, on this computer's clock, have
+ * progress between them that the run never saw, and the gap between their
+ * lastProgressAt is not one frame's (ChunkRun.noteProgress). Reads are
+ * STATE_POLL_MS apart plus a read's own 30 s deadline; a gap across closer
+ * reads overstates the frame by at most that much.
+ */
+const PROGRESS_READ_GAP_MS = 2 * 60_000
+
+/**
  * No state file for this long after the spec was queued, and the run asks
  * the node why (ChunkRun.checkMissingState). The agent writes one within
  * seconds of taking a spec, and the spec stays in its inbox until the render
@@ -605,6 +614,8 @@ class ChunkRun {
    */
   private framesSeen: number | null = null
   private timedFrame = false
+  /** When the last state read came back (epoch ms, this computer's clock). */
+  private stateReadAt: number | null = null
 
   /** EWMA of frames/sec while rendering; null until two progress samples land. */
   private framesPerSec: number | null = null
@@ -1350,17 +1361,29 @@ class ChunkRun {
    * reads). Before that its gaps are Blender starting and loading the scene,
    * which say nothing of how long a frame takes. From then on it is the
    * job's to know (Scheduler.noteFrameTime), for every run of it there.
+   *
+   * Only between reads close together (PROGRESS_READ_GAP_MS). Across a
+   * longer one, this computer asleep or the node unread for a while, any
+   * number of frames started and were saved unseen, and the gap was taken
+   * for one frame's time: after an 8 h sleep every later run of the job on
+   * that hardware got a limit of about a day, for the rest of the session.
+   * framesDone is no divisor for it: it counts files, two a frame in stereo.
    */
   private noteProgress(state: AgentState): void {
+    const now = Date.now()
+    const watched = this.stateReadAt != null && now - this.stateReadAt <= PROGRESS_READ_GAP_MS
+    this.stateReadAt = now
     const at = state.lastProgressAt
     if (typeof at === 'number' && Number.isFinite(at)) {
-      if (this.progressAt != null && at > this.progressAt) {
+      if (watched && this.progressAt != null && at > this.progressAt) {
         this.slowestProgressS = Math.max(this.slowestProgressS, at - this.progressAt)
       }
       if (this.progressAt == null || at > this.progressAt) this.progressAt = at
     }
     if (typeof state.framesDone === 'number') {
-      if (this.framesSeen != null && state.framesDone > this.framesSeen) this.timedFrame = true
+      if (watched && this.framesSeen != null && state.framesDone > this.framesSeen) {
+        this.timedFrame = true
+      }
       this.framesSeen = state.framesDone
     }
     if (this.timedFrame && this.slowestProgressS > 0) {
