@@ -340,7 +340,9 @@ at boot:
   "maxNodeSlots": 0, // 0/omitted = the app decides concurrency per node
   "slotsPerGpu": 1,  // renders per GPU on a node (0 = one process on all GPUs)
   "spendCapPerHour": 2,
-  "offerFilters": { "cpuBound": true, "minNumGpus": 4 }
+  "offerFilters": { "cpuBound": true, "minNumGpus": 4 },
+  "name": "hero pass", // names the job, or leads each job's name; a blend's own "name" wins
+  "dedupe": "campaign" // or "never": submit every blend as a new job
 }
 ```
 
@@ -421,6 +423,34 @@ key in that file, DPAPI-wrapped. A profile with a working key is a second fleet
 on the same account. It rents up to its own max nodes and spend cap, not the
 real profile's, and its reconcile lists the other profile's instances under
 *Unclaimed instances* rather than destroying them.
+
+## Local API and CLI
+
+A running app can also be driven from scripts, without relaunching it. Turn
+on **Settings › General › Local API**, or start the app with `VR_API=1`. The
+app then serves a small HTTP API on `127.0.0.1` and writes its address and a
+token to `api.json` in the profile folder. The folder button next to the
+setting shows you the file. The token changes each time the API starts, and
+the file is deleted when the app quits. Requests from web pages (anything with
+an `Origin` header) are refused.
+
+```bash
+vast-render-cli submit ~/scenes/shot_010.blend --frames 1-120 --engine cycles --name "hero pass"
+vast-render-cli list
+vast-render-cli watch            # job, node and alert events as they happen
+vast-render-cli rm <job> --cancel
+```
+
+`vast-render-cli` is `bin/vast-render-cli.mjs`: no dependencies, Node 18 or
+later. Use `npm link` to put it on your `PATH`. It exits 0 when the command
+succeeded, 1 when the app refused it (the reason is printed), and 2 when the
+app is not running.
+
+`POST /v1/jobs` takes the same spec as `VR_JOB_SPEC`, with every path
+absolute. It also takes `name` and `dedupe`. It applies the same fleet
+settings rule as a hand-off: a campaign's settings are used only when nothing
+else is open. Every route, the security model and curl examples are in
+[docs/API.md](docs/API.md).
 
 ## How machines are chosen
 

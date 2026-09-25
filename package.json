@@ -3,6 +3,9 @@
   "version": "2.3.0",
   "description": "Electron render-farm manager: Blender rendering on Vast.ai GPU fleets",
   "main": "./out/main/index.js",
+  "bin": {
+    "vast-render-cli": "bin/vast-render-cli.mjs"
+  },
   "author": "Elliot Woods",
   "homepage": "https://github.com/elliotwoods/vastai-blender",
   "scripts": {

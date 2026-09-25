@@ -52,10 +52,10 @@ describe('runJobSpec on a campaign already submitted', () => {
     w.db.prepare(`UPDATE chunks SET state = 'failed', retries = 4 WHERE job_id = ?`).run(jobId)
     w.db.prepare(`UPDATE jobs SET state = 'partial' WHERE id = ?`).run(jobId)
 
-    const { runJobSpec } = await import('./jobSpec')
+    const { runJobSpecFile } = await import('./jobSpec')
     const unsubmitted: string[] = []
     const kick = vi.fn()
-    await runJobSpec(specFor(blend), { kick, unsubmitted })
+    await runJobSpecFile(specFor(blend), { kick, unsubmitted })
 
     expect(w.all('SELECT id FROM jobs')).toEqual([{ id: jobId }])
     expect(
@@ -87,10 +87,10 @@ describe('runJobSpec on a campaign already submitted', () => {
       .run(jobId)
     w.db.prepare(`UPDATE jobs SET state = 'partial' WHERE id = ?`).run(jobId)
 
-    const { runJobSpec } = await import('./jobSpec')
+    const { runJobSpecFile } = await import('./jobSpec')
     const unsubmitted: string[] = []
     const kick = vi.fn()
-    await runJobSpec(specFor(blend), { kick, unsubmitted })
+    await runJobSpecFile(specFor(blend), { kick, unsubmitted })
 
     expect(unsubmitted).toEqual([
       `${blend}: revive failed: frame range ends before it starts (8–5)`
@@ -119,8 +119,8 @@ describe('runJobSpec on a campaign already submitted', () => {
     app.scheduler.start()
     expect(app.scheduler.recoveryHoldCount()).not.toBeNull()
 
-    const { runJobSpec } = await import('./jobSpec')
-    await runJobSpec(specFor(blend), {
+    const { runJobSpecFile } = await import('./jobSpec')
+    await runJobSpecFile(specFor(blend), {
       kick: vi.fn(),
       unsubmitted: [],
       resume: resumeAsIndexDoes(app)
@@ -148,9 +148,9 @@ describe('runJobSpec on a campaign already submitted', () => {
     expect(held).not.toBeNull()
     for (let i = 0; i < 4; i++) w.vast.addOffer()
 
-    const { runJobSpec } = await import('./jobSpec')
+    const { runJobSpecFile } = await import('./jobSpec')
     const campaign: string[] = []
-    await runJobSpec(specFor(w.blend('campaign.blend')), {
+    await runJobSpecFile(specFor(w.blend('campaign.blend')), {
       kick: () => app.scheduler.kick(),
       unsubmitted: [],
       campaign,
@@ -207,13 +207,90 @@ describe('runJobSpec on a campaign already submitted', () => {
       })
     )
 
-    const { runJobSpec } = await import('./jobSpec')
+    const { runJobSpecFile } = await import('./jobSpec')
     const unsubmitted: string[] = []
-    await runJobSpec(path, { kick: vi.fn(), unsubmitted })
+    await runJobSpecFile(path, { kick: vi.fn(), unsubmitted })
 
     const jobs = w.all<{ blend_path: string }>('SELECT blend_path FROM jobs ORDER BY submitted_at')
     expect(jobs.map((j) => j.blend_path)).toEqual([relative(process.cwd(), legacy), blend])
     expect(unsubmitted).toHaveLength(1)
     expect(unsubmitted[0]).toMatch(/fileserver.*on this computer/)
+  })
+})
+
+describe('runJobSpec on an inline spec (B6)', () => {
+  it('names each job: a blend entry its own, else the spec name leads the file name', async () => {
+    await w.boot({ start: false })
+    const { runJobSpec } = await import('./jobSpec')
+    const unsubmitted: string[] = []
+    const campaign: string[] = []
+    await runJobSpec(
+      {
+        name: 'hero pass',
+        blends: [w.blend('a.blend'), { path: w.blend('b.blend'), name: 'the B side' }],
+        engine: 'cycles',
+        frameStart: 1,
+        frameEnd: 4
+      },
+      { kick: vi.fn(), unsubmitted, campaign }
+    )
+    expect(unsubmitted).toEqual([])
+    const names = campaign.map(
+      (id) => w.get<{ name: string }>('SELECT name FROM jobs WHERE id = ?', id)?.name
+    )
+    expect(names).toEqual(['hero pass · a', 'the B side'])
+  })
+
+  it("dedupe 'never' submits a scene again; the default heals the open job instead", async () => {
+    await w.boot({ start: false })
+    const { runJobSpec } = await import('./jobSpec')
+    const blend = w.blend()
+    const spec = { blends: [blend], engine: 'cycles', frameStart: 1, frameEnd: 4 }
+    const first: string[] = []
+    await runJobSpec(spec, { kick: vi.fn(), unsubmitted: [], campaign: first })
+    const again: string[] = []
+    await runJobSpec(spec, { kick: vi.fn(), unsubmitted: [], campaign: again })
+    expect(again).toEqual(first)
+    const fresh: string[] = []
+    await runJobSpec(
+      { ...spec, dedupe: 'never' },
+      { kick: vi.fn(), unsubmitted: [], campaign: fresh }
+    )
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0]).not.toBe(first[0])
+    expect(w.all('SELECT id FROM jobs')).toHaveLength(2)
+  })
+
+  it('a bad name or dedupe refuses the whole spec before anything is submitted', async () => {
+    await w.boot({ start: false })
+    const { runJobSpec } = await import('./jobSpec')
+    const kick = vi.fn()
+    await expect(
+      runJobSpec({ blends: [w.blend()], dedupe: 'sometimes' }, { kick, unsubmitted: [] })
+    ).rejects.toThrow(/dedupe must be one of campaign, never/)
+    await expect(
+      runJobSpec({ blends: [{ path: w.blend(), name: '' }] }, { kick, unsubmitted: [] })
+    ).rejects.toThrow(/blends\[0\]\.name/)
+    expect(w.all('SELECT id FROM jobs')).toEqual([])
+    expect(kick).not.toHaveBeenCalled()
+  })
+
+  it("trackCampaignSettings releases the campaign's settings once its jobs are done", async () => {
+    await w.boot({ start: false })
+    const { trackCampaignSettings } = await import('./jobSpec')
+    const { SettingsOverlay } = await import('../settingsOverlay')
+    const overlay = new SettingsOverlay()
+    overlay.set({ maxActiveNodes: 3 })
+    let open = 1
+    trackCampaignSettings(
+      ['job-x'],
+      { maxActiveNodes: 3 },
+      { openJobs: () => open, overlay, pollMs: 1_000 }
+    )
+    await w.advance(3_000)
+    expect(overlay.fields()).toEqual({ maxActiveNodes: 3 })
+    open = 0
+    await w.advance(2_000)
+    expect(overlay.fields()).toEqual({})
   })
 })

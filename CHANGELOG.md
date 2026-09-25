@@ -31,6 +31,32 @@ stalled the app).
   greys out cancelled frames. A trash button cancels a live job, or removes
   a finished one from the list (its files stay on disk). Both ask first.
 
+- **A local HTTP API and a CLI.** Turn on Settings › General › Local API (or
+  launch with `VR_API=1`) and the running app serves `/v1` on `127.0.0.1`:
+  - submit a campaign (an inline `VR_JOB_SPEC` with `name` and `dedupe`);
+  - list, inspect, cancel, remove, restore, move, group, share, resume and
+    retry jobs;
+  - read the queue, the fleet and its cost;
+  - stream events over SSE.
+
+  Its address and a per-start token are in `<userData>/api.json` (mode 0600,
+  deleted on stop and quit). Requests need `Authorization: Bearer`. Any
+  request with an `Origin` header, or a `Host` other than loopback, gets 403,
+  and bodies are JSON of at most 1 MB. `bin/vast-render-cli.mjs`
+  (`vast-render-cli`, no dependencies) wraps it and exits 0 (ok), 1 (refused)
+  or 2 (app not running). See [docs/API.md](docs/API.md).
+
+- **One command layer for jobs, the queue and the fleet.** The job and queue
+  IPC channels (and `fleet:cost`) now go through `main/commands`: each
+  checks its arguments with a small shared validator (`shared/validate.ts`)
+  before anything runs, and refuses malformed ones as `bad_request: …`; an
+  unknown job is `not_found: …`. The renderer sees the same answers and the
+  same error text as before. The same commands answer `{ ok, value }` or
+  `{ ok: false, code, message }` for the coming local API. Campaign specs
+  gain `name` (top level and per blend: a job's name) and
+  `dedupe: "campaign" | "never"` (`never` submits every blend as a new job),
+  and can be submitted as an object as well as a file.
+
 - **Fleet GPU history over the whole range, and per GPU.** `fleet:gpuHistory`
   returns a `summary` for the range asked for: mean utilisation over every
   reading of every GPU in it (so the Fleet screen's *mean util* can be the

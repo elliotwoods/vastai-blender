@@ -1180,6 +1180,33 @@ export interface SettingsPublic {
   dockerImageByEngine?: Partial<Record<EngineId, string>>
   /** Octane (plan 1.18). Absent = every option off. */
   octane?: OctaneSettings
+  /**
+   * The local HTTP API (main/api, docs/API.md) for scripts and the CLI:
+   * 127.0.0.1 only, with a token in <userData>/api.json. Off by default;
+   * VR_API=1 turns it on for a session whatever this says.
+   */
+  apiEnabled?: boolean
+  /** The local API's port; 0 (the default) = one the OS picks at each start. */
+  apiPort?: number
+  /**
+   * The local API as it is now. Main's own, like the has* flags: handed out
+   * by settings:get and settings:update, never saved, and dropped from a
+   * patch.
+   */
+  apiServer?: ApiServerStatus
+}
+
+/** Whether the local API is up, and where (SettingsPublic.apiServer). */
+export interface ApiServerStatus {
+  running: boolean
+  /** VR_API=1: on for this session whatever the setting says. */
+  forced: boolean
+  /** Where api.json (url, port, token) is while it runs. */
+  file: string
+  url?: string
+  port?: number
+  /** Why it is not running although asked to (the port in use, …). */
+  error?: string
 }
 
 export interface OctaneSettings {

@@ -63,6 +63,8 @@ interface Rig {
   notes: string[]
   stderr: string[]
   closedDb: number
+  /** beforeExit calls: the local API's api.json removed (main/api) */
+  stoppedApi: number
   ensuredWindow: number
   hooks: { accrued: number[]; reconciled: number }
 }
@@ -92,6 +94,7 @@ async function rig(
     notes: [],
     stderr: [],
     closedDb: 0,
+    stoppedApi: 0,
     ensuredWindow: 0,
     hooks: { accrued: [], reconciled: 0 }
   }
@@ -114,6 +117,7 @@ async function rig(
     ensureWindow: () => r.ensuredWindow++,
     fleet,
     closeDb: () => r.closedDb++,
+    beforeExit: () => r.stoppedApi++,
     headless: opts.headless ? { policy: opts.headless } : null,
     signals: r.signals,
     stderr: (text) => r.stderr.push(text),
@@ -165,6 +169,7 @@ describe('quitting with nodes billing (plan 1.1, field incident A1)', () => {
     // Nothing billing at the moment of exit, and one exit.
     expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
     expect(r.closedDb).toBe(1)
+    expect(r.stoppedApi).toBe(1)
     expect(w.alerts('info')).toContain('Destroying 2 nodes before quitting…')
     expect(w.alerts('error')).toEqual([])
   })

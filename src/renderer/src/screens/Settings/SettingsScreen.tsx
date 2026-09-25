@@ -560,7 +560,85 @@ function GeneralSection(): React.JSX.Element {
         <BlenderVersionField value={settings.blenderVersionOverride} save={save} />
       </div>
       <FieldNote error={errorFor('blenderVersionOverride')} />
+      <LocalApiRows settings={settings} save={save} errorFor={errorFor} />
     </div>
+  )
+}
+
+/**
+ * The local HTTP API (main/api, docs/API.md): on or off, its port, and the
+ * api.json that holds its address and token, for scripts and
+ * bin/vast-render-cli.mjs. What main reports of it comes with the settings
+ * (SettingsPublic.apiServer).
+ */
+function LocalApiRows({
+  settings,
+  save,
+  errorFor
+}: {
+  settings: SettingsPublic
+  save: (patch: SettingsPatch) => void
+  errorFor: (field: string) => SettingsFieldError | undefined
+}): React.JSX.Element {
+  const status = settings.apiServer
+  const state = status?.running
+    ? `listening on ${status.url}`
+    : status?.error
+      ? `not running: ${status.error}`
+      : 'off'
+  return (
+    <>
+      <div style={{ ...sectionLabel(), margin: `${SCALE.space4} 0 ${SCALE.space3}` }}>
+        Local API
+      </div>
+      <div style={formRow}>
+        <span style={label}>Local API</span>
+        <label
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            fontSize: SCALE.textXs,
+            color: TOKENS.textMuted
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={settings.apiEnabled === true || status?.forced === true}
+            disabled={status?.forced === true}
+            onChange={(e) => save({ apiEnabled: e.target.checked })}
+          />
+          {status?.forced
+            ? 'on for this session (VR_API=1)'
+            : 'let scripts and the CLI drive the app'}
+        </label>
+        <span style={hintText}>
+          127.0.0.1 only, with a token that changes at every start. Anyone who can read api.json can
+          submit and cancel jobs, as you can.
+        </span>
+      </div>
+      <FieldNote error={errorFor('apiEnabled')} />
+      <div style={formRow}>
+        <span style={label}>Port</span>
+        <NumberField
+          aria-label="Local API port"
+          value={settings.apiPort || null}
+          onCommit={(v) => save({ apiPort: v ?? 0 })}
+          {...limitsOf('apiPort')}
+          allowBlank="any"
+          width={90}
+        />
+        <span style={hintText}>blank = any free port, chosen at each start</span>
+      </div>
+      <FieldNote error={errorFor('apiPort')} />
+      <div style={formRow}>
+        <span style={label}>Status</span>
+        <span style={{ ...mono, fontSize: SCALE.textSm, color: TOKENS.textSecondary }}>
+          {state}
+        </span>
+        {status?.running ? <OpenInExplorerButton path={status.file} /> : null}
+      </div>
+    </>
   )
 }
 

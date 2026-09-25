@@ -34,10 +34,11 @@ import type {
   NodeChunkView,
   NodeSnapshot,
   RequestNodeOptions,
+  SettingsPublic,
   ThumbAsset
 } from '../shared/models'
 import { applySettingsPatch, describeFieldErrors, type GateOptions } from './app/settingsGate'
-import { cancelJob, isCancelling, reprovisionNode, retryMissing } from './app/recovery'
+import { reprovisionNode } from './app/recovery'
 import { externalUrl, openPathVerdict, revealPath } from './app/windowPolicy'
 import { dismissAlerts, emit, onAlertSurfaced, onEvent, recentAlerts } from './events'
 import { hostPathFlavour } from './paths'
@@ -52,8 +53,14 @@ import {
   record as recordMetrics
 } from './nodes/metricsHistory'
 import { listAddons, registerAddon, removeAddon } from './addons/addons'
-import { createJob, getJob, listJobs, setJobShareNode } from './jobs/jobs'
-import { groupJobs, moveJob, queueEntries, removeJob, restoreJob, ungroupJob } from './jobs/queue'
+import {
+  commandArgs,
+  executeCommand,
+  type CommandArgs,
+  type CommandName,
+  type CommandValue
+} from './commands/registry'
+import { toCommandError } from './commands/result'
 import {
   groupInQueue,
   inQueue,
@@ -65,6 +72,7 @@ import {
   type QueueRow
 } from './jobs/queueModel'
 import { scheduler } from './scheduler/scheduler'
+import type { ApiController } from './api/server'
 import { co2Grams, intensityFor } from './carbon/intensity'
 import { getDb } from './db/db'
 import { jobFileMediaUrl, toMediaUrl } from './mediaUrl'
@@ -84,6 +92,51 @@ function handle<C extends InvokeChannel>(channel: C, handler: Handler<C>): void 
 }
 
 const MOCK = process.env.VR_MOCK === '1'
+
+/** Channels that are commands of the shared layer too, with the same arguments. */
+type CommandChannel = InvokeChannel & CommandName
+
+/** A channel whose command takes other arguments, or answers otherwise, than the contract says. */
+type Disagreeing = {
+  [C in CommandChannel]: IpcInvokeMap[C]['args'] extends CommandArgs<C>
+    ? CommandValue<C> extends IpcInvokeMap[C]['result']
+      ? never
+      : C
+    : C
+}[CommandChannel]
+// A compile error naming the channel when a command and its IPC contract part.
+const commandsAgree: [Disagreeing] extends [never] ? true : Disagreeing = true
+void commandsAgree
+
+/**
+ * The error a refused command rejects the invoke with. A domain error keeps
+ * its own words (and name), which is what the renderer has always shown:
+ * createJob's reasons, NotRevivable's, a QueueRefusal's "code: message". A
+ * refusal of the command layer's own (arguments that fail their validator,
+ * an unknown job) is "code: message". Electron keeps only the message.
+ */
+function ipcError(e: unknown): Error {
+  const err = toCommandError(e)
+  if (err.cause instanceof Error) return err.cause
+  return new Error(`${err.code}: ${err.message}`)
+}
+
+/**
+ * Register a channel that is a command (commands/registry.ts): its arguments
+ * are checked by the command's validator, then under VR_MOCK `mock` answers
+ * (when given), else the command runs.
+ */
+function handleCommand<C extends CommandChannel>(channel: C, mock?: Handler<C>): void {
+  ipcMain.handle(channel, async (_event, ...raw) => {
+    try {
+      const args = commandArgs(channel, raw)
+      if (MOCK && mock) return await mock(...(args as unknown as IpcInvokeMap[C]['args']))
+      return await executeCommand(channel, args)
+    } catch (e) {
+      throw ipcError(e)
+    }
+  })
+}
 
 /**
  * Asset kinds that are playable clips. Everything else in `assets` is not.
@@ -224,7 +277,9 @@ function revealablePlaces(): string[] {
     ...openableRoots(),
     ...blends.map((r) => r.blend_path),
     ...listAddons().map((a) => a.zipPath),
-    getSettings().sshKeyPath
+    getSettings().sshKeyPath,
+    // Settings' "Show in Finder" beside the local API (main/api).
+    ...(localApi ? [localApi.file] : [])
   ]
 }
 
@@ -1112,9 +1167,32 @@ export interface RegisterIpcOptions {
    * open. Without it such a click does nothing.
    */
   createWindow?: () => void
+  /**
+   * The local API (main/api): its status goes out with the settings, and a
+   * settings change starts or stops it before settings:update answers.
+   */
+  api?: Pick<ApiController, 'status' | 'sync' | 'file'>
+}
+
+/** The local API registerIpc was given, for the settings handlers and revealablePlaces. */
+let localApi: RegisterIpcOptions['api'] | null = null
+
+/** The settings as handed to the renderer: with the local API's status. */
+function withApiStatus(settings: SettingsPublic): SettingsPublic {
+  return localApi ? { ...settings, apiServer: localApi.status() } : settings
+}
+
+/** Start or stop the local API after a settings change; its failure is in its status. */
+async function syncApi(): Promise<void> {
+  try {
+    await localApi?.sync()
+  } catch (e) {
+    console.error('[api] sync failed:', e)
+  }
 }
 
 export function registerIpc(opts: RegisterIpcOptions = {}): void {
+  localApi = opts.api ?? null
   // -- events ---------------------------------------------------------------
   // Every bus event goes to every window. Subscribed here, once, before
   // index.ts starts the node manager and scheduler (the first emitters) and
@@ -1154,17 +1232,24 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   // VR_MOCK asserts the key too: mock mode exists to drive the UI on a
   // throwaway profile, and without this Fleet renders its "no API key" empty
   // state instead of the mock nodes, so the mocks are unreachable.
-  handle('settings:get', () => (MOCK ? { ...getSettings(), hasVastApiKey: true } : getSettings()))
+  handle('settings:get', () =>
+    withApiStatus(MOCK ? { ...getSettings(), hasVastApiKey: true } : getSettings())
+  )
   // Every patch from the renderer goes through the sanitizer, and only what
   // passed is saved (plan 1.14, app/settingsGate.ts). settings:update says
   // which fields did not and why; settings:set keeps its contract for its
   // callers and only logs them.
-  handle('settings:set', (patch) => {
+  handle('settings:set', async (patch) => {
     const { settings, errors } = applySettingsPatch(patch, settingsStore, gateOptions())
     if (errors.length) console.warn(`[settings] not saved as sent: ${describeFieldErrors(errors)}`)
-    return settings
+    await syncApi()
+    return withApiStatus(settings)
   })
-  handle('settings:update', (patch) => applySettingsPatch(patch, settingsStore, gateOptions()))
+  handle('settings:update', async (patch) => {
+    const result = applySettingsPatch(patch, settingsStore, gateOptions())
+    await syncApi()
+    return { ...result, settings: withApiStatus(result.settings) }
+  })
   handle('settings:setSecret', (key, value) => {
     setSecret(key, value)
     // A new key may be another account, and a hold the old key caused says
@@ -1276,11 +1361,13 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
     if (MOCK) return
     await nodeManager.requestNode(requestOptions(opts))
   })
-  handle('fleet:cost', () =>
-    MOCK
-      ? { perHour: 0.822, sessionTotal: 0.44, sessionWh: 612, sessionCo2g: 0, balance: 42.17 }
-      : nodeManager.fleetCost()
-  )
+  handleCommand('fleet:cost', () => ({
+    perHour: 0.822,
+    sessionTotal: 0.44,
+    sessionWh: 612,
+    sessionCo2g: 0,
+    balance: 42.17
+  }))
   handle('fleet:clearFailed', () => nodeManager.clearFailed())
   // The Unclaimed panel (plan 1.3): instances on the account no node of this
   // profile holds. Only one of them may be destroyed from here, and only by
@@ -1337,70 +1424,40 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   })
 
   // -- jobs -----------------------------------------------------------------
-  handle('jobs:list', (opts) =>
-    MOCK
-      ? mockJobs().filter((j) => opts?.includeHidden || j.hiddenAt == null)
-      : listJobs({ includeHidden: opts?.includeHidden === true })
+  // Through the shared command layer (commands/registry.ts), as main/api's
+  // routes are: the arguments are checked, and a refusal rejects (see
+  // handleCommand). The VR_MOCK branches run after the check.
+  handleCommand('jobs:list', (opts) =>
+    mockJobs().filter((j) => opts?.includeHidden || j.hiddenAt == null)
   )
-  handle('job:get', (id) => (MOCK ? mockJobDetail(id) : getJob(id)))
-  handle('job:create', async (sub) => {
-    // createJob refuses a scene that is not a file on this computer
-    // (validateSubmission): its path is somewhere shell:showItemInFolder may
-    // reveal, and a UNC path there hands the user's NTLM hash to whoever
-    // serves the share (Phase 0 review, plans 1.12 and 1.14).
-    const jobId = await createJob(sub)
-    scheduler.kick()
-    return { jobId }
-  })
-  // Through app/recovery.ts, which notes the cancel until it has stopped the
-  // job's renders on the nodes: job:retryMissing waits for that (plan 1.15).
-  handle('job:cancel', (id) => cancelJob(id))
-  handle('job:setShareNode', (id, shareNode) => {
-    setJobShareNode(id, shareNode)
-    // Newly shareable chunks may now fit alongside work already in flight.
-    scheduler.kick()
-  })
+  handleCommand('job:get', (id) => mockJobDetail(id))
+  handleCommand('job:create')
+  handleCommand('job:cancel')
+  handleCommand('job:setShareNode')
   // Queue the frames not yet downloaded again (plan 1.15, app/recovery.ts).
   // A refusal (a job failed outright) rejects, so the caller hears why.
-  handle('job:retryMissing', (id) => (MOCK ? { frames: 0, chunks: 0 } : retryMissing(id)))
+  handleCommand('job:retryMissing', () => ({ frames: 0, chunks: 0 }))
   // Release a job the retry breaker held (plan 1.17). Without it every hold
   // ended in cancel and resubmit: a new output folder, and every frame
   // already rendered paid for again.
-  handle('job:resume', (id) => (MOCK ? false : scheduler.resumeJob(id)))
+  handleCommand('job:resume', () => false)
 
   // -- the render queue (jobs/queue.ts) ---------------------------------------
-  // A refusal throws QueueRefusal, whose message is "code: message".
-  handle('queue:list', () => (MOCK ? queueOf(mockQueueRows()) : queueEntries()))
-  handle('job:move', ({ jobId, before }) => {
-    if (MOCK) return mockWriteQueue(moveInQueue(queueOf(mockQueueRows()), jobId, before))
-    const queue = moveJob(jobId, before)
-    // The next chunk handed out follows the new order.
-    scheduler.kick()
-    return queue
+  // A refusal rejects with the QueueRefusal, whose message is "code: message".
+  handleCommand('queue:list', () => queueOf(mockQueueRows()))
+  handleCommand('job:move', ({ jobId, before }) =>
+    mockWriteQueue(moveInQueue(queueOf(mockQueueRows()), jobId, before))
+  )
+  handleCommand('job:group', ({ jobId, withJobId }) => {
+    const r = groupInQueue(queueOf(mockQueueRows()), jobId, withJobId, `mock-group-${Date.now()}`)
+    mockWriteQueue(r.entries)
+    return { groupId: r.groupId }
   })
-  handle('job:group', ({ jobId, withJobId }) => {
-    if (MOCK) {
-      const r = groupInQueue(queueOf(mockQueueRows()), jobId, withJobId, `mock-group-${Date.now()}`)
-      mockWriteQueue(r.entries)
-      return { groupId: r.groupId }
-    }
-    const r = groupJobs(jobId, withJobId)
-    scheduler.kick()
-    return r
+  handleCommand('job:ungroup', (jobId) => {
+    mockWriteQueue(ungroupInQueue(queueOf(mockQueueRows()), jobId))
   })
-  handle('job:ungroup', (jobId) => {
-    if (MOCK) {
-      mockWriteQueue(ungroupInQueue(queueOf(mockQueueRows()), jobId))
-      return
-    }
-    ungroupJob(jobId)
-    scheduler.kick()
-  })
-  handle('job:remove', (jobId) => {
-    if (MOCK) return mockSetHidden(jobId, true)
-    removeJob(jobId, { liveRuns: scheduler.hasJobRuns(jobId) || isCancelling(jobId) })
-  })
-  handle('job:restore', (jobId) => (MOCK ? mockSetHidden(jobId, false) : restoreJob(jobId)))
+  handleCommand('job:remove', (jobId) => mockSetHidden(jobId, true))
+  handleCommand('job:restore', (jobId) => mockSetHidden(jobId, false))
 
   // -- scheduler ------------------------------------------------------------
   handle('scheduler:recoveryHold', () => {

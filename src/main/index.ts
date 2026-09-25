@@ -35,9 +35,11 @@ import { resolveMediaUrl, type MediaPlaces, type MediaTarget } from './app/media
 import { externalUrl, isAppPage, type AppPage } from './app/windowPolicy'
 import { resolveBlenderRelease } from './blender/blendInfo'
 import { closeDb, getDb } from './db/db'
-import { emit } from './events'
+import { emit, onEvent } from './events'
 import { setJobRateProvider } from './jobs/jobs'
 import { registerIpc } from './ipc'
+import { ApiController } from './api/server'
+import { runCommand } from './commands/registry'
 import {
   nodeManager,
   setActiveWorkProvider,
@@ -480,9 +482,19 @@ app.whenReady().then(() => {
   })
 
   registerMediaProtocol()
+  // The local HTTP API (main/api, docs/API.md): off unless the setting is
+  // on, or VR_API=1. Started below, once the scheduler is.
+  const api = new ApiController({
+    userData: app.getPath('userData'),
+    getSettings,
+    forced: process.env.VR_API === '1',
+    run: runCommand,
+    subscribe: onEvent,
+    version: app.getVersion()
+  })
   // createWindow: an alert's OS notification, clicked with the window closed
   // (macOS, still billing), opens one.
-  registerIpc({ createWindow })
+  registerIpc({ createWindow, api })
   // Provisioning pipeline: base setup, default Blender release, EEVEE probe.
   // Job-specific Blender versions are installed on demand at dispatch time.
   // 5.1 (not 4.5): campaign blends are saved by Blender 5.1, so probing EEVEE
@@ -506,6 +518,7 @@ app.whenReady().then(() => {
   // Stitch job clips for any job whose chunk clips outran them — e.g. chunks
   // that finished under a build without job clips, or while ffmpeg failed.
   jobClips.catchUp()
+  void api.sync()
   // Quit, sleep and Windows session end while nodes bill (app/lifecycle.ts).
   // Before createWindow, so the first window gets its session-end listeners.
   // A headless run never asks: VR_QUIT_POLICY decides (see the drivers below).
@@ -532,6 +545,7 @@ app.whenReady().then(() => {
       reconcile: () => nodeManager.reconcile()
     },
     closeDb,
+    beforeExit: () => api.stopNow(),
     headless: headless ? { policy: quitPolicy.policy } : null,
     signals: process,
     stderr: (text) => {

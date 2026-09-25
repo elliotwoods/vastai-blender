@@ -25,7 +25,7 @@
 import { getDb } from '../../db/db'
 import type { Lifecycle } from '../lifecycle'
 import { runE2e } from './e2e'
-import { SpecSettingsRefused, runJobSpec, type HeadlessResume } from './jobSpec'
+import { SpecSettingsRefused, runJobSpecFile, type HeadlessResume } from './jobSpec'
 
 /** How long after boot a driver submits: the scheduler and node manager are started by then. */
 export const SUBMIT_DELAY_MS = 3_000
@@ -74,7 +74,7 @@ export function startHeadlessDrivers(opts: HeadlessDriverOptions): void {
     const campaign: string[] = []
     let refused = false
     setTimeout(() => {
-      void runJobSpec(jobSpecPath, { kick, unsubmitted, resume, campaign })
+      void runJobSpecFile(jobSpecPath, { kick, unsubmitted, resume, campaign })
         .catch((e) => {
           refused = e instanceof SpecSettingsRefused
           if (refused) console.error(`[spec] ${(e as Error).message}`)

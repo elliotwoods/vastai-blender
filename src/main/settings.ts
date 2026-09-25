@@ -47,6 +47,9 @@ function defaults(): SettingsFile {
       maxNodeSlots: 0,
       slotsPerGpu: 1,
       eagerFleet: false,
+      // The local API (main/api) is opt-in.
+      apiEnabled: false,
+      apiPort: 0,
       // ~1.6x GPU draw covers host CPU/RAM/PSU plus a typical datacentre PUE.
       co2OverheadFactor: 1.6
     },
@@ -83,6 +86,8 @@ function load(): SettingsFile {
     cache = defaults()
   }
   migrateNodeSlots(cache.public)
+  // Main's own status, should a file ever carry it: never trusted from disk.
+  delete cache.public.apiServer
   // The has* flags are derived, never trusted from disk.
   cache.public.hasVastApiKey = !!cache.secrets.vastApiKey
   cache.public.hasOtoyCredentials = !!cache.secrets.otoyUsername && !!cache.secrets.otoyPassword
@@ -162,6 +167,8 @@ export function updateSettings(patch: Partial<SettingsPublic>): SettingsPublic {
   delete rest.hasVastApiKey
   delete rest.hasOtoyCredentials
   delete rest.installId
+  // The local API's status is main's (ipc.ts adds it to what it hands out).
+  delete rest.apiServer
   s.public = {
     ...s.public,
     ...rest,
