@@ -2535,9 +2535,11 @@ export class NodeManager {
       // Vast refusing the account before any create (a key it rejects, or
       // one without the permission to register an SSH key or search): the
       // account hold and its one alert, as a create refused for it gets,
-      // not a scale-up failure on every tick (n3 review).
+      // not a scale-up failure on every tick (n3 review). No key at all is
+      // this computer's settings, not Vast refusing anything: the Fleet
+      // says so, and saving one is all it takes.
       const c = classify(e, { via: 'vast' })
-      if (c.kind !== 'account') throw e
+      if (c.kind !== 'account' || c.rule === 'vast-no-key') throw e
       this.accountRefused(c)
       return []
     }
