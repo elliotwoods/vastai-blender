@@ -138,6 +138,16 @@ const RECONCILE_EVERY_MS = 5 * 60_000
 const RECONCILE_MIN_AGE_MS = 2 * 60_000
 
 /**
+ * Plan 1.5: once a search the spend cap left empty (no offer at or under
+ * what the cap leaves) has come back, scale-up does not search at that
+ * headroom or less again for this long, unless the offer filters change. A
+ * fleet sitting just under its cap, with less headroom than the cheapest
+ * offer, otherwise ran a Vast search, and drew a "scale-up failed" warning,
+ * on every scheduler tick. A manual request always searches.
+ */
+const CAP_EMPTY_BACKOFF_MS = 5 * 60_000
+
+/**
  * Plan 1.20: the credit guard's thresholds, in minutes of runway (the Vast
  * balance over what the fleet bills per minute). Under WARN the user is told
  * once; under HOLD renting stops (an account hold) until the balance goes up
@@ -795,6 +805,8 @@ export class NodeManager {
   /** The low-runway warning has been given, and not re-armed since. */
   private runwayWarned = false
   private holdListeners = new Set<(holds: FleetHolds) => void>()
+  /** The last search the spend cap left empty, for CAP_EMPTY_BACKOFF_MS. */
+  private capEmpty: { headroom: number; filters: string; at: number } | null = null
   /** Phase 3 hook: called when a node reaches SSH-reachable. */
   onReady: ((node: { id: string; ssh: SshConnection }) => Promise<void>) | null = null
 
@@ -1355,7 +1367,7 @@ export class NodeManager {
         throw new Error(spendCapReached(caps, settings))
       }
     }
-    const ids = await this.requestNodes(1, { overSpendCap })
+    const ids = await this.rentBatch(1, { overSpendCap }, true)
     if (ids.length > 0) return ids[0]
     // Vast refused for the account in this very request: its hold says why.
     const refused = this.accountHold()
@@ -1429,8 +1441,20 @@ export class NodeManager {
    * most. So does a refusal that is no fault of the offer's (a 429): the next
    * offer would meet it too. And so does an account refusal (plan 1.20): it
    * sets the account hold, and nothing is rented until that is released.
+   *
+   * A search the cap left empty is not repeated at that headroom for
+   * CAP_EMPTY_BACKOFF_MS: such a call returns [] without asking Vast.
    */
   async requestNodes(count: number, opts: RequestNodesOptions = {}): Promise<string[]> {
+    return this.rentBatch(count, opts, false)
+  }
+
+  /** requestNodes, and requestNode's rental (`manual`), which always searches. */
+  private async rentBatch(
+    count: number,
+    opts: RequestNodesOptions,
+    manual: boolean
+  ): Promise<string[]> {
     if (count <= 0) return []
     // Held for the account (plan 1.20): the hold's one alert has said why.
     // Scale-up asks every tick, and each ask used to add a failed row.
@@ -1443,17 +1467,32 @@ export class NodeManager {
     const first = this.liveCaps(settings, overSpendCap)
     const firstBudget = opts.budget ? withDemand(first, opts.budget) : first
     if (!budgetOpen(firstBudget)) return []
-    await ensureKeyRegistered()
 
     const filterMax = settings.offerFilters.maxDphTotal
     const headroom = first.headroomPerHour
     const maxDphTotal =
       headroom != null && (filterMax == null || headroom < filterMax) ? headroom : filterMax
+    const capBound = headroom != null && maxDphTotal === headroom
+    const filters = JSON.stringify(settings.offerFilters)
+    const lastEmpty = this.capEmpty
+    if (
+      !manual &&
+      capBound &&
+      lastEmpty &&
+      headroom <= lastEmpty.headroom + 1e-9 &&
+      lastEmpty.filters === filters &&
+      Date.now() - lastEmpty.at < CAP_EMPTY_BACKOFF_MS
+    ) {
+      return []
+    }
+    await ensureKeyRegistered()
+
     const offers = await findOffers({ ...settings.offerFilters, maxDphTotal }, this.blacklist)
     if (offers.length === 0) {
       // The cap may be what left nothing: say so, and do not cry "no offers"
       // on every tick while the fleet sits just under its cap.
-      if (headroom != null && maxDphTotal === headroom) {
+      if (capBound) {
+        this.capEmpty = { headroom, filters, at: Date.now() }
         throw new Error(
           `no matching offers at or under ${money(headroom)}/hr, what the spend cap of ${money(first.spendCap ?? 0)}/hr leaves`
         )
@@ -1461,6 +1500,7 @@ export class NodeManager {
       emit('alert', { level: 'warn', message: 'No matching Vast.ai offers found' })
       throw new Error('no matching offers')
     }
+    if (capBound) this.capEmpty = null
     const ids: string[] = []
     const usedMachines = new Set<number>()
     let lastErr: Error | null = null

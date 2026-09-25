@@ -111,6 +111,40 @@ describe('1.5 cap headroom at rent time (A7)', () => {
     expect(w.vast.count('createInstance')).toBe(1)
   })
 
+  // Review of 3715efb: a fleet just under its cap, with less headroom than
+  // the cheapest offer, ran a Vast search and drew a "scale-up failed"
+  // warning on every 15 s scheduler tick.
+  it('a search the cap left empty is not repeated every tick at that headroom', async () => {
+    w = await setup({ settings: { spendCapPerHour: 2, maxActiveNodes: 4 } })
+    const app = await started()
+    const nodeId = await w.readyNode(app, { dph_total: 1.95 })
+    w.vast.addOffer({ dph_total: 0.4 })
+    const searches = w.vast.count('searchOffers')
+
+    // Scale-up asking, tick after tick.
+    await expect(app.nodeManager.requestNodes(1)).rejects.toThrow(/at or under \$0\.05\/hr/)
+    for (let tick = 0; tick < 16; tick++) {
+      await w.advance(15_000, 5_000)
+      await expect(app.nodeManager.requestNodes(1)).resolves.toEqual([])
+    }
+    expect(w.vast.count('searchOffers')).toBe(searches + 1)
+    // The user's button still searches, and says why nothing came of it.
+    await expect(app.nodeManager.requestNode()).rejects.toThrow(/at or under \$0\.05\/hr/)
+    expect(w.vast.count('searchOffers')).toBe(searches + 2)
+
+    // After the back-off, asked again.
+    await w.advance(5 * 60_000, 5_000)
+    await expect(app.nodeManager.requestNodes(1)).rejects.toThrow(/at or under/)
+    expect(w.vast.count('searchOffers')).toBe(searches + 3)
+    // New filters, or more headroom, are a new question: asked at once.
+    w.settings.offerFilters = { ...w.settings.offerFilters, minGpuRamGb: 8 }
+    await expect(app.nodeManager.requestNodes(1)).rejects.toThrow(/at or under/)
+    expect(w.vast.count('searchOffers')).toBe(searches + 4)
+    await app.nodeManager.destroyNode(nodeId)
+    await expect(app.nodeManager.requestNodes(1)).resolves.toHaveLength(1)
+    expect(lastSearchCeiling()).toEqual({ lte: 2 })
+  })
+
   it('a scheduler budget stops the batch once what it rented covers the demand (#227 #237)', async () => {
     w = await setup({ settings: { spendCapPerHour: 20, maxActiveNodes: 8 } })
     const app = await started()
