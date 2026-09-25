@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { OctaneState, SettingsPublic } from '../../shared/models'
 import type { CreateInstanceOptions } from '../vast/vastClient'
 import { fakeOctane } from '../test/fakeOctane'
-import { setup, type AgentSpec, type World } from '../test/harness'
+import { setup, type AgentSpec, type App, type World } from '../test/harness'
 
 // Plan 1.18 on the lifecycle harness: a node's Octane state as the fleet
 // sees it (NodeSnapshot.octaneState, kept from setup_octane.sh's lines), the
@@ -131,6 +131,73 @@ describe('1.18: Octane on a node, as the fleet sees it', () => {
       octaneState: 'none',
       octaneReady: false
     })
+  })
+})
+
+describe('1.18 (review): the scripted sign-in, under secure cloud only', () => {
+  const OCTANE_IMAGE = 'otoy/octane-blender:2025.2'
+
+  async function renderOctaneOn(app: App, nodeId: string): Promise<void> {
+    w.machineFor(nodeId).onSpec = (spec) => w.machineFor(nodeId).agent.finish(spec.chunkId)
+    const jobId = await w.submitJob(app, { engine: 'octane' })
+    app.scheduler.kick()
+    await w.until(
+      () =>
+        w.get<{ state: string }>('SELECT state FROM jobs WHERE id = ?', jobId)?.state ===
+        'complete',
+      'job complete',
+      { timeoutMs: 5 * MIN }
+    )
+  }
+
+  it('1.18 (review): an Octane chunk that reaches a node not rented through the filter sends it no credential', async () => {
+    Object.assign(w.settings, { octane: { scriptedSignIn: true, secureCloudOnly: true } })
+    const app = await w.boot()
+    const nm = await import('./nodeManager')
+    // Rented with no engine, as scale-up rents today: any host could take it.
+    const nodeId = await w.readyNode(app, { datacenter: false } as never)
+    expect(app.nodeManager.rentalOf(nodeId)).toEqual({
+      engine: null,
+      image: nm.DOCKER_IMAGE,
+      secureCloud: false
+    })
+    const machine = w.machineFor(nodeId)
+    const octane = fakeOctane(machine, { signIn: 'byHand' })
+    const done = renderOctaneOn(app, nodeId)
+    await w.until(
+      () => app.nodeManager.get(nodeId)?.snapshot.octaneState === 'needsLogin',
+      'needs a sign-in',
+      { timeoutMs: 3 * MIN }
+    )
+    expect(w.alerts('warn')).toEqual([
+      expect.stringMatching(
+        /waiting for a sign-in: .* The scripted sign-in was not used: this node was not rented as a datacenter/
+      )
+    ])
+    octane.state = 'licensed'
+    await done
+    expect(machine.ran(/--credentials-stdin|hunter2|artist@|OCTANE_USER|OCTANE_PASS/)).toEqual([])
+  })
+
+  it('1.18 (review): a node rented for Octane through the filter gets the scripted sign-in', async () => {
+    Object.assign(w.settings, {
+      octane: { scriptedSignIn: true, secureCloudOnly: true },
+      dockerImageByEngine: { octane: OCTANE_IMAGE }
+    })
+    const app = await w.boot()
+    w.vast.addOffer({ datacenter: true } as never)
+    const [nodeId] = await app.nodeManager.requestNodes(1, { engine: 'octane' })
+    await w.until(() => app.nodeManager.get(nodeId)?.state === 'ready', 'ready')
+    expect(app.nodeManager.rentalOf(nodeId)).toEqual({
+      engine: 'octane',
+      image: OCTANE_IMAGE,
+      secureCloud: true
+    })
+    const machine = w.machineFor(nodeId)
+    fakeOctane(machine)
+    await renderOctaneOn(app, nodeId)
+    expect(machine.ran(/setup_octane\.sh start-server --credentials-stdin$/)).toHaveLength(1)
+    expect(w.alerts('warn')).toEqual([])
   })
 })
 

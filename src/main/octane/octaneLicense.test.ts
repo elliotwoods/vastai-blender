@@ -252,6 +252,65 @@ describe('setupOctane: credentials (1.18, #40 #156)', () => {
     expect(launch.opts.stdin).toBeUndefined()
   })
 
+  it('1.18 (review): with secure cloud only, the credentials go only to a node rented through it; any other signs in by hand', async () => {
+    secrets.otoyUsername = USER
+    secrets.otoyPassword = PASS
+    h.settings = { octane: { scriptedSignIn: true, secureCloudOnly: true } }
+
+    /** One setup on a fresh node rented as `rental`: the start-server call, and the alerts it raised. */
+    async function launchOn(
+      rental: import('./octaneLicense').OctaneRentalFacts | null | 'noProvider'
+    ): Promise<{ launch: Call; alerts: string[] }> {
+      vi.resetModules()
+      octane = await import('./octaneLicense')
+      if (rental !== 'noProvider') octane.setRentalFacts((id) => (id === NODE ? rental : null))
+      h.db.prepare(`UPDATE nodes SET octane_state = 'none' WHERE id = ?`).run(NODE)
+      alerts.length = 0
+      const state = { now: 'none' as OctaneState }
+      const { ssh, calls } = octaneNode(state)
+      const setup = octane.setupOctane(ssh, NODE)
+      // Past the licence wait: the node asks for a sign-in by hand, unless
+      // the credentials went.
+      await vi.advanceTimersByTimeAsync(octane.OCTANE_LICENSE_WAIT_MS + 5_000)
+      state.now = 'licensed'
+      await vi.advanceTimersByTimeAsync(10_000)
+      await expect(setup).resolves.toBe('licensed')
+      return {
+        launch: calls.find((c) => /start-server/.test(c.command))!,
+        alerts: alerts.map((a) => a.message)
+      }
+    }
+
+    // A Cycles node on someone's own machine that an Octane chunk reached,
+    // a node rented without its engine, one from before a restart: none of
+    // them is known to be a datacenter host.
+    for (const rental of [
+      { engine: 'cycles' as const, secureCloud: false },
+      { engine: null, secureCloud: false },
+      { engine: 'octane' as const, secureCloud: false },
+      null,
+      'noProvider' as const
+    ]) {
+      const { launch, alerts: said } = await launchOn(rental)
+      expect(launch.command).toBe('bash /root/vastai/octane/setup_octane.sh start-server')
+      expect(launch.opts.stdin).toBeUndefined()
+      expect(said).toEqual([
+        expect.stringMatching(
+          /is waiting for a sign-in: .*Open VNC login.* The scripted sign-in was not used: this node was not rented as a datacenter \(secure cloud\) host/
+        ),
+        expect.stringMatching(/is signed in/)
+      ])
+    }
+
+    // Rented through the filter: the scripted sign-in goes ahead.
+    const { launch, alerts: said } = await launchOn({ engine: 'octane', secureCloud: true })
+    expect(launch.command).toBe(
+      'bash /root/vastai/octane/setup_octane.sh start-server --credentials-stdin'
+    )
+    expect(launch.opts.stdin).toBe(`${USER}\n${PASS}\n`)
+    expect(said.join('\n')).not.toMatch(/scripted sign-in was not used/)
+  })
+
   it('1.18: the VNC password goes on stdin, stays the same for the node, and is what the tunnel hands out', async () => {
     const state = { now: 'licensed' as OctaneState }
     const { ssh, calls } = octaneNode(state)

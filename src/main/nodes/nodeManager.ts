@@ -82,7 +82,9 @@ import {
   forgetOctaneNode,
   onOctaneState,
   refreshOctaneState,
-  stopOctaneServer
+  setRentalFacts,
+  stopOctaneServer,
+  type OctaneRentalFacts
 } from '../octane/octaneLicense'
 
 export const DOCKER_IMAGE = 'vastai/base-image:cuda-12.1.1-cudnn8-devel-ubuntu22.04'
@@ -723,6 +725,17 @@ export interface RequestNodesOptions {
   maxPerHour?: number | null
 }
 
+/**
+ * What a node was rented as, this session (plan 1.18): the engine the
+ * rental was for, the docker image it runs (rentalImage), and whether only
+ * datacenter (secure cloud) hosts could take it. octaneLicense sends OTOY
+ * credentials under secure cloud only to a node rented that way; the
+ * scheduler can keep Octane chunks to nodes rented with the Octane image.
+ */
+export interface RentalFacts extends OctaneRentalFacts {
+  image: string
+}
+
 /** What the billing predicates (shared/nodeState.ts) read, from a row. */
 function rowFacts(r: NodeRow): NodeCostFacts {
   return {
@@ -974,6 +987,12 @@ function rowToSnapshot(r: NodeRow): NodeSnapshot {
 
 class ManagedNode {
   ssh: SshConnection | null = null
+  /**
+   * What this session rented the node as (rentOffer), or null for a node
+   * from before a restart: kept in memory only, until nodes has a column
+   * for it.
+   */
+  rental: RentalFacts | null = null
   /**
    * Times the node's connection dropped (SshConnection's 'disconnected')
    * since the supervisor last looked: each counts as a failed probe, unless
@@ -1258,6 +1277,8 @@ export class NodeManager {
     // A node's Octane state changes outside this module (the scheduler's
     // setupOctane, the licence poll): its snapshot goes out with it.
     this.octaneUnsubscribe = onOctaneState((id) => this.nodes.get(id)?.emitChanged())
+    // Which nodes the OTOY credentials may go to under secure cloud only.
+    setRentalFacts((id) => this.rentalOf(id))
     const rows = getDb().prepare('SELECT * FROM nodes').all() as NodeRow[]
     for (const r of rows) {
       const facts = rowFacts(r)
@@ -2193,6 +2214,15 @@ export class NodeManager {
   }
 
   /**
+   * What this session rented the node as (RentalFacts), or null for one it
+   * did not rent: from before a restart, or unknown to it.
+   */
+  rentalOf(id: string): RentalFacts | null {
+    const r = this.nodes.get(id)?.rental
+    return r ? { ...r } : null
+  }
+
+  /**
    * The nodes that count against maxActiveNodes and the spend cap, and their
    * $/hr: every node that may be billing (shared/nodeState.ts
    * countsTowardCaps). That is booting, working and being destroyed, and
@@ -2426,7 +2456,11 @@ export class NodeManager {
       usedMachines.add(offer.machineId)
       let r: Rental
       try {
-        r = await this.rentOffer(offer, settings.offerFilters.minDiskGb, image)
+        r = await this.rentOffer(offer, settings.offerFilters.minDiskGb, {
+          engine: opts.engine ?? null,
+          image,
+          secureCloud: secureCloudOnly
+        })
       } catch (e) {
         // Not a failure rentOffer knows (those it returns): whatever it left
         // behind, rent nothing more on top of it.
@@ -2660,7 +2694,7 @@ export class NodeManager {
   }
 
   /** Create an instance from one offer, with `image`, and start driving it to ready. */
-  private async rentOffer(offer: Offer, diskGb: number, image: string): Promise<Rental> {
+  private async rentOffer(offer: Offer, diskGb: number, rental: RentalFacts): Promise<Rental> {
     const id = randomUUID()
     // This profile's install id and the node's (plan 1.3): the reconcile
     // matches the instance back to this row by it.
@@ -2676,6 +2710,7 @@ export class NodeManager {
       // exist under `label` that no row knows the id of.
       .run(id, offer.gpuName, offer.numGpus, offer.dphTotal, offer.geolocation, label, Date.now())
     const node = new ManagedNode(id)
+    node.rental = rental
     this.nodes.set(id, node)
     this.creating.add(id)
     emit('node:changed', node.snapshot)
@@ -2684,7 +2719,7 @@ export class NodeManager {
     try {
       instanceId = await createInstance({
         offerId: offer.id,
-        image,
+        image: rental.image,
         diskGb,
         onstart: ONSTART,
         env: { NVIDIA_DRIVER_CAPABILITIES: 'all' },

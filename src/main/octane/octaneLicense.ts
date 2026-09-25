@@ -13,9 +13,11 @@
  * `setup_octane.sh start-server --credentials-stdin`, which hands them on
  * to OctaneServer's stdin. They are never in a command line, the
  * environment, a file on the node, or an error's text (exec errors name
- * the label). The per-node VNC password goes on stdin too, and is kept in
- * memory only: after a restart the app sets a new one when it next opens
- * the tunnel.
+ * the label). With settings.octane.secureCloudOnly on as well, they go only
+ * to a node this session rented through that filter (setRentalFacts); any
+ * other node an Octane chunk reaches signs in by hand. The per-node VNC
+ * password goes on stdin too, and is kept in memory only: after a restart
+ * the app sets a new one when it next opens the tunnel.
  *
  * nodes.octane_state says where a node's Octane is, as setup_octane.sh's
  * `OCTANE_STATE <word>` lines say it (OctaneState: none | serverRunning |
@@ -42,7 +44,7 @@ import { emit } from '../events'
 import { ConnectionLostError, exitStatus, REMOTE_ROOT } from '../nodes/provisioner'
 import { getSecret, getSettings } from '../settings'
 import type { ExecOptions, ExecResult, SshConnection } from '../ssh/sshConnection'
-import type { OctaneState, VncTunnelInfo } from '../../shared/models'
+import type { EngineId, OctaneState, VncTunnelInfo } from '../../shared/models'
 
 const SCRIPT = `${REMOTE_ROOT}/octane/setup_octane.sh`
 
@@ -155,6 +157,60 @@ export function onOctaneState(listener: (nodeId: string, state: OctaneState) => 
   return () => {
     stateListeners.delete(listener)
   }
+}
+
+// -- what each node was rented as --------------------------------------------------
+
+/**
+ * What nodeManager rented a node as, this session: the engine the rental
+ * was for (for Octane, the docker image set for Octane nodes), and whether
+ * only datacenter (secure cloud) hosts could take it. Null when not known:
+ * a node from before a restart, the facts being kept in memory only.
+ */
+export interface OctaneRentalFacts {
+  engine: EngineId | null
+  secureCloud: boolean
+}
+
+let rentalFacts: (nodeId: string) => OctaneRentalFacts | null = () => null
+
+/**
+ * nodeManager's rentals, by node (plan 1.18 review). Unset, or null for a
+ * node, is not known: no secure host, no Octane image.
+ */
+export function setRentalFacts(provider: (nodeId: string) => OctaneRentalFacts | null): void {
+  rentalFacts = provider
+}
+
+function rentedAs(nodeId: string): OctaneRentalFacts | null {
+  try {
+    return rentalFacts(nodeId)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether the OTOY credentials may go to a node rented as `rental`, and are
+ * there to go: the user opted in to the scripted sign-in (off unless set),
+ * and, with secure cloud only on, the node was rented through that filter.
+ * That setting keeps Octane rentals off hosts nobody vetted; without this
+ * the credentials still reached one whenever an Octane chunk did (a Cycles
+ * node on someone's own machine in a mixed queue, a rental made without its
+ * engine, a node from before a restart). Anything not known to be secure is
+ * taken not to be: it signs in by hand.
+ */
+export function scriptedSignInFor(rental: OctaneRentalFacts | null): boolean {
+  const o = getSettings().octane
+  if (o?.scriptedSignIn !== true) return false
+  if (o.secureCloudOnly === true && rental?.secureCloud !== true) return false
+  return !!getSecret('otoyUsername') && !!getSecret('otoyPassword')
+}
+
+/** The user opted in to the scripted sign-in, but the node is not one the credentials may go to. */
+function signInWithheld(rental: OctaneRentalFacts | null): boolean {
+  const o = getSettings().octane
+  return o?.scriptedSignIn === true && o.secureCloudOnly === true && rental?.secureCloud !== true
 }
 
 function storedState(nodeId: string): OctaneState {
@@ -304,7 +360,12 @@ export async function refreshOctaneState(
   }
 }
 
-function announceLogin(nodeId: string): void {
+/** The scripted sign-in was withheld from this node: see scriptedSignInFor. */
+const WITHHELD =
+  ' The scripted sign-in was not used: this node was not rented as a datacenter (secure ' +
+  'cloud) host, which the Octane settings send the OTOY credentials to only.'
+
+function announceLogin(nodeId: string, withheld: boolean): void {
   if (loginAlerted.has(nodeId)) return
   loginAlerted.add(nodeId)
   emit('alert', {
@@ -312,7 +373,7 @@ function announceLogin(nodeId: string): void {
     message:
       `Octane on ${nodeName(nodeId)} is waiting for a sign-in: open the node in Fleet, use ` +
       'Open VNC login, and sign in to OTOY there. Its Octane chunks start once it is licensed; ' +
-      'the node bills meanwhile.'
+      `the node bills meanwhile.${withheld ? WITHHELD : ''}`
   })
 }
 
@@ -337,7 +398,8 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  * and once per node while it still needs one (OctaneLoginNeededError after
  * that), with one alert telling the user where to sign in. `signal` ends
  * the wait early. Credentials are sent only when the user opted in to the
- * scripted sign-in, and only on stdin.
+ * scripted sign-in, only to a node they may go to (scriptedSignInFor), and
+ * only on stdin.
  *
  * Throws OctaneBlenderMissingError, OctaneLoginNeededError,
  * ConnectionLostError (a command the link dropped under), or a setup
@@ -367,12 +429,15 @@ export async function setupOctane(
   )
   if (install.code !== 0) throw new Error(`octane install failed: ${said(install)}`)
 
-  const scripted = getSettings().octane?.scriptedSignIn === true
+  const rental = rentedAs(nodeId)
+  const scripted = scriptedSignInFor(rental)
+  const withheld = signInWithheld(rental)
   if ((await startVnc(ssh, vncPassword(nodeId))) === 'notVnc' && !scripted) {
     // OctaneServer would run on that display, but nobody could sign it in.
     throw new Error(
       'vnc start failed: display :0 on this node is held by an X server that is not VNC, ' +
-        'so there is no way to sign in to Octane by hand here'
+        'so there is no way to sign in to Octane by hand here' +
+        (withheld ? ', and the scripted sign-in goes to datacenter hosts only' : '')
     )
   }
 
@@ -413,7 +478,7 @@ export async function setupOctane(
       throw new Error('OctaneServer launch failed: the server stopped before it was licensed')
     }
     if (state === 'needsLogin') {
-      announceLogin(nodeId)
+      announceLogin(nodeId, withheld)
       if (loginWaited.has(nodeId)) throw new OctaneLoginNeededError()
       if (loginDeadline === Infinity) loginDeadline = Date.now() + loginWaitMs
     }
