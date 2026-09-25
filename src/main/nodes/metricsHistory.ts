@@ -355,11 +355,19 @@ export function bucketGrid(
   }
   if (!bucketMs) bucketMs = BUCKET_STEPS.find(fits) ?? 0
   if (!bucketMs) {
-    bucketMs = Math.max(DAY, Math.ceil(minBucketMs / DAY) * DAY)
-    while (!fits(bucketMs)) bucketMs += DAY
+    // Whole days, the fewest that fit: ceil(span / w) + 1 <= points holds
+    // from w = span / (points - 1). Worked out, not searched for: adding a
+    // day at a time to a width past 2^53 ms changes nothing, and the search
+    // for an absurd range never ended, on the main process.
+    const days = Math.max(1, Math.ceil(minBucketMs / DAY), Math.ceil(span / (points - 1) / DAY))
+    bucketMs = days * DAY
+    if (!fits(bucketMs)) bucketMs += DAY
   }
   const start = Math.floor(fromMs / bucketMs) * bucketMs
-  return { start, bucketMs, count: Math.max(1, Math.ceil(toMs / bucketMs) - start / bucketMs) }
+  // Never more than `points`, whatever float rounding makes of an extreme
+  // range: the count sizes the arrays a read allocates.
+  const count = Math.min(points, Math.max(1, Math.ceil(toMs / bucketMs) - start / bucketMs))
+  return { start, bucketMs, count: Number.isFinite(count) ? count : 1 }
 }
 
 /** Running min/mean/max of one bucket. */
@@ -441,10 +449,20 @@ export function bucketize(
   return { bucketMs: grid.bucketMs, points: toPoints(grid, accs) }
 }
 
-/** A query's window made safe: finite, in order, with a sane point count. */
-function rangeOf(q: MetricsHistoryQuery): { fromMs: number; toMs: number; maxPoints: number } {
-  const toMs = Number.isFinite(q.toMs) ? q.toMs : Date.now()
+/**
+ * A query's window made safe: finite, in order, with a sane point count, no
+ * wider than anything kept (RETENTION_MS, and a day for the prune's slack),
+ * and ending at most a day from now. The query comes over IPC: a range from
+ * -1e300 to now once had bucketGrid loop for ever on the main process, and
+ * every probe, destroy retry and download with it.
+ */
+function rangeOf(
+  q: MetricsHistoryQuery,
+  now: number
+): { fromMs: number; toMs: number; maxPoints: number } {
+  const toMs = Number.isFinite(q.toMs) ? Math.min(Math.max(q.toMs, 0), now + DAY) : now
   let fromMs = Number.isFinite(q.fromMs) ? q.fromMs : toMs - HOUR
+  fromMs = Math.max(fromMs, toMs - RETENTION_MS - DAY)
   if (!(fromMs < toMs)) fromMs = toMs - MIN_BUCKET_MS
   const maxPoints = Math.max(1, Math.min(MAX_POINTS, Math.floor(q.maxPoints) || 1))
   return { fromMs, toMs, maxPoints }
@@ -471,7 +489,7 @@ function vramPct(used: number | null, total: number | null): number | null {
  * null for the part of a range older than memory.
  */
 export function nodeHistory(q: NodeMetricsHistoryQuery, now = Date.now()): NodeMetricsHistory {
-  const { fromMs, toMs, maxPoints } = rangeOf(q)
+  const { fromMs, toMs, maxPoints } = rangeOf(q, now)
   const grid = bucketGrid(fromMs, toMs, maxPoints, MIN_BUCKET_MS)
   const gpus = new Map<number, GpuAccs>()
   const gpu = (i: number): GpuAccs => {
@@ -654,7 +672,7 @@ interface NodeBucket {
  * for its life.
  */
 export function fleetGpuHistory(q: MetricsHistoryQuery, now = Date.now()): FleetGpuHistory {
-  const { fromMs, toMs, maxPoints } = rangeOf(q)
+  const { fromMs, toMs, maxPoints } = rangeOf(q, now)
   const grid = bucketGrid(fromMs, toMs, maxPoints, MIN_BUCKET_MS)
   const perNode = new Map<string, Array<NodeBucket | null>>()
   const slot = (nodeId: string, b: number): NodeBucket | null => {

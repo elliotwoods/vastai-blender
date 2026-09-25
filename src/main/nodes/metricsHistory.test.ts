@@ -170,6 +170,36 @@ describe('bucketize', () => {
       expect(g.start + g.count * g.bucketMs).toBeGreaterThanOrEqual(T0)
     }
   })
+
+  it('Feature G (review): a range from the renderer, however absurd, is answered at once, within maxPoints', () => {
+    // Past 2^53 ms, adding a day to a width changed nothing: the width
+    // search for these never ended, and held the main process.
+    for (const fromMs of [-1e300, -Number.MAX_VALUE, -1e17, 0]) {
+      const g = mh.bucketGrid(fromMs, T0, 100, mh.MIN_BUCKET_MS)
+      expect(g.count).toBeLessThanOrEqual(100)
+      expect(g.bucketMs).toBeGreaterThanOrEqual(DAY)
+    }
+    addNode('n1', 2, 1)
+    mh.record('n1', metrics(T0 - MINUTE, [gpu(0, 80)]), mh.runsPerGpu(work(0), 1))
+    const queries = [
+      { fromMs: -1e300, toMs: T0, maxPoints: 500 },
+      { fromMs: -1e300, toMs: 1e300, maxPoints: 1e9 },
+      { fromMs: T0 - HOUR, toMs: 1e300, maxPoints: 60 },
+      { fromMs: Number.NaN, toMs: -1e300, maxPoints: Number.NaN }
+    ]
+    for (const q of queries) {
+      const fleet = mh.fleetGpuHistory(q)
+      const node = mh.nodeHistory({ ...q, nodeId: 'n1' })
+      expect(fleet.points.length).toBeLessThanOrEqual(mh.MAX_POINTS)
+      expect(node.cpuUtil.length).toBeLessThanOrEqual(mh.MAX_POINTS)
+      // Never wider than anything kept, nor ending past tomorrow.
+      expect(fleet.toMs - fleet.fromMs).toBeLessThanOrEqual(mh.RETENTION_MS + DAY)
+      expect(node.toMs).toBeLessThanOrEqual(T0 + DAY)
+    }
+    // Reaching back past retention still finds what is kept.
+    const hist = mh.fleetGpuHistory({ fromMs: -1e300, toMs: T0, maxPoints: 500 })
+    expect(hist.points.filter((p) => p.gpusRented != null).map((p) => p.meanUtil)).toEqual([80])
+  })
 })
 
 describe('runs per GPU', () => {
