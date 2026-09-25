@@ -12,7 +12,7 @@ import { dirname, join } from 'path'
 import { getDb } from '../db/db'
 import { describeError } from '../errors'
 import { emit } from '../events'
-import { toMediaUrl } from '../mediaUrl'
+import { jobFileMediaUrl } from '../mediaUrl'
 import { isInside, resolveInside } from '../paths'
 import { getSettings } from '../settings'
 import {
@@ -259,9 +259,21 @@ async function sinkTakes(dir: string, needBytes: number): Promise<boolean> {
   }
 }
 
-/** Local landing dir for a job: <projectRoot>/renders/<jobId>/ */
+/**
+ * A job's local folder, where its files land: jobs.output_dir, fixed when the
+ * job was submitted, under the project root of that moment (plan 1.13).
+ *
+ * It was worked out again from the current project root for every file. A
+ * root changed in Settings mid-job sent the rest of a running job's frames
+ * and previews to a second folder, while the job's own, the one "Open output
+ * folder" opens, kept only what had landed before (#9 #61 #175 #202 #214).
+ * A job with no row, which nothing should ask about, gets the folder the old
+ * rule gave it.
+ */
 export function jobLocalDir(jobId: string): string {
-  return join(getSettings().projectRoot, 'renders', jobId)
+  const row = getDb().prepare('SELECT output_dir FROM jobs WHERE id = ?').get(jobId) as
+    { output_dir: string } | undefined
+  return row?.output_dir ?? join(getSettings().projectRoot, 'renders', jobId)
 }
 
 export class ChunkDownloader {
@@ -284,8 +296,12 @@ export class ChunkDownloader {
   private lastProgressAt = Date.now()
   /** The last time a file finished: what ends a hold on the local disk (drain). */
   private lastLandedAt = 0
+  /** The job's folder (jobLocalDir), read once: every file of the chunk lands in it. */
+  private readonly jobDir: string
 
-  constructor(private readonly target: ChunkDownloadTarget) {}
+  constructor(private readonly target: ChunkDownloadTarget) {
+    this.jobDir = jobLocalDir(target.jobId)
+  }
 
   /** Frames this downloader gave up on permanently. See drain(). */
   private lostFrames = new Set<string>()
@@ -325,7 +341,7 @@ export class ChunkDownloader {
 
   /** Remove `entry`'s partial, in turn with any transfer of it (discardPartial). */
   private discardPartialOf(entry: ManifestEntry): void {
-    const localPath = resolveInside(jobLocalDir(this.target.jobId), entry.file)
+    const localPath = resolveInside(this.jobDir, entry.file)
     if (localPath) void discardPartial(localPath, entry)
   }
 
@@ -707,8 +723,8 @@ export class ChunkDownloader {
    * never ended while its node billed.
    */
   private sinkRefused(entry: ManifestEntry, e: LocalSinkError): void {
-    const localPath = resolveInside(jobLocalDir(this.target.jobId), entry.file)
-    const dir = localPath ? dirname(localPath) : jobLocalDir(this.target.jobId)
+    const localPath = resolveInside(this.jobDir, entry.file)
+    const dir = localPath ? dirname(localPath) : this.jobDir
     if (sinkTrouble) {
       // Already paused: the probe decides when it is tried again.
       this.queue.unshift(entry)
@@ -774,7 +790,7 @@ export class ChunkDownloader {
     // `file` is the node's word, so it only ever lands inside the job folder.
     // parseManifest already holds it to the names the agent writes; this is
     // the backstop that still holds if those patterns are ever loosened.
-    const localPath = resolveInside(jobLocalDir(jobId), entry.file)
+    const localPath = resolveInside(this.jobDir, entry.file)
     if (!localPath) {
       this.noteRejected([manifestReject(entry.kind, entry.file, 'outside the job folder')])
       return
@@ -830,7 +846,7 @@ export class ChunkDownloader {
         kind: 'thumb',
         frame,
         path: localPath,
-        mediaUrl: toMediaUrl(localPath)
+        mediaUrl: jobFileMediaUrl(jobId, this.jobDir, localPath)
       })
     } else {
       const m = entry.meta
@@ -840,7 +856,7 @@ export class ChunkDownloader {
       // run concurrently, so `previewSdr` finishing first would drop live
       // rows that do not exist yet, and this row would then never be removed.
       if (m.kindKey === 'live' && this.hasDefinitiveClip(chunkId)) {
-        unlinkLater([localPath], 0)
+        unlinkLater([localPath], 0, this.jobDir)
         return
       }
       db.prepare(
@@ -864,7 +880,7 @@ export class ChunkDownloader {
         chunkId,
         kind: m.kindKey,
         path: localPath,
-        mediaUrl: toMediaUrl(localPath)
+        mediaUrl: jobFileMediaUrl(jobId, this.jobDir, localPath)
       })
       if (m.kindKey === 'live') this.pruneLiveVersions(chunkId, localPath)
       // A definitive rendition supersedes the live clip entirely.
@@ -887,7 +903,11 @@ export class ChunkDownloader {
     getDb()
       .prepare(`DELETE FROM assets WHERE chunk_id = ? AND kind = 'live' AND abs_path != ?`)
       .run(chunkId, keepPath)
-    unlinkLater(stale.map((s) => s.abs_path))
+    unlinkLater(
+      stale.map((s) => s.abs_path),
+      undefined,
+      this.jobDir
+    )
   }
 
   /** True once any final rendition for this chunk has landed. */
@@ -905,7 +925,11 @@ export class ChunkDownloader {
       .all(chunkId) as Array<{ abs_path: string }>
     if (rows.length === 0) return
     getDb().prepare(`DELETE FROM assets WHERE chunk_id = ? AND kind = 'live'`).run(chunkId)
-    unlinkLater(rows.map((r) => r.abs_path))
+    unlinkLater(
+      rows.map((r) => r.abs_path),
+      undefined,
+      this.jobDir
+    )
   }
 }
 
@@ -919,12 +943,19 @@ const rejectAlerted = new Set<string>()
  * Delete after a grace period, so a renderer still holding the old URL has
  * time to swap to the new one rather than losing its source mid-frame.
  *
- * Only ever inside the project's renders folder. The paths come from assets
- * rows, which were built from node-supplied names, and a row written before
- * those names were validated could point anywhere.
+ * Only ever inside `root`: the job's own folder (jobLocalDir), as the
+ * downloader and the job clip builder pass it, or else the current project's
+ * renders folder. The paths come from assets rows, which were built from
+ * node-supplied names, and a row written before those names were validated
+ * could point anywhere. Held to the current root, a running job's
+ * superseded live clips were never removed once the root had changed: its
+ * folder was no longer inside it (plan 1.13).
  */
-export function unlinkLater(paths: string[], delayMs = 30_000): void {
-  const root = join(getSettings().projectRoot, 'renders')
+export function unlinkLater(
+  paths: string[],
+  delayMs = 30_000,
+  root = join(getSettings().projectRoot, 'renders')
+): void {
   const safe = paths.filter((p) => {
     if (isInside(root, p)) return true
     console.warn(`[download] not deleting ${JSON.stringify(p)}: not inside ${root}`)

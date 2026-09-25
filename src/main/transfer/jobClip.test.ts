@@ -109,4 +109,23 @@ describe('job clips', () => {
     expect(clip.abs_path).toBe(join(jobDir, 'previews', 'job_previewSdr.v1.mp4'))
     expect(existsSync(clip.abs_path)).toBe(true)
   })
+
+  it('1.13 (#9 #214): after the project root moved, are built from the job’s own folder into it, under a URL that loads', async () => {
+    const {
+      jobId,
+      jobDir,
+      chunkIds: [a, b]
+    } = await finishedJob()
+    chunkClip(jobId, a, join(jobDir, 'previews', `${a}_sdr.mp4`))
+    chunkClip(jobId, b, join(jobDir, 'previews', `${b}_sdr.mp4`))
+    // The job's folder stays where it was submitted: jobs.output_dir.
+    w.settings.projectRoot = join(w.dir, 'moved')
+
+    const clip = await stitch(jobId)
+
+    expect(clip.abs_path).toBe(join(jobDir, 'previews', 'job_previewSdr.v1.mp4'))
+    expect(existsSync(clip.abs_path)).toBe(true)
+    const [added] = w.eventsOf('asset:added').filter((e) => e.chunkId === '')
+    expect(added.mediaUrl).toBe(`media://job/${jobId}/previews/job_previewSdr.v1.mp4`)
+  })
 })

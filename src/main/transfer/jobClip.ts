@@ -22,7 +22,7 @@ import { getDb } from '../db/db'
 import { describeError } from '../errors'
 import { emit } from '../events'
 import { ffmpegPath, runFfmpeg } from '../media/ffmpeg'
-import { toMediaUrl } from '../mediaUrl'
+import { jobFileMediaUrl } from '../mediaUrl'
 import { isInside } from '../paths'
 import { jobLocalDir, unlinkLater } from './frameDownloader'
 import { concatList, nextVersionName, planSegments, type SegmentPlan } from './jobClipPlan'
@@ -115,7 +115,9 @@ class JobClipBuilder {
     if (chunks.length < 2) return
 
     // Chunk clip paths were built from node-supplied names, and ffmpeg reads
-    // them with `-safe 0`: only clips inside this job's folder go in.
+    // them with `-safe 0`: only clips inside this job's folder go in. The
+    // folder is jobs.output_dir, not one under the current project root,
+    // which the user may have changed since (plan 1.13).
     const jobDir = jobLocalDir(jobId)
     for (const kind of JOB_CLIP_KINDS) {
       const clips = (
@@ -140,12 +142,13 @@ class JobClipBuilder {
       const plan = planSegments(chunks, clips, job.frame_step)
       // One chunk's worth is just that chunk's clip — nothing to stitch.
       if (!plan || plan.files.length < 2) continue
-      await this.write(jobId, kind, plan, bin)
+      await this.write(jobId, jobDir, kind, plan, bin)
     }
   }
 
   private async write(
     jobId: string,
+    jobDir: string,
     kind: JobClipKind,
     plan: SegmentPlan,
     bin: string
@@ -160,7 +163,7 @@ class JobClipBuilder {
     if (prev.length === 1 && prev[0].segments === segJson) return
 
     // The job's own previews folder, never one derived from a clip's path.
-    const outDir = join(jobLocalDir(jobId), 'previews')
+    const outDir = join(jobDir, 'previews')
     await mkdir(outDir, { recursive: true })
     const outPath = join(outDir, nextVersionName(kind, prev[0]?.abs_path ?? null))
     const partPath = `${outPath}.part`
@@ -217,8 +220,18 @@ class JobClipBuilder {
         segJson
       )
     })()
-    emit('asset:added', { jobId, chunkId: '', kind, path: outPath, mediaUrl: toMediaUrl(outPath) })
-    unlinkLater(prev.map((p) => p.abs_path).filter((p) => p !== outPath))
+    emit('asset:added', {
+      jobId,
+      chunkId: '',
+      kind,
+      path: outPath,
+      mediaUrl: jobFileMediaUrl(jobId, jobDir, outPath)
+    })
+    unlinkLater(
+      prev.map((p) => p.abs_path).filter((p) => p !== outPath),
+      undefined,
+      jobDir
+    )
     console.log(
       `[jobClip] ${jobId.slice(0, 8)} ${kind}: ${plan.files.length} clips → ${basename(outPath)} (${plan.frames} frames)`
     )
