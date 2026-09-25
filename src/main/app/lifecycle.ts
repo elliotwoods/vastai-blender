@@ -160,7 +160,7 @@ export function describeNode(n: NodeSnapshot): string {
   const rate = fmtRate(n.dphTotal ?? 0)
   return n.instanceId != null
     ? `instance ${n.instanceId} (${gpus}${rate})`
-    : `"${vastLabel(n)}", still being rented (${gpus}${rate})`
+    : `the rental "${vastLabel(n)}" (${gpus}${rate})`
 }
 
 /** A message box, and the choice each of its buttons stands for. */
@@ -199,7 +199,7 @@ export type QuitChoice = 'destroy' | 'leave' | 'cancel'
  */
 export function quitPrompt(fleet: BillingFleet): Prompt<QuitChoice> {
   const n = fleet.nodes.length
-  const renting = fleet.nodes.filter((x) => createOutcomeUnknown(x)).length
+  const renting = fleet.nodes.filter(createMayStillAnswer).length
   return {
     type: 'warning',
     title: 'Quit Vast Render',
@@ -425,6 +425,20 @@ async function settlesWithin(p: Promise<unknown>, ms: number): Promise<boolean> 
 }
 
 /**
+ * A create that may still answer: no instance id, no known outcome, and not
+ * ended 'failed'. A create in flight is 'requested', or 'destroying' or
+ * 'destroyed' if a destroy landed on it meanwhile (destroyNode then leaves
+ * the instance to rentOffer). One that answered with no outcome (a 5xx, a
+ * lost reply, a cancel mid-create) ends 'failed' still counted, and nothing
+ * more will come for it until plan 1.4's label lookup. A row an earlier run
+ * left 'requested' and the boot's sweep could not settle (offline) reads as
+ * in flight too, and costs its budget in waiting.
+ */
+function createMayStillAnswer(n: NodeSnapshot): boolean {
+  return createOutcomeUnknown(n) && n.state !== 'failed'
+}
+
+/**
  * Destroy one node within `budgetMs`. Resolves null once it is confirmed not
  * billing, or with the reason it may still be.
  */
@@ -441,15 +455,14 @@ async function settleNode(
   // it marks the node destroyed and leaves whatever the create returns to
   // rentOffer, and the row holds until that destroy is confirmed. Waiting
   // here for the answer, then destroying what it rented, lets this node's
-  // budget cover the whole of it. Plan 1.4's label lookup settles a create
-  // whose reply was lost the same way, by finding the id or its absence.
-  while (n && createOutcomeUnknown(n) && Date.now() < deadline) {
+  // budget cover the whole of it.
+  while (n && createMayStillAnswer(n) && Date.now() < deadline) {
     await sleep(pollMs)
     n = fleet.snapshot(id)
   }
   if (!n || !holdsInstance(n)) return null
   if (createOutcomeUnknown(n)) {
-    return `its create got no answer within ${secs}, so an instance labelled "${vastLabel(n)}" may exist`
+    return `Vast never answered its create; look for "${vastLabel(n)}" in the Vast.ai console`
   }
   // A destroy already under way (the idle scale-down, the Fleet's button) is
   // joined, not repeated: ensureInstanceGone runs one check per instance.

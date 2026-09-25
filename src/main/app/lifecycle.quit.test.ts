@@ -344,6 +344,42 @@ describe('Destroy all against what Vast is really like (plan 1.1)', () => {
     expect(r.app.exits).toEqual([{ code: 0, live: [], created: instances }])
     expect(limit.gaveUp).toBe(0)
   })
+
+  it('a create that answered with no outcome is listed at once, not waited on', async () => {
+    // 1.1 review: such a row was polled for the whole 20 s, as if its create
+    // were still out, then listed as "got no answer within 20 s". Here, an
+    // earlier run's rental whose create got a 5xx, which Vast cannot be
+    // asked about now (the lookup by label fails too): it stays 'failed' and
+    // billing, and nothing within the quit will settle it.
+    w = await setup()
+    const engine = await w.boot({ start: false })
+    const label = 'vastai-blender 0bad0bad'
+    w.db
+      .prepare(
+        `INSERT INTO nodes (id, state, gpu_name, num_gpus, dph_total, accumulated_cost, blender_versions, geolocation, label, create_unknown_since, last_error)
+         VALUES ('0bad0bad-0000-4000-8000-000000000000', 'failed', 'RTX 4090', 1, 0.4, 0, '[]', NULL, ?, ?, 'Vast.ai server error: bad gateway (HTTP 502)')`
+      )
+      .run(label, Date.now() - 3_600_000)
+    w.vast.fail('listInstances', { status: 503, message: 'service unavailable' }, 1_000)
+    engine.nodeManager.init()
+    engine.scheduler.start()
+    await w.advance(1_000)
+    const r = await rig(engine)
+    r.answers.push(DESTROY)
+    const quitAt = Date.now()
+
+    r.app.quit()
+    await w.until(() => r.dialogs.length === 2, 'the failure list')
+
+    expect(r.dialogs[0].message).toBe('1 node is billing $0.40/hr')
+    expect(r.dialogs[0].detail).not.toContain('still being rented')
+    expect(Date.now() - quitAt).toBeLessThan(5_000)
+    expect(r.dialogs[1].detail).toContain(
+      `• the rental "${label}" (RTX 4090, $0.40/hr): Vast never answered its create; ` +
+        `look for "${label}" in the Vast.ai console`
+    )
+    expect(w.vast.count('destroyInstance')).toBe(0)
+  })
 })
 
 describe('Destroy all while the fleet is still changing (plan 1.1; Phase 0 review note)', () => {

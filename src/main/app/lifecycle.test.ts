@@ -97,6 +97,13 @@ describe('the quit dialog', () => {
     expect(p.detail).toContain('(1 of them is still being rented.)')
   })
 
+  it('a create that failed with no outcome counts as billing, but not as still being rented', () => {
+    const answered = node({ id: 'x', state: 'failed', instanceId: null, createUnknownSince: 1 })
+    const p = quitPrompt(billingFleet([node(), answered]))
+    expect(p.message).toBe('2 nodes are billing $0.80/hr')
+    expect(p.detail).not.toContain('still being rented')
+  })
+
   it('Enter destroys, Esc cancels, and an unknown response is Esc', () => {
     const p = quitPrompt(billingFleet([node()]))
     expect(choiceOf(p, p.defaultId)).toBe('destroy')
@@ -116,7 +123,8 @@ describe('the failure list', () => {
       },
       {
         node: node({ id: '0123456789abcdef', instanceId: null, state: 'requested' }),
-        reason: 'its create got no answer within 20 s'
+        reason:
+          'Vast never answered its create; look for "vastai-blender 01234567" in the Vast.ai console'
       }
     ])
     expect(p.message).toBe('2 instances may still be billing')
@@ -124,7 +132,7 @@ describe('the failure list', () => {
       '• instance 4242 (RTX 4090 ×8, $3.20/hr): destroy failed: 500 internal error'
     )
     expect(p.detail).toContain(
-      '• "vastai-blender 01234567", still being rented (RTX 4090, $0.40/hr)'
+      '• the rental "vastai-blender 01234567" (RTX 4090, $0.40/hr): Vast never answered its create'
     )
     expect(p.detail).toContain(VAST_CONSOLE)
     expect(p.choices).toEqual(['retry', 'console', 'quitAnyway'])
