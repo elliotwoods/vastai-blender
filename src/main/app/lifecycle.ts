@@ -702,6 +702,12 @@ export interface LifecycleDeps<W = unknown> {
   ensureWindow(): void
   fleet: FleetPort
   closeDb(): void
+  /**
+   * Last things to put away on the way out, before the database closes: the
+   * local API's api.json (main/api), so no script finds a server that is
+   * gone. Synchronous; a throw is logged and the exit goes on.
+   */
+  beforeExit?(): void
   /** null for the app a person runs; the quit policy for a headless run. */
   headless: { policy: QuitPolicy } | null
   /**
@@ -791,6 +797,7 @@ export function installLifecycle<W>(deps: LifecycleDeps<W>): Lifecycle {
     phase = 'exiting'
     contained('stopping the scheduler', () => fleet.stopScheduling())
     contained('closing node connections', () => fleet.shutdown())
+    contained('stopping the local API', () => deps.beforeExit?.())
     contained('closing the database', () => deps.closeDb())
     deps.app.exit(code)
   }

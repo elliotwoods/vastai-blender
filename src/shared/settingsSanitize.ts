@@ -75,7 +75,9 @@ export const SETTINGS_LIMITS = {
   /** Disk Vast allocates for every rental, and bills for. */
   minDiskGb: { min: 10, max: 4096 },
   minCpuCores: { min: 0, max: 1024 },
-  minNumGpus: { min: 1, max: 16, integer: true }
+  minNumGpus: { min: 1, max: 16, integer: true },
+  /** 0 = a port the OS picks; else an unprivileged port. */
+  apiPort: { min: 0, max: 65535, integer: true }
 } as const satisfies Record<string, Limits>
 
 /**
@@ -292,6 +294,7 @@ const RULES: { [K in keyof SettingsPublic]-?: TopRule<K> } = {
   hasVastApiKey: 'derived',
   hasOtoyCredentials: 'derived',
   installId: 'derived',
+  apiServer: 'derived',
   spendCapPerHour: 'spendCap',
   noSpendCap: 'spendCap',
   projectRoot: pathRule('project root'),
@@ -330,6 +333,12 @@ const RULES: { [K in keyof SettingsPublic]-?: TopRule<K> } = {
   maxNodeSlots: numberRule('max render slots per node', SETTINGS_LIMITS.maxNodeSlots),
   slotsPerGpu: numberRule('render slots per GPU', SETTINGS_LIMITS.slotsPerGpu),
   eagerFleet: booleanRule('buy-ahead fleet'),
+  apiEnabled: booleanRule('local API'),
+  apiPort: (v, c) => {
+    const port = numberRule('local API port', SETTINGS_LIMITS.apiPort)(v, c)
+    if (port === KEEP || port === 0 || port >= 1024) return port
+    return c.reject(`local API port must be 0 (any free port) or from 1024 to 65535 (got ${port})`)
+  },
   co2OverheadFactor: numberRule('CO2 overhead factor', SETTINGS_LIMITS.co2OverheadFactor),
   dockerImageByEngine: (v, c) => {
     if (!isRecord(v)) return c.reject(`docker images must be given per engine (got ${show(v)})`)

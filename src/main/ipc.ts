@@ -34,6 +34,7 @@ import type {
   NodeChunkView,
   NodeSnapshot,
   RequestNodeOptions,
+  SettingsPublic,
   ThumbAsset
 } from '../shared/models'
 import { applySettingsPatch, describeFieldErrors, type GateOptions } from './app/settingsGate'
@@ -71,6 +72,7 @@ import {
   type QueueRow
 } from './jobs/queueModel'
 import { scheduler } from './scheduler/scheduler'
+import type { ApiController } from './api/server'
 import { co2Grams, intensityFor } from './carbon/intensity'
 import { getDb } from './db/db'
 import { jobFileMediaUrl, toMediaUrl } from './mediaUrl'
@@ -275,7 +277,9 @@ function revealablePlaces(): string[] {
     ...openableRoots(),
     ...blends.map((r) => r.blend_path),
     ...listAddons().map((a) => a.zipPath),
-    getSettings().sshKeyPath
+    getSettings().sshKeyPath,
+    // Settings' "Show in Finder" beside the local API (main/api).
+    ...(localApi ? [localApi.file] : [])
   ]
 }
 
@@ -1163,9 +1167,32 @@ export interface RegisterIpcOptions {
    * open. Without it such a click does nothing.
    */
   createWindow?: () => void
+  /**
+   * The local API (main/api): its status goes out with the settings, and a
+   * settings change starts or stops it before settings:update answers.
+   */
+  api?: Pick<ApiController, 'status' | 'sync' | 'file'>
+}
+
+/** The local API registerIpc was given, for the settings handlers and revealablePlaces. */
+let localApi: RegisterIpcOptions['api'] | null = null
+
+/** The settings as handed to the renderer: with the local API's status. */
+function withApiStatus(settings: SettingsPublic): SettingsPublic {
+  return localApi ? { ...settings, apiServer: localApi.status() } : settings
+}
+
+/** Start or stop the local API after a settings change; its failure is in its status. */
+async function syncApi(): Promise<void> {
+  try {
+    await localApi?.sync()
+  } catch (e) {
+    console.error('[api] sync failed:', e)
+  }
 }
 
 export function registerIpc(opts: RegisterIpcOptions = {}): void {
+  localApi = opts.api ?? null
   // -- events ---------------------------------------------------------------
   // Every bus event goes to every window. Subscribed here, once, before
   // index.ts starts the node manager and scheduler (the first emitters) and
@@ -1205,17 +1232,24 @@ export function registerIpc(opts: RegisterIpcOptions = {}): void {
   // VR_MOCK asserts the key too: mock mode exists to drive the UI on a
   // throwaway profile, and without this Fleet renders its "no API key" empty
   // state instead of the mock nodes, so the mocks are unreachable.
-  handle('settings:get', () => (MOCK ? { ...getSettings(), hasVastApiKey: true } : getSettings()))
+  handle('settings:get', () =>
+    withApiStatus(MOCK ? { ...getSettings(), hasVastApiKey: true } : getSettings())
+  )
   // Every patch from the renderer goes through the sanitizer, and only what
   // passed is saved (plan 1.14, app/settingsGate.ts). settings:update says
   // which fields did not and why; settings:set keeps its contract for its
   // callers and only logs them.
-  handle('settings:set', (patch) => {
+  handle('settings:set', async (patch) => {
     const { settings, errors } = applySettingsPatch(patch, settingsStore, gateOptions())
     if (errors.length) console.warn(`[settings] not saved as sent: ${describeFieldErrors(errors)}`)
-    return settings
+    await syncApi()
+    return withApiStatus(settings)
   })
-  handle('settings:update', (patch) => applySettingsPatch(patch, settingsStore, gateOptions()))
+  handle('settings:update', async (patch) => {
+    const result = applySettingsPatch(patch, settingsStore, gateOptions())
+    await syncApi()
+    return { ...result, settings: withApiStatus(result.settings) }
+  })
   handle('settings:setSecret', (key, value) => {
     setSecret(key, value)
     // A new key may be another account, and a hold the old key caused says

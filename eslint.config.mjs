@@ -28,5 +28,11 @@ export default defineConfig(
       ...eslintPluginReactRefresh.configs.vite.rules
     }
   },
+  {
+    // The CLI is plain JavaScript run by Node as it is (bin/vast-render-cli.mjs):
+    // there are no types to write return types in.
+    files: ['bin/**/*.mjs'],
+    rules: { '@typescript-eslint/explicit-function-return-type': 'off' }
+  },
   eslintConfigPrettier
 )

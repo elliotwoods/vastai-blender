@@ -22,6 +22,21 @@ stalled the app).
 
 ### Added
 
+- **A local HTTP API and a CLI.** Turn on Settings › General › Local API (or
+  launch with `VR_API=1`) and the running app serves `/v1` on `127.0.0.1`:
+  - submit a campaign (an inline `VR_JOB_SPEC` with `name` and `dedupe`);
+  - list, inspect, cancel, remove, restore, move, group, share, resume and
+    retry jobs;
+  - read the queue, the fleet and its cost;
+  - stream events over SSE.
+
+  Its address and a per-start token are in `<userData>/api.json` (mode 0600,
+  deleted on stop and quit). Requests need `Authorization: Bearer`. Any
+  request with an `Origin` header, or a `Host` other than loopback, gets 403,
+  and bodies are JSON of at most 1 MB. `bin/vast-render-cli.mjs`
+  (`vast-render-cli`, no dependencies) wraps it and exits 0 (ok), 1 (refused)
+  or 2 (app not running). See [docs/API.md](docs/API.md).
+
 - **One command layer for jobs, the queue and the fleet.** The job and queue
   IPC channels (and `fleet:cost`) now go through `main/commands`: each
   checks its arguments with a small shared validator (`shared/validate.ts`)

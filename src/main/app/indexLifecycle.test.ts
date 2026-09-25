@@ -197,6 +197,7 @@ async function load(
             : join(opts.userData, name)
           : '/profiles/test',
       getAppPath: () => '/app',
+      getVersion: () => '0.0.0-test',
       isPackaged: false,
       requestSingleInstanceLock: () => true,
       on: (event: string, fn: (...args: unknown[]) => void) => {
