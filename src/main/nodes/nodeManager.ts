@@ -80,8 +80,10 @@ import { prune as pruneMetrics, record as recordMetrics, runsPerGpu } from './me
 import {
   asOctaneState,
   forgetOctaneNode,
+  octaneSignInHold,
   onOctaneState,
   refreshOctaneState,
+  scriptedSignInFor,
   setRentalFacts,
   stopOctaneServer,
   type OctaneRentalFacts
@@ -2377,9 +2379,42 @@ export class NodeManager {
    *
    * A search the cap left empty is not repeated at that headroom for
    * CAP_EMPTY_BACKOFF_MS: such a call returns [] without asking Vast.
+   *
+   * For Octane (`engine`), a sign-in by hand bounds the batch as well
+   * (octaneRentalRoom): no more nodes waiting for a sign-in than are signed
+   * in, one before any is, and none after a sign-in nobody made.
    */
   async requestNodes(count: number, opts: RequestNodesOptions = {}): Promise<string[]> {
     return this.rentBatch(count, opts, false)
+  }
+
+  /**
+   * How many Octane nodes scale-up may rent now (plan 1.18 review). A
+   * sign-in by hand needs the user at each node's desktop, and nothing says
+   * they are there until one is signed in. Field incident A1's shape: the
+   * user away overnight, and every node rented for the queue waiting on a
+   * sign-in nobody made, billing idle, let go, and rented again.
+   *
+   * - None while a sign-in has been missed (octaneLicense's
+   *   octaneSignInHold), until the user acts.
+   * - Signed in by hand: no more nodes waiting for a sign-in than there are
+   *   signed in, and one before any is. Waiting is a live node rented for
+   *   Octane, or with OctaneServer up, that is not licensed.
+   * - A scripted sign-in waits on nobody: the caps alone.
+   */
+  private octaneRentalRoom(settings: SettingsPublic): number {
+    if (octaneSignInHold()) return 0
+    const secureCloud = settings.octane?.secureCloudOnly === true
+    if (scriptedSignInFor({ engine: 'octane', secureCloud })) return Infinity
+    let licensed = 0
+    let waiting = 0
+    for (const n of this.nodes.values()) {
+      if (DESTROY_STATES.has(n.state) || !holdsInstance(n.facts)) continue
+      const octane = n.octaneState
+      if (octane === 'licensed') licensed++
+      else if (octane !== 'none' || n.rental?.engine === 'octane') waiting++
+    }
+    return Math.max(0, Math.max(1, licensed) - waiting)
   }
 
   /** requestNodes, and requestNode's rental (`manual`), which always searches. */
@@ -2393,6 +2428,12 @@ export class NodeManager {
     // Scale-up asks every tick, and each ask used to add a failed row.
     if (this.hold) return []
     let settings = getSettings()
+    // Octane signed in by hand waits on the user (plan 1.18): the Fleet's
+    // own request is the user acting, and is not bounded here.
+    if (opts.engine === 'octane' && !manual) {
+      count = Math.min(count, this.octaneRentalRoom(settings))
+      if (count <= 0) return []
+    }
     // activeCount rather than the budget's own count: quit's destroy-all
     // stops renting by making it read as full (lifecycle.ts fleetPort).
     if (this.activeCount() >= settings.maxActiveNodes) return []

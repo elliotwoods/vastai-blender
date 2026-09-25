@@ -87,6 +87,12 @@ const LOCK_BUSY = /another start-server or stop-server still running/
  * the node's OctaneServer runs with no licence. Nothing is wrong with the
  * machine or the job; the node is not usable for Octane until someone signs
  * in over VNC.
+ *
+ * Nothing but the user ends that, so the chunk must not simply go back to
+ * the queue uncharged: sent again it fails again, and while it is pending it
+ * keeps every idle node billing. Its job waits on the user instead (the
+ * scheduler's jobs.attention) until a node reads licensed or the user acts
+ * (octaneSignInHold).
  */
 export class OctaneLoginNeededError extends Error {
   override readonly name = 'OctaneLoginNeededError'
@@ -157,6 +163,11 @@ const loginWaited = new Set<string>()
 const loginAlerted = new Set<string>()
 /** Nodes the setup found without OctaneBlender, until a later check finds it. */
 const blenderMissing = new Set<string>()
+/**
+ * A sign-in by hand that nobody made (octaneSignInHold): the node whose
+ * wait ran out, and when.
+ */
+let signInMissed: { nodeId: string; since: number } | null = null
 
 const stateListeners = new Set<(nodeId: string, state: OctaneState) => void>()
 
@@ -236,7 +247,58 @@ export function octaneUnfit(nodeId: string): string | null {
   if (blenderMissing.has(nodeId)) {
     return `OctaneBlender is not installed on this node (${OCTANE_BLENDER})`
   }
+  if (loginWaited.has(nodeId)) {
+    return 'nobody signed in to Octane on this node while its first Octane chunk waited'
+  }
+  if (signInMissed && storedState(nodeId) === 'needsLogin') {
+    return 'its Octane waits for a sign-in, and one was already missed on another node'
+  }
   return null
+}
+
+// -- a sign-in nobody made ----------------------------------------------------------
+
+/** A sign-in by hand nobody made, as octaneSignInHold gives it. */
+export interface OctaneSignInHold {
+  nodeId: string
+  since: number
+  reason: string
+}
+
+/**
+ * A sign-in by hand that nobody made (plan 1.18 review, field incident A1:
+ * the user away, overnight). Set when a node's wait for a sign-in runs out,
+ * and kept past that node, until a node reads licensed, the user opens a VNC
+ * login (openVncTunnel), or releaseOctaneSignInHold. Null while there is
+ * none.
+ *
+ * While it stands, no setup waits for a sign-in again (a scripted one still
+ * gets the licence wait), and nodeManager rents no Octane node for
+ * scale-up. Each such node would wait for a user who is not there, go idle,
+ * be let go, and be rented again in its place, with no end. The scheduler
+ * holds the job for the user on the OctaneLoginNeededError it gets. Kept in
+ * memory only: a restart is the user acting.
+ */
+export function octaneSignInHold(): OctaneSignInHold | null {
+  const m = signInMissed
+  if (!m) return null
+  return {
+    ...m,
+    reason:
+      `nobody signed in to Octane on ${nodeName(m.nodeId)} within ` +
+      `${Math.round(OCTANE_LOGIN_WAIT_MS / 60_000)} min: sign in over VNC (Fleet → the node → ` +
+      'Open VNC login)'
+  }
+}
+
+/**
+ * The user acted on a missed sign-in: resumed the job, or released the hold
+ * by hand. Each node may be waited on once more, and says so again.
+ */
+export function releaseOctaneSignInHold(): void {
+  signInMissed = null
+  loginWaited.clear()
+  loginAlerted.clear()
 }
 
 function storedState(nodeId: string): OctaneState {
@@ -262,6 +324,8 @@ function writeState(nodeId: string, state: OctaneState): void {
     loginAlerted.delete(nodeId)
     unlicensedSince.delete(nodeId)
   }
+  // Someone signed in: whoever missed one before is back.
+  if (state === 'licensed') signInMissed = null
   if (was === state) return
   if (was === 'needsLogin' && state === 'licensed') {
     emit('alert', {
@@ -422,8 +486,9 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  *
  * A server that needs a sign-in is waited on, OCTANE_LOGIN_WAIT_MS at most
  * and once per node while it still needs one (OctaneLoginNeededError after
- * that), with one alert telling the user where to sign in. `signal` ends
- * the wait early. Credentials are sent only when the user opted in to the
+ * that), with one alert telling the user where to sign in; not at all once
+ * a sign-in has been missed (octaneSignInHold). `signal` ends the wait
+ * early. Credentials are sent only when the user opted in to the
  * scripted sign-in, only to a node they may go to (scriptedSignInFor), and
  * only on stdin.
  *
@@ -498,7 +563,10 @@ export async function setupOctane(
   let state = judge(nodeId, word, /OctaneServer launched/.test(launch.stdout))
   writeState(nodeId, state)
 
-  const loginWaitMs = opts.loginWaitMs ?? OCTANE_LOGIN_WAIT_MS
+  // A sign-in already missed on some node (octaneSignInHold): nobody is
+  // there to sign this one in either, so only a scripted sign-in's licence
+  // line is waited for.
+  const loginWaitMs = signInMissed ? 0 : (opts.loginWaitMs ?? OCTANE_LOGIN_WAIT_MS)
   // However the reads go: a node whose state cannot be read is waited on
   // no longer than one that says it needs a sign-in.
   const giveUpAt = Date.now() + OCTANE_LICENSE_WAIT_MS + loginWaitMs
@@ -514,6 +582,9 @@ export async function setupOctane(
     }
     if (Date.now() >= Math.min(loginDeadline, giveUpAt)) {
       loginWaited.add(nodeId)
+      // Asked for a sign-in, and none came. Not a node whose state could
+      // not be read: that says nothing of the user.
+      if (loginDeadline !== Infinity) signInMissed ??= { nodeId, since: Date.now() }
       throw new OctaneLoginNeededError()
     }
     if (opts.signal?.aborted) throw new Error('Octane setup stopped: the chunk was taken back')
@@ -557,6 +628,10 @@ export async function openVncTunnel(ssh: SshConnection, nodeId: string): Promise
       'no VNC sign-in on this node: its display :0 is held by an X server that is not VNC'
     )
   }
+  // The user is at the node's desktop: a sign-in missed before is theirs to
+  // make now, and this node's next Octane chunk may wait for it again.
+  signInMissed = null
+  loginWaited.delete(nodeId)
 
   const server = createServer((socket) => {
     void ssh
@@ -596,6 +671,7 @@ export function forgetOctaneNode(nodeId: string): void {
   loginWaited.delete(nodeId)
   loginAlerted.delete(nodeId)
   blenderMissing.delete(nodeId)
+  // Not signInMissed: the node going (let go idle) is not anyone signing in.
 }
 
 /** Where setup_octane.sh records the OctaneServer it launched ($VASTAI_HOME/state). */

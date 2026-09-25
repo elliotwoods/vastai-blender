@@ -193,6 +193,8 @@ describe('setupOctane: deadlines and labels (1.8)', () => {
     )
     expect(settled).toBe(true)
     expect(await setup).toBeInstanceOf(octane.OctaneLoginNeededError)
+    // A node that never answered never asked anyone to sign in.
+    expect(octane.octaneSignInHold()).toBeNull()
   })
 })
 
@@ -458,6 +460,82 @@ describe('setupOctane: the node and its state (1.18, #85)', () => {
     expect(Date.now()).toBe(t)
     // One alert for the whole while it needed a sign-in.
     expect(alerts.filter((a) => a.level === 'warn')).toHaveLength(1)
+  })
+
+  it('1.18 (review, A1): a sign-in nobody made holds: no other node waits for one, until someone signs in or acts', async () => {
+    const NODE_B = 'node-2-bbbbbbbb'
+    h.db
+      .prepare(
+        `INSERT INTO nodes (id, instance_id, state, gpu_name) VALUES (?, 2, 'rendering', 'RTX 4090')`
+      )
+      .run(NODE_B)
+    const a = { now: 'needsLogin' as OctaneState }
+    const nodeA = octaneNode(a)
+    expect(octane.octaneSignInHold()).toBeNull()
+    const waited = octane.setupOctane(nodeA.ssh, NODE).catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LOGIN_WAIT_MS + 10_000)
+    expect(await waited).toBeInstanceOf(octane.OctaneLoginNeededError)
+    const since = octane.octaneSignInHold()?.since
+    expect(octane.octaneSignInHold()).toEqual({
+      nodeId: NODE,
+      since: expect.any(Number),
+      reason:
+        'nobody signed in to Octane on RTX 4090 node-1-a within 10 min: sign in over VNC ' +
+        '(Fleet → the node → Open VNC login)'
+    })
+    expect(octane.octaneUnfit(NODE)).toMatch(/^nobody signed in to Octane on this node/)
+
+    // Another node gets no wait of its own: nobody is there to sign it in
+    // either. Only the licence wait a scripted sign-in would need.
+    const b = { now: 'none' as OctaneState }
+    const nodeB = octaneNode(b)
+    const t = Date.now()
+    const second = octane.setupOctane(nodeB.ssh, NODE_B).catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LICENSE_WAIT_MS + 10_000)
+    expect(await second).toBeInstanceOf(octane.OctaneLoginNeededError)
+    expect(Date.now() - t).toBeLessThanOrEqual(octane.OCTANE_LICENSE_WAIT_MS + 10_000)
+    expect(octane.octaneUnfit(NODE_B)).not.toBeNull()
+    // The hold names the first miss, and outlives the node that missed it.
+    octane.forgetOctaneNode(NODE)
+    expect(octane.octaneSignInHold()).toMatchObject({ nodeId: NODE, since })
+
+    // Someone signs in on B: the hold is over, and A may wait once more.
+    b.now = 'licensed'
+    expect(await octane.refreshOctaneState(nodeB.ssh, NODE_B)).toBe('licensed')
+    expect(octane.octaneSignInHold()).toBeNull()
+    expect(octane.octaneUnfit(NODE_B)).toBeNull()
+
+    // Missed again, then released by the user (the job resumed): each node
+    // may be waited on once more.
+    const again = octane.setupOctane(nodeA.ssh, NODE).catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LOGIN_WAIT_MS + 10_000)
+    expect(await again).toBeInstanceOf(octane.OctaneLoginNeededError)
+    expect(octane.octaneSignInHold()).not.toBeNull()
+    octane.releaseOctaneSignInHold()
+    expect(octane.octaneSignInHold()).toBeNull()
+    expect(octane.octaneUnfit(NODE)).toBeNull()
+    let settled = false
+    const third = octane.setupOctane(nodeA.ssh, NODE).finally(() => (settled = true))
+    third.catch(() => {})
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LOGIN_WAIT_MS - 30_000)
+    expect(settled).toBe(false)
+    a.now = 'licensed'
+    await vi.advanceTimersByTimeAsync(10_000)
+    await expect(third).resolves.toBe('licensed')
+  })
+
+  it('1.18 (review): opening the VNC login is the user acting: the hold ends, and that node may wait again', async () => {
+    const a = { now: 'needsLogin' as OctaneState }
+    const { ssh } = octaneNode(a)
+    const waited = octane.setupOctane(ssh, NODE).catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(octane.OCTANE_LOGIN_WAIT_MS + 10_000)
+    expect(await waited).toBeInstanceOf(octane.OctaneLoginNeededError)
+    expect(octane.octaneSignInHold()).not.toBeNull()
+    vi.useRealTimers()
+    await octane.openVncTunnel(ssh, NODE)
+    octane.closeVncTunnel(NODE)
+    expect(octane.octaneSignInHold()).toBeNull()
+    expect(octane.octaneUnfit(NODE)).toBeNull()
   })
 
   it('1.18: the licence poll moves a node that needed a sign-in to licensed, and a dead server to none', async () => {

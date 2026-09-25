@@ -111,6 +111,77 @@ describe('1.18: Octane on a node, as the fleet sees it', () => {
     expect(machine.ran(/setup_octane\.sh status/)).toHaveLength(reads)
   })
 
+  it('1.18 (A1): an Octane job whose sign-in nobody makes keeps no node billing past the wait and the idle timeout, and rents none in its place', async () => {
+    // Signed in by hand, the default, and the user away (overnight). The
+    // report's first handoff gave such a chunk back uncharged and unheld:
+    // pending for ever, it kept every idle node billing, or, with the node
+    // unfit, had it let go and another rented for another wait, with no end.
+    w.settings.dockerImageByEngine = { octane: 'otoy/octane-blender:2025.2' }
+    const app = await w.boot()
+    const lic = await import('../octane/octaneLicense')
+    const { holdsInstance } = await import('../../shared/nodeState')
+    const nodeId = await w.readyNode(app)
+    const machine = w.machineFor(nodeId)
+    const octane = fakeOctane(machine, { signIn: 'byHand' })
+    const specs: AgentSpec[] = []
+    machine.onSpec = (spec) => specs.push(spec)
+    const jobId = await w.submitJob(app, {
+      engine: 'octane',
+      frameStart: 1,
+      frameEnd: 3,
+      chunkSize: 1
+    })
+    const t0 = Date.now()
+    app.scheduler.kick()
+
+    // The licence wait, the one wait for a sign-in, and the idle timeout,
+    // plus five minutes: the scheduler as it stands charges each chunk's
+    // render retries, one dispatch per tick, before its job fails. Holding
+    // the job on the first OctaneLoginNeededError (the corrected handoff)
+    // takes that out.
+    const bound =
+      lic.OCTANE_LICENSE_WAIT_MS +
+      lic.OCTANE_LOGIN_WAIT_MS +
+      w.settings.idleTimeoutMinutes * MIN +
+      5 * MIN
+    await w.until(
+      () =>
+        w.get<{ destroyed_at: number | null }>(
+          'SELECT destroyed_at FROM nodes WHERE id = ?',
+          nodeId
+        )?.destroyed_at != null,
+      'the node let go',
+      { timeoutMs: bound }
+    )
+    expect(Date.now() - t0).toBeLessThanOrEqual(bound)
+    expect(lic.octaneSignInHold()).toMatchObject({ nodeId })
+
+    // Nothing in its place, then or later, and nothing billing.
+    await w.advance(30 * MIN)
+    expect(w.vast.count('createInstance')).toBe(1)
+    expect(app.nodeManager.list().filter((n) => holdsInstance(n))).toEqual([])
+    // Scale-up for Octane, once it names the engine, rents nothing either,
+    // and does not even search.
+    const searches = w.vast.count('searchOffers')
+    w.vast.addOffer()
+    expect(await app.nodeManager.requestNodes(1, { engine: 'octane' })).toEqual([])
+    expect(w.vast.count('searchOffers')).toBe(searches)
+    // The job keeps no chunk queued for a node: it waits on the user, or
+    // its chunks failed.
+    const { attention } = w.get<{ attention: string | null }>(
+      'SELECT attention FROM jobs WHERE id = ?',
+      jobId
+    )!
+    const queued = w.all(
+      "SELECT id FROM chunks WHERE job_id = ? AND state NOT IN ('failed', 'complete')",
+      jobId
+    )
+    expect(attention != null || queued.length === 0).toBe(true)
+    // One wait, one server, nothing rendered unlicensed.
+    expect(octane.launches).toBe(1)
+    expect(specs).toEqual([])
+  })
+
   it('1.18: a node that never ran Octane is never asked about it', async () => {
     const app = await w.boot()
     const nodeId = await w.readyNode(app)
@@ -215,6 +286,40 @@ describe('1.18: renting for Octane', () => {
       ...o
     })
   }
+
+  it('1.18 (review, A1): signed in by hand, scale-up rents Octane nodes no faster than they are signed in', async () => {
+    const app = await w.boot()
+    octaneSettings({ maxActiveNodes: 8, spendCapPerHour: null, noSpendCap: true })
+    for (let i = 0; i < 8; i++) w.vast.addOffer()
+    const octaneIds = (): string[] =>
+      w
+        .all<{ id: string }>('SELECT id FROM nodes ORDER BY rowid')
+        .map((r) => r.id)
+        .filter((id) => app.nodeManager.rentalOf(id)?.engine === 'octane')
+
+    // Nobody is known to be at a desktop: one node, for the user to sign in.
+    expect(await app.nodeManager.requestNodes(3, { engine: 'octane' })).toHaveLength(1)
+    const [first] = octaneIds()
+    // While it waits, no other: nothing searched, nothing rented.
+    const searches = w.vast.count('searchOffers')
+    expect(await app.nodeManager.requestNodes(3, { engine: 'octane' })).toEqual([])
+    expect(w.vast.count('searchOffers')).toBe(searches)
+    // Other engines are not held by it.
+    expect(await app.nodeManager.requestNodes(1, { engine: 'cycles' })).toHaveLength(1)
+
+    // Signed in: one more may wait beside it, and no more.
+    w.db.prepare(`UPDATE nodes SET octane_state = 'licensed' WHERE id = ?`).run(first)
+    expect(await app.nodeManager.requestNodes(3, { engine: 'octane' })).toHaveLength(1)
+    expect(await app.nodeManager.requestNodes(3, { engine: 'octane' })).toEqual([])
+    // The Fleet's own request is the user, there to sign it in.
+    await app.nodeManager.requestNode({ engine: 'octane' })
+    expect(octaneIds()).toHaveLength(3)
+
+    // A scripted sign-in waits on nobody: the caps alone.
+    w.settings.octane = { scriptedSignIn: true, secureCloudOnly: false }
+    expect(await app.nodeManager.requestNodes(2, { engine: 'octane' })).toHaveLength(2)
+    expect(octaneIds()).toHaveLength(5)
+  })
 
   it('1.18: each engine rents with its own docker image; one with none set, the built-in', async () => {
     const app = await w.boot()
