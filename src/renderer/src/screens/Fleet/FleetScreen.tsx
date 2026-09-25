@@ -13,7 +13,7 @@ import { ipcErrorText } from '../../lib/recovery'
 import { DestroyNodeButton } from './NodeActions'
 import { NodeDetail } from './NodeDetail'
 import { FleetGpuStrip } from './FleetGpuStrip'
-import { overCapRequest } from './requestNode'
+import { overCapBound, overCapRequest } from './requestNode'
 import { ScaleStatusLine } from './ScaleStatusLine'
 import { UnclaimedPanel } from './UnclaimedPanel'
 import { MeterPair, MiniMeter } from './meters'
@@ -365,11 +365,11 @@ function RequestNodeButton({
     (message != null && /spend cap/i.test(message))
   const noCap = settings?.spendCapPerHour == null
   const past = overCapRequest(settings)
-  const bound = past.maxPerHour ?? null
+  const bound = overCapBound(settings)
   const request = (overSpendCap: boolean): Promise<unknown> =>
     // The refusal is shown from the mutation's error; nothing to rethrow.
     req.mutateAsync(overSpendCap ? past : undefined).catch(() => undefined)
-  const price = bound != null ? `at most ${fmtRate(bound)}` : 'at any price'
+  const price = bound != null ? `at most ${fmtRate(bound.perHour)}` : 'at any price'
 
   return (
     <>
@@ -403,9 +403,11 @@ function RequestNodeButton({
               ? 'No spend cap is set, so scale-up rents nothing. Click twice to rent one node anyway, '
               : `The fleet bills ${fmtRate(budget?.perHour ?? 0)} of its ${fmtRate(budget?.spendCap ?? 0)} spend cap. ` +
                 'A node rented now takes it past the cap: click twice to rent one anyway, ') +
-            (bound != null
-              ? `at no more than ${fmtRate(bound)} (the offer filter's price).`
-              : 'at whatever the offer filters allow: they set no price.')
+            (bound == null
+              ? 'at whatever the offer filters allow: they set no price.'
+              : bound.from === 'offerFilter'
+                ? `at no more than ${fmtRate(bound.perHour)} (the offer filter's price).`
+                : `at no more than ${fmtRate(bound.perHour)}, the cap itself: the offer filters set no price.`)
           }
           onConfirm={() => request(true)}
         />
