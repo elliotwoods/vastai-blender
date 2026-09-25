@@ -25,6 +25,7 @@ import type {
   JobSummary,
   NodeChunkView,
   NodeSnapshot,
+  RetryMissingResult,
   SettingsPatch,
   SettingsPatchResult,
   SettingsPublic
@@ -214,6 +215,22 @@ export function useSetJobShareNode(): UseMutationResult<
     mutationFn: ({ jobId, shareNode }: { jobId: string; shareNode: boolean }) =>
       ipc.invoke('job:setShareNode', jobId, shareNode),
     onSuccess: (_r, { jobId }) => {
+      void qc.invalidateQueries({ queryKey: qk.jobs })
+      void qc.invalidateQueries({ queryKey: qk.job(jobId) })
+    }
+  })
+}
+
+/**
+ * "Re-render missing" (plan 1.15): queue the job's frames not yet
+ * downloaded again. Main emits chunk:changed and job:changed for what it
+ * queued; the invalidations cover a result that changed nothing visible.
+ */
+export function useRetryMissing(): UseMutationResult<RetryMissingResult | void, Error, string> {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (jobId: string) => ipc.invoke('job:retryMissing', jobId),
+    onSuccess: (_r, jobId) => {
       void qc.invalidateQueries({ queryKey: qk.jobs })
       void qc.invalidateQueries({ queryKey: qk.job(jobId) })
     }

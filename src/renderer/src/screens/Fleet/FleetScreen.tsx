@@ -7,6 +7,7 @@ import { fmtDuration, fmtEnergy, fmtMoney, fmtRate, fmtWatts } from '../../lib/f
 import { HINTS } from '../../lib/hints'
 import { ipc } from '../../lib/ipc'
 import { useNav } from '../../lib/nav'
+import { DestroyNodeButton } from './NodeActions'
 import { NodeDetail } from './NodeDetail'
 import { MeterPair, MiniMeter } from './meters'
 import { pctOf, usageTone } from '../../lib/usage'
@@ -52,7 +53,9 @@ const COLS = {
   rate: 82,
   cost: 70,
   power: 76,
-  uptime: 72
+  uptime: 72,
+  // Room for the destroy button's armed "confirm destroy?".
+  actions: 116
 } as const
 
 const cellSm: CSSProperties = { fontSize: SCALE.textSm }
@@ -131,7 +134,7 @@ function HeaderRow(): React.JSX.Element {
       <HeaderCell h={h} width={COLS.power} label="power" hint={HINTS.power} />
       <span style={{ ...h, width: COLS.uptime }}>uptime</span>
       <span style={{ ...h, flex: 1 }}>activity</span>
-      <span style={{ width: 70 }} />
+      <span style={{ width: COLS.actions }} />
     </div>
   )
 }
@@ -273,16 +276,8 @@ function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
         >
           {node.lastError ?? activitySummary(node)}
         </span>
-        <span style={{ width: 70, display: 'inline-flex', justifyContent: 'flex-end' }}>
-          <button
-            style={btn({ variant: 'danger', size: 'sm' })}
-            onClick={(e) => {
-              e.stopPropagation()
-              void ipc.invoke('node:destroy', node.id)
-            }}
-          >
-            destroy
-          </button>
+        <span style={{ width: COLS.actions, display: 'inline-flex', justifyContent: 'flex-end' }}>
+          <DestroyNodeButton node={node} onDestroy={() => ipc.invoke('node:destroy', node.id)} />
         </span>
       </div>
       {expanded ? <NodeDetail node={node} /> : null}

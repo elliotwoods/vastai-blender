@@ -17,10 +17,12 @@ import { useLogStore } from '../../lib/logStore'
 import { useNav } from '../../lib/nav'
 import { usePreview } from '../../lib/preview'
 import { useChunkProgress } from '../../lib/progressStore'
-import { useJob, useSetJobShareNode } from '../../lib/queries'
+import { useJob, useRetryMissing, useSetJobShareNode } from '../../lib/queries'
+import { describeRetry, ipcErrorText } from '../../lib/recovery'
 import { CHUNK_TONE, SCALE, STATUS_VARS, TOKENS } from '../../lib/theme'
 import { Filmstrip } from '../../media/Filmstrip'
 import type { ChunkSnapshot } from '../../../../shared/models'
+import { JobActions, JobAttentionNote } from './JobActions'
 
 function ChunkCell({ chunk }: { chunk: ChunkSnapshot }): React.JSX.Element {
   const openPreview = usePreview((s) => s.open)
@@ -187,7 +189,15 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
     return [...ids]
   }, [job])
 
-  const running = job && ['queued', 'running'].includes(job.state)
+  // "Re-render missing" (plan 1.15): what it queued, or why main refused,
+  // beside the button. Kept per job, so another job's screen starts clean.
+  const retryMissing = useRetryMissing()
+  const [note, setNote] = useState<{ jobId: string; text: string } | null>(null)
+  const onRetryMissing = (): Promise<void> =>
+    retryMissing.mutateAsync(jobId).then(
+      (r) => setNote({ jobId, text: describeRetry(r) }),
+      (e: unknown) => setNote({ jobId, text: ipcErrorText(e) })
+    )
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -207,14 +217,12 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
               >
                 open output
               </button>
-              {running ? (
-                <button
-                  style={btn({ variant: 'danger', size: 'sm' })}
-                  onClick={() => void ipc.invoke('job:cancel', jobId)}
-                >
-                  cancel
-                </button>
-              ) : null}
+              <JobActions
+                job={job}
+                onRetryMissing={onRetryMissing}
+                onCancel={() => ipc.invoke('job:cancel', jobId)}
+                note={note?.jobId === jobId ? note.text : null}
+              />
             </>
           ) : undefined
         }
@@ -260,6 +268,7 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
                 share node
               </label>
             ) : null}
+            {job ? <JobAttentionNote job={job} /> : null}
           </>
         }
       />

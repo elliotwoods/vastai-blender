@@ -24,10 +24,12 @@ import {
 } from '../../lib/format'
 import { ipc } from '../../lib/ipc'
 import { NO_LINES, useLogStore } from '../../lib/logStore'
+import { describeReprovision, ipcErrorText } from '../../lib/recovery'
 import { SCALE, TOKENS } from '../../lib/theme'
 import { useNow } from '../../lib/useNow'
 import { TONE_COLOR, pctOf, usageTone, type Tone } from '../../lib/usage'
 import { Meter } from './meters'
+import { ReprovisionButton } from './NodeActions'
 import { NodeWorkload } from './NodeWorkload'
 import type { NodeSnapshot } from '../../../../shared/models'
 
@@ -251,6 +253,19 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
     say(res.message)
   }
 
+  /**
+   * Restart the node's agent (plan 1.15). Resolves either way, with what
+   * happened beside the button: main has already raised an alert for a
+   * failure, which also says whether the node was destroyed.
+   */
+  const reprovision = async (): Promise<void> => {
+    try {
+      say(describeReprovision(await ipc.invoke('node:reprovision', node.id)))
+    } catch (e) {
+      say(`reprovision failed: ${ipcErrorText(e)}`)
+    }
+  }
+
   const m = node.metrics
   const vramPct = m ? pctOf(m.vramUsedGb, m.vramTotalGb) : null
   const ramPct = m ? pctOf(m.ramUsedGb, m.ramTotalGb) : null
@@ -333,6 +348,7 @@ export function NodeDetail({ node }: { node: NodeSnapshot }): React.JSX.Element 
           <Icon name="terminal" size={12} />
           ssh
         </button>
+        <ReprovisionButton node={node} onReprovision={reprovision} />
         <span style={{ flex: 1 }} />
         {flash ? (
           <span style={{ fontSize: SCALE.textXs, color: TOKENS.accent }}>{flash}</span>
