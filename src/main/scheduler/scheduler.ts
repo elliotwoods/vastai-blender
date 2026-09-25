@@ -268,6 +268,8 @@ class JobCannotRun extends Error {
   }
 }
 
+const ENGINE_IDS: ReadonlySet<string> = new Set<EngineId>(['cycles', 'eevee', 'octane'])
+
 /**
  * What a failed agent state means for the retry policy. classify() reads
  * errorKind 'scene' and the exit code; the agent's errorKind 'job' and
@@ -336,6 +338,7 @@ class ChunkRun {
   private downloader: ChunkDownloader | null = null
   private stopTail: (() => void) | null = null
   private dispatchedAt = Date.now()
+  private engineNoted = false
 
   /** EWMA of frames/sec while rendering; null until two progress samples land. */
   private framesPerSec: number | null = null
@@ -416,6 +419,38 @@ class ChunkRun {
 
   private job(): JobRow {
     return getDb().prepare('SELECT * FROM jobs WHERE id = ?').get(this.jobId) as JobRow
+  }
+
+  /** Chunks the job is split into now, requeue's splits included. */
+  private jobChunks(): number {
+    return (
+      getDb().prepare('SELECT COUNT(*) AS n FROM chunks WHERE job_id = ?').get(this.jobId) as {
+        n: number
+      }
+    ).n
+  }
+
+  /**
+   * The scene's real engine, from the agent, written back to the job (plan
+   * 1.16): the submit dialog's engine is only a label, and the spec, the
+   * Jobs list and History all go by it. Once per run; an engine that is not
+   * one of the app's (workbench, a render add-on's) leaves the label alone.
+   */
+  private noteEngine(engine: string | null | undefined): void {
+    if (this.engineNoted || typeof engine !== 'string' || engine === '') return
+    this.engineNoted = true
+    if (!ENGINE_IDS.has(engine)) return
+    const r = getDb()
+      .prepare('UPDATE jobs SET engine = ? WHERE id = ? AND engine != ?')
+      .run(engine, this.jobId, engine)
+    if (r.changes === 0) return
+    emit('render:logLine', {
+      nodeId: this.nodeId,
+      chunkId: this.chunkId,
+      line: `the scene renders with ${engine}: the job's engine is now ${engine}`,
+      ts: Date.now()
+    })
+    emitJobChanged(this.jobId)
   }
 
   /**
@@ -535,6 +570,10 @@ class ChunkRun {
       frameStart: chunk.frame_start,
       frameEnd: chunk.frame_end,
       frameStep: job.frame_step,
+      // How many chunks the job is split into, so the scene preflight refuses
+      // an unbaked simulation that each chunk would start cold (plan 1.16)
+      // before the first one renders, rather than when the second one does.
+      jobChunks: this.jobChunks(),
       // Concurrent render slots the agent may use (1 = single-slot). This is
       // the node's current auto-judged target, not a global setting.
       nodeSlots: slotTarget,
@@ -680,6 +719,7 @@ class ChunkRun {
         if (state.status === 'rendering') {
           this.sampleRate(state.framesDone, scheduler.slotsInUse(this.nodeId))
         }
+        this.noteEngine(state.engine)
         if (state.status === 'encoding') this.setChunk({ state: 'encoding' })
         if (state.status === 'done') {
           this.setChunk({ state: 'downloading' })

@@ -251,6 +251,38 @@ describe('1.16: a job no node can render fails once, with the reason', () => {
     })
   }
 
+  it('1.16: the spec tells the preflight how many chunks the job is split into', async () => {
+    const { app, ids } = await nodes(1)
+    const specs: AgentSpec[] = []
+    const machine = w.machineFor(ids[0])
+    machine.onSpec = (spec) => {
+      specs.push(spec)
+      machine.agent.finish(spec.chunkId)
+    }
+    const jobId = await w.submitJob(app, { frameStart: 1, frameEnd: 6, chunkSize: 2 })
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(specs.map((s) => s.jobChunks)).toEqual([3, 3, 3])
+  })
+
+  it("1.16: the scene's real engine, as the agent reports it, becomes the job's", async () => {
+    const { app, ids } = await nodes(1)
+    const machine = w.machineFor(ids[0])
+    machine.onSpec = (spec) => {
+      machine.agent.writeState(spec.chunkId, {
+        status: 'rendering',
+        engine: 'eevee'
+      } as Partial<AgentStateFile>)
+      // The next poll reads that before the chunk finishes.
+      setTimeout(() => machine.agent.finish(spec.chunkId), 6_000)
+    }
+    const jobId = await w.submitJob(app, { engine: 'cycles' })
+    app.scheduler.kick()
+    await w.until(() => jobState(jobId) === 'complete', 'job complete')
+    expect(w.get('SELECT engine FROM jobs WHERE id = ?', jobId)).toEqual({ engine: 'eevee' })
+    expect(w.eventsOf('job:changed').at(-1)).toMatchObject({ id: jobId, engine: 'eevee' })
+  })
+
   it('A12: an add-on gone from the registry fails the job; it never renders without it', async () => {
     const { app, ids } = await nodes(1)
     const specs: AgentSpec[] = []
