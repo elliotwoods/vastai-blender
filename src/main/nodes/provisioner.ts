@@ -1,8 +1,19 @@
 /**
- * Provisioning: ship the remote/ tree, run base setup (apt deps, static
- * ffmpeg, agent under tmux), install the required Blender version(s), and
- * probe EEVEE capability. Idempotent — re-runs are cheap (everything on the
- * node checks before doing work).
+ * Provisioning: ship the remote/ tree, install the node's dependencies (apt
+ * deps, static ffmpeg), start the agent under tmux, install the required
+ * Blender version(s), and probe EEVEE capability. Idempotent — re-runs are
+ * cheap (everything on the node checks before doing work).
+ *
+ * provision.sh's `deps` and `restart-agent` are separate steps (plan 1.9):
+ * the installs are skipped when this build already ran them, and the agent is
+ * restarted only when asked to (`--force`) or when it is dead or runs other
+ * code. `agent-status` says which, and what a restart would kill, before
+ * anything is done. So the app can bring back a node that lost its connection
+ * without killing the renders its live agent is running (plan 1.7).
+ *
+ * Every step has a deadline (plan 1.8). provisionBase, installBlender and the
+ * rest used to await their command with none, so one stalled download left a
+ * node 'provisioning', and billing, for good (#37 #82).
  */
 
 import { app } from 'electron'
@@ -15,6 +26,40 @@ import type { SshConnection } from '../ssh/sshConnection'
 
 export const REMOTE_ROOT = '/root/vastai'
 
+const PROVISION = `${REMOTE_ROOT}/provision.sh`
+
+/**
+ * The longest `provision.sh deps` may run: provision.sh's own worst case.
+ * Its static ffmpeg download may take about an hour (two attempts at the
+ * 30-minute ceiling) before it falls back to apt's ffmpeg, and apt runs
+ * before and after that. A node that meets the offer filters' bandwidth
+ * installs everything in a minute or two; onReady's deadline in
+ * nodeManager.ts, not this, is what ends a slow one there.
+ */
+export const DEPS_TIMEOUT_MS = 75 * 60_000
+
+/**
+ * The longest `provision.sh install-blender` may run: one pass over its four
+ * mirrors at the 30-minute ceiling each, then the extraction. It also runs at
+ * dispatch, inside the scheduler's per-node prep lock, whose caller can pass
+ * a shorter `timeoutMs`.
+ */
+export const INSTALL_BLENDER_TIMEOUT_MS = 4 * 30 * 60_000 + 10 * 60_000
+
+/**
+ * The longest `provision.sh restart-agent` may run: up to 90 s waiting for
+ * another restart-agent on the node (AGENT_LOCK_WAIT_S), 10 s for the old
+ * agent to exit before it is killed (AGENT_STOP_WAIT_S), and 30 s for the new
+ * one's first heartbeat (AGENT_START_WAIT_S).
+ */
+export const RESTART_AGENT_TIMEOUT_MS = 3 * 60_000
+
+/** `agent-status` hashes a few small files and answers with one line. */
+const AGENT_STATUS_TIMEOUT_MS = 60_000
+
+/** An extension install starts Blender twice; its extraction is a zip. */
+const EXTENSION_TIMEOUT_MS = 10 * 60_000
+
 /** The repo's remote/ tree (bundled as extraResource in production builds). */
 export function localRemoteDir(): string {
   const dev = join(app.getAppPath(), 'remote')
@@ -26,42 +71,246 @@ function logLine(nodeId: string, line: string): void {
   emit('render:logLine', { nodeId, chunkId: null, line, ts: Date.now() })
 }
 
+/**
+ * Run a provisioning command, streaming its output to the node's log, and
+ * return its lines and exit code. Past `timeoutMs` the command's channel is
+ * closed and this rejects with the timeout, naming `label`, never the command
+ * text. A connection that drops under it ends it with exit code null.
+ */
+async function runCaptured(
+  ssh: SshConnection,
+  nodeId: string,
+  command: string,
+  label: string,
+  timeoutMs: number
+): Promise<{ code: number | null; lines: string[] }> {
+  logLine(nodeId, `$ ${label}`)
+  const lines: string[] = []
+  const { done } = await ssh.execStream(
+    command,
+    (line) => {
+      lines.push(line)
+      logLine(nodeId, line)
+    },
+    { timeoutMs, label }
+  )
+  const code = await done
+  return { code, lines }
+}
+
 async function runLogged(
   ssh: SshConnection,
   nodeId: string,
   command: string,
-  label: string
+  label: string,
+  timeoutMs: number
 ): Promise<void> {
-  logLine(nodeId, `$ ${label}`)
-  const { done } = await ssh.execStream(command, (line) => logLine(nodeId, line))
-  const code = await done
+  const { code } = await runCaptured(ssh, nodeId, command, label, timeoutMs)
   if (code !== 0) throw new Error(`${label} failed (exit ${code})`)
 }
 
-/** Base provisioning — everything except Blender versions. */
-export async function provisionBase(ssh: SshConnection, nodeId: string): Promise<void> {
-  logLine(nodeId, 'uploading remote scripts…')
-  const files = await uploadTree(ssh, localRemoteDir(), REMOTE_ROOT)
-  logLine(nodeId, `uploaded ${files} files`)
+/** What `provision.sh restart-agent` did: whether the agent, and every render on the node, was restarted. */
+export interface AgentRestart {
+  restarted: boolean
+  /** Why it restarted (provision.sh's reason: "forced", "heartbeat stale (75s)"…), when it did. */
+  reason: string | null
+}
+
+/**
+ * restart-agent found another restart-agent running on the node, and gave up
+ * waiting for it: the node is busy, not broken.
+ */
+export class AgentBusyError extends Error {
+  override readonly name = 'AgentBusyError'
+
+  constructor() {
+    super('another restart-agent is still running on the node')
+  }
+}
+
+/**
+ * restart-agent's verdict, from its output: the last line is AGENT_KEPT or
+ * AGENT_RESTARTED <reason>. Null when it is neither.
+ */
+export function parseAgentRestart(lines: readonly string[]): AgentRestart | null {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim()
+    if (!line) continue
+    if (line === 'AGENT_KEPT') return { restarted: false, reason: null }
+    const m = /^AGENT_RESTARTED(?: (.*))?$/.exec(line)
+    if (m) return { restarted: true, reason: m[1]?.trim() || null }
+    return null
+  }
+  return null
+}
+
+/**
+ * `provision.sh restart-agent`: restart the agent when it is dead or runs
+ * other code than the app shipped, or always with `force`. A restart kills
+ * every Blender on the node and empties its inbox, so a caller with runs on
+ * the node must forget them exactly when this says it restarted: a check made
+ * beforehand can go stale in between.
+ *
+ * A restart-agent already under way on the node is waited for by the script,
+ * up to 90 s, and then once more here: it may be ours, left running on the
+ * node when a deadline gave up on it. An exit that gives no verdict counts as
+ * a restart. Forgetting runs a live agent kept costs a re-render; keeping
+ * runs a restart killed leaves them polling a render that is gone.
+ */
+export async function restartAgent(
+  ssh: SshConnection,
+  nodeId: string,
+  opts: { force?: boolean; timeoutMs?: number } = {}
+): Promise<AgentRestart> {
+  const command = `bash ${PROVISION} restart-agent${opts.force ? ' --force' : ''}`
+  const label = `provision.sh restart-agent${opts.force ? ' --force' : ''}`
+  for (let attempt = 1; ; attempt++) {
+    const { code, lines } = await runCaptured(
+      ssh,
+      nodeId,
+      command,
+      label,
+      opts.timeoutMs ?? RESTART_AGENT_TIMEOUT_MS
+    )
+    if (code === 0) return parseAgentRestart(lines) ?? { restarted: true, reason: null }
+    const busy = code === 1 && lines.some((l) => l.includes('another restart-agent still running'))
+    if (busy && attempt < 2) continue
+    if (busy) throw new AgentBusyError()
+    const last = [...lines].reverse().find((l) => l.trim())
+    throw new Error(`${label} failed (exit ${code})${last ? `: ${last.trim()}` : ''}`)
+  }
+}
+
+/** `provision.sh deps`: directories, apt packages and static ffmpeg, skipped when this build installed them. */
+export async function provisionDeps(ssh: SshConnection, nodeId: string): Promise<void> {
   await runLogged(
     ssh,
     nodeId,
-    `chmod +x ${REMOTE_ROOT}/provision.sh && bash ${REMOTE_ROOT}/provision.sh base`,
-    'provision.sh base'
+    `chmod +x ${PROVISION} && bash ${PROVISION} deps`,
+    'provision.sh deps',
+    DEPS_TIMEOUT_MS
   )
+}
+
+/**
+ * Base provisioning — everything except Blender versions: the remote/ tree,
+ * the deps, and the agent, always restarted. That is `provision.sh base`, run
+ * as its two steps so that each has its own deadline and the restart's
+ * verdict is read.
+ *
+ * Always a restart. A node provisioned here is new, or is being resumed at
+ * start-up, when the scheduler has put every chunk it had in flight back in
+ * the queue and re-attaches to none of them (scheduler.start). A render the
+ * old agent went on with would be work nobody collects, on lanes the app
+ * counts as free. A node that loses its connection mid-session is brought
+ * back without one (nodeManager's reviveAgent).
+ */
+export async function provisionBase(ssh: SshConnection, nodeId: string): Promise<AgentRestart> {
+  logLine(nodeId, 'uploading remote scripts…')
+  const files = await uploadTree(ssh, localRemoteDir(), REMOTE_ROOT)
+  logLine(nodeId, `uploaded ${files} files`)
+  await provisionDeps(ssh, nodeId)
+  return restartAgent(ssh, nodeId, { force: true })
+}
+
+/** What `provision.sh agent-status` reports: one JSON line. */
+export interface AgentStatus {
+  /** The code the running agent was started from; '' when unknown. */
+  agentHash: string
+  /** The agent code on disk, which the app uploaded. */
+  shippedAgentHash: string
+  agentCurrent: boolean
+  /** The vr-agent tmux session exists. */
+  agentSession: boolean
+  /** Seconds since the agent's last heartbeat; null when it never beat. */
+  heartbeatAgeS: number | null
+  heartbeatStale: boolean
+  /** Blender processes the agent started: the renders a restart would kill. */
+  blenderProcs: number
+  /** Specs waiting in the inbox, which a restart would delete. */
+  inboxSpecs: number
+  /** deps are installed for the tree on disk. */
+  depsCurrent: boolean
+  /** restart-agent without --force would restart the agent, and why. */
+  restartNeeded: boolean
+  restartReason: string
+}
+
+/** agent-status's line, or null when the output has none (an older or a missing provision.sh). */
+export function parseAgentStatus(stdout: string): AgentStatus | null {
+  const line = stdout
+    .split('\n')
+    .map((l) => l.trim())
+    .reverse()
+    .find((l) => l.startsWith('{'))
+  if (!line) return null
+  let raw: Record<string, unknown>
+  try {
+    raw = JSON.parse(line) as Record<string, unknown>
+  } catch {
+    return null
+  }
+  const bool = (k: string): boolean | null => {
+    const v = raw[k]
+    return typeof v === 'boolean' ? v : null
+  }
+  const count = (k: string): number | null => {
+    const v = raw[k]
+    return typeof v === 'number' && Number.isFinite(v) ? v : null
+  }
+  const str = (k: string): string => {
+    const v = raw[k]
+    return typeof v === 'string' ? v : ''
+  }
+  const restartNeeded = bool('restartNeeded')
+  const blenderProcs = count('blenderProcs')
+  const inboxSpecs = count('inboxSpecs')
+  // What the app decides on must be there; a line without it is no status.
+  if (restartNeeded == null || blenderProcs == null || inboxSpecs == null) return null
+  const age = count('heartbeatAgeS')
+  return {
+    agentHash: str('agentHash'),
+    shippedAgentHash: str('shippedAgentHash'),
+    agentCurrent: bool('agentCurrent') ?? false,
+    agentSession: bool('agentSession') ?? false,
+    heartbeatAgeS: age,
+    heartbeatStale: bool('heartbeatStale') ?? age == null,
+    blenderProcs,
+    inboxSpecs,
+    depsCurrent: bool('depsCurrent') ?? false,
+    restartNeeded,
+    restartReason: str('restartReason')
+  }
+}
+
+/**
+ * Ask the node's provision.sh about its agent, changing nothing. Null when
+ * the node's tree has no agent-status (a build before the split provisioned
+ * it, or the tree is gone): only a full provision puts that right. Rejects
+ * when the command itself fails: the connection, or the deadline.
+ */
+export async function agentStatus(ssh: SshConnection): Promise<AgentStatus | null> {
+  const r = await ssh.exec(`bash ${PROVISION} agent-status`, {
+    timeoutMs: AGENT_STATUS_TIMEOUT_MS,
+    label: 'provision.sh agent-status'
+  })
+  if (r.code === null) throw new Error('provision.sh agent-status lost its connection')
+  return r.code === 0 ? parseAgentStatus(r.stdout) : null
 }
 
 /** Install a Blender release (idempotent) and record it on the node row. */
 export async function installBlender(
   ssh: SshConnection,
   nodeId: string,
-  version: string
+  version: string,
+  opts: { timeoutMs?: number } = {}
 ): Promise<void> {
   await runLogged(
     ssh,
     nodeId,
-    `bash ${REMOTE_ROOT}/provision.sh install-blender ${version}`,
-    `install blender ${version}`
+    `bash ${PROVISION} install-blender ${version}`,
+    `install blender ${version}`,
+    opts.timeoutMs ?? INSTALL_BLENDER_TIMEOUT_MS
   )
   const db = getDb()
   const row = db.prepare('SELECT blender_versions FROM nodes WHERE id = ?').get(nodeId) as
@@ -82,8 +331,9 @@ export async function probeEevee(
   nodeId: string,
   version: string
 ): Promise<boolean> {
-  const r = await ssh.exec(`bash ${REMOTE_ROOT}/provision.sh probe-eevee ${version}`, {
-    timeoutMs: 120_000
+  const r = await ssh.exec(`bash ${PROVISION} probe-eevee ${version}`, {
+    timeoutMs: 120_000,
+    label: `EEVEE probe ${version}`
   })
   const ok = r.stdout.includes('PROBE_OK')
   getDb()
@@ -119,7 +369,8 @@ export async function installExtension(
       // not surface later as a scene-guard abort on every render attempt.
       `${blender} --command extension install-file -r user_default --enable '${remoteZip}' && ` +
         `${blender} -b -noaudio --python-exit-code 1 --python-expr "import bpy; bpy.ops.preferences.addon_enable(module='bl_ext.user_default.${addon.id}'); bpy.ops.wm.save_userpref()"`,
-      `install extension ${addon.id}`
+      `install extension ${addon.id}`,
+      EXTENSION_TIMEOUT_MS
     )
     return null
   }
@@ -129,7 +380,8 @@ export async function installExtension(
     ssh,
     nodeId,
     `rm -rf '${srcDir}' && mkdir -p '${srcDir}' && python3 -m zipfile -e '${remoteZip}' '${srcDir}'`,
-    `extract extension ${addon.id}`
+    `extract extension ${addon.id}`,
+    EXTENSION_TIMEOUT_MS
   )
   return `import sys; sys.path.insert(0, '${srcDir}'); import ${addon.id}; ${addon.id}.register()`
 }
@@ -137,7 +389,8 @@ export async function installExtension(
 /** Check the agent is alive (heartbeat fresh within 30s). */
 export async function agentAlive(ssh: SshConnection): Promise<boolean> {
   const r = await ssh.exec(
-    `python3 -c "import os,time;p='${REMOTE_ROOT}/state/heartbeat';print('alive' if os.path.exists(p) and time.time()-os.path.getmtime(p)<30 else 'dead')"`
+    `python3 -c "import os,time;p='${REMOTE_ROOT}/state/heartbeat';print('alive' if os.path.exists(p) and time.time()-os.path.getmtime(p)<30 else 'dead')"`,
+    { timeoutMs: 30_000, label: 'agent heartbeat' }
   )
   return r.stdout.includes('alive')
 }
