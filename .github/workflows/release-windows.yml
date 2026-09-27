@@ -1,0 +1,52 @@
+# Builds the Windows installer on a Windows runner and attaches it to the
+# tag's GitHub Release. It cannot be built on a Mac: electron-builder.yml sets
+# npmRebuild: false, so the package would carry the Mac's better-sqlite3 and
+# ffmpeg-static binaries. Here `npm ci` runs postinstall
+# (`electron-builder install-app-deps`), which builds better-sqlite3 for
+# Electron on win32-x64, and ffmpeg-static fetches the Windows ffmpeg.
+name: Release (Windows)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and attach to (e.g. v2.4.0)'
+        required: true
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # --publish never: the upload below is the only way files reach the release.
+      - run: npm run build:win -- --x64 --publish never
+
+      # The release is normally created by hand with the CHANGELOG's notes; if
+      # this run gets there first, it makes a draft to attach to.
+      - name: Attach to release
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --title "$TAG" --notes ""
+          gh release upload "$TAG" dist/*-setup.exe dist/*-setup.exe.blockmap --clobber
