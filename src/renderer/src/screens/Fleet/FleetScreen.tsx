@@ -5,6 +5,7 @@ import { Sparkline } from '../../components/charts/Sparkline'
 import { Icon } from '../../components/Icon'
 import { InfoHint } from '../../components/Tooltip'
 import { btn, mono, panel, sectionLabel, statusDot, tableRow } from '../../lib/controls'
+import { fitColumns, useMeasuredWidth, type FitColumn } from '../../lib/layout'
 import { fmtDuration, fmtEnergy, fmtMoney, fmtRate, fmtWatts } from '../../lib/format'
 import { HINTS } from '../../lib/hints'
 import { ipc } from '../../lib/ipc'
@@ -78,6 +79,42 @@ const COLS = {
 
 const cellSm: CSSProperties = { fontSize: SCALE.textSm }
 
+type Col = keyof typeof COLS | 'activity'
+const GAP = 12
+const w = (col: keyof typeof COLS): number => COLS[col] + GAP
+
+/**
+ * The order a tight table sheds its columns in: the trend first, the GPU
+ * meters never. Below the undroppable columns' width the rows stack instead
+ * (StackedNodeRow), since a table that narrow has nothing left to drop.
+ */
+const FIT: readonly FitColumn<Col>[] = [
+  { key: 'caret', width: w('caret') },
+  { key: 'dot', width: w('dot') },
+  { key: 'state', width: w('state') },
+  { key: 'gpu', width: w('gpu') },
+  { key: 'gpuUse', width: w('gpuUse') },
+  { key: 'gpuTrend', width: w('gpuTrend'), drop: 1 },
+  { key: 'cpuUse', width: w('cpuUse'), drop: 5 },
+  { key: 'rate', width: w('rate') },
+  { key: 'cost', width: w('cost'), drop: 4 },
+  { key: 'power', width: w('power'), drop: 2 },
+  { key: 'uptime', width: w('uptime'), drop: 3 },
+  { key: 'activity', width: ACTIVITY_MIN_W + GAP, drop: 6 },
+  { key: 'actions', width: COLS.actions }
+]
+const ALL_COLS: ReadonlySet<Col> = new Set(FIT.map((c) => c.key))
+/** Row padding, left and right. */
+const ROW_PAD = 24
+const TABLE_MIN = FIT.filter((c) => c.drop == null).reduce((sum, c) => sum + c.width, 0) + ROW_PAD
+
+/** A cell that keeps its column's width rather than wrapping its text. */
+const fixed = (col: keyof typeof COLS): CSSProperties => ({
+  width: COLS[col],
+  flexShrink: 0,
+  whiteSpace: 'nowrap'
+})
+
 const MAX_NODES_UI = 64
 
 function MaxNodesStepper(): React.JSX.Element {
@@ -132,14 +169,24 @@ function HeaderCell({
   hint: string
 }): React.JSX.Element {
   return (
-    <span style={{ ...h, width, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+    <span
+      style={{
+        ...h,
+        width,
+        flexShrink: 0,
+        whiteSpace: 'nowrap',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4
+      }}
+    >
       {label}
       <InfoHint text={hint} size={10} />
     </span>
   )
 }
 
-function HeaderRow(): React.JSX.Element {
+function HeaderRow({ show }: { show: ReadonlySet<Col> }): React.JSX.Element {
   const h: CSSProperties = { ...sectionLabel(), fontSize: 'var(--text-2xs)' }
   return (
     <div
@@ -149,19 +196,29 @@ function HeaderRow(): React.JSX.Element {
         padding: '6px 12px'
       }}
     >
-      <span style={{ width: COLS.caret }} />
-      <span style={{ width: COLS.dot }} />
-      <span style={{ ...h, width: COLS.state }}>state</span>
-      <span style={{ ...h, width: COLS.gpu }}>gpu</span>
-      <span style={{ ...h, width: COLS.gpuUse }}>gpu % · vram %</span>
-      <HeaderCell h={h} width={COLS.gpuTrend} label="30 min" hint={HINTS.gpuTrend} />
-      <span style={{ ...h, width: COLS.cpuUse }}>cpu % · ram %</span>
+      <span style={fixed('caret')} />
+      <span style={fixed('dot')} />
+      <span style={{ ...h, ...fixed('state') }}>state</span>
+      <span style={{ ...h, ...fixed('gpu') }}>gpu</span>
+      <span style={{ ...h, ...fixed('gpuUse') }}>gpu % · vram %</span>
+      {show.has('gpuTrend') ? (
+        <HeaderCell h={h} width={COLS.gpuTrend} label="30 min" hint={HINTS.gpuTrend} />
+      ) : null}
+      {show.has('cpuUse') ? <span style={{ ...h, ...fixed('cpuUse') }}>cpu % · ram %</span> : null}
       <HeaderCell h={h} width={COLS.rate} label="rate" hint={HINTS.rate} />
-      <HeaderCell h={h} width={COLS.cost} label="cost" hint={HINTS.spent} />
-      <HeaderCell h={h} width={COLS.power} label="power" hint={HINTS.power} />
-      <span style={{ ...h, width: COLS.uptime }}>uptime</span>
-      <span style={{ ...h, flex: 1, minWidth: ACTIVITY_MIN_W }}>activity</span>
-      <span style={{ width: COLS.actions }} />
+      {show.has('cost') ? (
+        <HeaderCell h={h} width={COLS.cost} label="cost" hint={HINTS.spent} />
+      ) : null}
+      {show.has('power') ? (
+        <HeaderCell h={h} width={COLS.power} label="power" hint={HINTS.power} />
+      ) : null}
+      {show.has('uptime') ? <span style={{ ...h, ...fixed('uptime') }}>uptime</span> : null}
+      {show.has('activity') ? (
+        <span style={{ ...h, flex: 1, minWidth: ACTIVITY_MIN_W }}>activity</span>
+      ) : (
+        <span style={{ flex: 1 }} />
+      )}
+      <span style={fixed('actions')} />
     </div>
   )
 }
@@ -180,7 +237,7 @@ function GpuTrend({ nodeId }: { nodeId: string }): React.JSX.Element {
   const { fromMs, toMs } = liveWindow(readings, now, SPARK_MS)
   const points = useMemo(() => sparkPoints(readings, fromMs, toMs), [readings, fromMs, toMs])
   return (
-    <span style={{ width: COLS.gpuTrend, display: 'inline-flex', alignItems: 'center' }}>
+    <span style={{ ...fixed('gpuTrend'), display: 'inline-flex', alignItems: 'center' }}>
       <Sparkline
         points={points}
         fromMs={fromMs}
@@ -196,123 +253,209 @@ function GpuTrend({ nodeId }: { nodeId: string }): React.JSX.Element {
   )
 }
 
-function NodeRow({ node }: { node: NodeSnapshot }): React.JSX.Element {
+/**
+ * One node, collapsed: a table row of the columns that fit (`show`), or, in a
+ * panel too narrow for even the undroppable ones, three stacked lines —
+ * who it is and what it costs, how busy it is, what it is working on.
+ */
+function NodeRow({
+  node,
+  show = ALL_COLS,
+  stacked = false
+}: {
+  node: NodeSnapshot
+  show?: ReadonlySet<Col>
+  stacked?: boolean
+}): React.JSX.Element {
   const [expanded, setExpanded] = useState(EXPAND_ALL)
   const now = useNow()
   const uptime = node.startedAt ? fmtDuration(now - node.startedAt) : '—'
   const m = node.metrics
   const vramPct = m ? pctOf(m.vramUsedGb, m.vramTotalGb) : null
   const ramPct = m ? pctOf(m.ramUsedGb, m.ramTotalGb) : null
-  return (
-    <>
-      <div style={tableRow({ clickable: true, expanded })} onClick={() => setExpanded(!expanded)}>
-        <span
-          style={{
-            width: COLS.caret,
-            display: 'inline-flex',
-            color: expanded ? TOKENS.accent : TOKENS.textFaint,
-            transform: expanded ? 'rotate(90deg)' : 'none',
-            transition: 'transform 140ms'
-          }}
-        >
-          <Icon name="chevron" size={12} />
-        </span>
-        <span style={{ width: COLS.dot, display: 'inline-flex' }}>
-          <span style={statusDot(STATE_TONE[node.state])} />
-        </span>
-        <span style={{ ...cellSm, width: COLS.state, color: TOKENS.textSecondary }}>
-          {node.state}
-        </span>
-        <span style={{ ...mono, ...cellSm, width: COLS.gpu }}>
-          {node.gpuName ?? '…'}
-          {node.numGpus > 1 ? ` ×${node.numGpus}` : ''}
-        </span>
-        <MeterPair
-          width={COLS.gpuUse}
-          top={
-            <MiniMeter
-              icon="gpu"
-              pct={m ? m.gpuUtil : null}
-              tone={usageTone(m ? m.gpuUtil : null, { idleBelow: 5, compute: true })}
-              title={m ? `GPU compute ${m.gpuUtil.toFixed(0)}%` : 'no metrics yet'}
-            />
-          }
-          bottom={
-            <MiniMeter
-              icon="memory"
-              pct={vramPct}
-              tone={usageTone(vramPct)}
-              title={
-                m ? `VRAM ${m.vramUsedGb.toFixed(1)} / ${m.vramTotalGb.toFixed(0)} GB` : undefined
-              }
-            />
-          }
+
+  const caret = (
+    <span
+      style={{
+        ...fixed('caret'),
+        display: 'inline-flex',
+        color: expanded ? TOKENS.accent : TOKENS.textFaint,
+        transform: expanded ? 'rotate(90deg)' : 'none',
+        transition: 'transform 140ms'
+      }}
+    >
+      <Icon name="chevron" size={12} />
+    </span>
+  )
+  const dot = (
+    <span style={{ ...fixed('dot'), display: 'inline-flex' }}>
+      <span style={statusDot(STATE_TONE[node.state])} />
+    </span>
+  )
+  const state = (
+    <span style={{ ...cellSm, ...fixed('state'), color: TOKENS.textSecondary }}>{node.state}</span>
+  )
+  const gpuName = `${node.gpuName ?? '…'}${node.numGpus > 1 ? ` ×${node.numGpus}` : ''}`
+  const gpu = (
+    <span
+      title={gpuName}
+      style={{
+        ...mono,
+        ...cellSm,
+        ...(stacked ? { flex: 1, minWidth: 0, whiteSpace: 'nowrap' } : fixed('gpu')),
+        overflow: 'hidden',
+        textOverflow: 'ellipsis'
+      }}
+    >
+      {gpuName}
+    </span>
+  )
+  const gpuUse = (
+    <MeterPair
+      width={COLS.gpuUse}
+      top={
+        <MiniMeter
+          icon="gpu"
+          pct={m ? m.gpuUtil : null}
+          tone={usageTone(m ? m.gpuUtil : null, { idleBelow: 5, compute: true })}
+          title={m ? `GPU compute ${m.gpuUtil.toFixed(0)}%` : 'no metrics yet'}
         />
-        <GpuTrend nodeId={node.id} />
-        <MeterPair
-          width={COLS.cpuUse}
-          top={
-            <MiniMeter
-              icon="cpu"
-              pct={m ? m.cpuUtil : null}
-              tone={usageTone(m ? m.cpuUtil : null, { idleBelow: 5, compute: true })}
-              title={
-                m
-                  ? `CPU ${m.cpuUtil.toFixed(0)}% · load ${m.cpuLoad1.toFixed(1)} / ${m.cpuCores} cores`
-                  : undefined
-              }
-            />
-          }
-          bottom={
-            <MiniMeter
-              icon="memory"
-              pct={ramPct}
-              tone={usageTone(ramPct)}
-              title={
-                m && m.ramTotalGb > 0
-                  ? `RAM ${m.ramUsedGb.toFixed(1)} / ${m.ramTotalGb.toFixed(0)} GB`
-                  : undefined
-              }
-            />
-          }
+      }
+      bottom={
+        <MiniMeter
+          icon="memory"
+          pct={vramPct}
+          tone={usageTone(vramPct)}
+          title={m ? `VRAM ${m.vramUsedGb.toFixed(1)} / ${m.vramTotalGb.toFixed(0)} GB` : undefined}
         />
-        <span style={{ ...mono, ...cellSm, width: COLS.rate }}>
-          {node.dphTotal != null ? fmtRate(node.dphTotal) : '—'}
-        </span>
-        <span style={{ ...mono, ...cellSm, width: COLS.cost }}>
-          {fmtMoney(node.accumulatedCost)}
-        </span>
-        <span
-          style={{
-            ...cellSm,
-            width: COLS.power,
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 5
-          }}
+      }
+    />
+  )
+  const cpuUse = (
+    <MeterPair
+      width={COLS.cpuUse}
+      top={
+        <MiniMeter
+          icon="cpu"
+          pct={m ? m.cpuUtil : null}
+          tone={usageTone(m ? m.cpuUtil : null, { idleBelow: 5, compute: true })}
           title={
-            m && m.powerW > 0
-              ? `GPU draw ${fmtWatts(m.powerW)}${m.powerLimitW > 0 ? ` of ${fmtWatts(m.powerLimitW)} limit` : ''} · ${fmtEnergy(node.energyWh)} this session`
+            m
+              ? `CPU ${m.cpuUtil.toFixed(0)}% · load ${m.cpuLoad1.toFixed(1)} / ${m.cpuCores} cores`
               : undefined
           }
+        />
+      }
+      bottom={
+        <MiniMeter
+          icon="memory"
+          pct={ramPct}
+          tone={usageTone(ramPct)}
+          title={
+            m && m.ramTotalGb > 0
+              ? `RAM ${m.ramUsedGb.toFixed(1)} / ${m.ramTotalGb.toFixed(0)} GB`
+              : undefined
+          }
+        />
+      }
+    />
+  )
+  const rate = (
+    <span style={{ ...mono, ...cellSm, ...fixed('rate') }}>
+      {node.dphTotal != null ? fmtRate(node.dphTotal) : '—'}
+    </span>
+  )
+  const cost = (
+    <span style={{ ...mono, ...cellSm, ...fixed('cost') }}>{fmtMoney(node.accumulatedCost)}</span>
+  )
+  const power = (
+    <span
+      style={{
+        ...cellSm,
+        ...fixed('power'),
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 5
+      }}
+      title={
+        m && m.powerW > 0
+          ? `GPU draw ${fmtWatts(m.powerW)}${m.powerLimitW > 0 ? ` of ${fmtWatts(m.powerLimitW)} limit` : ''} · ${fmtEnergy(node.energyWh)} this session`
+          : undefined
+      }
+    >
+      <span
+        style={{
+          display: 'flex',
+          color: m && m.powerW > 0 ? TOKENS.warn : TOKENS.textDisabled
+        }}
+      >
+        <Icon name="power" size={11} />
+      </span>
+      <span style={{ ...mono, color: m && m.powerW > 0 ? TOKENS.text : TOKENS.textDisabled }}>
+        {m && m.powerW > 0 ? fmtWatts(m.powerW) : '—'}
+      </span>
+    </span>
+  )
+  const up = <span style={{ ...mono, ...cellSm, ...fixed('uptime') }}>{uptime}</span>
+  const actions = (
+    <span style={{ ...fixed('actions'), display: 'inline-flex', justifyContent: 'flex-end' }}>
+      <DestroyNodeButton node={node} onDestroy={() => ipc.invoke('node:destroy', node.id)} />
+    </span>
+  )
+
+  const toggle = (): void => setExpanded(!expanded)
+  if (stacked) {
+    // Lines two and three start under the state, past the caret and the dot.
+    const indent = COLS.caret + COLS.dot + 2 * GAP
+    const line: CSSProperties = { display: 'flex', alignItems: 'center', gap: GAP, minWidth: 0 }
+    return (
+      <>
+        <div
+          style={{
+            ...tableRow({ clickable: true, expanded }),
+            flexDirection: 'column',
+            alignItems: 'stretch',
+            gap: 8
+          }}
+          onClick={toggle}
         >
-          <span
-            style={{
-              display: 'flex',
-              color: m && m.powerW > 0 ? TOKENS.warn : TOKENS.textDisabled
-            }}
-          >
-            <Icon name="power" size={11} />
-          </span>
-          <span style={{ ...mono, color: m && m.powerW > 0 ? TOKENS.text : TOKENS.textDisabled }}>
-            {m && m.powerW > 0 ? fmtWatts(m.powerW) : '—'}
-          </span>
-        </span>
-        <span style={{ ...mono, ...cellSm, width: COLS.uptime }}>{uptime}</span>
-        <NodeActivity node={node} />
-        <span style={{ width: COLS.actions, display: 'inline-flex', justifyContent: 'flex-end' }}>
-          <DestroyNodeButton node={node} onDestroy={() => ipc.invoke('node:destroy', node.id)} />
-        </span>
+          <div style={line}>
+            {caret}
+            {dot}
+            {state}
+            {gpu}
+            {rate}
+          </div>
+          <div style={{ ...line, flexWrap: 'wrap', paddingLeft: indent }}>
+            {gpuUse}
+            {cpuUse}
+            {up}
+          </div>
+          <div style={{ ...line, paddingLeft: indent }}>
+            <NodeActivity node={node} />
+            {actions}
+          </div>
+        </div>
+        {expanded ? <NodeDetail node={node} /> : null}
+      </>
+    )
+  }
+  return (
+    <>
+      <div style={tableRow({ clickable: true, expanded })} onClick={toggle}>
+        {caret}
+        {dot}
+        {state}
+        {gpu}
+        {gpuUse}
+        {show.has('gpuTrend') ? <GpuTrend nodeId={node.id} /> : null}
+        {show.has('cpuUse') ? cpuUse : null}
+        {rate}
+        {show.has('cost') ? cost : null}
+        {show.has('power') ? power : null}
+        {show.has('uptime') ? up : null}
+        {show.has('activity') ? <NodeActivity node={node} /> : <span style={{ flex: 1 }} />}
+        {actions}
       </div>
       {expanded ? <NodeDetail node={node} /> : null}
     </>
@@ -427,6 +570,11 @@ export function FleetScreen(): React.JSX.Element {
   const { navigate } = useNav()
   const [showFailed, setShowFailedState] = useState(readShowFailed)
   const [clearing, setClearing] = useState(false)
+  // The node table's own width, less its border and row padding.
+  const [tableRef, tableWidth] = useMeasuredWidth<HTMLDivElement>()
+  const inner = tableWidth && tableWidth - 2 - ROW_PAD
+  const show = useMemo(() => fitColumns(inner, FIT), [inner])
+  const stacked = tableWidth > 0 && tableWidth - 2 < TABLE_MIN
 
   const setShowFailed = (on: boolean): void => {
     setShowFailedState(on)
@@ -541,10 +689,10 @@ export function FleetScreen(): React.JSX.Element {
             </span>
           </div>
         ) : (
-          <div style={panel()}>
-            <HeaderRow />
+          <div ref={tableRef} style={panel()}>
+            {stacked ? null : <HeaderRow show={show} />}
             {visible.map((n) => (
-              <NodeRow key={n.id} node={n} />
+              <NodeRow key={n.id} node={n} show={show} stacked={stacked} />
             ))}
           </div>
         )}

@@ -189,8 +189,10 @@ export function FleetGpuStrip({ hasNodes }: { hasNodes: boolean }): React.JSX.El
       <div
         style={{
           display: 'flex',
+          flexWrap: 'wrap',
           alignItems: 'center',
-          gap: SCALE.space3,
+          columnGap: SCALE.space3,
+          rowGap: 6,
           marginBottom: SCALE.space2
         }}
       >

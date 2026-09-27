@@ -7,6 +7,7 @@ import { InfoHint } from '../../components/Tooltip'
 import { btn, chip, input, menuItem, mono, panel, sectionLabel } from '../../lib/controls'
 import { HINTS } from '../../lib/hints'
 import { ipc } from '../../lib/ipc'
+import { useNarrow } from '../../lib/layout'
 import { useNav, type SettingsSection } from '../../lib/nav'
 import { qk, useAddons, useSettings, useUpdateSettings } from '../../lib/queries'
 import { SCALE, TOKENS } from '../../lib/theme'
@@ -40,14 +41,23 @@ const SECTIONS: Array<{ key: SettingsSection; label: string }> = [
   { key: 'offers', label: 'Offer filters' }
 ]
 
+// Wraps: in a narrow window a field drops under its label rather than
+// running off the panel's edge.
 const formRow: CSSProperties = {
   display: 'flex',
+  flexWrap: 'wrap',
   alignItems: 'center',
-  gap: SCALE.space3,
+  columnGap: SCALE.space3,
+  rowGap: 6,
   marginBottom: SCALE.space3
 }
 
-const label: CSSProperties = { width: 170, fontSize: SCALE.textSm, color: TOKENS.textMuted }
+const label: CSSProperties = {
+  width: 170,
+  flexShrink: 0,
+  fontSize: SCALE.textSm,
+  color: TOKENS.textMuted
+}
 
 /** Form label with an ⓘ, for settings whose effect isn't obvious from the name. */
 function FieldLabel({ text, hint }: { text: string; hint: string }): React.JSX.Element {
@@ -125,7 +135,14 @@ function ApiSection(): React.JSX.Element {
           Create a key just for this app on Vast&apos;s keys page, restricted to the permissions it
           needs: <span style={mono}>misc, user_read, instance_read, instance_write</span>. Paste the
           permissions JSON into Vast&apos;s key dialog, or tick the same groups.
-          <div style={{ display: 'flex', gap: SCALE.space2, marginTop: SCALE.space2 }}>
+          <div
+            style={{
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: SCALE.space2,
+              marginTop: SCALE.space2
+            }}
+          >
             <button
               style={btn({ size: 'sm' })}
               onClick={() =>
@@ -667,7 +684,7 @@ function AddonsSection(): React.JSX.Element {
         Blender extensions (user-provided zips)
       </div>
       {(addons ?? []).map((a) => (
-        <div key={a.id} style={{ ...formRow, gap: SCALE.space2 }}>
+        <div key={a.id} style={{ ...formRow, columnGap: SCALE.space2 }}>
           <span style={{ fontSize: SCALE.textSm, width: 160 }}>{a.name}</span>
           <span style={{ ...mono, fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
             {a.version}
@@ -1073,23 +1090,45 @@ function OffersSection(): React.JSX.Element {
 export function SettingsScreen({ section }: { section?: SettingsSection }): React.JSX.Element {
   const { navigate } = useNav()
   const active = section ?? 'api'
+  // Narrow: the section menu becomes a scrolling row above the form, and the
+  // form keeps the width the menu had.
+  const narrow = useNarrow()
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <AppToolbar />
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+      <div
+        style={{
+          flex: 1,
+          display: 'flex',
+          flexDirection: narrow ? 'column' : 'row',
+          overflow: 'hidden'
+        }}
+      >
         <div
-          style={{
-            width: 180,
-            flexShrink: 0,
-            padding: SCALE.space3,
-            borderRight: `1px solid ${TOKENS.border}`
-          }}
+          style={
+            narrow
+              ? {
+                  display: 'flex',
+                  gap: SCALE.space1,
+                  flexShrink: 0,
+                  overflowX: 'auto',
+                  padding: `${SCALE.space2} ${SCALE.space3}`,
+                  borderBottom: `1px solid ${TOKENS.border}`
+                }
+              : {
+                  width: 180,
+                  flexShrink: 0,
+                  padding: SCALE.space3,
+                  borderRight: `1px solid ${TOKENS.border}`
+                }
+          }
         >
           {SECTIONS.map((s) => (
             <button
               key={s.key}
               style={{
                 ...menuItem({ accent: s.key === active }),
+                ...(narrow ? { width: 'auto', flexShrink: 0, whiteSpace: 'nowrap' } : {}),
                 background: s.key === active ? TOKENS.accentSoftBg : 'transparent'
               }}
               onClick={() => navigate({ screen: 'settings', section: s.key })}
@@ -1098,8 +1137,10 @@ export function SettingsScreen({ section }: { section?: SettingsSection }): Reac
             </button>
           ))}
         </div>
-        <div style={{ flex: 1, overflow: 'auto', padding: SCALE.space5 }}>
-          <div style={{ ...panel(), padding: SCALE.space5, maxWidth: 720 }}>
+        <div
+          style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: narrow ? 12 : SCALE.space5 }}
+        >
+          <div style={{ ...panel(), padding: narrow ? 14 : SCALE.space5, maxWidth: 720 }}>
             {active === 'api' ? (
               <ApiSection />
             ) : active === 'general' ? (

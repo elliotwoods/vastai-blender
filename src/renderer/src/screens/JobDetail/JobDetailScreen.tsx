@@ -34,6 +34,7 @@ import {
 } from '../../lib/queries'
 import { describeResume, describeRetry, ipcErrorText } from '../../lib/recovery'
 import { SCALE, TOKENS } from '../../lib/theme'
+import { useNarrow } from '../../lib/layout'
 import { useMediaQuery } from '../../lib/useMediaQuery'
 import { ZoomFilmstrip } from '../../media/ZoomFilmstrip'
 import { ChunkGrid } from './ChunkGrid'
@@ -91,6 +92,7 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
   const openPreview = usePreview((s) => s.open)
 
   const wide = useMediaQuery(SIDEBAR_QUERY)
+  const narrow = useNarrow()
   const [sidebarOpen, toggleSidebar] = useFlag(SIDEBAR_KEY, true)
   const [settingsOpen, toggleSettings] = useFlag(SETTINGS_KEY, true)
   const order = useMemo(() => sidebarOrder(jobs ?? []), [jobs])
@@ -216,7 +218,16 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
               Jobs
             </button>
             <span style={{ color: TOKENS.textFaint }}>/</span>
-            <span style={{ fontSize: SCALE.textSm, color: TOKENS.textSecondary }}>
+            <span
+              style={{
+                fontSize: SCALE.textSm,
+                color: TOKENS.textSecondary,
+                minWidth: 0,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap'
+              }}
+            >
               {job ? job.name || basename(job.blendPath) : jobId}
             </span>
             {job ? (
@@ -281,9 +292,11 @@ export function JobDetailScreen({ jobId }: { jobId: string }): React.JSX.Element
                 <Section
                   title="frames"
                   right={
-                    <span style={{ fontSize: 'var(--text-2xs)', color: TOKENS.textFaint }}>
-                      click to pick · double-click or Enter to preview · ←/→ step
-                    </span>
+                    narrow ? undefined : (
+                      <span style={{ fontSize: 'var(--text-2xs)', color: TOKENS.textFaint }}>
+                        click to pick · double-click or Enter to preview · ←/→ step
+                      </span>
+                    )
                   }
                 >
                   <ZoomFilmstrip

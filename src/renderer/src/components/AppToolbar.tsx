@@ -7,6 +7,7 @@ import { HINTS } from '../lib/hints'
 import { Icon } from './Icon'
 import { InfoDot, Tooltip } from './Tooltip'
 import { ipc } from '../lib/ipc'
+import { useNarrow } from '../lib/layout'
 import { useNav } from '../lib/nav'
 import { useFleetCost, useNodes, useSettings, useUnclaimed } from '../lib/queries'
 import {
@@ -19,12 +20,17 @@ import {
 import { capUsage } from '../../../shared/nodeState'
 import type { HistoryMetric } from '../../../shared/models'
 
+// Wraps rather than overlaps: each cluster is sized to its content, so one
+// that no longer fits drops to a row of its own instead of shrinking to
+// nothing under its neighbour.
 const bar: CSSProperties = {
   display: 'flex',
+  flexWrap: 'wrap',
   alignItems: 'center',
-  gap: SCALE.space3,
-  height: 46,
-  padding: `0 ${SCALE.space4}`,
+  columnGap: SCALE.space3,
+  rowGap: 6,
+  minHeight: 46,
+  padding: `6px ${SCALE.space4}`,
   borderBottom: `1px solid ${TOKENS.border}`,
   background: TOKENS.surfaceRaised,
   flexShrink: 0
@@ -46,7 +52,9 @@ const divider: CSSProperties = {
   flexShrink: 0
 }
 
-function Brand(): React.JSX.Element {
+function Brand({ compact }: { compact: boolean }): React.JSX.Element {
+  // Compact: the square alone — the window's own title bar already says it.
+  if (compact) return <span style={brandSquare} title="Vast Render" />
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
       <span style={brandSquare} />
@@ -66,7 +74,11 @@ function Brand(): React.JSX.Element {
   )
 }
 
-function FleetReadouts(): React.JSX.Element {
+/**
+ * Compact drops the labels for icons, the rate's watts and the session total
+ * (all still a click away in History), leaving what a glance needs.
+ */
+function FleetReadouts({ compact }: { compact: boolean }): React.JSX.Element {
   const { data: cost } = useFleetCost()
   const { data: nodes } = useNodes()
   const { data: settings } = useSettings()
@@ -92,11 +104,27 @@ function FleetReadouts(): React.JSX.Element {
     .reduce((sum, n) => sum + (n.metrics?.powerW ?? 0), 0)
   // Every readout is a live number with a past — clicking one opens its series.
   const toHistory = (metric: HistoryMetric) => () => navigate({ screen: 'history', metric })
-  const linked: CSSProperties = { ...readout(), cursor: 'pointer' }
+  const pill: CSSProperties = compact ? { ...readout(), padding: '4px 8px' } : readout()
+  const linked: CSSProperties = { ...pill, cursor: 'pointer' }
+  const label = (text: string, icon: 'server' | 'battery'): React.JSX.Element =>
+    compact ? (
+      <span style={{ color: TOKENS.textFaint, display: 'inline-flex' }}>
+        <Icon name={icon} size={12} />
+      </span>
+    ) : (
+      <span style={{ color: TOKENS.textFaint }}>{text}</span>
+    )
   return (
-    <div style={{ display: 'flex', gap: SCALE.space2 }}>
-      <span style={readout()}>
-        <span style={{ color: TOKENS.textFaint }}>nodes</span>
+    <div
+      style={{
+        display: 'flex',
+        flexWrap: 'wrap',
+        justifyContent: 'flex-end',
+        gap: compact ? 6 : SCALE.space2
+      }}
+    >
+      <span style={pill} title={compact ? 'nodes active / max' : undefined}>
+        {label('nodes', 'server')}
         <span style={mono}>
           {usage?.nodes ?? '—'} / {settings?.maxActiveNodes ?? '—'}
         </span>
@@ -106,51 +134,57 @@ function FleetReadouts(): React.JSX.Element {
           HTML. Same shape as the balance pill below. */}
       <Tooltip text={HINTS.fleetRate}>
         <button style={linked} onClick={toHistory('spend')}>
-          <span style={{ color: TOKENS.textFaint }}>rate</span>
+          {compact ? null : <span style={{ color: TOKENS.textFaint }}>rate</span>}
           <span style={mono}>{perHour != null ? fmtRate(perHour) : '—'}</span>
-          <span style={{ color: TOKENS.border }}>|</span>
-          <span
-            style={{
-              ...mono,
-              color: powerW > 0 ? TOKENS.textMuted : TOKENS.textDisabled,
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 3
-            }}
-          >
-            <Icon name="power" size={11} />
-            {powerW > 0 ? fmtWatts(powerW) : '— W'}
-          </span>
-          <InfoDot size={10} />
+          {compact ? null : (
+            <>
+              <span style={{ color: TOKENS.border }}>|</span>
+              <span
+                style={{
+                  ...mono,
+                  color: powerW > 0 ? TOKENS.textMuted : TOKENS.textDisabled,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 3
+                }}
+              >
+                <Icon name="power" size={11} />
+                {powerW > 0 ? fmtWatts(powerW) : '— W'}
+              </span>
+              <InfoDot size={10} />
+            </>
+          )}
         </button>
       </Tooltip>
-      <Tooltip
-        text={
-          cost && cost.sessionCo2g > 0
-            ? `${HINTS.fleetSession}\n\n${fmtCo2(cost.sessionCo2g)} — ${compareCo2(cost.sessionCo2g)}`
-            : HINTS.fleetSession
-        }
-      >
-        <button style={linked} onClick={toHistory('spend')}>
-          <span style={{ color: TOKENS.textFaint }}>total</span>
-          {/* Unknown until main's first fleet:cost, not $0.00. */}
-          <span style={mono}>{cost ? `$${cost.sessionTotal.toFixed(2)}` : '—'}</span>
-          <span style={{ color: TOKENS.border }}>|</span>
-          <span
-            style={{
-              ...mono,
-              color: TOKENS.textMuted,
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 3
-            }}
-          >
-            <Icon name="power" size={11} />
-            {cost ? fmtEnergy(cost.sessionWh) : '—'}
-          </span>
-          <InfoDot size={10} />
-        </button>
-      </Tooltip>
+      {compact ? null : (
+        <Tooltip
+          text={
+            cost && cost.sessionCo2g > 0
+              ? `${HINTS.fleetSession}\n\n${fmtCo2(cost.sessionCo2g)} — ${compareCo2(cost.sessionCo2g)}`
+              : HINTS.fleetSession
+          }
+        >
+          <button style={linked} onClick={toHistory('spend')}>
+            <span style={{ color: TOKENS.textFaint }}>total</span>
+            {/* Unknown until main's first fleet:cost, not $0.00. */}
+            <span style={mono}>{cost ? `$${cost.sessionTotal.toFixed(2)}` : '—'}</span>
+            <span style={{ color: TOKENS.border }}>|</span>
+            <span
+              style={{
+                ...mono,
+                color: TOKENS.textMuted,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 3
+              }}
+            >
+              <Icon name="power" size={11} />
+              {cost ? fmtEnergy(cost.sessionWh) : '—'}
+            </span>
+            <InfoDot size={10} />
+          </button>
+        </Tooltip>
+      )}
       {/* The `+` already reads as an action, so this pill gets the tooltip
           without a second glyph competing with it. The pill itself opens the
           balance history; only the `+` leaves the app for the billing page. */}
@@ -163,7 +197,7 @@ function FleetReadouts(): React.JSX.Element {
         }
       >
         <button style={linked} onClick={toHistory('balance')}>
-          <span style={{ color: TOKENS.textFaint }}>balance</span>
+          {label('balance', 'battery')}
           <span
             style={{
               ...mono,
@@ -204,27 +238,54 @@ export interface AppToolbarProps {
   subRow?: ReactNode
 }
 
+const cluster: CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  alignItems: 'center',
+  gap: SCALE.space2,
+  minWidth: 0
+}
+
 export function AppToolbar({ left, right, subRow }: AppToolbarProps): React.JSX.Element {
+  const compact = useNarrow()
+  const actions = left != null || right != null
   return (
     <header style={{ flexShrink: 0 }}>
-      <div style={bar}>
-        <Brand />
-        <span style={divider} />
-        <div
-          style={{ display: 'flex', alignItems: 'center', gap: SCALE.space2, flex: 1, minWidth: 0 }}
-        >
-          {left}
+      {compact ? (
+        // Brand and readouts on top; the screen's own controls get a full-width
+        // row beneath, where none of them has to fight the readouts for room.
+        <div style={bar}>
+          <Brand compact />
+          <div style={{ ...cluster, flex: '1 1 0', justifyContent: 'flex-end' }}>
+            <FleetReadouts compact />
+          </div>
+          {actions ? (
+            <div style={{ ...cluster, flexBasis: '100%' }}>
+              {left}
+              {right ? <div style={{ ...cluster, marginLeft: 'auto' }}>{right}</div> : null}
+            </div>
+          ) : null}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: SCALE.space2, flexShrink: 0 }}>
-          {right}
-          <FleetReadouts />
+      ) : (
+        <div style={bar}>
+          <Brand compact={false} />
+          <span style={divider} />
+          {/* Basis is the content's width, so on a tight bar the whole cluster
+              moves down a row rather than being squeezed under the readouts. */}
+          <div style={{ ...cluster, flex: '1 1 auto' }}>{left}</div>
+          <div style={{ ...cluster, marginLeft: 'auto', justifyContent: 'flex-end' }}>
+            {right}
+            <FleetReadouts compact={false} />
+          </div>
         </div>
-      </div>
+      )}
       {subRow ? (
         <div
           style={{
             display: 'flex',
+            flexWrap: 'wrap',
             alignItems: 'center',
+            minWidth: 0,
             gap: SCALE.space2,
             padding: `6px ${SCALE.space4}`,
             borderBottom: `1px solid ${TOKENS.border}`,

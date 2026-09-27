@@ -127,7 +127,8 @@ export function JobSettingsPanel({
         padding: SCALE.space3,
         display: 'grid',
         // the switch and its wording beside the details when there is room
-        gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))',
+        // (min(): one column never wider than a narrow panel)
+        gridTemplateColumns: 'repeat(auto-fit, minmax(min(360px, 100%), 1fr))',
         gap: `${SCALE.space4} ${SCALE.space6}`,
         alignItems: 'start'
       }}

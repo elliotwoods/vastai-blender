@@ -190,7 +190,8 @@ export function GradeLabScreen(): React.JSX.Element {
                 style={{
                   ...mono,
                   fontSize: SCALE.textXs,
-                  color: r.pass ? TOKENS.text : TOKENS.warn
+                  color: r.pass ? TOKENS.text : TOKENS.warn,
+                  overflowWrap: 'anywhere'
                 }}
               >
                 {formatResult(r)}

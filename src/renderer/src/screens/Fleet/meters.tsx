@@ -83,7 +83,7 @@ export function MeterPair({
   bottom: React.JSX.Element
 }): React.JSX.Element {
   return (
-    <span style={{ width, display: 'flex', flexDirection: 'column', gap: 4 }}>
+    <span style={{ width, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
       {top}
       {bottom}
     </span>

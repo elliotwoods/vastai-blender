@@ -8,6 +8,10 @@
  * a finished job has no place to move to. Alt+↑ / Alt+↓ on a focused row
  * does what dragging does, from the keyboard. The whole row opens the job;
  * every button in it stops its click reaching the row.
+ *
+ * On a narrow list the row sheds columns (jobCols.ts, via fitColumns) rather
+ * than squeezing the name to nothing: time-ago goes first, then cost, then
+ * state and frames move onto a line of their own under the name.
  */
 
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react'
@@ -28,11 +32,16 @@ import { SCALE, TOKENS, type StatusTone } from '../../lib/theme'
 import type { ThumbState } from '../../media/Thumb'
 import { Thumb } from '../../media/Thumb'
 
-export const THUMB_W = 64
-export const THUMB_H = 36
-/** the grip's column, kept on finished rows too so the thumbnails line up */
-const GRIP_W = 18
-const ICON_W = 26
+import {
+  ALL_JOB_COLS,
+  COMPACT_THUMB_H,
+  COMPACT_THUMB_W,
+  GRIP_W,
+  ICON_W,
+  THUMB_H,
+  THUMB_W,
+  type JobCol
+} from './jobCols'
 
 const smallChip: CSSProperties = {
   textTransform: 'uppercase',
@@ -146,6 +155,8 @@ export interface JobRowProps {
   /** a member of a group: leave it */
   onUngroup?: () => void
   onError: (text: string) => void
+  /** the columns that fit the list (fitColumns over JOB_COLS); all by default */
+  cols?: ReadonlySet<JobCol>
 }
 
 export function JobRow({
@@ -156,7 +167,8 @@ export function JobRow({
   lifted = false,
   block,
   onUngroup,
-  onError
+  onError,
+  cols = ALL_JOB_COLS
 }: JobRowProps): React.JSX.Element {
   const { navigate } = useNav()
   const live = isLiveJob(job.state)
@@ -165,6 +177,24 @@ export function JobRow({
   const { background: _bg, ...rowBase } = tableRow({ clickable: true })
   void _bg
   const open = (): void => navigate({ screen: 'job', jobId: job.id })
+  const stacked = !cols.has('meta')
+  const frames = (
+    <span
+      style={{
+        ...mono,
+        ...(stacked ? {} : { width: 96, textAlign: 'right' }),
+        flexShrink: 0,
+        fontSize: SCALE.textSm
+      }}
+      title={
+        job.framesCancelled > 0
+          ? `${job.framesCancelled.toLocaleString()} frames cancelled`
+          : undefined
+      }
+    >
+      {fmtFrames(job.framesDone, job.framesTotal)}
+    </span>
+  )
 
   return (
     <div
@@ -221,14 +251,24 @@ export function JobRow({
 
       <Thumb
         url={job.thumbUrl}
-        width={THUMB_W}
-        height={THUMB_H}
+        width={stacked ? COMPACT_THUMB_W : THUMB_W}
+        height={stacked ? COMPACT_THUMB_H : THUMB_H}
         state={job.thumbUrl ? undefined : thumbState(job)}
         title={job.thumbUrl ? `latest frame of ${name}` : undefined}
       />
 
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 5 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: SCALE.space2, minWidth: 0 }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: SCALE.space2,
+            minWidth: 0,
+            overflow: 'hidden'
+          }}
+        >
+          {/* A floor under the name: the chips beside it give way (clipped at
+              the line's end) before the name does. */}
           <span
             title={name}
             style={{
@@ -237,15 +277,18 @@ export function JobRow({
               overflow: 'hidden',
               textOverflow: 'ellipsis',
               whiteSpace: 'nowrap',
-              minWidth: 0
+              minWidth: Math.min(96, name.length * 8),
+              flexShrink: 1
             }}
           >
             {name}
           </span>
-          <span style={{ ...chip({ tone: 'accent' }), ...smallChip }}>{job.engine}</span>
+          <span style={{ ...chip({ tone: 'accent' }), ...smallChip, flexShrink: 0 }}>
+            {job.engine}
+          </span>
           {job.shareNode ? (
             <span
-              style={{ ...chip({ tone: 'neutral' }), ...smallChip }}
+              style={{ ...chip({ tone: 'neutral' }), ...smallChip, flexShrink: 0 }}
               title="May run alongside other renders on one node"
             >
               shared node
@@ -254,7 +297,7 @@ export function JobRow({
           {live && job.groupId && !block ? (
             <span
               data-group-chip
-              style={{ ...chip({ tone: 'neutral' }), ...smallChip }}
+              style={{ ...chip({ tone: 'neutral' }), ...smallChip, flexShrink: 0 }}
               title="Shares its place in the queue with the other jobs in its group"
             >
               <Icon name="link" size={10} />
@@ -275,42 +318,47 @@ export function JobRow({
           height={5}
           ticks
         />
+        {stacked ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: SCALE.space2, minWidth: 0 }}>
+            <StateChip job={job} />
+            {frames}
+          </div>
+        ) : null}
         <div style={{ display: 'flex', minWidth: 0, overflow: 'hidden', height: 16 }}>
           <JobTiming job={job} style={{ fontSize: SCALE.textXs }} />
         </div>
       </div>
 
-      <span style={{ width: 96, flexShrink: 0, display: 'inline-flex' }}>
-        <StateChip job={job} />
-      </span>
-      <span
-        style={{ ...mono, width: 96, flexShrink: 0, fontSize: SCALE.textSm, textAlign: 'right' }}
-        title={
-          job.framesCancelled > 0
-            ? `${job.framesCancelled.toLocaleString()} frames cancelled`
-            : undefined
-        }
-      >
-        {fmtFrames(job.framesDone, job.framesTotal)}
-      </span>
-      <span
-        style={{ ...mono, width: 60, flexShrink: 0, fontSize: SCALE.textSm, textAlign: 'right' }}
-      >
-        {fmtMoney(job.costSoFar)}
-      </span>
-      <span
-        title={new Date(job.submittedAt).toLocaleString()}
-        style={{
-          ...mono,
-          width: 72,
-          flexShrink: 0,
-          fontSize: SCALE.textXs,
-          color: TOKENS.textFaint,
-          textAlign: 'right'
-        }}
-      >
-        {fmtTimeAgo(job.submittedAt)}
-      </span>
+      {stacked ? null : (
+        <>
+          <span style={{ width: 96, flexShrink: 0, display: 'inline-flex' }}>
+            <StateChip job={job} />
+          </span>
+          {frames}
+        </>
+      )}
+      {cols.has('cost') ? (
+        <span
+          style={{ ...mono, width: 60, flexShrink: 0, fontSize: SCALE.textSm, textAlign: 'right' }}
+        >
+          {fmtMoney(job.costSoFar)}
+        </span>
+      ) : null}
+      {cols.has('ago') ? (
+        <span
+          title={new Date(job.submittedAt).toLocaleString()}
+          style={{
+            ...mono,
+            width: 72,
+            flexShrink: 0,
+            fontSize: SCALE.textXs,
+            color: TOKENS.textFaint,
+            textAlign: 'right'
+          }}
+        >
+          {fmtTimeAgo(job.submittedAt)}
+        </span>
+      ) : null}
 
       <span style={{ display: 'inline-flex', gap: SCALE.space1, flexShrink: 0 }}>
         <OpenInExplorerButton path={job.outputDir} mode="open" title="Open output folder" />

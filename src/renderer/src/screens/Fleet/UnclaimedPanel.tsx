@@ -82,8 +82,22 @@ function Row({
         borderTop: `1px solid ${TOKENS.border}`
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: SCALE.space3, minWidth: 0 }}>
-        <span style={{ ...mono, fontSize: SCALE.textSm, color: TOKENS.text, width: 92 }}>
+      {/* Wraps in a narrow panel: the label gives way first, then the
+          status, rate and destroy move to a line of their own. */}
+      <div
+        style={{
+          display: 'flex',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          columnGap: SCALE.space3,
+          rowGap: 6,
+          minWidth: 0,
+          whiteSpace: 'nowrap'
+        }}
+      >
+        <span
+          style={{ ...mono, fontSize: SCALE.textSm, color: TOKENS.text, width: 92, flexShrink: 0 }}
+        >
           #{u.instanceId}
         </span>
         <span style={{ ...chip({ tone: 'neutral' }), fontSize: SCALE.text2xs }} title={owner.title}>
@@ -95,7 +109,7 @@ function Row({
             fontSize: SCALE.textXs,
             color: TOKENS.textMuted,
             minWidth: 0,
-            flex: 1,
+            flex: '1 1 80px',
             overflow: 'hidden',
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
@@ -105,11 +119,13 @@ function Row({
         >
           {u.label ?? 'no label'}
         </span>
-        <span style={{ ...mono, fontSize: SCALE.textSm, width: 150 }}>
+        <span style={{ ...mono, fontSize: SCALE.textSm, width: 150, flexShrink: 0 }}>
           {u.gpuName ?? 'gpu unknown'}
           {u.numGpus > 1 ? ` ×${u.numGpus}` : ''}
         </span>
-        <span style={{ fontSize: SCALE.textXs, color: TOKENS.textSecondary, width: 70 }}>
+        <span
+          style={{ fontSize: SCALE.textXs, color: TOKENS.textSecondary, width: 70, flexShrink: 0 }}
+        >
           {u.status ?? 'status ?'}
         </span>
         <span
@@ -117,6 +133,7 @@ function Row({
             ...mono,
             fontSize: SCALE.textSm,
             width: 92,
+            flexShrink: 0,
             color: billing ? TOKENS.warn : TOKENS.textFaint
           }}
           title={
@@ -130,7 +147,13 @@ function Row({
           {u.dphTotal != null ? fmtRate(u.dphTotal) : '—'}
         </span>
         <span
-          style={{ ...mono, fontSize: SCALE.textXs, color: TOKENS.textFaint, width: 78 }}
+          style={{
+            ...mono,
+            fontSize: SCALE.textXs,
+            color: TOKENS.textFaint,
+            width: 78,
+            flexShrink: 0
+          }}
           title={
             (u.startedAt != null ? `started ${new Date(u.startedAt).toLocaleString()}; ` : '') +
             `listed here since ${new Date(u.firstSeenAt).toLocaleString()}`
