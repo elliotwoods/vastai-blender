@@ -57,6 +57,9 @@ input,
 select,
 textarea {
   font: inherit;
+  /* Fields set a fixed inline width for a wide window; in a narrow one they
+     give way to their container rather than pushing it sideways. */
+  max-width: 100%;
 }
 
 input:focus-visible,

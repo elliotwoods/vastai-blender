@@ -16,17 +16,26 @@ const overlay: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
+  padding: 16,
   zIndex: 1000
 }
 
+// Wraps, so in a narrow window a row's fields go under its label.
 const row: CSSProperties = {
   display: 'flex',
+  flexWrap: 'wrap',
   alignItems: 'center',
-  gap: SCALE.space3,
+  columnGap: SCALE.space3,
+  rowGap: 6,
   marginBottom: SCALE.space3
 }
 
-const label: CSSProperties = { width: 110, fontSize: SCALE.textSm, color: TOKENS.textMuted }
+const label: CSSProperties = {
+  width: 110,
+  flexShrink: 0,
+  fontSize: SCALE.textSm,
+  color: TOKENS.textMuted
+}
 
 const ENGINES: EngineId[] = ['eevee', 'cycles', 'octane']
 
@@ -80,7 +89,14 @@ export function SubmitJobDialog({ onClose }: { onClose: () => void }): React.JSX
   return (
     <div style={overlay} onClick={onClose}>
       <div
-        style={{ ...panel({ elevated: true }), padding: SCALE.space5, width: 520 }}
+        style={{
+          ...panel({ elevated: true }),
+          padding: SCALE.space5,
+          width: 520,
+          maxWidth: '100%',
+          maxHeight: '100%',
+          overflowY: 'auto'
+        }}
         onClick={(e) => e.stopPropagation()}
       >
         <div style={{ ...sectionLabel(), marginBottom: SCALE.space4 }}>New render</div>

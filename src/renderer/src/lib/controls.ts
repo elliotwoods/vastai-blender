@@ -256,7 +256,8 @@ export function sectionLabel(): CSSProperties {
     fontWeight: SCALE.weightSemibold,
     textTransform: 'uppercase',
     letterSpacing: '0.08em',
-    color: TOKENS.textFaint
+    color: TOKENS.textFaint,
+    whiteSpace: 'nowrap'
   }
 }
 

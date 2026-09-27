@@ -7,7 +7,7 @@
  * back through them and `?screen=history&metric=power` still works for shots.
  */
 
-import type { CSSProperties } from 'react'
+import { useMemo, type CSSProperties } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
 import { Chart, type ChartPoint, type MarkKind } from './Chart'
 import { recordingBegan } from './recordingBegan'
@@ -16,6 +16,7 @@ import { chip, mono, panel, sectionLabel, segmented, tableRow } from '../../lib/
 import { compareCo2 } from '../../lib/co2'
 import { fmtCo2, fmtEnergy, fmtMoney, fmtWatts } from '../../lib/format'
 import { HINTS } from '../../lib/hints'
+import { fitColumns, useMeasuredWidth, type FitColumn } from '../../lib/layout'
 import { useNav } from '../../lib/nav'
 import { useHistorySummary } from '../../lib/queries'
 import { SCALE, TOKENS } from '../../lib/theme'
@@ -214,15 +215,38 @@ function viewFor(metric: HistoryMetric, s: HistorySummary): MetricView {
 }
 
 const COLS = { cost: 84, share: 96, energy: 84, hours: 74, perFrame: 92, state: 84 }
+type Col = keyof typeof COLS
+const GAP = 12
+
+/**
+ * What each column costs the row (its width and gap) and the order a narrow
+ * table sheds them in: per-frame first, state last. The job (a name and its
+ * engine chip) and its cost always stay.
+ */
+const FIT: readonly FitColumn<Col | 'job'>[] = [
+  { key: 'job', width: 150 + 2 * GAP + 24 },
+  { key: 'cost', width: COLS.cost + GAP },
+  { key: 'share', width: COLS.share + GAP, drop: 4 },
+  { key: 'energy', width: COLS.energy + GAP, drop: 3 },
+  { key: 'hours', width: COLS.hours + GAP, drop: 2 },
+  { key: 'perFrame', width: COLS.perFrame + GAP, drop: 1 },
+  { key: 'state', width: COLS.state + GAP, drop: 5 }
+]
+const ALL: ReadonlySet<string> = new Set(FIT.map((c) => c.key))
+
+/** A fixed-width cell that holds its width rather than squeezing. */
+const cell = (col: Col): CSSProperties => ({ width: COLS[col], flexShrink: 0 })
 
 function JobRow({
   job,
   maxCost,
-  onOpen
+  onOpen,
+  show = ALL
 }: {
   job: JobCostRow
   maxCost: number
   onOpen: () => void
+  show?: ReadonlySet<string>
 }): React.JSX.Element {
   return (
     <div style={tableRow({ clickable: true })} onClick={onOpen}>
@@ -235,6 +259,7 @@ function JobRow({
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap'
         }}
+        title={job.name ?? job.jobId}
       >
         {job.name ?? job.jobId}
       </span>
@@ -243,59 +268,70 @@ function JobRow({
           style={{
             ...chip({ tone: 'accent' }),
             textTransform: 'uppercase',
-            fontSize: SCALE.text2xs
+            fontSize: SCALE.text2xs,
+            flexShrink: 0
           }}
         >
           {job.engine}
         </span>
       ) : null}
-      <span style={{ ...mono, width: COLS.cost, fontSize: SCALE.textSm, textAlign: 'right' }}>
+      <span style={{ ...mono, ...cell('cost'), fontSize: SCALE.textSm, textAlign: 'right' }}>
         {fmtMoney(job.cost)}
       </span>
-      <span style={{ width: COLS.share }}>
-        <Meter pct={maxCost > 0 ? (job.cost / maxCost) * 100 : 0} tone="normal" height={4} />
-      </span>
-      <Tooltip
-        text={`${fmtEnergy(job.wh)} on this job.\n${fmtCo2(job.co2g)}\n${compareCo2(job.co2g) ?? ''}\n\n${HINTS.co2}`}
-        style={{ width: COLS.energy, justifyContent: 'flex-end' }}
-      >
+      {show.has('share') ? (
+        <span style={cell('share')}>
+          <Meter pct={maxCost > 0 ? (job.cost / maxCost) * 100 : 0} tone="normal" height={4} />
+        </span>
+      ) : null}
+      {show.has('energy') ? (
+        <Tooltip
+          text={`${fmtEnergy(job.wh)} on this job.\n${fmtCo2(job.co2g)}\n${compareCo2(job.co2g) ?? ''}\n\n${HINTS.co2}`}
+          style={{ ...cell('energy'), justifyContent: 'flex-end' }}
+        >
+          <span
+            style={{
+              ...mono,
+              fontSize: SCALE.textXs,
+              color: TOKENS.textMuted,
+              textAlign: 'right',
+              cursor: 'help'
+            }}
+          >
+            {fmtEnergy(job.wh)}
+          </span>
+        </Tooltip>
+      ) : null}
+      {show.has('hours') ? (
         <span
           style={{
             ...mono,
+            ...cell('hours'),
             fontSize: SCALE.textXs,
             color: TOKENS.textMuted,
-            textAlign: 'right',
-            cursor: 'help'
+            textAlign: 'right'
           }}
         >
-          {fmtEnergy(job.wh)}
+          {fmtHours(job.gpuHours)}
         </span>
-      </Tooltip>
-      <span
-        style={{
-          ...mono,
-          width: COLS.hours,
-          fontSize: SCALE.textXs,
-          color: TOKENS.textMuted,
-          textAlign: 'right'
-        }}
-      >
-        {fmtHours(job.gpuHours)}
-      </span>
-      <span
-        style={{
-          ...mono,
-          width: COLS.perFrame,
-          fontSize: SCALE.textXs,
-          color: TOKENS.textMuted,
-          textAlign: 'right'
-        }}
-      >
-        {job.costPerFrame != null ? `${fmtMoney(job.costPerFrame)}/fr` : '—'}
-      </span>
-      <span style={{ width: COLS.state, fontSize: SCALE.textXs, color: TOKENS.textSecondary }}>
-        {job.state ?? 'deleted'}
-      </span>
+      ) : null}
+      {show.has('perFrame') ? (
+        <span
+          style={{
+            ...mono,
+            ...cell('perFrame'),
+            fontSize: SCALE.textXs,
+            color: TOKENS.textMuted,
+            textAlign: 'right'
+          }}
+        >
+          {job.costPerFrame != null ? `${fmtMoney(job.costPerFrame)}/fr` : '—'}
+        </span>
+      ) : null}
+      {show.has('state') ? (
+        <span style={{ ...cell('state'), fontSize: SCALE.textXs, color: TOKENS.textSecondary }}>
+          {job.state ?? 'deleted'}
+        </span>
+      ) : null}
     </div>
   )
 }
@@ -316,6 +352,9 @@ export function HistoryScreen({
 }: HistoryScreenProps): React.JSX.Element {
   const { navigate } = useNav()
   const { data, isLoading } = useHistorySummary(range)
+  // The table's own width (less its row padding), not the window's.
+  const [tableRef, tableWidth] = useMeasuredWidth<HTMLDivElement>()
+  const show = useMemo(() => fitColumns(tableWidth && tableWidth - 24, FIT), [tableWidth])
   // The right edge of every chart is "now", so it has to tick.
   const now = useNow(60_000)
 
@@ -434,7 +473,7 @@ export function HistoryScreen({
 
         <div style={{ marginTop: SCALE.space5 }}>
           <span style={sectionLabel()}>top jobs by cost</span>
-          <div style={{ ...panel(), marginTop: 6 }}>
+          <div ref={tableRef} style={{ ...panel(), marginTop: 6 }}>
             <div
               style={{
                 ...tableRow(),
@@ -444,12 +483,22 @@ export function HistoryScreen({
               }}
             >
               <span style={{ ...sectionLabel(), flex: 1 }}>job</span>
-              <span style={{ ...headerCell, width: COLS.cost }}>cost</span>
-              <span style={{ ...sectionLabel(), width: COLS.share }}>share</span>
-              <span style={{ ...headerCell, width: COLS.energy }}>energy</span>
-              <span style={{ ...headerCell, width: COLS.hours }}>node hrs</span>
-              <span style={{ ...headerCell, width: COLS.perFrame }}>per frame</span>
-              <span style={{ ...sectionLabel(), width: COLS.state }}>state</span>
+              <span style={{ ...headerCell, ...cell('cost') }}>cost</span>
+              {show.has('share') ? (
+                <span style={{ ...sectionLabel(), ...cell('share') }}>share</span>
+              ) : null}
+              {show.has('energy') ? (
+                <span style={{ ...headerCell, ...cell('energy') }}>energy</span>
+              ) : null}
+              {show.has('hours') ? (
+                <span style={{ ...headerCell, ...cell('hours') }}>node hrs</span>
+              ) : null}
+              {show.has('perFrame') ? (
+                <span style={{ ...headerCell, ...cell('perFrame') }}>per frame</span>
+              ) : null}
+              {show.has('state') ? (
+                <span style={{ ...sectionLabel(), ...cell('state') }}>state</span>
+              ) : null}
             </div>
             {data.topJobs.length === 0 ? (
               <div
@@ -463,36 +512,56 @@ export function HistoryScreen({
                   key={j.jobId}
                   job={j}
                   maxCost={maxCost}
+                  show={show}
                   onOpen={() => navigate({ screen: 'job', jobId: j.jobId })}
                 />
               ))
             )}
             {data.unattributedCost > 0 ? (
               <div style={{ ...tableRow(), color: TOKENS.textMuted }}>
-                <span style={{ flex: 1, fontSize: SCALE.textSm, fontStyle: 'italic' }}>
+                <span
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    fontSize: SCALE.textSm,
+                    fontStyle: 'italic',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap'
+                  }}
+                >
                   idle, provisioning &amp; unattributed
                 </span>
                 <span
-                  style={{ ...mono, width: COLS.cost, fontSize: SCALE.textSm, textAlign: 'right' }}
+                  style={{ ...mono, ...cell('cost'), fontSize: SCALE.textSm, textAlign: 'right' }}
                 >
                   {fmtMoney(data.unattributedCost)}
                 </span>
-                <span style={{ width: COLS.share }}>
-                  <Meter
-                    pct={maxCost > 0 ? (data.unattributedCost / maxCost) * 100 : 0}
-                    tone="idle"
-                    height={4}
-                  />
-                </span>
-                <Tooltip
-                  text={`${fmtEnergy(data.unattributedWh)} drawn while no job was rendering.\n${fmtCo2(data.unattributedCo2g)}\n${compareCo2(data.unattributedCo2g) ?? ''}\n\n${HINTS.co2}`}
-                  style={{ width: COLS.energy, justifyContent: 'flex-end' }}
-                >
-                  <span style={{ ...mono, fontSize: SCALE.textXs, cursor: 'help' }}>
-                    {fmtEnergy(data.unattributedWh)}
+                {show.has('share') ? (
+                  <span style={cell('share')}>
+                    <Meter
+                      pct={maxCost > 0 ? (data.unattributedCost / maxCost) * 100 : 0}
+                      tone="idle"
+                      height={4}
+                    />
                   </span>
-                </Tooltip>
-                <span style={{ width: COLS.hours + COLS.perFrame + COLS.state }} />
+                ) : null}
+                {show.has('energy') ? (
+                  <Tooltip
+                    text={`${fmtEnergy(data.unattributedWh)} drawn while no job was rendering.\n${fmtCo2(data.unattributedCo2g)}\n${compareCo2(data.unattributedCo2g) ?? ''}\n\n${HINTS.co2}`}
+                    style={{ ...cell('energy'), justifyContent: 'flex-end' }}
+                  >
+                    <span style={{ ...mono, fontSize: SCALE.textXs, cursor: 'help' }}>
+                      {fmtEnergy(data.unattributedWh)}
+                    </span>
+                  </Tooltip>
+                ) : null}
+                {/* Blank under whichever of hours, per frame and state show. */}
+                {(['hours', 'perFrame', 'state'] as const)
+                  .filter((c) => show.has(c))
+                  .map((c) => (
+                    <span key={c} style={cell(c)} />
+                  ))}
               </div>
             ) : null}
           </div>

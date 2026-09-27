@@ -121,7 +121,14 @@ export function GalleryScreen({
             {jobOptions.map((j) => (
               <button
                 key={j.id}
-                style={btn({ size: 'sm', active: j.id === activeJobId })}
+                title={j.name}
+                style={{
+                  ...btn({ size: 'sm', active: j.id === activeJobId }),
+                  display: 'inline-block',
+                  maxWidth: 160,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis'
+                }}
                 onClick={() => navigate({ screen: 'gallery', jobId: j.id })}
               >
                 {j.name}

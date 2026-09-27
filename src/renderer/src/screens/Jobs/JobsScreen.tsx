@@ -13,13 +13,15 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AppToolbar } from '../../components/AppToolbar'
 import { Icon } from '../../components/Icon'
 import { btn, panel } from '../../lib/controls'
+import { fitColumns, useMeasuredWidth } from '../../lib/layout'
 import { basename } from '../../lib/format'
 import { useGroupJob, useJobs, useMoveJob, useUngroupJob } from '../../lib/queries'
 import { ipcErrorText } from '../../lib/recovery'
 import { SCALE, TOKENS } from '../../lib/theme'
 import { Thumb } from '../../media/Thumb'
 import type { JobSummary } from '../../../../shared/models'
-import { JobRow, THUMB_H, THUMB_W } from './JobRow'
+import { JobRow } from './JobRow'
+import { JOB_COLS, THUMB_H, THUMB_W } from './jobCols'
 import {
   dropAction,
   groupRows,
@@ -158,10 +160,19 @@ export function JobsScreen(): React.JSX.Element {
         : null
   const dragged = drag ? list.find((j) => j.id === drag.jobId) : undefined
 
+  // The scroller, not the list: it is there before the first jobs load, so
+  // the measurement is too. Less its padding and the list's border.
+  const [scrollRef, scrollWidth] = useMeasuredWidth<HTMLDivElement>()
+  const cols = useMemo(
+    () => fitColumns(scrollWidth && scrollWidth - 2 * 16 - 2, JOB_COLS),
+    [scrollWidth]
+  )
+
   const rowOf = (job: JobSummary, block?: { index: number; size: number }): React.JSX.Element => (
     <JobRow
       key={job.id}
       job={job}
+      cols={cols}
       onGripPointerDown={gripProps(job.id).onPointerDown}
       onKeyMove={(dir) => apply(keyboardMove(list, job.id, dir))}
       dropClassName={dropClass(shown, job.id)}
@@ -210,7 +221,7 @@ export function JobsScreen(): React.JSX.Element {
           </>
         }
       />
-      <div style={{ flex: 1, overflow: 'auto', padding: SCALE.space4 }}>
+      <div ref={scrollRef} style={{ flex: 1, overflow: 'auto', padding: SCALE.space4 }}>
         {list.length === 0 ? (
           <div style={{ ...panel(), padding: SCALE.space6, textAlign: 'center' }}>
             <span style={{ color: TOKENS.textFaint }}>
