@@ -18,7 +18,17 @@ function TimesRow({ times }: { times: SceneRenderTimes }): React.JSX.Element | n
   const { segments, perFrameS, gpuBusy } = summary
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-      <div style={{ display: 'flex', gap: SCALE.space2, fontSize: SCALE.textXs }}>
+      {/* Each figure whole, wrapping as a unit rather than mid-phrase. */}
+      <div
+        style={{
+          display: 'flex',
+          flexWrap: 'wrap',
+          columnGap: SCALE.space2,
+          rowGap: 2,
+          fontSize: SCALE.textXs,
+          whiteSpace: 'nowrap'
+        }}
+      >
         <span style={{ color: TOKENS.textSecondary }}>{times.gpuName}</span>
         <span style={{ color: TOKENS.textFaint }}>
           {times.frames} frames · {fmtSeconds(perFrameS)} a frame

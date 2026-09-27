@@ -258,17 +258,22 @@ export function JobRow({
       />
 
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 5 }}>
+        {/* One line tall and wrapping: a chip that doesn't fit wraps onto a
+            second line that the height hides, so it goes whole rather than
+            cut off mid-word. The name comes first, so it always stays. */}
         <div
           style={{
             display: 'flex',
+            flexWrap: 'wrap',
             alignItems: 'center',
-            gap: SCALE.space2,
+            columnGap: SCALE.space2,
+            // Past the line's height, so none of a wrapped chip shows.
+            rowGap: 12,
+            height: 20,
             minWidth: 0,
             overflow: 'hidden'
           }}
         >
-          {/* A floor under the name: the chips beside it give way (clipped at
-              the line's end) before the name does. */}
           <span
             title={name}
             style={{

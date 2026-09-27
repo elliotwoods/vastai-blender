@@ -236,7 +236,16 @@ export function ZoomFilmstrip({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: SCALE.space2, minWidth: 0 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: SCALE.space2, minWidth: 0 }}>
+      {/* Wraps: in a narrow column the minimap takes a line of its own. */}
+      <div
+        style={{
+          display: 'flex',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          gap: SCALE.space2,
+          minWidth: 0
+        }}
+      >
         <span
           data-testid="zoom-chip"
           data-sampled={layout.sampled ? 'true' : 'false'}
@@ -264,7 +273,7 @@ export function ZoomFilmstrip({
             zoom to all frames
           </button>
         ) : null}
-        <div style={{ flex: 1, minWidth: 80 }}>
+        <div style={{ flex: '1 1 200px', minWidth: 80 }}>
           <FrameMinimap
             domain={domain}
             chunks={chunks}
