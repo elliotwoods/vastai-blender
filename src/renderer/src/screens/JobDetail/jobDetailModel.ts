@@ -2,13 +2,15 @@
  * The job detail screen's pure half: the sidebar's order and its Alt+↑/↓
  * hops, what the chunk grid says about each chunk, the chunk counts, which
  * chunks the live panel shows and when one has gone quiet, and the node
- * sharing switch's wording. Kept apart from the components so it is tested
+ * sharing switch's wording, how many chunk tiles a row takes, and which clip
+ * the preview card shows. Kept apart from the components so it is tested
  * without a DOM.
  */
 
 import type {
   ChunkSnapshot,
   ChunkState,
+  ClipAsset,
   ErrorClass,
   JobState,
   JobSummary,
@@ -16,6 +18,7 @@ import type {
   RenderStatus
 } from '../../../../shared/models'
 import type { StatusTone } from '../../lib/theme'
+import { pickClip } from '../../media/renditions'
 
 // -- the jobs sidebar ---------------------------------------------------------
 
@@ -123,6 +126,22 @@ const ACTIVE_STATES: readonly ChunkState[] = ['assigned', 'rendering', 'encoding
 
 export function isActiveChunk(state: ChunkState): boolean {
   return ACTIVE_STATES.includes(state)
+}
+
+/**
+ * The chunk the Preview button opens the overlay at. A finished chunk first:
+ * with the job's stitched clip that is the whole job, played from the start.
+ * Else one rendering now, for its live clip; else any with a frame down.
+ * null = nothing to see yet.
+ */
+export function previewChunk(chunks: readonly ChunkSnapshot[]): ChunkSnapshot | null {
+  const byFrame = [...chunks].sort((a, b) => a.frameStart - b.frameStart)
+  return (
+    byFrame.find((c) => c.state === 'complete') ??
+    byFrame.find((c) => isActiveChunk(c.state)) ??
+    byFrame.find((c) => c.framesDone > 0) ??
+    null
+  )
 }
 
 export interface ChunkCounts {
@@ -289,3 +308,41 @@ export const SHARE_COPY = {
     'Applies to chunks not yet started. Chunks already rendering keep their placement, so ' +
     'turning it off takes effect as the shared renders finish.'
 } as const
+
+// -- chunk map -------------------------------------------------------------------
+
+/** Past this many chunks, tiles instead of cards. */
+export const DENSE_AFTER = 24
+const TILE_MIN = 16
+/** px between chunk tiles */
+export const TILE_GAP = 3
+/** px for the row labels in front of the tiles */
+export const LABEL_W = 40
+/** Tiles per row: round numbers, so the row labels count up evenly. */
+const ROW_SIZES = [5, 10, 20, 25, 50]
+
+/** The most tiles a row of `width` px takes, as a round number. */
+export function tilesPerRow(width: number): number {
+  const room = width - LABEL_W
+  let best = ROW_SIZES[0]
+  for (const n of ROW_SIZES) if (n * (TILE_MIN + TILE_GAP) <= room) best = n
+  return width > 0 ? best : 10
+}
+
+// -- preview card ----------------------------------------------------------------
+
+/** The clip the card shows: the whole job's, else the start chunk's. */
+export function cardClip(
+  clips: readonly ClipAsset[],
+  startChunk: ChunkSnapshot | null
+): ClipAsset | null {
+  const all = [...clips]
+  return (
+    pickClip(all, { scope: 'job', wall: true }) ??
+    // A chunk still rendering has only its live clip, which the wall order skips.
+    (startChunk
+      ? (pickClip(all, { chunkId: startChunk.id, wall: true }) ??
+        pickClip(all, { chunkId: startChunk.id, preferLive: true }))
+      : null)
+  )
+}

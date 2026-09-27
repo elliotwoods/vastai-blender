@@ -1,8 +1,11 @@
 /**
  * One job in the Jobs list, left to right:
  *
- *   grip · thumbnail · name, chips, bar and time · state · frames · cost ·
- *   submitted · open output · (unlink) · trash
+ *   grip · thumbnail · name, chips, bar and time · state · frames · time ·
+ *   cost · submitted · open output · (unlink) · trash
+ *
+ * Frames, time and cost each read "so far / in all" while the job is live
+ * (lib/jobProjection.ts), and just the final figure once it has finished.
  *
  * The grip is there only while the job is in the queue (queued or running):
  * a finished job has no place to move to. Alt+↑ / Alt+↓ on a focused row
@@ -10,7 +13,7 @@
  * every button in it stops its click reaching the row.
  *
  * On a narrow list the row sheds columns (jobCols.ts, via fitColumns) rather
- * than squeezing the name to nothing: time-ago goes first, then cost, then
+ * than squeezing the name to nothing: time-ago goes first, then time, then cost, then
  * state and frames move onto a line of their own under the name.
  */
 
@@ -20,15 +23,18 @@ import type { JobState, JobSummary } from '../../../../shared/models'
 import { ConfirmButton } from '../../components/ConfirmButton'
 import { Icon } from '../../components/Icon'
 import { JobTiming } from '../../components/JobTiming'
+import { jobTimingView } from '../../components/jobTimingView'
 import { OpenInExplorerButton } from '../../components/OpenInExplorerButton'
 import { ProgressBar } from '../../components/ProgressBar'
 import { barStateOf } from '../../components/progressSegments'
 import { chip, iconBtn, mono, statusDot, tableRow, type ChipTone } from '../../lib/controls'
-import { basename, fmtFrames, fmtMoney, fmtTimeAgo } from '../../lib/format'
+import { basename, fmtFrames, fmtMoney, fmtSpan, fmtTimeAgo } from '../../lib/format'
+import { expectedCost, jobTimeTotals, roughMark, type CostBasis } from '../../lib/jobProjection'
 import { useNav } from '../../lib/nav'
 import { useCancelJob, useRemoveJob } from '../../lib/queries'
 import { ipcErrorText } from '../../lib/recovery'
 import { SCALE, TOKENS, type StatusTone } from '../../lib/theme'
+import { useNow } from '../../lib/useNow'
 import type { ThumbState } from '../../media/Thumb'
 import { Thumb } from '../../media/Thumb'
 
@@ -36,10 +42,12 @@ import {
   ALL_JOB_COLS,
   COMPACT_THUMB_H,
   COMPACT_THUMB_W,
+  COST_W,
   GRIP_W,
   ICON_W,
   THUMB_H,
   THUMB_W,
+  TIME_W,
   type JobCol
 } from './jobCols'
 
@@ -140,6 +148,74 @@ export function JobTrashButton({
   )
 }
 
+const COST_BASIS_TEXT: Record<CostBasis, string> = {
+  final: 'what it cost',
+  time: 'the spend so far, scaled by the time it has left',
+  frames: 'the spend so far per frame, times the frames to render'
+}
+
+/** "so far / in all", the "in all" faint; a null `all` (no estimate) reads "—". */
+function SoFar({ now, all }: { now: string; all?: string | null }): React.JSX.Element {
+  return (
+    <>
+      {now}
+      {all !== undefined ? <span style={{ color: TOKENS.textFaint }}> / {all ?? '—'}</span> : null}
+    </>
+  )
+}
+
+/** The time column: taken of the total while live, what it took once finished. */
+function JobTimeCell({ job, now }: { job: JobSummary; now: number }): React.JSX.Element {
+  const live = isLiveJob(job.state)
+  const { takenMs, totalMs } = jobTimeTotals(job, now)
+  const title = jobTimingView(job, now).title || undefined
+  return (
+    <span
+      title={title}
+      style={{ ...mono, width: TIME_W, flexShrink: 0, fontSize: SCALE.textSm, textAlign: 'right' }}
+    >
+      {takenMs == null ? (
+        <span style={{ color: TOKENS.textFaint }}>—</span>
+      ) : live ? (
+        <SoFar
+          now={fmtSpan(takenMs)}
+          all={totalMs != null ? `${roughMark(job)}${fmtSpan(totalMs)}` : null}
+        />
+      ) : (
+        fmtSpan(takenMs)
+      )}
+    </span>
+  )
+}
+
+/** The cost column: spent of what it should cost while live, what it cost once finished. */
+function JobCostCell({ job, now }: { job: JobSummary; now: number }): React.JSX.Element {
+  const live = isLiveJob(job.state)
+  const expected = expectedCost(job, now)
+  const title = expected
+    ? `${fmtMoney(job.costSoFar)} spent${
+        live
+          ? `; expected ${fmtMoney(expected.cost)} in all, from ${COST_BASIS_TEXT[expected.basis]}`
+          : ''
+      }`
+    : `${fmtMoney(job.costSoFar)} spent; nothing to project the total from yet`
+  return (
+    <span
+      title={title}
+      style={{ ...mono, width: COST_W, flexShrink: 0, fontSize: SCALE.textSm, textAlign: 'right' }}
+    >
+      {live ? (
+        <SoFar
+          now={fmtMoney(job.costSoFar)}
+          all={expected ? `~${fmtMoney(expected.cost)}` : null}
+        />
+      ) : (
+        fmtMoney(job.costSoFar)
+      )}
+    </span>
+  )
+}
+
 export interface JobRowProps {
   job: JobSummary
   /** a grip's pointerdown: starts a drag (live jobs only) */
@@ -172,6 +248,7 @@ export function JobRow({
 }: JobRowProps): React.JSX.Element {
   const { navigate } = useNav()
   const live = isLiveJob(job.state)
+  const now = useNow(1000, live)
   const name = job.name || basename(job.blendPath)
   // tableRow's transparent background would sit over .vr-drop-group's.
   const { background: _bg, ...rowBase } = tableRow({ clickable: true })
@@ -342,13 +419,8 @@ export function JobRow({
           {frames}
         </>
       )}
-      {cols.has('cost') ? (
-        <span
-          style={{ ...mono, width: 60, flexShrink: 0, fontSize: SCALE.textSm, textAlign: 'right' }}
-        >
-          {fmtMoney(job.costSoFar)}
-        </span>
-      ) : null}
+      {cols.has('time') ? <JobTimeCell job={job} now={now} /> : null}
+      {cols.has('cost') ? <JobCostCell job={job} now={now} /> : null}
       {cols.has('ago') ? (
         <span
           title={new Date(job.submittedAt).toLocaleString()}

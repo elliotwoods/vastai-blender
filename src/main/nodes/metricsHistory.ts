@@ -761,6 +761,7 @@ export function fleetGpuHistory(q: FleetGpuHistoryQuery, now = Date.now()): Flee
   let gpuHours = 0
   let busyGpuHours = 0
   let idleCost = 0
+  let onMs = 0
   for (let b = 0; b < grid.count; b++) {
     let polled = false
     let rented = 0
@@ -782,7 +783,9 @@ export function fleetGpuHistory(q: FleetGpuHistoryQuery, now = Date.now()): Flee
     }
     const ts = grid.start + b * grid.bucketMs
     if (polled) {
-      const hours = Math.max(0, Math.min(ts + grid.bucketMs, toMs) - Math.max(ts, fromMs)) / HOUR
+      const inRange = Math.max(0, Math.min(ts + grid.bucketMs, toMs) - Math.max(ts, fromMs))
+      const hours = inRange / HOUR
+      onMs += inRange
       gpuHours += rented * hours
       busyGpuHours += busy * hours
       idleCost += idlePerHour * hours
@@ -797,6 +800,7 @@ export function fleetGpuHistory(q: FleetGpuHistoryQuery, now = Date.now()): Flee
   }
   const summary: FleetGpuSummary = {
     meanUtil: rangeUtilN > 0 ? rangeUtilSum / rangeUtilN : null,
+    onMs,
     gpuHours,
     busyGpuHours,
     idleCost

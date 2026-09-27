@@ -157,6 +157,19 @@ describe('JobsScreen', () => {
     expect(rowOf(html, 'wait-c')).toContain('queued')
   })
 
+  it('reads time and cost as so far / in all while live, the final figure once done', () => {
+    // run-a: 30 min in, 45 min left, $1 spent → 1h 15m and ~$2.50 in all.
+    const list = jobs.map((j) => (j.id === 'run-a' ? { ...j, costSoFar: 1 } : j))
+    const running = rowOf(render(list), 'run-a')
+    expect(running).toContain('30m 00s')
+    expect(running).toContain('1h 15m')
+    expect(running).toContain('$1.00')
+    expect(running).toContain('~$2.50')
+    const done = rowOf(html, 'done-d')
+    expect(done).toContain('1h 00m')
+    expect(done).not.toContain('~$')
+  })
+
   it('draws a group as one block, with an unlink per member', () => {
     const start = html.indexOf('data-group-block="g1"')
     expect(start).toBeGreaterThanOrEqual(0)

@@ -33,6 +33,7 @@ export function Filmstrip({
   frameStep,
   chunks,
   currentFrame,
+  playing = false,
   onSelect,
   onOpen,
   height = CELL_H + 12
@@ -45,6 +46,8 @@ export function Filmstrip({
   chunks?: ChunkSnapshot[]
   /** Frame number to highlight and keep in view. */
   currentFrame?: number
+  /** Playback is running: keep `currentFrame` centred rather than merely in view. */
+  playing?: boolean
   onSelect?: (frame: number) => void
   onOpen?: (frame: number) => void
   height?: number
@@ -95,16 +98,23 @@ export function Filmstrip({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [domain.count])
 
-  // Keep the playhead cell in view while scrubbing.
+  // Keep the playhead cell in view. While playing it stays centred, placed
+  // outright each frame: a smooth scroll restarted 25 times a second never
+  // gets anywhere, and the playhead ran off the strip. Stepped or clicked, the
+  // strip only moves when the cell has left the view, so the cell you just
+  // clicked stays under the pointer.
   useEffect(() => {
     if (currentFrame == null) return
     const el = scrollRef.current
     if (!el) return
     const x = indexOf(domain, currentFrame) * STRIDE
-    if (x < el.scrollLeft || x > el.scrollLeft + el.clientWidth - CELL_W) {
-      el.scrollTo({ left: Math.max(0, x - el.clientWidth / 2), behavior: 'smooth' })
+    const centred = Math.max(0, x + CELL_W / 2 - el.clientWidth / 2)
+    if (playing) {
+      el.scrollLeft = centred
+    } else if (x < el.scrollLeft || x > el.scrollLeft + el.clientWidth - CELL_W) {
+      el.scrollTo({ left: centred, behavior: 'smooth' })
     }
-  }, [currentFrame, domain])
+  }, [currentFrame, domain, playing])
 
   const thumbs = useThumbWindow(jobId, frameAt(domain, range.from), frameAt(domain, range.to))
 

@@ -16,10 +16,20 @@ export function TransportBar({
   controller,
   quality,
   keysEnabled = true,
-  extras
+  extras,
+  frameNumbers
 }: {
   controller: ClipSyncController
   quality: string
+  /**
+   * Clip index ↔ the job's own frame numbers. Given, the counter shows and
+   * takes job frames (the same numbers as the filmstrip and the file names)
+   * rather than a 0-based index into the clip.
+   */
+  frameNumbers?: {
+    toFrame: (index: number) => number | undefined
+    toIndex: (frame: number) => number | null
+  }
   /** Bind the global transport keys. Off when another surface owns them. */
   keysEnabled?: boolean
   /** Extra controls rendered at the right-hand end (LIVE pill, HDR toggle…). */
@@ -52,10 +62,14 @@ export function TransportBar({
 
   useTransportKeys(controller, keysEnabled)
 
+  const shown = frameNumbers?.toFrame(frame) ?? frame
+  const lastShown = frameNumbers?.toFrame(totalFrames - 1) ?? totalFrames
+
   const commitFrameInput = (): void => {
     if (frameInput != null) {
       const n = parseInt(frameInput, 10)
-      if (Number.isFinite(n)) controller.seekFrame(n)
+      const index = frameNumbers && Number.isFinite(n) ? frameNumbers.toIndex(n) : n
+      if (index != null && Number.isFinite(index)) controller.seekFrame(index)
     }
     setFrameInput(null)
   }
@@ -65,8 +79,11 @@ export function TransportBar({
       style={{
         ...panel(),
         display: 'flex',
+        // Wraps on a narrow window: the speed presets and the quality readout
+        // go to a second line rather than off the right-hand edge.
+        flexWrap: 'wrap',
         alignItems: 'center',
-        gap: SCALE.space3,
+        gap: `6px ${SCALE.space3}`,
         padding: `6px ${SCALE.space3}`
       }}
     >
@@ -117,7 +134,9 @@ export function TransportBar({
         {formatTimecode(frame, fps)}
       </span>
 
-      <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 4 }}>
+      <span
+        style={{ display: 'inline-flex', alignItems: 'baseline', gap: 4, whiteSpace: 'nowrap' }}
+      >
         {frameInput != null ? (
           <input
             autoFocus
@@ -143,24 +162,26 @@ export function TransportBar({
         ) : (
           <button
             style={{ ...quietField(), ...mono, fontSize: SCALE.textSm }}
-            onClick={() => setFrameInput(String(frame))}
+            onClick={() => setFrameInput(String(shown))}
             title="Click to type a frame number"
           >
-            {frame}
+            {shown}
           </button>
         )}
         <span style={{ ...mono, fontSize: SCALE.textXs, color: TOKENS.textFaint }}>
-          / {totalFrames}
+          / {lastShown}
         </span>
       </span>
 
-      <FrameRuler
-        frame={frame}
-        totalFrames={totalFrames}
-        fps={fps}
-        onPreview={(f) => controller.dragPreview(f)}
-        onCommit={(f) => controller.dragCommit(f)}
-      />
+      <span style={{ flex: '1 1 260px', minWidth: 0, display: 'flex' }}>
+        <FrameRuler
+          frame={frame}
+          totalFrames={totalFrames}
+          fps={fps}
+          onPreview={(f) => controller.dragPreview(f)}
+          onCommit={(f) => controller.dragCommit(f)}
+        />
+      </span>
 
       <span
         style={{ ...mono, fontSize: SCALE.textXs, color: TOKENS.textFaint, whiteSpace: 'nowrap' }}

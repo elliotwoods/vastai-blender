@@ -557,11 +557,14 @@ export const FLEET_GPU_SERIES_MAX = 64
 export interface FleetGpuSummary {
   /**
    * Mean utilisation (%) over every reading of every GPU in the range: each
-   * GPU weighted by the time it was rented and read, gaps (no reading) left
-   * out. What the Fleet screen's "mean util" shows for the range. null = no
-   * reading in the range.
+   * GPU weighted by the time it was on and read, gaps (no reading) left out,
+   * so a fleet on for 20 minutes of the hour is averaged over those 20. What
+   * the Fleet screen's "mean util" shows for the range. null = no reading in
+   * the range.
    */
   meanUtil: number | null
+  /** ms of the range in which at least one node was read: the time `meanUtil` is over */
+  onMs: number
   /** GPU-hours rented in the range (Σ over buckets of GPUs rented × bucket width) */
   gpuHours: number
   /** of those, GPU-hours busy (above GPU_BUSY_UTIL_PCT, or with a run) */

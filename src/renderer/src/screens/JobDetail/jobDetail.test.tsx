@@ -6,6 +6,7 @@ import type { StateCreator, StoreApi, UseBoundStore } from 'zustand'
 import type {
   ChunkSnapshot,
   ChunkState,
+  ClipAsset,
   JobDetail,
   JobSummary,
   NodeSnapshot,
@@ -316,6 +317,33 @@ describe('failed and cancelled chunks', () => {
   })
 })
 
+describe('a job cut into many chunks', () => {
+  // 60 chunks of 2 frames, the shape real jobs have: a map of tiles, not cards.
+  const many = Array.from({ length: 60 }, (_, i) =>
+    chunk(`c-${i}`, i < 20 ? 'complete' : i === 20 ? 'failed' : 'pending', i * 2 + 1, i * 2 + 2)
+  )
+
+  it('draws a tile per chunk, rows labelled with their first frame', () => {
+    const html = renderToStaticMarkup(<ChunkGrid chunks={many} step={1} />)
+    expect(html.match(/data-chunk-state=/g)).toHaveLength(60)
+    // 900px wide (useWidth is stubbed): 25 a row, so rows start at 1, 51, 101
+    for (const label of ['>1<', '>51<', '>101<']) expect(html).toContain(label)
+    expect(html).toContain('aria-label="frames 41–42, failed"')
+  })
+
+  it('keeps cards for a few chunks', () => {
+    const html = renderToStaticMarkup(<ChunkGrid chunks={many.slice(0, 5)} step={1} />)
+    expect(html).toContain('1–2')
+    expect(html).not.toContain('aria-label="frames 1–2')
+  })
+})
+
+describe('the preview card', () => {
+  it('sits on the job screen and opens the preview', () => {
+    expect(screen(detail())).toMatch(/<button[^>]*aria-label="Open the preview"/)
+  })
+})
+
 describe('the jobs sidebar', () => {
   const jobs = [
     summary({ id: 'job-1', name: 'hero_shot' }),
@@ -339,6 +367,19 @@ describe('the jobs sidebar', () => {
   })
 })
 
+describe('the Preview button', () => {
+  it('is on the toolbar, and off until there is something to see', () => {
+    expect(screen(detail())).toMatch(/<button[^>]*title="Preview the job \(P\)"[^>]*>/)
+    const nothing = screen(detail({ chunks: [chunk('c-1', 'pending', 1, 40)] }))
+    expect(nothing).toMatch(/<button[^>]*disabled=""[^>]*title="Nothing rendered yet"/)
+  })
+
+  it('shows the expected cost beside the spend while the job runs', () => {
+    // 1 min in, 2 min left, $1.50 spent → ~$4.50 in all.
+    expect(screen(detail())).toContain('~$4.50')
+  })
+})
+
 describe('jobDetailModel', () => {
   it('orders the sidebar as the queue, then finished jobs newest first', () => {
     const order = model.sidebarOrder([
@@ -349,6 +390,51 @@ describe('jobDetailModel', () => {
       summary({ id: 'hidden', state: 'complete', finishedAt: 30, hiddenAt: 5 })
     ])
     expect(order.map((j) => j.id)).toEqual(['q1', 'q2', 'done-new', 'done-old'])
+  })
+
+  it('previews the first finished chunk, else a rendering one, else nothing', () => {
+    expect(model.previewChunk(detail().chunks)?.id).toBe('c-1')
+    expect(
+      model.previewChunk([chunk('p', 'pending', 1, 10), chunk('r', 'rendering', 11, 20)])?.id
+    ).toBe('r')
+    expect(
+      model.previewChunk([
+        chunk('f', 'failed', 1, 10, { framesDone: 3 }),
+        chunk('p', 'pending', 11, 20)
+      ])?.id
+    ).toBe('f')
+    expect(model.previewChunk([chunk('p', 'pending', 1, 10)])).toBeNull()
+  })
+
+  it('rows the chunk map in round numbers of tiles', () => {
+    expect(model.tilesPerRow(0)).toBe(10)
+    expect(model.tilesPerRow(200)).toBe(5)
+    expect(model.tilesPerRow(600)).toBe(25)
+    expect(model.tilesPerRow(1200)).toBe(50)
+  })
+
+  it("shows the job's clip on the preview card, else the start chunk's", () => {
+    const clip = (p: Partial<ClipAsset>): ClipAsset => ({
+      kind: 'previewSdr',
+      scope: 'chunk',
+      chunkId: 'c-1',
+      label: '',
+      absPath: '',
+      mediaUrl: '',
+      fps: 25,
+      frames: 10,
+      width: 16,
+      height: 9,
+      codec: 'hevc',
+      hdr: false,
+      ...p
+    })
+    const start = chunk('c-2', 'rendering', 11, 20)
+    const job = clip({ scope: 'job', chunkId: '', label: 'job' })
+    const live = clip({ kind: 'live', chunkId: 'c-2', label: 'live' })
+    expect(model.cardClip([clip({}), job, live], start)?.label).toBe('job')
+    expect(model.cardClip([clip({}), live], start)?.label).toBe('live')
+    expect(model.cardClip([clip({})], null)).toBeNull()
   })
 
   it('hops to the neighbouring job, and nowhere past either end', () => {

@@ -11,17 +11,18 @@
  * utilisation 0–100% on its own chart.
  *
  * The lead figure, "mean util", is over the whole window chosen (main's
- * summary, each GPU weighted by the time it was rented), not the newest
- * bucket: a fleet that idled for most of the hour and is busy now averaged
- * low, and that is what the hour cost. The other figures are the latest
- * reading and say so.
+ * summary), not the newest bucket: a fleet that idled for most of the hour
+ * and is busy now averaged low, and that is what the hour cost. It counts
+ * only the time GPUs were on and read, so a fleet up for 20 minutes of the
+ * hour is averaged over those 20, and the label says so. The other figures
+ * are the latest reading and say so.
  */
 
 import { useState, type CSSProperties } from 'react'
 import { TimeChart } from '../../components/charts/TimeChart'
 import { InfoHint } from '../../components/Tooltip'
 import { panel, sectionLabel, segmented } from '../../lib/controls'
-import { fmtMoney, fmtRate } from '../../lib/format'
+import { fmtMoney, fmtRate, fmtSpan } from '../../lib/format'
 import { useFleetGpuHistory } from '../../lib/queries'
 import { ipcErrorText } from '../../lib/recovery'
 import { SCALE, TOKENS } from '../../lib/theme'
@@ -41,8 +42,9 @@ import {
 const HINT =
   `GPUs on nodes that may be billing, and how many of them are busy: above ${GPU_BUSY_UTIL_PCT}% ` +
   'utilisation, or with a render pinned to them. The gap between the lines is GPUs paid for and ' +
-  'idle. "Per GPU" draws each GPU\'s utilisation instead. Mean util is over the whole window, ' +
-  'each GPU weighted by the time it was rented; the other figures are the latest reading.'
+  'idle. "Per GPU" draws each GPU\'s utilisation instead. Mean util counts only the time GPUs ' +
+  'were on and reporting in the window, each GPU weighted by that time; the other figures are ' +
+  'the latest reading.'
 
 type GpuView = 'combined' | 'perGpu'
 
@@ -141,6 +143,12 @@ function Figure({
 
 const pct = (v: number): string => `${v.toFixed(0)}%`
 
+/** Time on, to the minute under an hour ("20m"): buckets make the seconds noise. */
+function fmtOn(ms: number): string {
+  const m = Math.max(1, Math.round(ms / 60_000))
+  return m < 60 ? `${m}m` : fmtSpan(m * 60_000)
+}
+
 /**
  * `hasNodes`: the Fleet lists a node. Without one the strip shows only if
  * its window saw GPUs rented, so a fleet that has scaled down can still be
@@ -170,7 +178,15 @@ export function FleetGpuStrip({ hasNodes }: { hasNodes: boolean }): React.JSX.El
   const rented = latest?.gpusRented ?? null
   const idle = latest?.idlePerHour ?? null
   const summary = data?.summary ?? null
-  const over = `over the last ${USAGE_RANGES.find((r) => r.key === range)?.label ?? range}`
+  const rangeLabel = USAGE_RANGES.find((r) => r.key === range)?.label ?? range
+  const over = `over the last ${rangeLabel}`
+  // Mean util is over the time something was on; say how long that was when
+  // it is short of the window (a bucket's slack either way reads as all of it).
+  const onMs = summary?.onMs ?? null
+  const utilOver =
+    onMs != null && onMs > 0 && onMs < span - Math.max(data?.bucketMs ?? 0, 60_000)
+      ? `over ${fmtOn(onMs)} on · last ${rangeLabel}`
+      : over
 
   const tooltipExtra = (x: number): string[] | null => {
     const p = strip?.byX.get(x)
@@ -226,7 +242,7 @@ export function FleetGpuStrip({ hasNodes }: { hasNodes: boolean }): React.JSX.El
             lead
             label="mean util"
             value={summary?.meanUtil != null ? pct(summary.meanUtil) : '—'}
-            sub={`all GPUs, ${over}`}
+            sub={`all GPUs, ${utilOver}`}
             tone={summary?.meanUtil != null ? TOKENS.accent : undefined}
           />
           <Figure

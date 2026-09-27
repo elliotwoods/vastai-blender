@@ -517,6 +517,19 @@ describe('the fleet over time', () => {
     expect(hist.gpus).toBeUndefined()
   })
 
+  it('the summary’s mean util is over the time nodes were on, not the whole range', () => {
+    // On for the last 20 minutes of the hour, at 90% throughout.
+    addNode('E', 2, 1)
+    for (let t = T0 - 20 * MINUTE; t < T0; t += 15 * SECOND) {
+      vi.setSystemTime(t)
+      mh.record('E', metrics(t, [gpu(0, 90)]), mh.runsPerGpu([], 1), { numGpus: 1 })
+    }
+    vi.setSystemTime(T0)
+    const hist = mh.fleetGpuHistory({ fromMs: T0 - HOUR, toMs: T0, maxPoints: 60 })
+    expect(hist.summary.meanUtil).toBeCloseTo(90, 9)
+    expect(hist.summary.onMs).toBe(20 * MINUTE)
+  })
+
   it('the summary over a range memory and the table share is what memory alone says', async () => {
     oneAndFour()
     const q = { fromMs: T0 - 10 * MINUTE, toMs: T0, maxPoints: 6 }

@@ -181,6 +181,10 @@ function Overlay({
     (cb) => controller.subscribe(cb),
     () => controller.lastKnownFrame
   )
+  const playing = useSyncExternalStore(
+    (cb) => controller.subscribe(cb),
+    () => controller.playing
+  )
 
   const frameNumber = clip ? toFrame(currentFrame) : undefined
   // The chunk under the playhead. In job mode that moves as it plays; in chunk
@@ -335,7 +339,8 @@ function Overlay({
         position: 'fixed',
         inset: 0,
         zIndex: 40,
-        background: 'rgba(6,7,9,0.94)',
+        // Near-opaque: at 0.94 the screen behind read through as ghosted text.
+        background: 'rgba(6,7,9,0.985)',
         display: 'flex',
         flexDirection: 'column',
         gap: SCALE.space3,
@@ -484,6 +489,7 @@ function Overlay({
         <TransportBar
           controller={controller}
           quality={quality}
+          frameNumbers={{ toFrame, toIndex }}
           keysEnabled
           extras={<SpeedControl controller={controller} />}
         />
@@ -503,6 +509,7 @@ function Overlay({
           frameStep={job.frameStep}
           chunks={job.chunks}
           currentFrame={frameNumber}
+          playing={playing}
           onSelect={(frame) => {
             // Seek when the showing clip holds the frame; otherwise retarget
             // to the chunk that owns it, so the strip navigates the whole job.

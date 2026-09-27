@@ -386,7 +386,13 @@ describe('Feature G: GPU use over time', () => {
         { ts: now - 90_000, gpusRented: 24, gpusBusy: 20, meanUtil: 70, idlePerHour: 1.1 },
         { ts: now - 60_000, gpusRented: 24, gpusBusy: 17, meanUtil: 61, idlePerHour: 2.4 }
       ],
-      summary: { meanUtil: 65.5, gpuHours: 0.4, busyGpuHours: 0.31, idleCost: 0.03 }
+      summary: {
+        meanUtil: 65.5,
+        onMs: 3_600_000,
+        gpuHours: 0.4,
+        busyGpuHours: 0.31,
+        idleCost: 0.03
+      }
     }
     const html = withCache(
       (qc) => {
@@ -414,7 +420,7 @@ describe('Feature G: GPU use over time', () => {
         { ts: now - 90_000, gpusRented: 4, gpusBusy: 0, meanUtil: 3, idlePerHour: 1 },
         { ts: now - 60_000, gpusRented: 4, gpusBusy: 4, meanUtil: 97, idlePerHour: 0 }
       ],
-      summary: { meanUtil: 23.4, gpuHours: 4, busyGpuHours: 1, idleCost: 0.75 }
+      summary: { meanUtil: 23.4, onMs: 3_600_000, gpuHours: 4, busyGpuHours: 1, idleCost: 0.75 }
     }
     const html = withCache(
       (qc) => {
@@ -429,6 +435,25 @@ describe('Feature G: GPU use over time', () => {
     expect(html).toContain('$0.75 over the last 1h')
   })
 
+  it('mean util says how long GPUs were on when that is short of the window', () => {
+    const history: FleetGpuHistory = {
+      fromMs: now - 3_600_000,
+      toMs: now,
+      bucketMs: 30_000,
+      points: [{ ts: now - 60_000, gpusRented: 2, gpusBusy: 2, meanUtil: 90, idlePerHour: 0 }],
+      summary: { meanUtil: 90, onMs: 20 * 60_000, gpuHours: 0.66, busyGpuHours: 0.66, idleCost: 0 }
+    }
+    const html = withCache(
+      (qc) => {
+        qc.setQueryData(qk.nodes, [node({})])
+        qc.setQueryData(qk.fleetGpuHistory('1h'), history)
+      },
+      <FleetScreen />
+    )
+    expect(html).toContain('>90%<')
+    expect(html).toContain('all GPUs, over 20m on · last 1h')
+  })
+
   it('per GPU: one utilisation line per GPU, named by node and index', () => {
     stored['vr:fleet:gpuView'] = 'perGpu'
     const util = (mean: number): { ts: number; mean: number; min: null; max: null }[] => [
@@ -440,7 +465,7 @@ describe('Feature G: GPU use over time', () => {
       toMs: now,
       bucketMs: 30_000,
       points: [{ ts: now - 60_000, gpusRented: 2, gpusBusy: 1, meanUtil: 50, idlePerHour: 0.4 }],
-      summary: { meanUtil: 50, gpuHours: 2, busyGpuHours: 1, idleCost: 0.1 },
+      summary: { meanUtil: 50, onMs: 3_600_000, gpuHours: 2, busyGpuHours: 1, idleCost: 0.1 },
       gpus: [
         { nodeId: 'node-a', gpuIndex: 0, label: 'RTX 4090 · node-a #0', util: util(95) },
         { nodeId: 'node-b', gpuIndex: 0, label: 'RTX 3090 · node-b #0', util: util(5) }

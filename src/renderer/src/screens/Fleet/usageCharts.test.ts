@@ -155,7 +155,7 @@ describe('the fleet strip', () => {
       { ts: 0, gpusRented: 24, gpusBusy: 17, meanUtil: 60, idlePerHour: 2.5 },
       { ts: 60_000, gpusRented: null, gpusBusy: null, meanUtil: null, idlePerHour: null }
     ],
-    summary: { meanUtil: 60, gpuHours: 0.4, busyGpuHours: 0.28, idleCost: 0.04 }
+    summary: { meanUtil: 60, onMs: 3_600_000, gpuHours: 0.4, busyGpuHours: 0.28, idleCost: 0.04 }
   }
 
   it('draws rented and busy per bucket, a bucket no node was polled in as a break', () => {
@@ -193,7 +193,7 @@ describe('the fleet strip, per GPU', () => {
     toMs: 120_000,
     bucketMs: 60_000,
     points: [],
-    summary: { meanUtil: 50, gpuHours: 1, busyGpuHours: 0.5, idleCost: 0 },
+    summary: { meanUtil: 50, onMs: 3_600_000, gpuHours: 1, busyGpuHours: 0.5, idleCost: 0 },
     gpus: Array.from({ length: n }, (_, i) => ({
       nodeId: `node-${i >> 1}`,
       gpuIndex: i % 2,

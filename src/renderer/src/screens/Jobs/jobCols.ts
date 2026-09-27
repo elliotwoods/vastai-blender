@@ -14,7 +14,11 @@ export const COMPACT_THUMB_H = 27
 export const GRIP_W = 18
 export const ICON_W = 26
 
-export type JobCol = 'fixed' | 'name' | 'meta' | 'cost' | 'ago'
+export type JobCol = 'fixed' | 'name' | 'meta' | 'time' | 'cost' | 'ago'
+
+/** the time and cost columns' widths: room for "so far / in all" */
+export const TIME_W = 132
+export const COST_W = 124
 
 /**
  * `fixed` is the grip, the compact thumbnail, the actions and the padding;
@@ -25,8 +29,9 @@ export type JobCol = 'fixed' | 'name' | 'meta' | 'cost' | 'ago'
 export const JOB_COLS: readonly FitColumn<JobCol>[] = [
   { key: 'fixed', width: GRIP_W + COMPACT_THUMB_W + 3 * ICON_W + 8 + 3 * 12 + 18 },
   { key: 'name', width: 240 },
-  { key: 'meta', width: 96 + 96 + 2 * 12 + (THUMB_W - COMPACT_THUMB_W), drop: 3 },
-  { key: 'cost', width: 60 + 12, drop: 2 },
+  { key: 'meta', width: 96 + 96 + 2 * 12 + (THUMB_W - COMPACT_THUMB_W), drop: 4 },
+  { key: 'time', width: TIME_W + 12, drop: 2 },
+  { key: 'cost', width: COST_W + 12, drop: 3 },
   { key: 'ago', width: 72 + 12, drop: 1 }
 ]
 export const ALL_JOB_COLS: ReadonlySet<JobCol> = new Set(JOB_COLS.map((c) => c.key))

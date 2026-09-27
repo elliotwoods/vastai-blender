@@ -748,8 +748,60 @@ const mockJobs = (now = Date.now()): JobSummary[] => {
   })
 }
 
-/** Chunks of the mock jobs that no mock node holds (job-3's, all settled). */
+/**
+ * Chunks of the mock jobs that no mock node holds: job-3's, all settled;
+ * job-1's either side of the two node-a is rendering; and job-5 cut into
+ * 2-frame chunks, the shape real jobs have (a hundred chunks and more).
+ */
 const mockSettledChunks = (jobId: string): ChunkSnapshot[] => {
+  if (jobId === 'job-1') {
+    const spans: Array<[number, number, ChunkState, number]> = [
+      [1, 25, 'complete', 25],
+      [26, 50, 'complete', 25]
+    ]
+    for (let s = 101; s <= 250; s += 25) spans.push([s, s + 24, 'pending', 0])
+    return spans.map(([frameStart, frameEnd, state, framesDone]) => ({
+      id: `job1abcd-${frameStart}-${frameEnd}`,
+      jobId,
+      frameStart,
+      frameEnd,
+      state,
+      nodeId: state === 'pending' ? null : 'node-a',
+      framesDone,
+      retries: 0
+    }))
+  }
+  if (jobId === 'job-5') {
+    const out: ChunkSnapshot[] = []
+    for (let s = 1; s <= 120; s += 2) {
+      const i = (s - 1) / 2
+      const failed = i === 12
+      const state: ChunkState = failed
+        ? 'failed'
+        : i < 25
+          ? 'complete'
+          : i < 29
+            ? 'rendering'
+            : 'pending'
+      out.push({
+        id: `job5abcd-${s}-${s + 1}`,
+        jobId,
+        frameStart: s,
+        frameEnd: s + 1,
+        state,
+        nodeId: state === 'pending' ? null : 'node-b',
+        framesDone: state === 'complete' ? 2 : state === 'rendering' ? i % 2 : 0,
+        retries: failed ? 2 : 0,
+        ...(failed
+          ? {
+              errorClass: 'job' as const,
+              lastError: 'blender exited with code 1 (out of GPU memory)'
+            }
+          : {})
+      })
+    }
+    return out
+  }
   if (jobId !== 'job-3') return []
   const chunk = (
     frameStart: number,
