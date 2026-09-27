@@ -13,6 +13,8 @@ GitHub Releases with the notes from this file.
 
 ## [Unreleased]
 
+## [2.4.0] — 2026-09-27
+
 Phase 1 of the audit ([docs/AUDIT-2026-09.md](docs/AUDIT-2026-09.md)): what
 the app spends, what it keeps, and how busy the GPUs it pays for really are.
 Field incidents behind it: job 81fe2875 (7 of 24 paid GPUs held by renders
@@ -30,6 +32,8 @@ stalled the app).
   frame, how long it has run, the time left and the ETA, and a bar that
   greys out cancelled frames. A trash button cancels a live job, or removes
   a finished one from the list (its files stay on disk). Both ask first.
+  Time and cost read "so far / in all": a live job's total is projected
+  from its timing (by frames when there is no estimate yet).
 
 - **A local HTTP API and a CLI.** Turn on Settings › General › Local API (or
   launch with `VR_API=1`) and the running app serves `/v1` on `127.0.0.1`:
@@ -60,7 +64,8 @@ stalled the app).
 - **Fleet GPU history over the whole range, and per GPU.** `fleet:gpuHistory`
   returns a `summary` for the range asked for: mean utilisation over every
   reading of every GPU in it (so the Fleet screen's *mean util* can be the
-  range's, not the latest bucket's), GPU-hours rented and busy, and the $
+  range's, not the latest bucket's, averaged over the time something was on,
+  and saying how long that was), GPU-hours rented and busy, and the $
   paid for idle GPUs. With `perGpu: true` it adds each GPU's own utilisation
   line (at most 64).
 
@@ -215,7 +220,7 @@ stalled the app).
 - **Preview playback speed.** The preview's transport bar has 0.25×, 0.5×,
   1×, 2× and 4× buttons, and `<` / `>` step between them. The choice is
   remembered. Compared clips stay in sync at any speed.
-- **A zoomable film strip** (built, not yet on the job page): a minimap of the
+- **A zoomable film strip** on the job page: a minimap of the
   whole job, coloured by chunk state, with a window you drag, resize and
   Ctrl/⌘-scroll to zoom, over a row of thumbnails that never scrolls. When the
   window holds more frames than fit, the row shows every Nth frame and a chip
@@ -254,7 +259,15 @@ stalled the app).
   then the chunks and node logs, side by side when the column is 1100 px
   wide. Failed chunks are red and marked "!", cancelled ones grey hatching
   marked "–", with a legend and the last error in each tooltip. A finished
-  job can be removed from the Jobs list from here (its files stay).
+  job can be removed from the Jobs list from here (its files stay). At the
+  top, the job's clip, large: hovering plays it, a click (or P) opens the
+  preview. A job cut into more than a few dozen chunks shows them as a map
+  of small tiles, a row per run labelled with its first frame, not a wall of
+  cards. The preview's frame counter uses the job's own frame numbers.
+
+- **Narrow windows.** The toolbar and filmstrip header wrap, chips stay
+  whole, and tables shed their least useful columns
+  rather than scroll sideways.
 
 - **Cancelled is not failed.** Cancelling a job used to mark its unfinished
   chunks *failed*, so the job screen could not tell what the user stopped from
@@ -877,7 +890,8 @@ new on-node agent.
 - Energy totals are in-memory for the session; they reset when the app
   restarts. Cost totals are persisted in SQLite.
 
-[Unreleased]: https://github.com/elliotwoods/vastai-blender/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/elliotwoods/vastai-blender/compare/v2.4.0...HEAD
+[2.4.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.3.0...v2.4.0
 [2.3.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/elliotwoods/vastai-blender/compare/v2.0.0...v2.1.0
